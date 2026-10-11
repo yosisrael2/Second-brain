@@ -237,23 +237,32 @@ scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
 
 Behavior worth knowing:
 
-- **Stable compose project** — `COMPOSE_PROJECT_NAME` defaults to
-  `second-brain-dev` (override in `.env`), so container names never drift.
+- **Stable compose project** — both scripts resolve `COMPOSE_PROJECT_NAME`
+  identically (`scripts/lib.sh`: real environment > `.env` > default
+  `second-brain-dev`) and print it before any docker call, so a stop can never
+  target another project's volumes. Container names never drift.
 - **Port collisions with other compose projects** — if 5432/6333 are already
   published by a foreign compose project, the script says who holds it and
-  REUSES the healthy service (verify against `DATABASE_URL` / `QDRANT_URL`)
+  REUSES the healthy service (verified against `DATABASE_URL` / `QDRANT_URL`)
   instead of touching another project's containers; if what's on the port is
   not healthy/compatible it fails with exact instructions. It never removes
   other projects' containers.
 - **Preflight** — creates `.venv` + `pip install -e '.[dev]'` if missing;
   creates `.env` from `.env.example` if absent; reports JEV key as set/unset
-  and the Claude Code login as ok/not-logged-in (a warning, not a failure).
-  `JEV_BASE_URL` is optional — the default works.
+  and checks the `claude` CLI is installed (no LLM round-trip — if `/ask`
+  returns 502, run `claude` once and `/login`). `JEV_BASE_URL` is optional —
+  the default works.
 - **State** — pid + log live under `.dev/` (gitignored). Starting twice is
   safe: it refuses with the running pid. A busy port is refused with the
-  holder named. `PORT` overrides the default 8000.
-- **Data purge** — `scripts/dev-stop.sh --purge-data` deletes both docker
-  volumes (all items + vectors) and requires typing `PURGE`.
+  holder named. `PORT` overrides the default 8000. Stopping kills the whole
+  uvicorn tree (no orphans under `--reload`).
+- **Data purge** — `scripts/dev-stop.sh --purge-data` deletes the resolved
+  project's docker volumes (all items + vectors), naming the project and each
+  volume in the confirmation prompt (`PURGE` to proceed).
+- **`.env` loading in the scripts** — plain `KEY=VALUE` lines; surrounding
+  quotes stripped; inline `#` comments and trailing whitespace are NOT
+  stripped (keep values comment-free). The real environment always wins over
+  `.env`, matching pydantic-settings. Secrets are never printed.
 
 ## Setup
 
