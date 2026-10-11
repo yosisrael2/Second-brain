@@ -64,6 +64,13 @@ class QdrantItemIndexer:
         self._store.delete_collection()
         self._ensured = False
 
+    def close(self) -> None:
+        """Lifecycle hook for the app-lifetime factory (deps.close_shared_clients).
+
+        The indexer owns no connections of its own — the injected embedder and
+        store are closed separately by their own factories.
+        """
+
     @staticmethod
     def _payload_for(item: MemoryItem) -> dict[str, object]:
         return {

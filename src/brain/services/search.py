@@ -8,8 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from brain.ai.embedder import Embedder
-from brain.ai.vectorstore import VectorStore
+from brain.ai.embedder import Embedder, EmbedderError
+from brain.ai.vectorstore import VectorStore, VectorStoreError
 from brain.db.models import MemoryItem
 from brain.services.items import ItemsRepositoryProto
 
@@ -56,7 +56,7 @@ class SearchService:
         try:
             vector = self._embedder.embed(query)
             raw_hits = self._store.search(vector, k=limit + offset)
-        except Exception:
+        except (EmbedderError, VectorStoreError):
             logger.warning(
                 "search: semantic search unavailable; falling back to keywords", exc_info=True
             )

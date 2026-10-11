@@ -81,9 +81,21 @@ def _vector_store() -> QdrantVectorStore:
     )
 
 
+@lru_cache
+def _item_indexer() -> QdrantItemIndexer:
+    """App-lifetime item indexer over the shared embedder and store.
+
+    Keeps ensure_collection to once per process.
+    """
+    return QdrantItemIndexer(_embedder(), _vector_store())
+
+
 def close_shared_clients() -> None:
-    """Close every cached AI client; called from the app lifespan on shutdown."""
-    for client in (_jev_client(), _embedder(), _llm_client(), _vector_store()):
+    """Close every cached AI client; called from the app lifespan on shutdown.
+
+    All close() implementations are idempotent.
+    """
+    for client in (_jev_client(), _llm_client(), _item_indexer(), _embedder(), _vector_store()):
         client.close()
 
 
@@ -97,12 +109,9 @@ def get_vector_store() -> QdrantVectorStore:
     return _vector_store()
 
 
-def get_item_indexer(
-    embedder: Embedder = Depends(get_embedder),
-    store: QdrantVectorStore = Depends(get_vector_store),
-) -> QdrantItemIndexer:
-    """Provide the shared item indexer (embed + upsert / remove / purge)."""
-    return QdrantItemIndexer(embedder, store)
+def get_item_indexer() -> QdrantItemIndexer:
+    """Provide the shared app-lifetime item indexer."""
+    return _item_indexer()
 
 
 def get_classifier() -> JevClassifier:

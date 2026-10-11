@@ -144,7 +144,7 @@ class JevClient:
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
 
     def close(self) -> None:
-        """Release the underlying HTTP connection pool."""
+        """Release the underlying HTTP connection pool (idempotent)."""
         self._http.close()
 
     def decide(self, state: Any, questions: Mapping[str, dict[str, Any]]) -> dict[str, Any]:

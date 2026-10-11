@@ -71,7 +71,7 @@ def test_cli_main_parses_batch_size(monkeypatch):
     assert seen["batch_size"] == 7
 
 
-def test_cli_reindex_missing_embedding_key_fails_cleanly():
+def test_cli_reindex_missing_embedding_key_fails_cleanly(capsys):
     repo = _repo_with("note")
     store = QdrantVectorStore(client=QdrantClient(":memory:"))
     broken = OpenAIEmbedder(api_key=None)  # no key: embed() raises EmbedderError
@@ -79,6 +79,9 @@ def test_cli_reindex_missing_embedding_key_fails_cleanly():
     exit_code = _reindex_with(repo=repo, embedder=broken, store=store, batch_size=10)
 
     assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "reindex failed" in err
+    assert "PARTIAL" in err and "rerun 'brain reindex'" in err
 
 
 def test_cli_rejects_unknown_command():
@@ -101,11 +104,27 @@ def test_app_lifespan_closes_shared_clients(monkeypatch):
             closed.append(self._name)
 
     monkeypatch.setattr(deps, "_jev_client", lambda: FakeClient("jev"))
-    monkeypatch.setattr(deps, "_embedder", lambda: FakeClient("embedder"))
+    monkeypatch.setattr(deps, "_item_indexer", lambda: FakeClient("indexer"))
     monkeypatch.setattr(deps, "_llm_client", lambda: FakeClient("llm"))
+    monkeypatch.setattr(deps, "_embedder", lambda: FakeClient("embedder"))
     monkeypatch.setattr(deps, "_vector_store", lambda: FakeClient("qdrant"))
 
     with TestClient(create_app()):
         pass
 
-    assert sorted(closed) == ["embedder", "jev", "llm", "qdrant"]
+    assert sorted(closed) == ["embedder", "indexer", "jev", "llm", "qdrant"]
+
+
+def test_item_indexer_is_app_lifetime(monkeypatch):
+    """The cached factory returns one indexer (ensure_collection once per process)."""
+    deps._item_indexer.cache_clear()  # noqa: SLF001 - test isolation
+    monkeypatch.setattr(deps, "_embedder", lambda: FakeEmbedder(dim=8))
+    monkeypatch.setattr(
+        deps, "_vector_store", lambda: QdrantVectorStore(client=QdrantClient(":memory:"))
+    )
+
+    first = deps.get_item_indexer()
+    second = deps.get_item_indexer()
+
+    assert first is second
+    deps._item_indexer.cache_clear()  # noqa: SLF001 - do not leak fakes into other tests

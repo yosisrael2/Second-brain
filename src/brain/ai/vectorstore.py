@@ -74,7 +74,7 @@ class QdrantVectorStore:
         return QdrantClient(url=url, api_key=api_key, timeout=timeout_s)
 
     def close(self) -> None:
-        """Release the underlying Qdrant client connection."""
+        """Release the underlying Qdrant client connection (idempotent)."""
         self._client.close()
 
     def ensure_collection(self, dim: int) -> None:
@@ -125,7 +125,11 @@ class QdrantVectorStore:
 
     @contextmanager
     def _translated(self) -> Iterator[None]:
-        """Translate qdrant-client failures into :class:`VectorStoreError`."""
+        """Translate qdrant-client failures into :class:`VectorStoreError`.
+
+        Deliberate boundary: this is the one place catching broad exceptions,
+        so callers can narrow to VectorStoreError.
+        """
         try:
             yield
         except VectorStoreError:

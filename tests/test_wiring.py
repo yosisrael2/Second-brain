@@ -12,6 +12,7 @@ from brain.ai.classify import FALLBACK_CLASSIFICATION
 from brain.ai.embedder import FakeEmbedder
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.api import deps
+from brain.api.deps import QdrantItemIndexer
 from brain.db.enums import ItemStatus
 from brain.main import create_app
 
@@ -28,6 +29,9 @@ def wired_fixture():
     app.dependency_overrides[deps.get_classifier] = lambda: StubClassifier(FULL_CLASSIFICATION)
     app.dependency_overrides[deps.get_embedder] = lambda: FakeEmbedder(dim=8)
     app.dependency_overrides[deps.get_vector_store] = lambda: store
+    app.dependency_overrides[deps.get_item_indexer] = lambda: QdrantItemIndexer(
+        FakeEmbedder(dim=8), store
+    )
     app.dependency_overrides[deps.get_llm_client] = lambda: FakeLLMClient(reply="see sources")
     yield app, repo, store
     app.dependency_overrides.clear()

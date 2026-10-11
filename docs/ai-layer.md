@@ -10,8 +10,7 @@ tests run fully offline.
 | Module | What it provides | Pattern |
 | ------ | ---------------- | ------- |
 | `jev.py` | `JevClient` — typed-decision API adapter (`choice`, `score`, `score_batch`, `decide`) | Adapter |
-| `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus`; `JevClassifier` adapter | Service / Adapter |
-| `enums.py` | Temporary copies of `ItemType` / `Actionability` / `ItemStatus` (TODO: swap to shared `brain.domain` enums when worker_1 lands them) | — |
+| `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus`; `JevClassifier` adapter. Enums come from `brain.db.enums` (single shared definition) | Service / Adapter |
 | `embedder.py` | `Embedder` protocol; `OpenAIEmbedder` (network) and `FakeEmbedder` (deterministic, offline) | Strategy |
 | `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError` | Repository / Adapter |
 | `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering; `JevReranker` adapter | Strategy |

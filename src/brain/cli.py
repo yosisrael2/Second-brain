@@ -69,7 +69,11 @@ def _reindex(
         service = IngestService(repo, classifier=_NoopClassifier(), indexer=indexer)
         indexed = service.reindex(batch_size=batch_size)
     except (EmbedderError, VectorStoreError) as exc:
-        print(f"reindex failed: {exc}", file=sys.stderr)
+        print(
+            f"reindex failed: {exc}. The collection is now PARTIAL; "
+            "rerun 'brain reindex' to finish rebuilding.",
+            file=sys.stderr,
+        )
         return 1
     finally:
         if live_store is not None:

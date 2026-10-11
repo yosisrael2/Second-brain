@@ -5,7 +5,7 @@ from qdrant_client import QdrantClient
 from tests.fakes import FakeRepository
 
 from brain.ai.embedder import EmbedderError, FakeEmbedder
-from brain.ai.vectorstore import QdrantVectorStore
+from brain.ai.vectorstore import QdrantVectorStore, VectorStoreError
 from brain.db.models import MemoryItem
 from brain.services.search import SearchService
 
@@ -29,18 +29,30 @@ class StubReranker:
 
 class BrokenStore:
     def ensure_collection(self, dim: int) -> None:
-        raise RuntimeError("qdrant down")
+        raise VectorStoreError("qdrant down")
 
     def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
-        raise RuntimeError("qdrant down")
+        raise VectorStoreError("qdrant down")
+
+    def delete(self, item_id: str) -> None:
+        raise VectorStoreError("qdrant down")
+
+    def delete_collection(self) -> None:
+        raise VectorStoreError("qdrant down")
 
     def search(self, vector: list[float], k: int) -> list[dict]:
-        raise RuntimeError("qdrant down")
+        raise VectorStoreError("qdrant down")
+
+    def close(self) -> None:
+        pass
 
 
 class BrokenEmbedder:
     def embed(self, text: str) -> list[float]:
         raise EmbedderError("no key")
+
+    def close(self) -> None:
+        pass
 
 
 def seed(repo: FakeRepository, *texts: str) -> list[MemoryItem]:
