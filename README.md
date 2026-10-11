@@ -43,12 +43,13 @@ client ──> api/routes      (thin routers: HTTP in/out, no business logic)
 src/brain/
 ├── config.py            # env-based settings (pydantic-settings)
 ├── main.py              # FastAPI app factory + ASGI entrypoint (app = create_app())
+├── cli.py               # `brain` CLI (reindex: rebuild Qdrant from Postgres)
 ├── schemas.py           # pydantic request/response models
 ├── ai/                  # AI integrations (owned by AI/integrations track)
 ├── api/
 │   ├── deps.py          # FastAPI dependency providers (service composition)
-│   └── routes/          # thin routers: health.py, items.py
-├── services/            # business logic: items.py (+ ItemsRepositoryProto)
+│   └── routes/          # thin routers: health.py, items.py, search.py, ask.py
+├── services/            # business logic: items, ingest, search, ask
 ├── repositories/        # data access: items.py
 └── db/
     ├── enums.py         # shared enums + FTS constant (single definition)
@@ -58,8 +59,13 @@ src/brain/
     └── migrations/      # Alembic env + versions
 tests/
 ├── conftest.py          # app client, DB migration + cleanup fixtures
+├── fakes.py             # offline fakes shared by wiring tests
 ├── test_health.py
-└── test_items.py
+├── test_items.py
+├── test_wiring.py       # /items /search /ask with fake-backed infra
+├── test_ingest_service.py / test_search_service.py / test_ask_service.py
+├── test_cli_and_lifespan.py
+└── ai/                  # AI-layer unit tests (offline)
 ```
 
 ## Memory items API
@@ -93,12 +99,14 @@ the AI/integrations track).
 
 | Method | Path               | Behavior                                                        |
 | ------ | ------------------ | --------------------------------------------------------------- |
-| POST   | `/items`           | Create; 201 + item. Validation errors -> 422                     |
+| POST   | `/items`           | Create; 201 + item. Validation errors -> 422. `?classify=false` disables auto-classification (default: on) |
 | GET    | `/items`           | List newest-first; filters `type`, `project`, `status`; `limit` (1–200, default 50), `offset` |
 | GET    | `/items/search?q=` | Keyword search over `raw_text` via Postgres FTS (websearch syntax, e.g. `foo OR bar`); same pagination |
 | GET    | `/items/{id}`      | Fetch one; 404 if missing                                        |
 | PATCH  | `/items/{id}`      | Partial update (absent fields unchanged); 404 if missing         |
 | DELETE | `/items/{id}`      | Delete; 204, or 404 if missing                                   |
+| GET    | `/search?q=`       | Semantic search (embed -> Qdrant -> Jev rerank); falls back to keyword search (`score: null`) when embeddings/Qdrant are unavailable |
+| POST   | `/ask`             | Answer a question from top-k items with citations; 502 when the LLM is unconfigured/down |
 
 Example:
 
@@ -109,10 +117,35 @@ curl 'localhost:8000/items?type=task&status=inbox'
 curl 'localhost:8000/items/search?q=renew+cert'
 curl -X PATCH localhost:8000/items/<id> -H 'Content-Type: application/json' -d '{"status": "filed"}'
 curl -X DELETE localhost:8000/items/<id>
+# AI endpoints (see docs/ai-layer.md for behavior + env vars)
+curl -X POST 'localhost:8000/items?classify=false' -H 'Content-Type: application/json' \
+  -d '{"raw_text": "raw capture, no classification"}'
+curl 'localhost:8000/search?q=how+do+I+roll+out+kubernetes'
+curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+  -d '{"question": "what port does the server run on?"}'
 ```
 
 Tests: `tests/test_items.py` (needs the compose Postgres; skipped with a hint
-if it is down).
+if it is down). Wiring tests run fully offline (`tests/test_wiring.py`).
+
+## AI layer and the `brain` CLI
+
+Auto-classification on `POST /items` (Jev), semantic `/search` (embeddings +
+Qdrant + rerank), and grounded `/ask` (Anthropic) are optional at runtime:
+with their API keys unset the app still captures and keyword-searches —
+degradations and failure modes are documented in
+[docs/ai-layer.md](docs/ai-layer.md).
+
+Rebuild the vector index from Postgres (covers items that missed indexing
+while Jev/Qdrant were down):
+
+```bash
+brain reindex [--batch-size 500]
+# exit 0 + "indexed N item(s)"; exit 1 with a clear error when embeddings/Qdrant are unavailable
+```
+
+The shared AI clients are app-lifetime singletons built in
+`src/brain/api/deps.py` and closed on shutdown via the app lifespan.
 
 ## Setup
 
@@ -148,10 +181,11 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:5432/brain` | Postgres (SQLAlchemy URL) |
 | `QDRANT_URL`   | `http://localhost:6333`                                | Qdrant API endpoint |
 
-AI-layer variables (`JEV_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`QDRANT_COLLECTION`, timeouts, base URLs) are documented in
-[docs/ai-layer.md](docs/ai-layer.md). None are required to boot the app;
-`classify`/`rerank` fall back gracefully when Jev is unconfigured.
+All settings live in `Settings` (`src/brain/config.py`); AI-layer variables
+(keys as `SecretStr`, base URLs, models, timeouts) are listed in
+[docs/ai-layer.md](docs/ai-layer.md) and `.env.example`. None are required to
+boot the app; `classify`/`rerank` fall back gracefully when Jev is
+unconfigured.
 
 ## Tests
 

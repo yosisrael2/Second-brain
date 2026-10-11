@@ -24,6 +24,9 @@ dev = [
     "httpx>=0.27,<1",
 ]
 
+[project.scripts]
+brain = "brain.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -33,6 +36,10 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI's Depends()/Query() in parameter defaults is the framework idiom.
+"src/brain/api/**" = ["B008"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -122,7 +122,9 @@ def test_list_items_pagination(client: TestClient, clean_items: None) -> None:
 def test_patch_item_updates_only_given_fields(client: TestClient, clean_items: None) -> None:
     created = _create_item(client, raw_text="Call Bob", project="alpha", type="task")
 
-    response = client.patch(f"{_ENDPOINT}/{created['id']}", json={"status": "filed", "importance": 5})
+    response = client.patch(
+        f"{_ENDPOINT}/{created['id']}", json={"status": "filed", "importance": 5}
+    )
 
     assert response.status_code == 200
     body = response.json()
@@ -205,7 +207,10 @@ def test_search_matches_words_with_search_operators(client: TestClient, clean_it
     response = client.get(f"{_ENDPOINT}/search", params={"q": "offsite OR budget"})
 
     assert response.status_code == 200
-    assert {item["raw_text"] for item in response.json()} == {"Plan the offsite agenda", "Plan the budget"}
+    assert {item["raw_text"] for item in response.json()} == {
+        "Plan the offsite agenda",
+        "Plan the budget",
+    }
 
 
 def test_db_check_constraints_backstop(clean_items: None) -> None:

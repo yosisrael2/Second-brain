@@ -41,7 +41,9 @@ def upgrade() -> None:
         sa.Column("confidence", sa.Float(), nullable=True),
         sa.Column(
             "status",
-            sa.Enum("inbox", "filed", "needs_review", name="itemstatus", native_enum=False, length=32),
+            sa.Enum(
+                "inbox", "filed", "needs_review", name="itemstatus", native_enum=False, length=32
+            ),
             nullable=False,
         ),
         sa.Column(
@@ -50,10 +52,24 @@ def upgrade() -> None:
             sa.Computed("to_tsvector('english', coalesce(raw_text, ''))", persisted=True),
             nullable=True,
         ),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-        sa.CheckConstraint("actionability IN ('none', 'later', 'now')", name=op.f("ck_memory_items_actionability")),
-        sa.CheckConstraint("status IN ('inbox', 'filed', 'needs_review')", name=op.f("ck_memory_items_status")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "actionability IN ('none', 'later', 'now')", name=op.f("ck_memory_items_actionability")
+        ),
+        sa.CheckConstraint(
+            "status IN ('inbox', 'filed', 'needs_review')", name=op.f("ck_memory_items_status")
+        ),
         sa.CheckConstraint(
             "type IN ('task', 'decision', 'note', 'event', 'reference', 'idea')",
             name=op.f("ck_memory_items_type"),
@@ -78,5 +94,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_memory_items_search_vector", table_name="memory_items", postgresql_using="gin")
+    op.drop_index(
+        "ix_memory_items_search_vector", table_name="memory_items", postgresql_using="gin"
+    )
     op.drop_table("memory_items")

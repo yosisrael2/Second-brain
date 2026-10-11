@@ -64,3 +64,23 @@ class ItemRead(BaseModel):
     status: ItemStatus
     created_at: datetime
     updated_at: datetime
+
+
+class SearchResultRead(ItemRead):
+    """A memory item plus its semantic-search score (None for keyword fallback)."""
+
+    score: float | None = None
+
+
+class AskQuestion(BaseModel):
+    """Payload for POST /ask."""
+
+    question: str = Field(min_length=1, max_length=RAW_TEXT_MAX_LENGTH)
+
+
+class AskAnswer(BaseModel):
+    """Response for POST /ask: answer, cited item ids, and the sources used."""
+
+    answer: str
+    cited_ids: list[str]
+    sources: list[SearchResultRead]

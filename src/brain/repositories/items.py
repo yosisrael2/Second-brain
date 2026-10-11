@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -40,7 +41,7 @@ class ItemsRepository:
         status: ItemStatus | None,
         limit: int,
         offset: int,
-    ) -> list[MemoryItem]:
+    ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status."""
         stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc())
         if item_type is not None:
@@ -51,7 +52,7 @@ class ItemsRepository:
             stmt = stmt.where(MemoryItem.status == status)
         return list(self._db.scalars(stmt.limit(limit).offset(offset)))
 
-    def search(self, *, query: str, limit: int, offset: int) -> list[MemoryItem]:
+    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
         """Full-text search over raw_text via Postgres FTS, best match first."""
         tsquery = func.websearch_to_tsquery(FTS_LANGUAGE, query)
         stmt = (

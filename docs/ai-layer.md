@@ -70,28 +70,56 @@ Revisit only if M1 traffic shows a real need.
 
 | Variable | Default | Used by |
 | -------- | ------- | ------- |
-| `JEV_API_KEY` | — (required) | `JevClient` |
+| `JEV_API_KEY` | — (optional; unset = fail-closed fallback) | `JevClient` |
 | `JEV_BASE_URL` | `https://api.typesafe.ai/v1/systemone` | `JevClient` |
 | `JEV_MODEL` | `jev-latest` | `JevClient` |
-| `JEV_TIMEOUT_MS` | `5000` | `JevClient` |
-| `OPENAI_API_KEY` | — (required for real embeddings) | `OpenAIEmbedder` |
+| `JEV_TIMEOUT_MS` | `5000` (int; pydantic-validated) | `JevClient` |
+| `OPENAI_API_KEY` | — (optional; unset = keyword fallback) | `OpenAIEmbedder` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | `OpenAIEmbedder` |
-| `ANTHROPIC_API_KEY` | — (required for real answers) | `ClaudeLLMClient` |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (dim 1536) | `OpenAIEmbedder` |
+| `OPENAI_TIMEOUT_S` | `30` | `OpenAIEmbedder` |
+| `ANTHROPIC_API_KEY` | — (optional; unset = `/ask` returns 502) | `ClaudeLLMClient` |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com/v1` | `ClaudeLLMClient` |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | `ClaudeLLMClient` |
-| `QDRANT_URL` | — (required) | `QdrantVectorStore` |
+| `ANTHROPIC_MAX_TOKENS` | `1024` | `ClaudeLLMClient` |
+| `ANTHROPIC_TIMEOUT_S` | `60` | `ClaudeLLMClient` |
+| `QDRANT_URL` | `http://localhost:6333` | `QdrantVectorStore` |
 | `QDRANT_API_KEY` | — | `QdrantVectorStore` |
 | `QDRANT_COLLECTION` | `brain_items` | `QdrantVectorStore` |
+| `QDRANT_TIMEOUT_S` | `10` | `QdrantVectorStore` |
 
-Secrets live in `.env` (gitignored) and are only sent as auth headers — never
-logged, never committed.
+All of them are `Settings` fields (`src/brain/config.py`, pydantic-settings;
+keys are `SecretStr` so they never leak into logs or reprs) — the AI modules
+themselves read no environment variables. Secrets live in `.env` (gitignored)
+and are only sent as auth headers.
 
-## Wiring into the app (planned, M1)
+## App wiring (live)
 
-Routers in `src/brain/api/routes/` will receive these as constructor-injected
-collaborators of a service (FastAPI `Depends`); `/search` will combine
-`Embedder` + `VectorStore` (+ `rerank`), `/ask` will add `answer`. Not wired
-yet.
+The layer is wired into the app on this branch (see also README):
+
+- **Composition root**: `src/brain/api/deps.py` builds app-lifetime clients
+  (`JevClient`, `OpenAIEmbedder`, `ClaudeLLMClient`, `QdrantVectorStore`) from
+  `Settings` as cached factories, assembles the services per request via
+  `Depends`, and exposes `close_shared_clients()` — called by the app lifespan
+  on shutdown.
+- **IngestService** (`services/ingest.py`): `POST /items` persists first, then
+  classifies (fills only unset fields, routes by confidence), then indexes the
+  text in Qdrant. Classifier/indexing failures are logged and skipped: the
+  item is captured, stays in the inbox, and is picked up later by `brain
+  reindex`. `?classify=false` disables classification; explicit payload fields
+  are never overwritten.
+- **SearchService** (`services/search.py`): `GET /search?q=` embeds the query,
+  searches Qdrant, reranks via Jev, and resolves items from Postgres. Falls
+  back to Postgres keyword search (hits with `score: null`) when embeddings or
+  Qdrant are unavailable.
+- **AskService** (`services/ask.py`): `POST /ask` searches top-k and answers
+  via `LLMClient` with `[id]` citations. LLM failures raise `LLMError`, mapped
+  to HTTP 502 by the router layer.
+- **CLI**: `brain reindex` (`src/brain/cli.py`) rebuilds the Qdrant collection
+  from Postgres, page by page; exits 1 with a clear message when embeddings or
+  Qdrant are unavailable.
+- **Collections**: `QdrantVectorStore.ensure_collection` is called with the
+  embedder's `dim` (1536 for `text-embedding-3-small`).
 
 ## Tests
 
@@ -102,3 +130,6 @@ pytest tests/ai -v
 All tests are offline: HTTP is stubbed with `httpx.MockTransport`, Qdrant with
 an in-memory client, Jev/LLM with stub classes covering the three routing
 bands, Jev-failure fallbacks (classify + rerank), and citation presence.
+Endpoint wiring is covered by `tests/test_wiring.py` with fake-backed
+infrastructure; `tests/test_cli_and_lifespan.py` covers `brain reindex` and
+client shutdown.

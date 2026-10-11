@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Protocol
 
 from brain import schemas
@@ -33,9 +34,9 @@ class ItemsRepositoryProto(Protocol):
         status: ItemStatus | None,
         limit: int,
         offset: int,
-    ) -> list[MemoryItem]: ...
+    ) -> Sequence[MemoryItem]: ...
 
-    def search(self, *, query: str, limit: int, offset: int) -> list[MemoryItem]: ...
+    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]: ...
 
     def delete(self, item: MemoryItem) -> None: ...
 
@@ -87,7 +88,7 @@ class ItemsService:
         status: ItemStatus | None,
         limit: int,
         offset: int,
-    ) -> list[MemoryItem]:
+    ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status."""
         return self._repo.list(
             item_type=item_type,
@@ -97,7 +98,7 @@ class ItemsService:
             offset=offset,
         )
 
-    def search(self, *, query: str, limit: int, offset: int) -> list[MemoryItem]:
+    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
         """Full-text keyword search over raw_text, best match first."""
         return self._repo.search(query=query, limit=limit, offset=offset)
 

@@ -87,13 +87,19 @@ class MemoryItem(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
-    source: Mapped[str] = mapped_column(String(_SOURCE_MAX_LENGTH), nullable=False, default="manual")
+    source: Mapped[str] = mapped_column(
+        String(_SOURCE_MAX_LENGTH), nullable=False, default="manual"
+    )
     type: Mapped[ItemType | None] = mapped_column(_enum_column(ItemType), nullable=True)
     project: Mapped[str | None] = mapped_column(String(_PROJECT_MAX_LENGTH), nullable=True)
     importance: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    actionability: Mapped[Actionability | None] = mapped_column(_enum_column(Actionability), nullable=True)
+    actionability: Mapped[Actionability | None] = mapped_column(
+        _enum_column(Actionability), nullable=True
+    )
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    status: Mapped[ItemStatus] = mapped_column(_enum_column(ItemStatus), nullable=False, default=ItemStatus.INBOX)
+    status: Mapped[ItemStatus] = mapped_column(
+        _enum_column(ItemStatus), nullable=False, default=ItemStatus.INBOX
+    )
     search_vector: Mapped[TSVECTOR] = mapped_column(
         TSVECTOR,
         Computed(f"to_tsvector('{FTS_LANGUAGE}', coalesce(raw_text, ''))", persisted=True),

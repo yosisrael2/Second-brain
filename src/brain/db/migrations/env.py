@@ -4,8 +4,8 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from brain.config import get_settings
-from brain.db.base import Base
 from brain.db import models  # noqa: F401  (registers models on Base.metadata)
+from brain.db.base import Base
 
 config = context.config
 
