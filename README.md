@@ -13,6 +13,10 @@ search.
 
 ## Architecture
 
+A visual, code-referenced tour lives in
+[docs/how-it-works.html](docs/how-it-works.html) (self-contained, open in any
+browser). The short version:
+
 ```
 client ──> api/routes      (thin routers: HTTP in/out, no business logic)
               │ Depends
@@ -332,7 +336,10 @@ each test; they skip with a hint if Postgres is unreachable).
    in `create_app()` (`src/brain/main.py`).
 5. Tests next to the behavior in `tests/`.
 6. Document the feature in this README (or `docs/<feature>.md` linked from
-   here) in the same change.
+   here) in the same change. If the change affects anything described in
+   [docs/how-it-works.html](docs/how-it-works.html) (flows, components, data
+   model, degradation behavior, security model), update that page in the same
+   change so it stays an accurate picture of the code.
 
 ## Git rules
 

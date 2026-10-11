@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Second Brain MVP — how it works</title>
+<style>
+  :root {
+    --bg: #f6f7fb;
+    --fg: #1c2030;
+    --muted: #565d75;
+    --accent: #2456d6;
+    --accent-contrast: #ffffff;
+    --box-bg: #ffffff;
+    --box-border: #c9cede;
+    --ai-bg: #eef2ff;
+    --ai-border: #9db1e8;
+    --ok-bg: #e9f7ef;
+    --ok-border: #79b98d;
+    --fail-bg: #fdf0ee;
+    --fail-border: #d99a8e;
+    --fail-fg: #8c3a2b;
+    --arrow: #5c6580;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12141c;
+      --fg: #e6e8f2;
+      --muted: #a6adc6;
+      --accent: #8db2ff;
+      --accent-contrast: #10131c;
+      --box-bg: #1b1e2b;
+      --box-border: #3a4056;
+      --ai-bg: #1c2340;
+      --ai-border: #46538c;
+      --ok-bg: #16281e;
+      --ok-border: #3f7a53;
+      --fail-bg: #2c1a16;
+      --fail-border: #9c5a4a;
+      --fail-fg: #f0a893;
+      --arrow: #8b93ad;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.7rem; line-height: 1.25; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); margin: 0 0 20px; }
+  h2 { font-size: 1.3rem; margin: 44px 0 10px; padding-top: 10px; border-top: 1px solid var(--box-border); }
+  h3 { font-size: 1.05rem; margin: 22px 0 6px; }
+  p { margin: 10px 0; }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+    background: var(--box-bg);
+    border: 1px solid var(--box-border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    overflow-wrap: anywhere;
+  }
+  .principle {
+    background: var(--ai-bg);
+    border: 1px solid var(--ai-border);
+    border-left: 5px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 16px 0;
+  }
+  .principle strong { font-size: 1.05em; }
+  figure { margin: 18px 0; padding: 0; }
+  figure svg {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    background: var(--box-bg);
+    border: 1px solid var(--box-border);
+    border-radius: 10px;
+  }
+  .tablewrap { overflow-x: auto; }
+  figcaption { color: var(--muted); font-size: 0.9em; margin-top: 6px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.92em; }
+  .tablewrap table { min-width: 560px; }
+  th, td { border: 1px solid var(--box-border); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--ai-bg); }
+  td code, th code { white-space: normal; }
+  ul, ol { margin: 10px 0; padding-left: 24px; }
+  li { margin: 4px 0; }
+  .refs { color: var(--muted); font-size: 0.9em; }
+  .badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 1px 10px;
+    font-size: 0.82em;
+    font-weight: 600;
+    border: 1px solid var(--box-border);
+  }
+  .badge.done { background: var(--ok-bg); border-color: var(--ok-border); }
+  .badge.planned { background: var(--fail-bg); border-color: var(--fail-border); color: var(--fail-fg); }
+  footer { color: var(--muted); font-size: 0.88em; margin-top: 48px; border-top: 1px solid var(--box-border); padding-top: 12px; }
+
+  /* SVG shared styles (inline svg elements inherit these rules) */
+  .svgbox { fill: var(--box-bg); stroke: var(--box-border); stroke-width: 1.5; }
+  .svgai  { fill: var(--ai-bg);  stroke: var(--ai-border);  stroke-width: 1.5; }
+  .svgok  { fill: var(--ok-bg);  stroke: var(--ok-border);  stroke-width: 1.5; }
+  .svgfail{ fill: var(--fail-bg); stroke: var(--fail-border); stroke-width: 1.5; stroke-dasharray: 5 4; }
+  .t-main { fill: var(--fg); font: 600 18px system-ui, sans-serif; }
+  .t-sub  { fill: var(--fg); font: 15px system-ui, sans-serif; }
+  .t-code { fill: var(--muted); font: 14px ui-monospace, Menlo, monospace; }
+  .t-label{ fill: var(--accent); font: 600 15px system-ui, sans-serif; }
+  .t-step { fill: var(--accent-contrast); font: 700 15px system-ui, sans-serif; }
+  .t-fail { fill: var(--fail-fg); font: 600 14.5px system-ui, sans-serif; }
+  .t-failsub { fill: var(--fail-fg); font: 13.5px ui-monospace, Menlo, monospace; }
+  .t-cap  { fill: var(--accent); font: 600 14px system-ui, sans-serif; }
+  .t-head { fill: var(--fg); font: 700 19px system-ui, sans-serif; }
+  .edge   { stroke: var(--arrow); stroke-width: 2; fill: none; }
+  .edge-dash { stroke: var(--arrow); stroke-width: 1.8; fill: none; stroke-dasharray: 6 4; }
+  .stepdot{ fill: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Second Brain MVP — how it works</h1>
+<p class="subtitle">A guided tour of the running code on <code>feature/mvp-dev-providers</code> (commit <code>b22a3b0</code>). Every claim links to the file and line that implements it.</p>
+
+<div class="principle">
+  <strong>Jev decides, LLMs write, the DB remembers.</strong>
+  Jev (the TypeSafe decision API, <code>ai/jev.py:123</code>, default model
+  <code>jev-latest</code>) makes the judgment calls — what an item <em>is</em>, how
+  confident the classification is, which search candidates matter. Claude writes the
+  answers, in a tool-less sandbox with no access to your machine. Postgres is the
+  source of truth: vectors are an accelerant, never the record.
+</div>
+
+<h2 id="overview">1 · What this is, in one paragraph</h2>
+<p>
+Second Brain is a personal knowledge capture service. You POST pieces of text
+(a note, a decision, a task) to <code>POST /items</code>; Jev classifies each one
+(type, importance, actionability, confidence) and routes it into an inbox /
+review / filed workflow. Everything is stored in Postgres and embedded into
+Qdrant so you can later search semantically (<code>GET /search</code>) or ask
+questions over your own knowledge (<code>POST /ask</code>), with answers that cite
+the stored items they used. The interesting engineering property is
+<strong>graceful degradation</strong>: every AI component can be down (no API
+keys, network down, service restarting) and the core loop — capture, store,
+keyword-search — keeps working.
+</p>
+
+<h2 id="components">2 · Component map</h2>
+<p>
+Thin HTTP routers call framework-free services; services own the business logic
+and talk to two kinds of collaborators: repositories (Postgres, via SQLAlchemy)
+and the AI layer (Jev, embedders, vector store, LLM clients).
+</p>
+
+<figure>
+<svg viewBox="0 0 640 688" role="img" aria-labelledby="cmp-t cmp-d">
+  <title id="cmp-t">Component map: routers, services, repositories, AI layer, storage</title>
+  <desc id="cmp-d">HTTP routers call services; services call ItemsRepository (Postgres) and the AI layer: JevClient, Embedder, VectorStore (Qdrant) and LLMClient, chosen by provider in factories.</desc>
+
+  <rect x="24" y="32" width="520" height="48" rx="10" class="svgbox"/>
+  <text x="284" y="62" text-anchor="middle" class="t-main">client (curl / UI)</text>
+
+  <path d="M284 80 L284 100" class="edge" marker-end="url(#arrowCmp)"/>
+  <text x="296" y="96" class="t-label">HTTP · JSON</text>
+
+  <rect x="24" y="104" width="520" height="84" rx="10" class="svgbox"/>
+  <text x="284" y="130" text-anchor="middle" class="t-main">FastAPI routers — thin HTTP in/out</text>
+  <text x="284" y="152" text-anchor="middle" class="t-code">POST /items · GET /items · PATCH · DELETE</text>
+  <text x="284" y="172" text-anchor="middle" class="t-code">GET /items/search · GET /search · POST /ask · /health</text>
+
+  <path d="M284 188 L284 208" class="edge" marker-end="url(#arrowCmp)"/>
+  <text x="296" y="204" class="t-label">Depends</text>
+
+  <rect x="24" y="212" width="520" height="104" rx="10" class="svgbox"/>
+  <text x="284" y="240" text-anchor="middle" class="t-main">services — business logic, framework-free</text>
+  <text x="284" y="264" text-anchor="middle" class="t-code">IngestService · ItemsService · SearchService · AskService</text>
+  <text x="284" y="284" text-anchor="middle" class="t-code">services/ingest.py · items.py · search.py · ask.py</text>
+
+  <path d="M284 316 L284 336" class="edge" marker-end="url(#arrowCmp)"/>
+  <text x="296" y="332" class="t-label">SQLAlchemy session</text>
+
+  <rect x="24" y="340" width="520" height="64" rx="10" class="svgbox"/>
+  <text x="284" y="366" text-anchor="middle" class="t-main">ItemsRepository</text>
+  <text x="284" y="388" text-anchor="middle" class="t-code">repositories/items.py — SQLAlchemy 2, FTS search_vector</text>
+
+  <path d="M284 404 L284 424" class="edge" marker-end="url(#arrowCmp)"/>
+  <text x="296" y="420" class="t-label">SQL</text>
+
+  <rect x="24" y="428" width="520" height="76" rx="10" class="svgok"/>
+  <text x="284" y="456" text-anchor="middle" class="t-main">Postgres — source of truth</text>
+  <text x="284" y="480" text-anchor="middle" class="t-code">migration f50d89c124c2 · generated tsvector + GIN index</text>
+
+  <path d="M544 264 L580 264 L580 512 L480 512 L480 536" class="edge-dash" marker-end="url(#arrowCmp)"/>
+  <text x="24" y="532" class="t-cap">services → AI layer: classify · embed · rerank · complete</text>
+
+  <rect x="24" y="544" width="272" height="56" rx="10" class="svgai"/>
+  <text x="160" y="568" text-anchor="middle" class="t-main">JevClient</text>
+  <text x="160" y="590" text-anchor="middle" class="t-code">classify · route · rerank</text>
+
+  <rect x="344" y="544" width="272" height="56" rx="10" class="svgai"/>
+  <text x="480" y="568" text-anchor="middle" class="t-main">Embedder</text>
+  <text x="480" y="590" text-anchor="middle" class="t-code">fastembed | openai</text>
+
+  <rect x="24" y="616" width="272" height="56" rx="10" class="svgai"/>
+  <text x="160" y="640" text-anchor="middle" class="t-main">VectorStore</text>
+  <text x="160" y="662" text-anchor="middle" class="t-code">ai/vectorstore.py → Qdrant</text>
+
+  <rect x="344" y="616" width="272" height="56" rx="10" class="svgai"/>
+  <text x="480" y="640" text-anchor="middle" class="t-main">LLMClient</text>
+  <text x="480" y="662" text-anchor="middle" class="t-code">claude_sdk | anthropic</text>
+
+  <defs>
+    <marker id="arrowCmp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Routers are thin (<code>routes/*.py</code>); business logic lives in <code>services/</code>; <code>repositories/</code> owns SQL; <code>ai/</code> isolates every external model call behind small Protocols (<code>services/ingest.py:20</code>, <code>services/search.py:19</code>, <code>services/indexing.py:16</code>). Everything is built at startup by <code>factories.py:16,28</code> from <code>config.Settings</code>, cached app-lifetime via <code>lru_cache</code> in <code>api/deps.py</code>, and closed on shutdown (<code>deps.py:75</code>). The CLI lives in <code>cli.py:34</code> (<code>brain reindex</code>).</figcaption>
+</figure>
+
+<h2 id="capture">3 · Flow: capture (<code>POST /items</code>)</h2>
+<p>
+The write to Postgres happens <strong>first</strong> (<code>ingest.py:59</code>);
+classification and embedding run after, and their failures are logged but never
+fail the request.
+</p>
+
+<figure>
+<svg viewBox="0 0 640 728" role="img" aria-labelledby="cap-t cap-d">
+  <title id="cap-t">Capture flow</title>
+  <desc id="cap-d">Client posts raw text; the item is persisted to Postgres first; Jev classifies it; confidence routes it to filed, needs_review or inbox; the text is embedded and upserted into Qdrant; response 201. Jev failures leave the item in inbox; embedder or Qdrant failures are healed by brain reindex.</desc>
+
+  <circle cx="48" cy="48" r="14" class="stepdot"/><text x="48" y="53" text-anchor="middle" class="t-step">1</text>
+  <rect x="24" y="20" width="592" height="56" rx="10" class="svgbox"/>
+  <text x="72" y="46" class="t-main">POST /items { raw_text, source?, project?, type? }</text>
+  <text x="72" y="66" class="t-code">routes/items.py:21 → IngestService.create</text>
+
+  <path d="M320 76 L320 96" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="92" class="t-label">persist first</text>
+
+  <circle cx="48" cy="128" r="14" class="stepdot"/><text x="48" y="133" text-anchor="middle" class="t-step">2</text>
+  <rect x="24" y="100" width="592" height="56" rx="10" class="svgok"/>
+  <text x="72" y="126" class="t-main">INSERT row into Postgres</text>
+  <text x="72" y="146" class="t-code">services/ingest.py:59 — durable before any AI runs</text>
+
+  <path d="M320 156 L320 176" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="172" class="t-label">classify — skipped when type given</text>
+
+  <circle cx="48" cy="218" r="14" class="stepdot"/><text x="48" y="223" text-anchor="middle" class="t-step">3</text>
+  <rect x="24" y="180" width="592" height="76" rx="10" class="svgai"/>
+  <text x="72" y="206" class="t-main">Jev classify — the judgment call</text>
+  <text x="72" y="226" class="t-code">type · importance · actionability · confidence</text>
+  <text x="72" y="246" class="t-code">services/ingest.py:92 · ai/jev.py:123</text>
+
+  <rect x="24" y="264" width="592" height="52" rx="10" class="svgfail"/>
+  <text x="40" y="286" class="t-fail">✗ Jev down → warning logged; fields stay empty</text>
+  <text x="40" y="306" class="t-failsub">item stays in inbox (services/ingest.py:98)</text>
+
+  <path d="M320 316 L320 336" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="332" class="t-label">route(confidence)</text>
+
+  <circle cx="48" cy="378" r="14" class="stepdot"/><text x="48" y="383" text-anchor="middle" class="t-step">4</text>
+  <rect x="24" y="340" width="592" height="76" rx="10" class="svgai"/>
+  <text x="72" y="366" class="t-main">confidence routing bands</text>
+  <text x="72" y="386" class="t-code">≥ 0.90 → filed · 0.50–0.89 → needs_review · &lt; 0.50 → inbox</text>
+  <text x="72" y="406" class="t-code">ai/classify.py:58-65 — thresholds 0.9 / 0.5</text>
+
+  <path d="M320 416 L320 436" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="432" class="t-label">embed + index</text>
+
+  <circle cx="48" cy="468" r="14" class="stepdot"/><text x="48" y="473" text-anchor="middle" class="t-step">5</text>
+  <rect x="24" y="440" width="592" height="56" rx="10" class="svgai"/>
+  <text x="72" y="466" class="t-main">Embedder.embed(raw_text) → vector</text>
+  <text x="72" y="486" class="t-code">services/indexing.py:50 — default: fastembed, runs locally</text>
+
+  <path d="M320 496 L320 516" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="512" class="t-label">upsert</text>
+
+  <circle cx="48" cy="548" r="14" class="stepdot"/><text x="48" y="553" text-anchor="middle" class="t-step">6</text>
+  <rect x="24" y="520" width="592" height="56" rx="10" class="svgai"/>
+  <text x="72" y="546" class="t-main">VectorStore.upsert(point) → Qdrant</text>
+  <text x="72" y="566" class="t-code">ai/vectorstore.py:108 — collection ensured on first write</text>
+
+  <rect x="24" y="584" width="592" height="52" rx="10" class="svgfail"/>
+  <text x="40" y="606" class="t-fail">✗ embedder / Qdrant down → logged, never blocks</text>
+  <text x="40" y="626" class="t-failsub">brain reindex repairs later (services/ingest.py:114)</text>
+
+  <path d="M320 636 L320 656" class="edge" marker-end="url(#arrowCap)"/>
+  <text x="332" y="652" class="t-label">201 always</text>
+
+  <rect x="24" y="660" width="592" height="52" rx="10" class="svgok"/>
+  <text x="72" y="692" class="t-main">201 Created — AI failures never block the write</text>
+
+  <defs>
+    <marker id="arrowCap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Capture. The failure side-notes sit directly below the steps they apply to; the commit happens once, at <code>ingest.py:63</code>, after both AI steps have had their chance.</figcaption>
+</figure>
+
+<h2 id="search">4 · Flow: semantic search (<code>GET /search</code>)</h2>
+
+<figure>
+<svg viewBox="0 0 640 580" role="img" aria-labelledby="sea-t sea-d">
+  <title id="sea-t">Search flow</title>
+  <desc id="sea-d">Query comes in; it is embedded; Qdrant returns nearest candidates; Jev reranks them; full items are loaded from Postgres and returned with scores. If the embedder or Qdrant is down, the service falls back to Postgres full-text search with null scores.</desc>
+
+  <circle cx="48" cy="48" r="14" class="stepdot"/><text x="48" y="53" text-anchor="middle" class="t-step">1</text>
+  <rect x="24" y="20" width="592" height="56" rx="10" class="svgbox"/>
+  <text x="72" y="46" class="t-main">GET /search?q=…&amp;limit=…&amp;offset=…</text>
+  <text x="72" y="66" class="t-code">routes/search.py:20 → SearchService.search</text>
+
+  <path d="M320 76 L320 96" class="edge" marker-end="url(#arrowSea)"/>
+  <text x="332" y="92" class="t-label">embed query</text>
+
+  <circle cx="48" cy="128" r="14" class="stepdot"/><text x="48" y="133" text-anchor="middle" class="t-step">2</text>
+  <rect x="24" y="100" width="592" height="56" rx="10" class="svgai"/>
+  <text x="72" y="126" class="t-main">Embedder.embed(query)</text>
+  <text x="72" y="146" class="t-code">services/search.py:55-57</text>
+
+  <rect x="24" y="164" width="592" height="40" rx="10" class="svgfail"/>
+  <text x="40" y="190" class="t-fail">✗ embedder / Qdrant down → FTS fallback, score: null (search.py:59, 75)</text>
+
+  <path d="M320 204 L320 224" class="edge" marker-end="url(#arrowSea)"/>
+  <text x="332" y="220" class="t-label">vector search</text>
+
+  <circle cx="48" cy="256" r="14" class="stepdot"/><text x="48" y="261" text-anchor="middle" class="t-step">3</text>
+  <rect x="24" y="228" width="592" height="56" rx="10" class="svgai"/>
+  <text x="72" y="254" class="t-main">Qdrant ANN → top (limit + offset) candidates</text>
+  <text x="72" y="274" class="t-code">ai/vectorstore.py:129</text>
+
+  <path d="M320 284 L320 304" class="edge" marker-end="url(#arrowSea)"/>
+  <text x="332" y="300" class="t-label">rerank (Jev)</text>
+
+  <circle cx="48" cy="336" r="14" class="stepdot"/><text x="48" y="341" text-anchor="middle" class="t-step">4</text>
+  <rect x="24" y="308" width="592" height="56" rx="10" class="svgai"/>
+  <text x="72" y="334" class="t-main">JevReranker reorders candidates</text>
+  <text x="72" y="354" class="t-code">one batched Jev call, most relevant first · ai/rerank.py:55</text>
+
+  <rect x="24" y="372" width="592" height="40" rx="10" class="svgfail"/>
+  <text x="40" y="398" class="t-fail">✗ Jev down → keep vector order (ai/rerank.py:47)</text>
+
+  <path d="M320 412 L320 432" class="edge" marker-end="url(#arrowSea)"/>
+  <text x="332" y="428" class="t-label">load items</text>
+
+  <circle cx="48" cy="464" r="14" class="stepdot"/><text x="48" y="469" text-anchor="middle" class="t-step">5</text>
+  <rect x="24" y="436" width="592" height="76" rx="10" class="svgbox"/>
+  <text x="72" y="462" class="t-main">Postgres: fetch by id</text>
+  <text x="72" y="482" class="t-code">skip concurrently-deleted rows</text>
+  <text x="72" y="502" class="t-code">stale vectors can't leak deleted data — search.py:80-87</text>
+
+  <path d="M320 512 L320 530" class="edge" marker-end="url(#arrowSea)"/>
+  <text x="332" y="529" class="t-label">score</text>
+
+  <rect x="24" y="536" width="592" height="36" rx="10" class="svgok"/>
+  <text x="72" y="563" class="t-main">200 · results with vector scores</text>
+
+  <defs>
+    <marker id="arrowSea" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Search. <code>GET /items/search?q=…</code> (<code>routes/items.py:39</code>) bypasses the AI layer entirely — pure Postgres full-text search, so a keyword path always exists (<code>services/search.py:59,75</code>, <code>repositories/items.py:57-62</code>).</figcaption>
+</figure>
+
+<h2 id="ask">5 · Flow: ask (<code>POST /ask</code>)</h2>
+
+<figure>
+<svg viewBox="0 0 640 604" role="img" aria-labelledby="ask-t ask-d">
+  <title id="ask-t">Ask flow</title>
+  <desc id="ask-d">Question comes in; the service searches top-5 sources; a prompt is built that contains only those sources plus the question; a tool-less Claude session answers; citations are parsed back out; response 200 with answer and cited_ids, or 502 if the LLM is unavailable.</desc>
+
+  <circle cx="48" cy="48" r="14" class="stepdot"/><text x="48" y="53" text-anchor="middle" class="t-step">1</text>
+  <rect x="24" y="20" width="592" height="56" rx="10" class="svgbox"/>
+  <text x="72" y="46" class="t-main">POST /ask { question }</text>
+  <text x="72" y="66" class="t-code">routes/ask.py:13 → AskService.ask</text>
+
+  <path d="M320 76 L320 96" class="edge" marker-end="url(#arrowAsk)"/>
+  <text x="332" y="92" class="t-label">top-k search (k = 5)</text>
+
+  <circle cx="48" cy="128" r="14" class="stepdot"/><text x="48" y="133" text-anchor="middle" class="t-step">2</text>
+  <rect x="24" y="100" width="592" height="56" rx="10" class="svgbox"/>
+  <text x="72" y="126" class="t-main">SearchService.search → top 5 sources</text>
+  <text x="72" y="146" class="t-code">services/ask.py:34 (DEFAULT_TOP_K = 5)</text>
+
+  <path d="M320 156 L320 176" class="edge" marker-end="url(#arrowAsk)"/>
+  <text x="332" y="172" class="t-label">grounded prompt</text>
+
+  <circle cx="48" cy="218" r="14" class="stepdot"/><text x="48" y="223" text-anchor="middle" class="t-step">3</text>
+  <rect x="24" y="180" width="592" height="76" rx="10" class="svgai"/>
+  <text x="72" y="206" class="t-main">build_prompt(): sources as [id] + question</text>
+  <text x="72" y="226" class="t-code">the model sees only these sources and the question</text>
+  <text x="72" y="246" class="t-code">ai/ask.py:145</text>
+
+  <path d="M320 256 L320 276" class="edge" marker-end="url(#arrowAsk)"/>
+  <text x="332" y="272" class="t-label">tool-less session</text>
+
+  <circle cx="48" cy="322" r="14" class="stepdot"/><text x="48" y="327" text-anchor="middle" class="t-step">4</text>
+  <rect x="24" y="280" width="592" height="84" rx="10" class="svgai"/>
+  <text x="72" y="306" class="t-main">ClaudeSdkLLMClient — one turn, zero capabilities</text>
+  <text x="72" y="328" class="t-code">tools=[] · setting_sources=[] · strict_mcp_config</text>
+  <text x="72" y="350" class="t-code">fresh scratch cwd (claude_sdk.py:74) · max_turns=1 (:107)</text>
+
+  <path d="M320 364 L320 384" class="edge" marker-end="url(#arrowAsk)"/>
+  <text x="332" y="380" class="t-label">parse citations</text>
+
+  <circle cx="48" cy="416" r="14" class="stepdot"/><text x="48" y="421" text-anchor="middle" class="t-step">5</text>
+  <rect x="24" y="388" width="592" height="56" rx="10" class="svgbox"/>
+  <text x="72" y="414" class="t-main">cited_ids = the [id]s the answer quotes</text>
+  <text x="72" y="434" class="t-code">ai/ask.py:165,168 — validated against sent ids</text>
+
+  <path d="M320 444 L320 464" class="edge" marker-end="url(#arrowAsk)"/>
+  <text x="332" y="460" class="t-label">200</text>
+
+  <rect x="24" y="468" width="592" height="52" rx="10" class="svgok"/>
+  <text x="72" y="500" class="t-main">200 · { answer, cited_ids }</text>
+
+  <rect x="24" y="536" width="592" height="52" rx="10" class="svgfail"/>
+  <text x="40" y="558" class="t-fail">✗ LLM down → 502</text>
+  <text x="40" y="578" class="t-failsub">502 "LLM unavailable; try again later" (main.py:40-41)</text>
+
+  <defs>
+    <marker id="arrowAsk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Ask. The model only ever sees the retrieved sources and the question; it cannot read files, run commands, or load settings.</figcaption>
+</figure>
+
+<h2 id="mutate">6 · Flow: update, delete, reindex</h2>
+
+<figure>
+<svg viewBox="0 0 640 538" role="img" aria-labelledby="mut-t mut-d">
+  <title id="mut-t">Update, delete and reindex flows</title>
+  <desc id="mut-d">PATCH updates the Postgres row and re-embeds only if an indexed field changed. DELETE removes the row and its vector. The brain reindex CLI purges the Qdrant collection and rebuilds it from Postgres.</desc>
+
+  <text x="24" y="26" class="t-head">PATCH /items/{id}</text>
+  <rect x="24" y="36" width="300" height="52" rx="10" class="svgbox"/>
+  <text x="40" y="58" class="t-main">update row in Postgres</text>
+  <text x="40" y="78" class="t-code">services/items.py:91</text>
+
+  <path d="M174 92 L174 110" class="edge" marker-end="url(#arrowMut)"/>
+  <text x="186" y="105" class="t-label">indexed field changed?</text>
+
+  <rect x="24" y="114" width="300" height="64" rx="10" class="svgbox"/>
+  <text x="40" y="140" class="t-main">raw_text · source · project</text>
+  <text x="40" y="162" class="t-code">_INDEXED_FIELDS · items.py:21</text>
+
+  <path d="M174 182 L174 200" class="edge" marker-end="url(#arrowMut)"/>
+  <text x="186" y="195" class="t-label">yes → re-index</text>
+
+  <rect x="24" y="204" width="300" height="52" rx="10" class="svgai"/>
+  <text x="40" y="226" class="t-main">re-embed + upsert vector</text>
+  <text x="40" y="246" class="t-code">items.py:102-110</text>
+
+  <path d="M174 260 L174 278" class="edge" marker-end="url(#arrowMut)"/>
+  <rect x="24" y="282" width="300" height="44" rx="10" class="svgok"/>
+  <text x="40" y="310" class="t-main">200 OK</text>
+
+  <text x="24" y="364" class="t-code">no change → skip re-index</text>
+  <text x="24" y="384" class="t-code">✗ index failure → logged; reindex heals (items.py:110)</text>
+
+  <text x="356" y="26" class="t-head">DELETE /items/{id}</text>
+  <rect x="356" y="36" width="260" height="52" rx="10" class="svgbox"/>
+  <text x="372" y="58" class="t-main">delete row</text>
+  <text x="372" y="78" class="t-code">services/items.py:139</text>
+
+  <path d="M486 92 L486 110" class="edge" marker-end="url(#arrowMut)"/>
+  <text x="498" y="105" class="t-label">remove vector</text>
+
+  <rect x="356" y="114" width="260" height="52" rx="10" class="svgai"/>
+  <text x="372" y="136" class="t-main">VectorStore.remove(id)</text>
+  <text x="372" y="156" class="t-code">indexing.py:58</text>
+
+  <path d="M486 170 L486 188" class="edge" marker-end="url(#arrowMut)"/>
+  <rect x="356" y="192" width="260" height="44" rx="10" class="svgok"/>
+  <text x="372" y="220" class="t-main">204 No Content</text>
+
+  <text x="356" y="272" class="t-code">✗ remove failure → logged;</text>
+  <text x="356" y="292" class="t-code">reindex purges stale points</text>
+
+  <text x="24" y="408" class="t-head">brain reindex — the self-healing path</text>
+  <rect x="24" y="418" width="592" height="104" rx="10" class="svgbox"/>
+  <text x="40" y="442" class="t-code">1 · purge: drop + recreate the collection (indexing.py:62)</text>
+  <text x="40" y="464" class="t-code">2 · page through every memory_items row in batches</text>
+  <text x="40" y="486" class="t-code">3 · embed + upsert each item</text>
+  <text x="40" y="508" class="t-code">4 · exit 0 · failure → 'PARTIAL; rerun' exit 1 (cli.py:66-77)</text>
+
+  <defs>
+    <marker id="arrowMut" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--arrow)"/>
+    </marker>
+  </defs>
+</svg>
+<figcaption>Mutations. The vector store is a cache over Postgres: every inconsistency is repairable by re-running <code>brain reindex</code> (<code>cli.py:34</code>).</figcaption>
+</figure>
+
+<h2 id="model">7 · Data model</h2>
+<p>
+One table, <code>memory_items</code> (<code>db/models.py:56</code>), created by
+migration <code>f50d89c124c2_create_memory_items_table</code>. Enum values are
+stored as CHECK-constrained VARCHARs rather than native Postgres enums, so adding a
+value is a migration, not a type change (<code>models.py:46-55</code>).
+</p>
+
+<div class="tablewrap"><table>
+<thead><tr><th>column</th><th>type</th><th>rules</th></tr></thead>
+<tbody>
+<tr><td><code>id</code></td><td>UUID PK</td><td><code>uuid4</code> default (<code>models.py:88</code>)</td></tr>
+<tr><td><code>raw_text</code></td><td>TEXT</td><td>required, ≤ 10 000 chars (API schema)</td></tr>
+<tr><td><code>source</code></td><td>VARCHAR(64)</td><td>required, default <code>'manual'</code>; free-form — future adapters (Gmail, Slack…) write their own value</td></tr>
+<tr><td><code>type</code></td><td>VARCHAR(32)</td><td>nullable; CHECK in <code>task · decision · note · event · reference · idea</code> (<code>db/enums.py:14</code>)</td></tr>
+<tr><td><code>project</code></td><td>VARCHAR(128)</td><td>nullable, free-form tag</td></tr>
+<tr><td><code>importance</code></td><td>INTEGER</td><td>nullable; CHECK 1–5 (<code>db/enums.py:8-9</code>)</td></tr>
+<tr><td><code>actionability</code></td><td>VARCHAR(32)</td><td>nullable; CHECK in <code>none · later · now</code> (<code>db/enums.py:25</code>)</td></tr>
+<tr><td><code>confidence</code></td><td>FLOAT</td><td>nullable; CHECK 0.0–1.0 (<code>db/enums.py:10-11</code>)</td></tr>
+<tr><td><code>status</code></td><td>VARCHAR(32)</td><td>default <code>inbox</code>; CHECK in <code>inbox · filed · needs_review</code> (<code>db/enums.py:33-38</code>)</td></tr>
+<tr><td><code>search_vector</code></td><td>TSVECTOR</td><td>generated always as <code>to_tsvector('english', coalesce(raw_text, ''))</code>, stored (<code>models.py:96-99</code>); GIN index <code>ix_memory_items_search_vector</code> (<code>models.py:74-78</code>)</td></tr>
+<tr><td><code>created_at</code> / <code>updated_at</code></td><td>TIMESTAMPTZ</td><td>server default <code>now()</code>; <code>updated_at</code> bumps on update (<code>models.py:101-107</code>)</td></tr>
+</tbody>
+</table></div>
+
+<p class="refs">
+Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
+≥ 0.50 → <code>needs_review</code>, else <code>inbox</code>
+(<code>ai/classify.py:16-17, 58-65</code>). Shared constants live once in
+<code>db/enums.py</code> and are imported, never duplicated.
+</p>
+
+<h2 id="degradation">8 · Degradation matrix</h2>
+<p>The design rule: <strong>Postgres is truth; every AI dependency is optional at runtime.</strong></p>
+
+<div class="tablewrap"><table>
+<thead><tr><th>component down</th><th>capture (POST /items)</th><th>search (GET /search)</th><th>ask (POST /ask)</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>Jev</strong> (classify / rerank)</td>
+  <td>item saved unclassified, stays <code>inbox</code>; warning logged (<code>ingest.py:98</code>)</td>
+  <td>results in vector order, unreranked (<code>ai/rerank.py:47</code>)</td>
+  <td>works — /ask never calls Jev</td>
+</tr>
+<tr>
+  <td><strong>Qdrant</strong></td>
+  <td>row saved without vector; warning logged (<code>ingest.py:114</code>); <code>brain reindex</code> repairs</td>
+  <td>keyword FTS fallback, <code>score: null</code> (<code>search.py:59</code>)</td>
+  <td>works with fallback sources (fewer / rougher)</td>
+</tr>
+<tr>
+  <td><strong>Embedder</strong></td>
+  <td>same as Qdrant — no vector is produced (<code>ingest.py:114</code>)</td>
+  <td>same keyword fallback (<code>search.py:59</code>)</td>
+  <td>same as Qdrant</td>
+</tr>
+<tr>
+  <td><strong>LLM</strong> (claude_sdk / anthropic)</td>
+  <td>works — no LLM in the write path</td>
+  <td>works — rerank is Jev, not the LLM client</td>
+  <td><code>502 LLM unavailable</code> (<code>main.py:40-41</code>)</td>
+</tr>
+<tr>
+  <td><strong>Postgres</strong></td>
+  <td><code>500</code> — the one hard dependency; nothing pretends otherwise</td>
+  <td><code>500</code></td>
+  <td><code>500</code></td>
+</tr>
+</tbody>
+</table></div>
+
+<p class="refs">
+No API keys at all? The stack still runs: fastembed embeds locally
+(<code>ai/embedder.py:111</code>), and the README's dogfood checklist exercises
+capture → keyword search with zero keys configured.
+</p>
+
+<h2 id="security">9 · Security model of <code>/ask</code></h2>
+<p>
+Captured text is untrusted input that reaches an LLM. <code>ClaudeSdkLLMClient</code>
+(<code>ai/claude_sdk.py:102-107</code>) runs every session with the model's
+capabilities <em>removed</em>, not merely restricted:
+</p>
+<ul>
+  <li><code>tools=[]</code> — the CLI is invoked with <code>--tools ''</code>: <strong>no
+  tools exist at all</strong>. (<code>allowed_tools=[]</code> would be a no-op — it only
+  auto-approves tools that already exist; <code>claude_sdk.py:47-48</code>.)</li>
+  <li><code>setting_sources=[]</code> — user and project settings files are never
+  loaded, so no repo file can grant permissions (<code>claude_sdk.py:49-51</code>).</li>
+  <li><code>strict_mcp_config=True</code> — no project <code>.mcp.json</code> server
+  discovery (<code>claude_sdk.py:51</code>).</li>
+  <li>Each session gets a fresh scratch working directory (<code>brain-ask-*</code>,
+  <code>tempfile.mkdtemp</code>, <code>claude_sdk.py:74</code>), deleted on close — it
+  never runs in this repository.</li>
+  <li><code>max_turns=1</code> — one prompt, one answer, no agentic loop
+  (<code>claude_sdk.py:107</code>).</li>
+</ul>
+<p>
+<strong>What a prompt injection inside a stored item can do:</strong> influence the
+<em>text</em> of the answer — that is all the model has. <strong>What it cannot
+do:</strong> execute commands, read files, load settings, or persist anything.
+Verified empirically: the spawned CLI session reports an empty tool list at
+startup, and adversarial items instructing the model to "use the Bash tool"
+produced only plain text — no tool call, no side effects.
+</p>
+
+<h2 id="run">10 · Run it locally</h2>
+<ol>
+  <li><code>docker compose up -d</code> — Postgres 16 + Qdrant with health checks (<code>docker-compose.yml</code>).</li>
+  <li><code>pip install -e ".[dev]"</code>; copy <code>.env.example</code> → <code>.env</code>.</li>
+  <li><code>alembic upgrade head</code> — create the schema.</li>
+  <li><code>uvicorn brain.main:app --reload</code>; check <code>GET /health</code>.</li>
+  <li>Capture: <code>curl -X POST :8000/items -H 'Content-Type: application/json' -d '{"raw_text": "…"}'</code></li>
+  <li>After bulk imports or outages: <code>brain reindex</code>.</li>
+</ol>
+
+<h3>Provider configuration</h3>
+<div class="tablewrap"><table>
+<thead><tr><th>setting</th><th>values</th><th>default</th><th>notes</th></tr></thead>
+<tbody>
+<tr><td>embedder provider</td><td><code>fastembed</code> · <code>openai</code> (<code>config.py:59</code>)</td><td><code>fastembed</code></td><td>local, no key needed; 384-dim</td></tr>
+<tr><td>LLM provider</td><td><code>claude_sdk</code> · <code>anthropic</code> (<code>config.py:58</code>)</td><td><code>claude_sdk</code></td><td>claude_sdk = local tool-less CLI; anthropic = API</td></tr>
+<tr><td>secrets</td><td><code>JEV_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code></td><td>—</td><td>all optional; absent → degradation (§8); <code>file:</code>/<code>env:</code> indirection via <code>unwrap_secret</code> (<code>config.py:31</code>)</td></tr>
+</tbody>
+</table></div>
+
+<h2 id="roadmap">11 · Roadmap</h2>
+<p>Six phases; the MVP is phases 1–3, all delivered on this branch.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>phase</th><th>scope</th><th>status</th></tr></thead>
+<tbody>
+<tr><td><strong>1 · Core Brain</strong></td><td>domain model, API, Postgres, manual capture, simple retrieval</td><td><span class="badge done">delivered</span></td></tr>
+<tr><td><strong>2 · Intelligent Ingestion</strong></td><td>Jev classification (type / importance / actionability / confidence), routing + thresholds</td><td><span class="badge done">delivered</span></td></tr>
+<tr><td><strong>3 · Semantic Memory + Q&amp;A</strong></td><td>embeddings, Qdrant, semantic search, <code>/ask</code>, Jev rerank — <strong>this is the MVP</strong></td><td><span class="badge done">delivered</span></td></tr>
+<tr><td><strong>4 · Knowledge Intelligence</strong></td><td>relationships between items — <code>duplicate · related · contradicts · supersedes · supports</code>, classified by Jev</td><td><span class="badge planned">planned</span></td></tr>
+<tr><td><strong>5 · External Integrations</strong></td><td>adapters: Gmail, Drive, Calendar, Slack, notes, tasks</td><td><span class="badge planned">planned</span></td></tr>
+<tr><td><strong>6 · Actions &amp; Agents</strong></td><td>task creation, calendar actions, email drafting, approval flows, morning summaries, weekly reviews, project briefings, multi-step agents (LangGraph where useful)</td><td><span class="badge planned">planned</span></td></tr>
+</tbody>
+</table></div>
+
+<h3>Where Jev fits</h3>
+<ul>
+  <li><strong>Ingestion</strong> — what is this? (classify each captured item — §3)</li>
+  <li><strong>Knowledge updates</strong> — how does it relate? (relationship classification — phase 4)</li>
+  <li><strong>Retrieval</strong> — what is relevant? (rerank search results for /ask — §4–5)</li>
+</ul>
+
+<footer>
+Generated from the code at <code>feature/mvp-dev-providers</code> commit <code>b22a3b0</code>.
+File references like <code>services/ingest.py:47</code> are relative to <code>src/brain/</code>.
+Keep this page in sync when the architecture changes (see README → Adding a feature).
+</footer>
+
+</main>
+</body>
+</html>
