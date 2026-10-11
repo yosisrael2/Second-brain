@@ -40,6 +40,10 @@ client ──> api/routes      (thin routers: HTTP in/out, no business logic)
 ## Folder layout
 
 ```
+scripts/
+├── dev-start.sh         # preflight + compose + alembic + uvicorn (local dev)
+└── dev-stop.sh          # stop server / containers / (optionally) purge volumes
+
 src/brain/
 ├── config.py            # env-based settings (pydantic-settings)
 ├── factories.py         # provider factories: LLM/embedder by LLM_PROVIDER/EMBEDDER_PROVIDER
@@ -66,6 +70,7 @@ tests/
 ├── test_wiring.py       # /items /search /ask with fake-backed infra
 ├── test_ingest_service.py / test_search_service.py / test_ask_service.py
 ├── test_cli_and_lifespan.py
+├── test_dev_scripts.py  # dev-start.sh/dev-stop.sh syntax + --help contracts
 └── ai/                  # AI-layer unit tests (offline)
 ```
 
@@ -166,18 +171,22 @@ embedder than the active one, indexing fails with a clear message — run
 ## Dogfood checklist (live run without API keys)
 
 Exact steps to exercise the AI features with ONLY a Jev key and your Claude
-Code login:
+Code login. `scripts/dev-start.sh` collapses steps 1-3 (see
+"Local dev start-up" above):
 
 ```bash
-# 1. Infrastructure + schema (Postgres + Qdrant 1.19.1, matching qdrant-client)
-docker compose up -d
-curl -s localhost:6333/healthz          # -> "healthz check passed"
-alembic upgrade head
+# 1. Infrastructure + schema + server (also creates .venv/.env if missing,
+#    checks your Claude login, reuses or starts healthy containers)
+scripts/dev-start.sh
+
+#    ...or by hand:
+# docker compose up -d && curl -s localhost:6333/healthz && alembic upgrade head
+# uvicorn brain.main:app --port 8000
 
 # 2. Keys: JEV_API_KEY in .env (gitignored) — optional but needed for
 #    classification/rerank. LLM + embeddings come from your Claude Code
 #    login and local fastembed; no OPENAI_API_KEY / ANTHROPIC_API_KEY needed.
-cp .env.example .env    # then fill JEV_API_KEY
+#    The script reports both checks; to fix login manually:
 claude -p ok            # verifies the Claude Code login; run `claude` + /login if it fails
 
 # 3. Run the API (first /search or /items call downloads the fastembed model,
@@ -212,9 +221,44 @@ exits 1 with a clear message. Fully keyless run (no JEV_API_KEY either):
 capture still works, `/search` scores real fastembed vectors without rerank
 reordering, `/ask` still answers from your login.
 
+## Local dev start-up
+
+`scripts/dev-start.sh` does the whole dance with preflight checks; `scripts/dev-stop.sh` stops it:
+
+```bash
+scripts/dev-start.sh             # preflight (docker, venv, .env, jev/claude status),
+                                 # compose up + health wait, alembic, uvicorn on :8000
+scripts/dev-start.sh --reindex   # also rebuild the vector collection first
+scripts/dev-start.sh --no-reload # production-ish uvicorn (no file watching)
+scripts/dev-stop.sh              # stop uvicorn (pid file)
+scripts/dev-stop.sh --down       # also stop postgres + qdrant containers
+scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
+```
+
+Behavior worth knowing:
+
+- **Stable compose project** — `COMPOSE_PROJECT_NAME` defaults to
+  `second-brain-dev` (override in `.env`), so container names never drift.
+- **Port collisions with other compose projects** — if 5432/6333 are already
+  published by a foreign compose project, the script says who holds it and
+  REUSES the healthy service (verify against `DATABASE_URL` / `QDRANT_URL`)
+  instead of touching another project's containers; if what's on the port is
+  not healthy/compatible it fails with exact instructions. It never removes
+  other projects' containers.
+- **Preflight** — creates `.venv` + `pip install -e '.[dev]'` if missing;
+  creates `.env` from `.env.example` if absent; reports JEV key as set/unset
+  and the Claude Code login as ok/not-logged-in (a warning, not a failure).
+  `JEV_BASE_URL` is optional — the default works.
+- **State** — pid + log live under `.dev/` (gitignored). Starting twice is
+  safe: it refuses with the running pid. A busy port is refused with the
+  holder named. `PORT` overrides the default 8000.
+- **Data purge** — `scripts/dev-stop.sh --purge-data` deletes both docker
+  volumes (all items + vectors) and requires typing `PURGE`.
+
 ## Setup
 
-Prerequisites: Python 3.11, Docker (compose v2).
+Prerequisites: Python 3.11, Docker (compose v2). The scripts above do all of
+this manually:
 
 ```bash
 # 1. Infrastructure: Postgres + Qdrant

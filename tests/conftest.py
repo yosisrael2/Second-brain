@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
+from brain.config import get_settings
 from brain.db.session import engine
 from brain.main import create_app
 
@@ -17,9 +18,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(name="client")
-def client_fixture() -> TestClient:
-    """TestClient wired to a fresh app instance."""
-    return TestClient(create_app())
+def client_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
+    """TestClient wired to a fresh app with hermetic settings.
+
+    Ambient secrets in .env / the environment (e.g. a real JEV_API_KEY) must
+    not change test outcomes: with Jev configured, POST /items would classify
+    and file items where these tests assert inbox defaults.
+    """
+    monkeypatch.setenv("JEV_API_KEY", "")
+    get_settings.cache_clear()
+    yield TestClient(create_app())
+    get_settings.cache_clear()
 
 
 @pytest.fixture(scope="session", name="database")

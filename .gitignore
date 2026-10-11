@@ -12,6 +12,9 @@ venv/
 # Secrets
 .env
 
+# Local dev state (pid/log from scripts/dev-start.sh)
+.dev/
+
 # Tooling
 .pytest_cache/
 .coverage
