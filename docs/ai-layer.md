@@ -10,11 +10,11 @@ tests run fully offline.
 | Module | What it provides | Pattern |
 | ------ | ---------------- | ------- |
 | `jev.py` | `JevClient` — typed-decision API adapter (`choice`, `score`, `score_batch`, `decide`) | Adapter |
-| `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus` | Service |
+| `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus`; `JevClassifier` adapter | Service / Adapter |
 | `enums.py` | Temporary copies of `ItemType` / `Actionability` / `ItemStatus` (TODO: swap to shared `brain.domain` enums when worker_1 lands them) | — |
 | `embedder.py` | `Embedder` protocol; `OpenAIEmbedder` (network) and `FakeEmbedder` (deterministic, offline) | Strategy |
-| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `search`) | Repository / Adapter |
-| `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering | Strategy |
+| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError` | Repository / Adapter |
+| `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering; `JevReranker` adapter | Strategy |
 | `ask.py` | `LLMClient` protocol; `ClaudeLLMClient`, `FakeLLMClient`; `answer(question, context_items)` → `{answer, cited_ids}` | Strategy |
 
 ## Behavior details
@@ -64,7 +64,7 @@ Deliberate: no automatic retries on Jev/OpenAI/Anthropic/Qdrant calls. Every
 client fails fast (bounded timeouts) and surfaces a typed error; callers own
 recovery. `classify` and `rerank` degrade gracefully (inbox fallback /
 original order), so a transient Jev blip never blocks capture or search.
-Revisit only if M1 traffic shows a real need.
+Revisit only if real production traffic shows a need.
 
 ## Configuration / env vars
 
@@ -104,20 +104,28 @@ The layer is wired into the app on this branch (see also README):
   on shutdown.
 - **IngestService** (`services/ingest.py`): `POST /items` persists first, then
   classifies (fills only unset fields, routes by confidence), then indexes the
-  text in Qdrant. Classifier/indexing failures are logged and skipped: the
-  item is captured, stays in the inbox, and is picked up later by `brain
-  reindex`. `?classify=false` disables classification; explicit payload fields
-  are never overwritten.
+  text via `ItemIndexer` (`services/indexing.py`, ensures the collection at
+  most once per instance). Classifier/indexing failures (`JevError`,
+  `EmbedderError`, `VectorStoreError`) are logged and skipped: the item is
+  captured, stays in the inbox, and is picked up later by `brain reindex`.
+  `?classify=false` disables classification; explicit payload fields are never
+  overwritten.
+- **ItemsService** (`services/items.py`): keeps vectors fresh — `DELETE
+  /items/{id}` removes the item's vector, and PATCHes touching
+  `raw_text`/`source`/`project` re-index it; index failures never fail the
+  request and are recovered by the next `brain reindex`.
 - **SearchService** (`services/search.py`): `GET /search?q=` embeds the query,
   searches Qdrant, reranks via Jev, and resolves items from Postgres. Falls
   back to Postgres keyword search (hits with `score: null`) when embeddings or
-  Qdrant are unavailable.
+  Qdrant are unavailable. Caveat: candidates are fetched and ranked per page
+  (`limit + offset`), so deep offsets approximate rather than globally rank.
 - **AskService** (`services/ask.py`): `POST /ask` searches top-k and answers
   via `LLMClient` with `[id]` citations. LLM failures raise `LLMError`, mapped
   to HTTP 502 by the router layer.
-- **CLI**: `brain reindex` (`src/brain/cli.py`) rebuilds the Qdrant collection
-  from Postgres, page by page; exits 1 with a clear message when embeddings or
-  Qdrant are unavailable.
+- **CLI**: `brain reindex` (`src/brain/cli.py`) does a full rebuild — it purges
+  the Qdrant collection first, which also removes ghost vectors for items no
+  longer in Postgres — then re-embeds every item page by page; exits 1 with a
+  clear message when embeddings or Qdrant are unavailable.
 - **Collections**: `QdrantVectorStore.ensure_collection` is called with the
   embedder's `dim` (1536 for `text-embedding-3-small`).
 

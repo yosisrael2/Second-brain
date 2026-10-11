@@ -35,6 +35,10 @@ class Embedder(Protocol):
         """Return the embedding vector for ``text``."""
         ...
 
+    def close(self) -> None:
+        """Release underlying connections (no-op for in-memory fakes)."""
+        ...
+
 
 class OpenAIEmbedder:
     """Strategy producing embeddings via the OpenAI ``/embeddings`` endpoint.

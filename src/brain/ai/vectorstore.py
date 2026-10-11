@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any, Protocol
 
 from qdrant_client import QdrantClient, models
@@ -27,8 +28,20 @@ class VectorStore(Protocol):
         """Insert or replace one item; ``payload`` is stored alongside it."""
         ...
 
+    def delete(self, item_id: str | int) -> None:
+        """Remove one item's vector; a missing id is not an error."""
+        ...
+
+    def delete_collection(self) -> None:
+        """Drop the whole collection if it exists (used by full rebuilds)."""
+        ...
+
     def search(self, vector: list[float], k: int = 5) -> list[dict[str, Any]]:
         """Return the ``k`` nearest items as ``{id, score, payload}`` dicts."""
+        ...
+
+    def close(self) -> None:
+        """Release underlying connections (no-op for in-memory fakes)."""
         ...
 
 
@@ -66,25 +79,41 @@ class QdrantVectorStore:
 
     def ensure_collection(self, dim: int) -> None:
         """Create the collection with cosine distance unless it exists."""
-        if self._client.collection_exists(self._collection):
-            return
-        self._client.create_collection(
-            self._collection,
-            vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
-        )
+        with self._translated():
+            if self._client.collection_exists(self._collection):
+                return
+            self._client.create_collection(
+                self._collection,
+                vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+            )
 
     def upsert(self, item_id: str | int, vector: list[float], payload: Mapping[str, Any]) -> None:
         """Insert or replace one item under a deterministic point id."""
         stored_payload = dict(payload)
         stored_payload.setdefault("id", item_id)
         point = models.PointStruct(id=_point_id(item_id), vector=vector, payload=stored_payload)
-        self._client.upsert(self._collection, points=[point])
+        with self._translated():
+            self._client.upsert(self._collection, points=[point])
+
+    def delete(self, item_id: str | int) -> None:
+        """Remove one item's vector; deleting a missing id is not an error."""
+        with self._translated():
+            self._client.delete(
+                self._collection, points_selector=models.PointIdsList(points=[_point_id(item_id)])
+            )
+
+    def delete_collection(self) -> None:
+        """Drop the whole collection if it exists (used by full rebuilds)."""
+        with self._translated():
+            if self._client.collection_exists(self._collection):
+                self._client.delete_collection(self._collection)
 
     def search(self, vector: list[float], k: int = 5) -> list[dict[str, Any]]:
         """Return the ``k`` nearest items, best match first."""
-        result = self._client.query_points(
-            self._collection, query=vector, limit=k, with_payload=True
-        )
+        with self._translated():
+            result = self._client.query_points(
+                self._collection, query=vector, limit=k, with_payload=True
+            )
         return [
             {
                 "id": (point.payload or {}).get("id", point.id),
@@ -93,6 +122,16 @@ class QdrantVectorStore:
             }
             for point in result.points
         ]
+
+    @contextmanager
+    def _translated(self) -> Iterator[None]:
+        """Translate qdrant-client failures into :class:`VectorStoreError`."""
+        try:
+            yield
+        except VectorStoreError:
+            raise
+        except Exception as exc:
+            raise VectorStoreError(f"qdrant operation failed: {type(exc).__name__}: {exc}") from exc
 
 
 def _point_id(item_id: str | int) -> str | int:

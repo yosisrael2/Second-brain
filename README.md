@@ -137,12 +137,17 @@ degradations and failure modes are documented in
 [docs/ai-layer.md](docs/ai-layer.md).
 
 Rebuild the vector index from Postgres (covers items that missed indexing
-while Jev/Qdrant were down):
+while Jev/Qdrant were down, and purges ghost vectors for items no longer in
+Postgres — it drops and rebuilds the collection):
 
 ```bash
 brain reindex [--batch-size 500]
 # exit 0 + "indexed N item(s)"; exit 1 with a clear error when embeddings/Qdrant are unavailable
 ```
+
+Note: semantic `/search` ranks candidates per page (`limit + offset` fetched
+before ranking), so deep offsets approximate rather than globally rank — fine
+for MVP top-k use.
 
 The shared AI clients are app-lifetime singletons built in
 `src/brain/api/deps.py` and closed on shutdown via the app lifespan.

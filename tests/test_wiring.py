@@ -146,3 +146,56 @@ def test_existing_items_contract_still_green(wired):
     assert patched["project"] == "ops"
     assert deleted.status_code == 204
     assert repo.items == {}
+
+
+def test_patch_raw_text_reindexes_the_vector(wired):
+    app, _, store = wired
+    client = TestClient(app)
+    created = client.post("/items?classify=false", json={"raw_text": "dolphins"}).json()
+    embedder = FakeEmbedder(dim=8)
+
+    response = client.patch(f"/items/{created['id']}", json={"raw_text": "volcanoes"})
+
+    assert response.status_code == 200
+    hits = store.search(embedder.embed("volcanoes"), k=5)
+    assert [hit["id"] for hit in hits] == [created["id"]]  # new vector indexed
+    assert hits[0]["payload"]["text"] == "volcanoes"  # stale payload replaced
+
+
+def test_delete_removes_the_vector(wired):
+    app, _, store = wired
+    client = TestClient(app)
+    created = client.post("/items?classify=false", json={"raw_text": "soon forgotten"}).json()
+    embedder = FakeEmbedder(dim=8)
+
+    response = client.delete(f"/items/{created['id']}")
+
+    assert response.status_code == 204
+    hits = store.search(embedder.embed(created["raw_text"]), k=5)
+    assert created["id"] not in [hit["id"] for hit in hits]  # vector gone
+
+
+def test_patch_with_broken_indexer_still_succeeds(wired):
+    from brain.ai.vectorstore import VectorStoreError
+
+    class BrokenIndexer:
+        def index(self, item) -> None:
+            raise VectorStoreError("qdrant down")
+
+        def remove(self, item_id) -> None:
+            raise VectorStoreError("qdrant down")
+
+        def purge(self) -> None:
+            raise VectorStoreError("qdrant down")
+
+    app, repo, _ = wired
+    app.dependency_overrides[deps.get_item_indexer] = lambda: BrokenIndexer()
+    client = TestClient(app)
+    created = client.post("/items?classify=false", json={"raw_text": "before"}).json()
+
+    patched = client.patch(f"/items/{created['id']}", json={"raw_text": "after"})
+    deleted = client.delete(f"/items/{created['id']}")
+
+    assert patched.status_code == 200  # update persisted despite index failure
+    assert deleted.status_code == 204
+    assert repo.items == {}

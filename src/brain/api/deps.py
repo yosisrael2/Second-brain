@@ -21,6 +21,7 @@ from brain.config import get_settings
 from brain.db.session import get_db
 from brain.repositories.items import ItemsRepository
 from brain.services.ask import AskService
+from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsService
 from brain.services.search import SearchService
@@ -96,6 +97,14 @@ def get_vector_store() -> QdrantVectorStore:
     return _vector_store()
 
 
+def get_item_indexer(
+    embedder: Embedder = Depends(get_embedder),
+    store: QdrantVectorStore = Depends(get_vector_store),
+) -> QdrantItemIndexer:
+    """Provide the shared item indexer (embed + upsert / remove / purge)."""
+    return QdrantItemIndexer(embedder, store)
+
+
 def get_classifier() -> JevClassifier:
     """Provide the shared classifier strategy."""
     return JevClassifier(_jev_client())
@@ -116,19 +125,21 @@ def get_items_repository(db: Session = Depends(get_db)) -> ItemsRepository:
     return ItemsRepository(db)
 
 
-def get_items_service(repo: ItemsRepository = Depends(get_items_repository)) -> ItemsService:
+def get_items_service(
+    repo: ItemsRepository = Depends(get_items_repository),
+    indexer: QdrantItemIndexer = Depends(get_item_indexer),
+) -> ItemsService:
     """Provide an ItemsService bound to the request-scoped DB session."""
-    return ItemsService(repo)
+    return ItemsService(repo, indexer)
 
 
 def get_ingest_service(
     repo: ItemsRepository = Depends(get_items_repository),
     classifier: JevClassifier = Depends(get_classifier),
-    embedder: Embedder = Depends(get_embedder),
-    store: QdrantVectorStore = Depends(get_vector_store),
+    indexer: QdrantItemIndexer = Depends(get_item_indexer),
 ) -> IngestService:
     """Provide an IngestService wired to the shared AI clients."""
-    return IngestService(repo, classifier, embedder, store)
+    return IngestService(repo, classifier, indexer)
 
 
 def get_search_service(

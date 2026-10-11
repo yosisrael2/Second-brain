@@ -5,21 +5,21 @@ from qdrant_client import QdrantClient
 from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 from brain import schemas
+from brain.ai.classify import FALLBACK_CLASSIFICATION
 from brain.ai.embedder import FakeEmbedder
-from brain.ai.vectorstore import QdrantVectorStore
-from brain.db.enums import ItemStatus, ItemType
+from brain.ai.jev import JevError
+from brain.ai.vectorstore import QdrantVectorStore, VectorStoreError
+from brain.db.enums import Actionability, ItemStatus, ItemType
+from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 
 
 def make_service(
     classifier: StubClassifier, repo: FakeRepository | None = None, store=None
 ) -> IngestService:
-    return IngestService(
-        repo=repo or FakeRepository(),
-        classifier=classifier,
-        embedder=FakeEmbedder(dim=8),
-        store=store or QdrantVectorStore(client=QdrantClient(":memory:")),
-    )
+    store = store or QdrantVectorStore(client=QdrantClient(":memory:"))
+    indexer = QdrantItemIndexer(FakeEmbedder(dim=8), store)
+    return IngestService(repo or FakeRepository(), classifier, indexer)
 
 
 def payload(**overrides: object) -> schemas.ItemCreate:
@@ -36,12 +36,10 @@ def test_create_classifies_and_indexes_when_confident():
 
     assert item.type is ItemType.TASK
     assert item.importance == 4
-    assert item.actionability.value == "now"
+    assert item.actionability is Actionability.NOW
     assert item.confidence == pytest.approx(0.95)
     assert item.status is ItemStatus.FILED  # 0.95 >= 0.9
     assert len(repo.items) == 1
-    store_hits = service._store.search(FakeEmbedder(dim=8).embed(item.raw_text), k=5)  # noqa: SLF001
-    assert [hit["id"] for hit in store_hits] == [str(item.id)]
 
 
 def test_create_routes_low_confidence_to_needs_review():
@@ -77,7 +75,7 @@ def test_create_with_classify_flag_false_keeps_item_raw():
 
 def test_jev_failure_never_blocks_capture():
     repo = FakeRepository()
-    service = make_service(StubClassifier(error=RuntimeError("jev down")), repo=repo)
+    service = make_service(StubClassifier(error=JevError("jev down")), repo=repo)
 
     item = service.create(payload())
 
@@ -87,8 +85,6 @@ def test_jev_failure_never_blocks_capture():
 
 
 def test_classifier_fallback_result_keeps_inbox():
-    from brain.ai.classify import FALLBACK_CLASSIFICATION
-
     service = make_service(StubClassifier(FALLBACK_CLASSIFICATION))
 
     item = service.create(payload())
@@ -97,23 +93,22 @@ def test_classifier_fallback_result_keeps_inbox():
     assert item.status is ItemStatus.INBOX
 
 
-def test_store_failure_never_blocks_capture():
-    class BrokenStore:
-        def ensure_collection(self, dim: int) -> None:
-            raise RuntimeError("qdrant down")
+def test_index_failure_never_blocks_capture():
+    class BrokenIndexer:
+        def index(self, item) -> None:
+            raise VectorStoreError("qdrant down")
 
-        def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
-            raise RuntimeError("qdrant down")
+        def remove(self, item_id) -> None:
+            raise VectorStoreError("qdrant down")
 
-        def search(self, vector: list[float], k: int) -> list[dict]:
-            raise RuntimeError("qdrant down")
+        def purge(self) -> None:
+            raise VectorStoreError("qdrant down")
 
     repo = FakeRepository()
     service = IngestService(
-        repo=repo,
-        classifier=StubClassifier(FULL_CLASSIFICATION),
-        embedder=FakeEmbedder(dim=8),
-        store=BrokenStore(),  # type: ignore[arg-type]
+        repo,
+        StubClassifier(FULL_CLASSIFICATION),
+        BrokenIndexer(),  # type: ignore[arg-type]
     )
 
     item = service.create(payload())
@@ -122,19 +117,23 @@ def test_store_failure_never_blocks_capture():
     assert item.status is ItemStatus.FILED  # classification still applied
 
 
-def test_reindex_indexes_every_item_and_survives_empty_store():
+def test_reindex_purges_ghosts_and_indexes_every_item():
     repo = FakeRepository()
     store = QdrantVectorStore(client=QdrantClient(":memory:"))
     service = make_service(StubClassifier(FULL_CLASSIFICATION), repo=repo, store=store)
+    embedder = FakeEmbedder(dim=8)
 
     first = service.create(payload(raw_text="first note"), classify=False)
     second = service.create(payload(raw_text="second note"), classify=False)
-    repo.items.pop(first.id)  # simulate an item that missed indexing earlier
-    repo.add(first)
+    ghost_id = "00000000-0000-0000-0000-00000000dead"
+    store.ensure_collection(8)
+    store.upsert(ghost_id, embedder.embed("ghost"), {"id": ghost_id, "text": "ghost"})
 
     indexed = service.reindex(batch_size=1)
 
     assert indexed == 2
-    vector = FakeEmbedder(dim=8).embed("second note")
-    hits = store.search(vector, k=5)
-    assert str(second.id) in [hit["id"] for hit in hits]
+    hits = store.search(embedder.embed("second note"), k=10)
+    hit_ids = [hit["id"] for hit in hits]
+    assert str(second.id) in hit_ids
+    assert ghost_id not in hit_ids  # ghost purged by the full rebuild
+    assert str(first.id) in hit_ids

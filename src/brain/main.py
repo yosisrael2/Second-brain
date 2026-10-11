@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from brain.ai.ask import LLMError
+from brain.api import deps
 from brain.api.routes import ask, health, items, search
 from brain.config import get_settings
 from brain.services.items import ItemNotFound
@@ -16,8 +17,6 @@ from brain.services.items import ItemNotFound
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     """Close the shared AI clients when the app shuts down."""
     yield
-    from brain.api import deps  # imported late to avoid a circular import
-
     deps.close_shared_clients()
 
 
