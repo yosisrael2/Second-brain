@@ -147,6 +147,52 @@ brain reindex [--batch-size 500]
 The shared AI clients are app-lifetime singletons built in
 `src/brain/api/deps.py` and closed on shutdown via the app lifespan.
 
+The shared AI clients are app-lifetime singletons built in
+`src/brain/api/deps.py` and closed on shutdown via the app lifespan.
+
+## Dogfood checklist (live run with real keys)
+
+Exact steps to exercise the AI features against real services:
+
+```bash
+# 1. Infrastructure + schema (Postgres + Qdrant 1.19.1, matching qdrant-client)
+docker compose up -d
+curl -s localhost:6333/healthz          # -> "healthz check passed"
+alembic upgrade head
+
+# 2. Real keys in .env (gitignored); minimum for full behavior:
+#    JEV_API_KEY=<typesafe key>  OPENAI_API_KEY=<sk-...>  ANTHROPIC_API_KEY=<sk-ant-...>
+cp .env.example .env    # then fill the three keys
+
+# 3. Run the API
+uvicorn brain.main:app --port 8000
+
+# 4. Capture with auto-classification (Jev fills type/importance/actionability,
+#    confidence, and routes by confidence)
+curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
+  -d '{"raw_text": "Renew the TLS certificate before Friday"}'
+# expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
+#             "confidence": 0.0-1.0, "status": "filed" (>=0.9) or "needs_review" (0.5-0.9)
+
+# 5. Semantic search (embeddings -> Qdrant -> Jev rerank)
+curl -s 'localhost:8000/search?q=renew+certificate&limit=5'
+# expect 200: array of items with float "score" (null only in keyword-fallback mode)
+
+# 6. Grounded answer with citations
+curl -s -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+  -d '{"question": "what do I need to renew?"}'
+# expect 200: {"answer": "...[<item-id>]...", "cited_ids": ["<item-id>"], "sources": [...]}
+
+# 7. Rebuild the vector index from Postgres
+brain reindex
+# expect: "indexed N item(s) into collection 'brain_items"' and exit 0
+```
+
+Degradation reference (all verified by tests): keys unset -> `/items` still
+returns 201 with `type: null, status: inbox`; `/search` returns keyword hits
+with `score: null`; `/ask` returns 502; `brain reindex` exits 1 with a clear
+message.
+
 ## Setup
 
 Prerequisites: Python 3.11, Docker (compose v2).
