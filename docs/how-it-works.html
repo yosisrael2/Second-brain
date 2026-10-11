@@ -63,7 +63,7 @@
     border: 1px solid var(--box-border);
     border-radius: 4px;
     padding: 1px 5px;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
   }
   .principle {
     background: var(--ai-bg);
@@ -78,13 +78,16 @@
   figure svg {
     display: block;
     width: 100%;
+    max-width: 100%;
     height: auto;
     background: var(--box-bg);
     border: 1px solid var(--box-border);
     border-radius: 10px;
   }
+  .tablewrap { overflow-x: auto; }
   figcaption { color: var(--muted); font-size: 0.9em; margin-top: 6px; }
   table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 0.92em; }
+  .tablewrap table { min-width: 560px; }
   th, td { border: 1px solid var(--box-border); padding: 7px 10px; text-align: left; vertical-align: top; }
   th { background: var(--ai-bg); }
   td code, th code { white-space: normal; }
@@ -194,7 +197,7 @@ and the AI layer (Jev, embedders, vector store, LLM clients).
 
   <rect x="24" y="428" width="520" height="76" rx="10" class="svgok"/>
   <text x="284" y="456" text-anchor="middle" class="t-main">Postgres — source of truth</text>
-  <text x="284" y="480" text-anchor="middle" class="t-code">migration 5e756509fb53 · generated tsvector + GIN index</text>
+  <text x="284" y="480" text-anchor="middle" class="t-code">migration f50d89c124c2 · generated tsvector + GIN index</text>
 
   <path d="M544 264 L580 264 L580 512 L480 512 L480 536" class="edge-dash" marker-end="url(#arrowCmp)"/>
   <text x="24" y="532" class="t-cap">services → AI layer: classify · embed · rerank · complete</text>
@@ -508,12 +511,12 @@ fail the request.
 <h2 id="model">7 · Data model</h2>
 <p>
 One table, <code>memory_items</code> (<code>db/models.py:56</code>), created by
-migration <code>5e756509fb53_create_memory_items_table</code>. Enum values are
+migration <code>f50d89c124c2_create_memory_items_table</code>. Enum values are
 stored as CHECK-constrained VARCHARs rather than native Postgres enums, so adding a
 value is a migration, not a type change (<code>models.py:46-55</code>).
 </p>
 
-<table>
+<div class="tablewrap"><table>
 <thead><tr><th>column</th><th>type</th><th>rules</th></tr></thead>
 <tbody>
 <tr><td><code>id</code></td><td>UUID PK</td><td><code>uuid4</code> default (<code>models.py:88</code>)</td></tr>
@@ -525,10 +528,10 @@ value is a migration, not a type change (<code>models.py:46-55</code>).
 <tr><td><code>actionability</code></td><td>VARCHAR(32)</td><td>nullable; CHECK in <code>none · later · now</code> (<code>db/enums.py:25</code>)</td></tr>
 <tr><td><code>confidence</code></td><td>FLOAT</td><td>nullable; CHECK 0.0–1.0 (<code>db/enums.py:10-11</code>)</td></tr>
 <tr><td><code>status</code></td><td>VARCHAR(32)</td><td>default <code>inbox</code>; CHECK in <code>inbox · filed · needs_review</code> (<code>db/enums.py:33-38</code>)</td></tr>
-<tr><td><code>search_vector</code></td><td>TSVECTOR</td><td>generated always as <code>to_tsvector('english', raw_text)</code>, stored (<code>models.py:96-99</code>); GIN index <code>ix_memory_items_search_vector</code> (<code>models.py:74-78</code>)</td></tr>
+<tr><td><code>search_vector</code></td><td>TSVECTOR</td><td>generated always as <code>to_tsvector('english', coalesce(raw_text, ''))</code>, stored (<code>models.py:96-99</code>); GIN index <code>ix_memory_items_search_vector</code> (<code>models.py:74-78</code>)</td></tr>
 <tr><td><code>created_at</code> / <code>updated_at</code></td><td>TIMESTAMPTZ</td><td>server default <code>now()</code>; <code>updated_at</code> bumps on update (<code>models.py:101-107</code>)</td></tr>
 </tbody>
-</table>
+</table></div>
 
 <p class="refs">
 Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
@@ -540,7 +543,7 @@ Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
 <h2 id="degradation">8 · Degradation matrix</h2>
 <p>The design rule: <strong>Postgres is truth; every AI dependency is optional at runtime.</strong></p>
 
-<table>
+<div class="tablewrap"><table>
 <thead><tr><th>component down</th><th>capture (POST /items)</th><th>search (GET /search)</th><th>ask (POST /ask)</th></tr></thead>
 <tbody>
 <tr>
@@ -574,7 +577,7 @@ Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
   <td><code>500</code></td>
 </tr>
 </tbody>
-</table>
+</table></div>
 
 <p class="refs">
 No API keys at all? The stack still runs: fastembed embeds locally
@@ -622,18 +625,18 @@ produced only plain text — no tool call, no side effects.
 </ol>
 
 <h3>Provider configuration</h3>
-<table>
+<div class="tablewrap"><table>
 <thead><tr><th>setting</th><th>values</th><th>default</th><th>notes</th></tr></thead>
 <tbody>
 <tr><td>embedder provider</td><td><code>fastembed</code> · <code>openai</code> (<code>config.py:59</code>)</td><td><code>fastembed</code></td><td>local, no key needed; 384-dim</td></tr>
 <tr><td>LLM provider</td><td><code>claude_sdk</code> · <code>anthropic</code> (<code>config.py:58</code>)</td><td><code>claude_sdk</code></td><td>claude_sdk = local tool-less CLI; anthropic = API</td></tr>
 <tr><td>secrets</td><td><code>JEV_API_KEY</code>, <code>ANTHROPIC_API_KEY</code>, <code>OPENAI_API_KEY</code></td><td>—</td><td>all optional; absent → degradation (§8); <code>file:</code>/<code>env:</code> indirection via <code>unwrap_secret</code> (<code>config.py:31</code>)</td></tr>
 </tbody>
-</table>
+</table></div>
 
 <h2 id="roadmap">11 · Roadmap</h2>
 <p>Six phases; the MVP is phases 1–3, all delivered on this branch.</p>
-<table>
+<div class="tablewrap"><table>
 <thead><tr><th>phase</th><th>scope</th><th>status</th></tr></thead>
 <tbody>
 <tr><td><strong>1 · Core Brain</strong></td><td>domain model, API, Postgres, manual capture, simple retrieval</td><td><span class="badge done">delivered</span></td></tr>
@@ -643,7 +646,7 @@ produced only plain text — no tool call, no side effects.
 <tr><td><strong>5 · External Integrations</strong></td><td>adapters: Gmail, Drive, Calendar, Slack, notes, tasks</td><td><span class="badge planned">planned</span></td></tr>
 <tr><td><strong>6 · Actions &amp; Agents</strong></td><td>task creation, calendar actions, email drafting, approval flows, morning summaries, weekly reviews, project briefings, multi-step agents (LangGraph where useful)</td><td><span class="badge planned">planned</span></td></tr>
 </tbody>
-</table>
+</table></div>
 
 <h3>Where Jev fits</h3>
 <ul>
