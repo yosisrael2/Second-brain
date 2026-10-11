@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 from typing import Protocol
 
@@ -16,6 +15,13 @@ DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OPENAI_TIMEOUT_S = 30.0
 FAKE_EMBED_DIM = 64
 _GRAM = re.compile(r"[a-z0-9]+")
+
+# Vector sizes per OpenAI embedding model (per OpenAI docs).
+_MODEL_DIMS: dict[str, int] = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
 
 
 class EmbedderError(RuntimeError):
@@ -39,27 +45,37 @@ class OpenAIEmbedder:
 
     def __init__(
         self,
-        model: str = DEFAULT_EMBEDDING_MODEL,
         api_key: str | None = None,
-        base_url: str | None = None,
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        base_url: str = DEFAULT_OPENAI_URL,
         timeout_s: float = DEFAULT_OPENAI_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._model = model
         self._api_key = api_key
-        self._url = (
-            (base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_URL).rstrip("/")
-            + "/embeddings"
-        )
+        self._url = base_url.rstrip("/") + "/embeddings"
         self._timeout_s = timeout_s
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
 
+    @property
+    def dim(self) -> int:
+        """Vector size for the configured embedding model."""
+        try:
+            return _MODEL_DIMS[self._model]
+        except KeyError as exc:
+            raise EmbedderError(
+                f"unknown embedding model {self._model!r}; known: {sorted(_MODEL_DIMS)}"
+            ) from exc
+
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool."""
+        self._http.close()
+
     def embed(self, text: str) -> list[float]:
         """Return the embedding vector for ``text``."""
-        api_key = self._api_key if self._api_key is not None else os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise EmbedderError("no API key: set OPENAI_API_KEY (or pass api_key)")
-        response = self._post(api_key, text)
+        if not self._api_key:
+            raise EmbedderError("no API key configured for embeddings (OPENAI_API_KEY)")
+        response = self._post(self._api_key, text)
         return self._extract_vector(response)
 
     def _post(self, api_key: str, text: str) -> httpx.Response:
@@ -98,6 +114,9 @@ class FakeEmbedder:
     @property
     def dim(self) -> int:
         return self._dim
+
+    def close(self) -> None:
+        """No-op: mirrors the real embedder's lifecycle method."""
 
     def embed(self, text: str) -> list[float]:
         """Return the deterministic embedding vector for ``text``."""

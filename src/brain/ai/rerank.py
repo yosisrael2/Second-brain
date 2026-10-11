@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from .ask import item_text
-from .jev import JevClient, JevClientProtocol, JevError
+from .jev import JevClientProtocol, JevError
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ def rerank(
     """
     if not candidates:
         return []
-    jev = jev or JevClient()
+    if jev is None:
+        raise ValueError("rerank requires a Jev client; build one in the DI factory")
     try:
         scores = jev.score_batch(
             f"How relevant is this candidate to the question: {question}",
@@ -47,3 +49,19 @@ def rerank(
         return list(candidates)[:top_n]
     ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0].score)
     return [candidate for _, candidate in ranked][:top_n]
+
+
+@dataclass(frozen=True)
+class JevReranker:
+    """Adapter exposing :func:`rerank` as an injectable Strategy object."""
+
+    jev: JevClientProtocol
+
+    def rerank(
+        self,
+        question: str,
+        candidates: Sequence[Mapping[str, Any]],
+        top_n: int = DEFAULT_TOP_N,
+    ) -> list[Mapping[str, Any]]:
+        """Rerank ``candidates`` by Jev-scored relevance to ``question``."""
+        return rerank(question, candidates, top_n, self.jev)

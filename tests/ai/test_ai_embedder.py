@@ -64,18 +64,31 @@ class TestOpenAIEmbedder:
         assert seen["body"] == {"model": "text-embedding-3-small", "input": "hello"}
         assert vector == [0.5, -0.5, 1.0]
 
-    def test_base_url_env_override(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_BASE_URL", "https://proxy.example/v1")
+    def test_base_url_override(self):
         seen = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen["url"] = str(request.url)
             return httpx.Response(200, json={"data": [{"embedding": [1.0]}]})
 
-        embedder = OpenAIEmbedder(api_key="k", transport=httpx.MockTransport(handler))
+        embedder = OpenAIEmbedder(
+            api_key="k", base_url="https://proxy.example/v1", transport=httpx.MockTransport(handler)
+        )
         embedder.embed("text")
 
         assert seen["url"] == "https://proxy.example/v1/embeddings"
+
+    def test_dim_matches_known_models(self):
+        assert OpenAIEmbedder(api_key="k").dim == 1536
+        assert OpenAIEmbedder(api_key="k", model="text-embedding-3-large").dim == 3072
+
+        with pytest.raises(EmbedderError, match="unknown embedding model"):
+            OpenAIEmbedder(api_key="k", model="mystery-model").dim  # noqa: B018
+
+    def test_close_releases_the_http_client(self):
+        embedder = OpenAIEmbedder(api_key="k")
+
+        embedder.close()  # must not raise
 
     def test_missing_api_key_fails_before_any_request(self):
         calls = []

@@ -2,9 +2,15 @@
 
 import pytest
 
-from brain.ai.classify import FALLBACK_CLASSIFICATION, IMPORTANCE_MAX, classify, route
-from brain.ai.enums import Actionability, ItemStatus, ItemType
+from brain.ai.classify import (
+    FALLBACK_CLASSIFICATION,
+    IMPORTANCE_MAX,
+    JevClassifier,
+    classify,
+    route,
+)
 from brain.ai.jev import JevError
+from brain.db.enums import Actionability, ItemStatus, ItemType
 
 
 class StubJev:
@@ -104,15 +110,24 @@ def test_classify_never_raises_on_malformed_answers():
     assert classify("text", StubJev(malformed)) == FALLBACK_CLASSIFICATION
 
 
-def test_classify_uses_real_jevclient_by_default(monkeypatch):
-    monkeypatch.delenv("JEV_API_KEY", raising=False)
+def test_classify_uses_real_jevclient_when_injected():
+    from brain.ai.jev import JevClient
 
-    # No key configured: the default client must fail closed via the fallback,
-    # not raise.
-    result = classify("text")
+    # No key configured: the real client fails closed via the fallback,
+    # not by raising.
+    result = classify("text", JevClient(api_key=None))
 
     assert result == FALLBACK_CLASSIFICATION
     assert route(result["confidence"]) is ItemStatus.INBOX
+
+
+def test_jev_classifier_adapter_uses_injected_client():
+    jev = StubJev(HAPPY_ANSWERS)
+
+    result = JevClassifier(jev).classify("Renew the certificate")
+
+    assert result["type"] is ItemType.TASK
+    assert len(jev.calls) == 1
 
 
 def test_item_type_enum_covers_the_contract():

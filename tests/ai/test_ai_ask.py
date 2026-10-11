@@ -100,18 +100,24 @@ class TestClaudeLLMClient:
         assert seen["body"]["messages"] == [{"role": "user", "content": "which port?"}]
         assert text == "Port 8000."  # non-text blocks skipped, texts joined
 
-    def test_model_env_override(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_MODEL", "claude-opus-4-6")
+    def test_model_override_via_config(self):
         seen = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             seen["body"] = json.loads(request.content.decode("utf-8"))
             return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
 
-        client = ClaudeLLMClient(api_key="k", transport=httpx.MockTransport(handler))
+        client = ClaudeLLMClient(
+            api_key="k", model="claude-opus-4-6", transport=httpx.MockTransport(handler)
+        )
         client.complete("hi")
 
         assert seen["body"]["model"] == "claude-opus-4-6"
+
+    def test_close_releases_the_http_client(self):
+        client = ClaudeLLMClient(api_key="k")
+
+        client.close()  # must not raise
 
     def test_missing_api_key_fails_before_any_request(self):
         calls = []

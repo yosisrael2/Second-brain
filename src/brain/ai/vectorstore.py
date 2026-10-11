@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from collections.abc import Mapping
 from typing import Any, Protocol
@@ -10,7 +9,7 @@ from typing import Any, Protocol
 from qdrant_client import QdrantClient, models
 
 DEFAULT_COLLECTION = "brain_items"
-_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
+DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
 
 
 class VectorStoreError(RuntimeError):
@@ -36,33 +35,34 @@ class VectorStore(Protocol):
 class QdrantVectorStore:
     """Repository (Adapter) implementing VectorStore on top of Qdrant.
 
-    Connection comes from ``QDRANT_URL`` / ``QDRANT_API_KEY`` unless a
-    ready-made ``QdrantClient`` is injected (tests use an in-memory client).
-    Non-integer, non-UUID item ids are mapped to a deterministic UUID point
-    id; the original id is always kept in the stored payload and returned by
-    :meth:`search`.
+    Configuration is injected; the app-wide factory lives in
+    ``brain.api.deps`` (values from ``Settings``). A ready-made
+    ``QdrantClient`` can be injected instead (tests use an in-memory
+    client). Non-integer, non-UUID item ids are mapped to a deterministic
+    UUID point id; the original id is always kept in the stored payload and
+    returned by :meth:`search`.
     """
 
     def __init__(
         self,
         url: str | None = None,
         api_key: str | None = None,
-        collection: str | None = None,
+        collection: str = DEFAULT_COLLECTION,
+        timeout_s: int = DEFAULT_QDRANT_TIMEOUT_S,
         client: QdrantClient | None = None,
     ) -> None:
-        self._collection = collection or os.getenv("QDRANT_COLLECTION") or DEFAULT_COLLECTION
-        self._client = client or self._build_client(url, api_key)
+        self._collection = collection
+        self._client = client or self._build_client(url, api_key, timeout_s)
 
     @staticmethod
-    def _build_client(url: str | None, api_key: str | None) -> QdrantClient:
-        url = url or os.getenv("QDRANT_URL")
+    def _build_client(url: str | None, api_key: str | None, timeout_s: int) -> QdrantClient:
         if not url:
-            raise VectorStoreError("no Qdrant URL: set QDRANT_URL (or pass url/client)")
-        return QdrantClient(
-            url=url,
-            api_key=api_key or os.getenv("QDRANT_API_KEY"),
-            timeout=_QDRANT_TIMEOUT_S,
-        )
+            raise VectorStoreError("no Qdrant URL configured (QDRANT_URL)")
+        return QdrantClient(url=url, api_key=api_key, timeout=timeout_s)
+
+    def close(self) -> None:
+        """Release the underlying Qdrant client connection."""
+        self._client.close()
 
     def ensure_collection(self, dim: int) -> None:
         """Create the collection with cosine distance unless it exists."""

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -10,6 +10,8 @@ from typing import Any, Protocol
 import httpx
 
 from ._http import post_json
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-latest"
@@ -130,31 +132,27 @@ class JevClient:
     def __init__(
         self,
         api_key: str | None = None,
-        base_url: str | None = None,
-        model: str | None = None,
-        timeout_s: float | None = None,
+        base_url: str = DEFAULT_BASE_URL,
+        model: str = DEFAULT_MODEL,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._api_key = api_key
-        self._base_url = (base_url or os.getenv("JEV_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-        self._model = model or os.getenv("JEV_MODEL") or DEFAULT_MODEL
-        self._timeout_s = self._resolve_timeout(timeout_s)
-        self._http = httpx.Client(timeout=self._timeout_s, transport=transport)
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._timeout_s = timeout_s
+        self._http = httpx.Client(timeout=timeout_s, transport=transport)
 
-    @staticmethod
-    def _resolve_timeout(timeout_s: float | None) -> float:
-        if timeout_s is not None:
-            return timeout_s
-        env_ms = os.getenv("JEV_TIMEOUT_MS")
-        return float(env_ms) / 1000.0 if env_ms else DEFAULT_TIMEOUT_S
+    def close(self) -> None:
+        """Release the underlying HTTP connection pool."""
+        self._http.close()
 
     def decide(self, state: Any, questions: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
         """POST all ``questions`` against one ``state``; returns raw answers by id."""
-        api_key = self._api_key if self._api_key is not None else os.getenv("JEV_API_KEY")
-        if not api_key:
-            raise JevError("no API key: set JEV_API_KEY (or pass api_key)")
+        if not self._api_key:
+            raise JevError("no API key configured for Jev (JEV_API_KEY)")
         payload = {"model": self._model, "state": state, "questions": dict(questions)}
-        response = self._post(payload, api_key)
+        response = self._post(payload, self._api_key)
         return self._parse_answers(response, requested=list(questions))
 
     def choice(

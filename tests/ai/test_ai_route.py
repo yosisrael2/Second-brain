@@ -3,7 +3,7 @@
 import pytest
 
 from brain.ai.classify import route
-from brain.ai.enums import ItemStatus
+from brain.db.enums import ItemStatus
 
 
 @pytest.mark.parametrize(

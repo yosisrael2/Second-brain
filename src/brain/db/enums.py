@@ -11,7 +11,7 @@ CONFIDENCE_MIN = 0.0
 CONFIDENCE_MAX = 1.0
 
 
-class ItemType(str, enum.Enum):
+class ItemType(enum.StrEnum):
     """What kind of knowledge a memory item represents."""
 
     TASK = "task"
@@ -22,7 +22,7 @@ class ItemType(str, enum.Enum):
     IDEA = "idea"
 
 
-class Actionability(str, enum.Enum):
+class Actionability(enum.StrEnum):
     """How urgently an item calls for action."""
 
     NONE = "none"
@@ -30,7 +30,7 @@ class Actionability(str, enum.Enum):
     NOW = "now"
 
 
-class ItemStatus(str, enum.Enum):
+class ItemStatus(enum.StrEnum):
     """Workflow state of a memory item."""
 
     INBOX = "inbox"

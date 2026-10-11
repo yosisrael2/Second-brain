@@ -1,5 +1,7 @@
 """AI layer: classification, embedding, vector search, rerank, and ask."""
 
+from brain.db.enums import Actionability, ItemStatus, ItemType
+
 from .ask import (
     ClaudeLLMClient,
     FakeLLMClient,
@@ -11,9 +13,8 @@ from .ask import (
 )
 from .classify import FALLBACK_CLASSIFICATION, classify, route
 from .embedder import Embedder, EmbedderError, FakeEmbedder, OpenAIEmbedder
-from .enums import Actionability, ItemStatus, ItemType
 from .jev import JevChoice, JevClient, JevClientProtocol, JevError, JevScore
-from .rerank import rerank
+from .rerank import JevReranker, rerank
 from .vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "JevClient",
     "JevClientProtocol",
     "JevError",
+    "JevReranker",
     "JevScore",
     "LLMClient",
     "LLMError",
