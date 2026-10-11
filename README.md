@@ -357,7 +357,7 @@ Anything marked **PROPOSAL** is an idea, not a decided behavior.
 | Search N+1 → get_many | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
 | Delete dead `ItemsService.create` | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
 | UUID guard in `_load_items` | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
-| Stable pagination (keyset) | offset paging shifts under concurrent writes | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | repeated page reads are disjoint |
+| Deterministic list ordering (secondary sort on id) | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
 | Qdrant healthcheck in compose | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
 | dev-start self-healing restart | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
 | Test DB isolation | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
