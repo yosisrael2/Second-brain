@@ -4,6 +4,8 @@ An AI-powered personal knowledge base: capture raw thoughts, organize them into
 typed, searchable memory items, and retrieve them with keyword and semantic
 search.
 
+Roadmap, known limitations, and where to pick up work: see [Next steps](#next-steps).
+
 ## Stack
 
 - Python 3.11, FastAPI, Pydantic v2
@@ -359,3 +361,91 @@ dev database, runs the DB-backed suite, and asserts the marker survives.
   `main`; never force-push or rewrite history.
 - Keep secrets out of the repo: local config lives in `.env` (gitignored);
   `.env.example` documents the shape.
+
+## Next steps
+
+For the next worker. Items in section 1 are **in progress on `feature/mvp-hardening` and NOT on main yet**.
+Anything marked **PROPOSAL** is an idea, not a decided behavior.
+
+### 1. In progress — `feature/mvp-hardening` (not on main yet)
+
+| Item | Why | Where | Acceptance hint |
+| --- | --- | --- | --- |
+| Reindex batching | reindex embeds+upserts one item per call (~2N round-trips) | `src/brain/services/ingest.py`, `src/brain/services/indexing.py` | one embed + one upsert per DB batch; identical final state; 1k items reindex in seconds |
+| Embedder probe before purge | purge-then-fail leaves the collection empty | `src/brain/services/ingest.py` (`reindex`) | EmbedderError before purge leaves the collection untouched |
+| Search N+1 → get_many | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
+| Delete dead `ItemsService.create` | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
+| UUID guard in `_load_items` | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
+| Deterministic list ordering (secondary sort on id) | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
+| Qdrant healthcheck in compose | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
+| dev-start self-healing restart | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
+| Test DB isolation | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
+| Seed-demo script | fresh clone has an empty DB | `scripts/` | `scripts/seed-demo.sh` fills a few example items |
+| `/ask` source truncation | a 10k-char item can blow the prompt | `src/brain/services/ask.py`, `src/brain/ai/ask.py` | per-source prompt budget enforced |
+| Config shim removal | ai modules re-export config defaults nobody imports | `src/brain/ai/jev.py` (same pattern in ask/embedder) | grep shows no shim imports |
+| `rerank(jev=...)` required | optional param + ValueError guard for a required dep | `src/brain/ai/rerank.py` | signature requires `jev`; guard deleted |
+
+### 2. Known limitations / tech debt (on main)
+
+| Limitation | Detail | Where |
+| --- | --- | --- |
+| Jev never returns `project` | the classifier question needs rewording, or a dedicated choice over known projects | `src/brain/ai/classify.py` |
+| Rerank reorders, score stays cosine | expose the rerank score alongside the vector score | `src/brain/ai/rerank.py`, `src/brain/services/search.py` |
+| Offset pagination is approximate | `/search` and reindex assume a quiet window; concurrent writes shift pages | `src/brain/services/search.py`, `src/brain/services/ingest.py` |
+| No auth | single user, localhost only — never expose publicly | `src/brain/main.py` |
+| No CI | add GitHub Actions: ruff, mypy, pytest (postgres+qdrant services), shellcheck | `.github/workflows/` (to create) |
+| Status transitions not enforced | any PATCH can set any status; no inbox→filed workflow rules | `src/brain/db/models.py`, `src/brain/services/items.py` |
+| No retries/backoff | external calls fail fast by design; revisit when an adapter needs resilience | `src/brain/ai/_http.py` |
+| fastembed first-run download | ~130MB model download on first capture/search, then offline | `src/brain/ai/embedder.py` |
+| Qdrant image pinned to client | image tag and qdrant-client version move together | `docker-compose.yml` |
+| Compose port collisions | two projects on 5432/6333: dev-start reuses healthy services or fails loudly | `scripts/dev-start.sh` |
+
+### 3. Roadmap — phases 4-6 (from the project plan)
+
+**Phase 4 — Knowledge Intelligence.** Detect relationships between items (duplicate / related /
+supports / contradicts / supersedes) with Jev over top-k neighbours at ingest time; store in a new
+relations table.
+1. Relations table + migration: `src/brain/db/models.py` + `alembic revision` (FK to `memory_items`,
+   relation-type CHECK). *Accept:* migration up/down round-trips.
+2. Relation classifier: new module in `src/brain/ai/` over `JevClientProtocol`, called from the
+   existing ingest seam (`src/brain/services/ingest.py` `_apply_classification`). *Accept:* capturing
+   a near-duplicate of an existing item records a `duplicate` relation.
+3. Read API: `GET /items/{id}/relations` in `src/brain/api/routes/items.py`. *Accept:* typed links
+   returned for a seeded pair.
+
+**Phase 5 — External Integrations.** Adapters per source (Gmail, Drive, Calendar, Slack, notes,
+tasks) feeding the existing `IngestService` with `source=<adapter>`; dedupe via Phase-4 relations.
+1. Adapter Protocol + registry: new `src/brain/adapters/`, reusing the Protocol/Factory seams
+   (`ClassifierProto`, `ItemIndexerProto` show the pattern; `factories.py` for wiring). *Accept:* an
+   adapter can be selected by config without touching services.
+2. First adapter (notes/files): import plain files via `IngestService.create` with
+   `source="notes"` (the free-form `source` column already supports this). *Accept:* imported note
+   is searchable and shows `source=notes`.
+3. Dedupe at ingest: check Phase-4 relations before insert; skip or link duplicates. *Accept:*
+   re-importing the same file creates no second item.
+
+**Phase 6 — Actions & Agents.** From passive store to active assistant: task creation, calendar
+actions, email drafting with an approval flow, morning summaries / weekly reviews; LangGraph only
+where a multi-step agent earns its place.
+1. Task queue: surface `type=task` items as actionable rows (new table or view over `memory_items`;
+   `src/brain/db/models.py`). *Accept:* open tasks listed newest-first with status.
+2. Daily summary: CLI/endpoint that asks `AskService` over today's items (seam:
+   `src/brain/services/ask.py`). *Accept:* `brain summary` returns a cited digest.
+3. Email drafting behind an approval gate: drafts stored as items, never auto-sent. *Accept:* a
+   draft requires explicit confirmation before any send action exists.
+
+### 4. Dogfood & feedback (PROPOSAL)
+
+Use Second Brain for real notes for a week, then decide the routing thresholds from data instead of
+the current guesses (0.9/0.5 in `src/brain/ai/classify.py`). **PROPOSAL** for what to log/count:
+confidence histogram of `confidence` (Postgres column), share of items landing `needs_review` vs
+`filed` vs `inbox`, and manual mis-route tallies; re-pick `ROUTE_FILE_THRESHOLD`/`ROUTE_REVIEW_THRESHOLD`
+from that distribution.
+
+### 5. Where to start tomorrow
+
+1. Review + merge PR #1 (this branch), then PR #2 (`feature/mvp-docs-html`).
+2. Finish `feature/mvp-hardening` — biggest bang: reindex batching (section 1, rows 1-2).
+3. Add the CI workflow (section 2) so everything above gets enforced automatically.
+4. Start the dogfood week (section 4) with real notes.
+5. Slice the first Phase-4 ticket (section 3) once the hardening branch lands.
