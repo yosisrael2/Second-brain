@@ -8,7 +8,6 @@ are request-scoped and assembled here via ``Depends``.
 from functools import lru_cache
 
 from fastapi import Depends
-from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
 from brain.ai.ask import LLMClient
@@ -17,7 +16,7 @@ from brain.ai.embedder import Embedder
 from brain.ai.jev import JevClient
 from brain.ai.rerank import JevReranker
 from brain.ai.vectorstore import QdrantVectorStore
-from brain.config import get_settings
+from brain.config import get_settings, unwrap_secret
 from brain.db.session import get_db
 from brain.factories import build_embedder, build_llm_client
 from brain.repositories.items import ItemsRepository
@@ -28,17 +27,12 @@ from brain.services.items import ItemsService
 from brain.services.search import SearchService
 
 
-def _secret(value: SecretStr | None) -> str | None:
-    """Unwrap an optional SecretStr for client constructors."""
-    return value.get_secret_value() if value else None
-
-
 @lru_cache
 def _jev_client() -> JevClient:
     """App-lifetime Jev client built from settings."""
     settings = get_settings()
     return JevClient(
-        api_key=_secret(settings.jev_api_key),
+        api_key=unwrap_secret(settings.jev_api_key),
         base_url=settings.jev_base_url,
         model=settings.jev_model,
         timeout_s=settings.jev_timeout_ms / 1000,
@@ -63,7 +57,7 @@ def _vector_store() -> QdrantVectorStore:
     settings = get_settings()
     return QdrantVectorStore(
         url=settings.qdrant_url,
-        api_key=_secret(settings.qdrant_api_key),
+        api_key=unwrap_secret(settings.qdrant_api_key),
         collection=settings.qdrant_collection,
         timeout_s=settings.qdrant_timeout_s,
     )

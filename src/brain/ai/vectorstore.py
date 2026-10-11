@@ -9,8 +9,10 @@ from typing import Any, Protocol
 
 from qdrant_client import QdrantClient, models
 
-DEFAULT_COLLECTION = "brain_items"
-DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
+from brain.config import DEFAULT_QDRANT_COLLECTION, DEFAULT_QDRANT_TIMEOUT_S
+
+# Canonical defaults live in brain.config; re-exported for convenience.
+DEFAULT_COLLECTION = DEFAULT_QDRANT_COLLECTION
 
 
 class VectorStoreError(RuntimeError):

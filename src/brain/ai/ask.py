@@ -8,13 +8,16 @@ from typing import Any, Protocol
 
 import httpx
 
+from brain.config import (
+    DEFAULT_ANTHROPIC_TIMEOUT_S,
+    DEFAULT_ANTHROPIC_URL,
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_MAX_TOKENS,
+)
+
 from ._http import post_json
 
-DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
-DEFAULT_MAX_TOKENS = 1024
-DEFAULT_ANTHROPIC_TIMEOUT_S = 60.0
 
 CITATION_RULES = (
     "Answer using only the source items. Cite the item id in square brackets, "

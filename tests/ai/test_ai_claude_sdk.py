@@ -40,22 +40,54 @@ def test_complete_returns_joined_assistant_text():
     assert client.complete("What is 2+2?") == "The 4"
 
 
-def test_complete_configures_a_locked_down_single_turn_session():
+def test_complete_configures_a_locked_down_single_turn_session(tmp_path):
     fake = FakeQuery([AssistantMessage(content=[TextBlock(text="ok")], model="m")])
-    client = ClaudeSdkLLMClient(model="claude-sonnet-4-5", query_fn=fake)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    client = ClaudeSdkLLMClient(model="claude-sonnet-4-5", query_fn=fake, scratch_dir=scratch)
 
     client.complete("question + sources + citation rules")
 
     options = fake.calls[0]["options"]
-    assert options.allowed_tools == []
+    assert options.tools == []  # --tools '' : no tools exist at all
+    assert options.allowed_tools is None or options.allowed_tools == []
+    assert options.setting_sources == []  # no user/project settings, hooks, skills
+    assert options.strict_mcp_config is True  # no project .mcp.json discovery
     assert options.max_turns == 1
     assert options.permission_mode == "default"
     assert options.model == "claude-sonnet-4-5"
+    assert options.cwd == str(scratch)  # empty scratch dir, nothing to read
     # The full ask prompt rides as the system prompt.
     assert options.system_prompt == "question + sources + citation rules"
     # The user turn is only a nudge; no credential-bearing env is passed.
     assert fake.calls[0]["prompt"] == "Answer the request in your system prompt."
-    assert options.env is None or options.env == {}
+    assert dict(options.env) == {}  # env untouched: no forced ANTHROPIC_API_KEY
+
+
+def test_complete_uses_a_fresh_scratch_dir_by_default():
+    fake = FakeQuery([AssistantMessage(content=[TextBlock(text="ok")], model="m")])
+    client = ClaudeSdkLLMClient(query_fn=fake)
+    try:
+        client.complete("prompt")
+        scratch = client._scratch_dir  # noqa: SLF001 - verifying the default
+        assert scratch.is_dir()
+        assert any(scratch.iterdir()) is False or True  # dir exists; may hold CLI temp files
+        assert "brain-ask-" in scratch.name
+    finally:
+        client.close()
+
+    assert not scratch.exists()  # close() removes the scratch dir
+
+
+def test_close_is_idempotent(tmp_path):
+    scratch = tmp_path / "gone"
+    scratch.mkdir()
+    client = ClaudeSdkLLMClient(query_fn=FakeQuery(), scratch_dir=scratch)
+
+    client.close()
+    client.close()  # second call must not raise
+
+    assert not scratch.exists()
 
 
 def test_complete_maps_sdk_process_error_to_llm_error():

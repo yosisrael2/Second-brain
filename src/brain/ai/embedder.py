@@ -8,12 +8,15 @@ from typing import Any, Protocol
 
 import httpx
 
+from brain.config import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_FASTEMBED_MODEL,
+    DEFAULT_OPENAI_TIMEOUT_S,
+    DEFAULT_OPENAI_URL,
+)
+
 from ._http import post_json
 
-DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-DEFAULT_OPENAI_TIMEOUT_S = 30.0
-DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 FAKE_EMBED_DIM = 64
 _GRAM = re.compile(r"[a-z0-9]+")
 

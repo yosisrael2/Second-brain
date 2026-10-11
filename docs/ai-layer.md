@@ -30,7 +30,7 @@ tokens.
 | `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError`; `ensure_collection` rejects a dim mismatch (remedy: `brain reindex`) | Repository / Adapter |
 | `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering; `JevReranker` adapter | Strategy |
 | `ask.py` | `LLMClient` protocol; `ClaudeLLMClient`, `FakeLLMClient`; `answer(question, context_items)` → `{answer, cited_ids}` | Strategy |
-| `claude_sdk.py` | `ClaudeSdkLLMClient` — single-turn, tool-less Claude Code session (`allowed_tools=[]`, `max_turns=1`); auth = local login, no env overrides; SDK errors → `LLMError` | Adapter / Strategy |
+| `claude_sdk.py` | `ClaudeSdkLLMClient` — single-turn, tool-less Claude Code session (`tools=[]` → `--tools ''`, `setting_sources=[]`, `strict_mcp_config=True`, scratch `cwd`); auth = local login, no env overrides; SDK errors → `LLMError` | Adapter / Strategy |
 
 ## Behavior details
 
@@ -64,6 +64,22 @@ tokens.
 - Returns `{"answer": str, "cited_ids": [...]}` where `cited_ids` are the
   context ids actually cited in the answer text.
 - LLM failures raise `LLMError`; callers own the fallback policy.
+
+### Security model of /ask (claude_sdk provider)
+
+Stored memory text is untrusted input: it is concatenated into the system
+prompt, so a malicious or poisoned item can carry prompt-injection
+instructions. The Claude Code session is therefore locked down so injection
+cannot escalate beyond producing text: `tools=[]` sends `--tools ''` — the
+session has NO tools at all (note `allowed_tools=[]` would be a no-op: it can
+only auto-approve, never remove tools); `setting_sources=[]` loads no
+user/project settings, so user permission allowlists (e.g. `Bash(curl *)`),
+hooks and skills are inert; `strict_mcp_config=True` blocks project
+`.mcp.json` server discovery; and `cwd` is a fresh empty scratch dir (removed
+on close), so there is no workspace content to read or write. Credentials are
+never handled by our code — the SDK authenticates with the existing local
+`claude` CLI login, and we pass no environment overrides. Worst case is a
+confused answer, not an executed command.
 
 ### Jev request shape
 

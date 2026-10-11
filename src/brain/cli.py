@@ -5,11 +5,10 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
-from typing import Any
 
 from brain.ai.embedder import Embedder, EmbedderError
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
-from brain.config import get_settings
+from brain.config import get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
@@ -51,7 +50,7 @@ def _reindex(
         if live_store is None:
             live_store = QdrantVectorStore(
                 url=settings.qdrant_url,
-                api_key=_secret(settings.qdrant_api_key),
+                api_key=unwrap_secret(settings.qdrant_api_key),
                 collection=settings.qdrant_collection,
                 timeout_s=settings.qdrant_timeout_s,
             )
@@ -76,12 +75,6 @@ def _reindex(
             live_embedder.close()
     print(f"indexed {indexed} item(s) into collection '{settings.qdrant_collection}'")
     return 0
-
-
-def _secret(value: Any) -> str | None:
-    """Unwrap an optional pydantic SecretStr from settings."""
-    return value.get_secret_value() if value else None
-
 
 class _NoopClassifier:
     """Classifier stand-in: reindex never classifies, only embeds."""

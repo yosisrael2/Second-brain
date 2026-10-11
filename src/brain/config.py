@@ -1,6 +1,8 @@
-"""Application settings, loaded from environment variables / .env.
+"""Application settings and default constants, from environment variables / .env.
 
-TLDR: single source of truth for configuration; no secrets in code.
+TLDR: single source of truth for configuration and AI defaults; no secrets in
+code. This module imports nothing from ``brain.ai`` (the ai modules import
+their defaults from here), keeping the dependency DAG one-way.
 """
 
 from functools import lru_cache
@@ -9,24 +11,26 @@ from typing import Literal
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from brain.ai.ask import (
-    DEFAULT_ANTHROPIC_TIMEOUT_S,
-    DEFAULT_ANTHROPIC_URL,
-    DEFAULT_CLAUDE_MODEL,
-    DEFAULT_MAX_TOKENS,
-)
-from brain.ai.claude_sdk import DEFAULT_SDK_TIMEOUT_S
-from brain.ai.embedder import (
-    DEFAULT_EMBEDDING_MODEL,
-    DEFAULT_FASTEMBED_MODEL,
-    DEFAULT_OPENAI_TIMEOUT_S,
-    DEFAULT_OPENAI_URL,
-)
-from brain.ai.jev import DEFAULT_BASE_URL as DEFAULT_JEV_BASE_URL
-from brain.ai.jev import DEFAULT_MODEL as DEFAULT_JEV_MODEL
-from brain.ai.jev import DEFAULT_TIMEOUT_S as DEFAULT_JEV_TIMEOUT_S
-from brain.ai.vectorstore import DEFAULT_COLLECTION as DEFAULT_QDRANT_COLLECTION
-from brain.ai.vectorstore import DEFAULT_QDRANT_TIMEOUT_S
+# --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
+DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com/v1"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
+DEFAULT_MAX_TOKENS = 1024
+DEFAULT_ANTHROPIC_TIMEOUT_S = 60.0
+DEFAULT_SDK_TIMEOUT_S = 120.0
+DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_OPENAI_TIMEOUT_S = 30.0
+DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1/systemone"
+DEFAULT_JEV_MODEL = "jev-latest"
+DEFAULT_JEV_TIMEOUT_S = 5.0
+DEFAULT_QDRANT_COLLECTION = "brain_items"
+DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
+
+
+def unwrap_secret(value: SecretStr | None) -> str | None:
+    """Unwrap an optional SecretStr for client constructors (single shared helper)."""
+    return value.get_secret_value() if value else None
 
 
 class Settings(BaseSettings):

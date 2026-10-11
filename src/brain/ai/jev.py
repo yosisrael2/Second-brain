@@ -9,13 +9,16 @@ from typing import Any, Protocol
 
 import httpx
 
+from brain.config import DEFAULT_JEV_BASE_URL, DEFAULT_JEV_MODEL, DEFAULT_JEV_TIMEOUT_S
+
 from ._http import post_json
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
-DEFAULT_MODEL = "jev-latest"
-DEFAULT_TIMEOUT_S = 5.0
+# Canonical defaults live in brain.config; re-exported for convenience.
+DEFAULT_BASE_URL = DEFAULT_JEV_BASE_URL
+DEFAULT_MODEL = DEFAULT_JEV_MODEL
+DEFAULT_TIMEOUT_S = DEFAULT_JEV_TIMEOUT_S
 
 
 class JevError(RuntimeError):
