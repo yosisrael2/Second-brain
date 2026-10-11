@@ -1,13 +1,14 @@
 """Tests for the /items endpoints (need the docker-compose Postgres)."""
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from brain.db.session import engine
+from brain.db.session import SessionLocal, engine
 
 _ENDPOINT = "/items"
 
@@ -117,6 +118,32 @@ def test_list_items_pagination(client: TestClient, clean_items: None) -> None:
     assert [item["raw_text"] for item in page] == ["note 1", "note 0"]
     assert client.get(_ENDPOINT, params={"limit": 0}).status_code == 422
     assert client.get(_ENDPOINT, params={"offset": -1}).status_code == 422
+
+
+def test_list_items_pagination_is_stable_for_identical_timestamps(
+    client: TestClient, clean_items: None
+) -> None:
+    """created_at ties are broken by id, so pages never repeat or skip rows."""
+    from sqlalchemy import update
+
+    from brain.db.models import MemoryItem
+
+    for i in range(4):
+        _create_item(client, raw_text=f"tie {i}")
+    session = SessionLocal()
+    try:
+        session.execute(
+            update(MemoryItem).values(created_at=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    page1 = client.get(_ENDPOINT, params={"limit": 2}).json()
+    page2 = client.get(_ENDPOINT, params={"limit": 2, "offset": 2}).json()
+
+    ids = [item["id"] for item in page1 + page2]
+    assert len(set(ids)) == 4  # no row repeated or dropped across the page boundary
 
 
 def test_patch_item_updates_only_given_fields(client: TestClient, clean_items: None) -> None:

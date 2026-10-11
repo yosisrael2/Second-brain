@@ -33,6 +33,13 @@ class ItemsRepository:
         """Return the item with the given id, or None if absent."""
         return self._db.get(MemoryItem, item_id)
 
+    def get_many(self, item_ids: Sequence[uuid.UUID]) -> Sequence[MemoryItem]:
+        """Return the items with the given ids, missing ones silently skipped."""
+        if not item_ids:
+            return []
+        stmt = select(MemoryItem).where(MemoryItem.id.in_(item_ids))
+        return list(self._db.scalars(stmt))
+
     def list(
         self,
         *,
@@ -43,7 +50,7 @@ class ItemsRepository:
         offset: int,
     ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status."""
-        stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc())
+        stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
         if item_type is not None:
             stmt = stmt.where(MemoryItem.type == item_type)
         if project is not None:
@@ -61,6 +68,7 @@ class ItemsRepository:
             .order_by(
                 func.ts_rank(MemoryItem.search_vector, tsquery).desc(),
                 MemoryItem.created_at.desc(),
+                MemoryItem.id.desc(),
             )
             .limit(limit)
             .offset(offset)

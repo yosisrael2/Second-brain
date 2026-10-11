@@ -194,7 +194,8 @@ claude -p ok            # verifies the Claude Code login; run `claude` + /login 
 uvicorn brain.main:app --port 8000
 
 # 4. Capture with auto-classification (Jev fills type/importance/actionability,
-#    confidence, and routes by confidence)
+#    confidence, and routes by confidence; fields you sent explicitly in the
+#    payload are never overwritten — classification only fills what's missing)
 curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
   -d '{"raw_text": "Renew the TLS certificate before Friday"}'
 # expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
