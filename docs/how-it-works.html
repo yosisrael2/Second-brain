@@ -225,12 +225,12 @@ and the AI layer (Jev, embedders, vector store, LLM clients).
     </marker>
   </defs>
 </svg>
-<figcaption>Routers are thin (<code>routes/*.py</code>); business logic lives in <code>services/</code>; <code>repositories/</code> owns SQL; <code>ai/</code> isolates every external model call behind small Protocols (<code>services/ingest.py:20</code>, <code>services/search.py:19</code>, <code>services/indexing.py:16</code>). Everything is built at startup by <code>factories.py:16,28</code> from <code>config.Settings</code>, cached app-lifetime via <code>lru_cache</code> in <code>api/deps.py</code>, and closed on shutdown (<code>deps.py:75</code>). The CLI lives in <code>cli.py:40</code> (<code>brain reindex</code>).</figcaption>
+<figcaption>Routers are thin (<code>routes/*.py</code>); business logic lives in <code>services/</code>; <code>repositories/</code> owns SQL; <code>ai/</code> isolates every external model call behind small Protocols (<code>services/ingest.py:20</code>, <code>services/search.py:19</code>, <code>services/indexing.py:16</code>). Everything is built at startup by <code>factories.py:16,28</code> from <code>config.Settings</code>, cached app-lifetime via <code>lru_cache</code> in <code>api/deps.py</code>, and closed on shutdown (<code>deps.py:75</code>). The CLI lives in <code>cli.py:34</code> (<code>brain reindex</code>).</figcaption>
 </figure>
 
 <h2 id="capture">3 · Flow: capture (<code>POST /items</code>)</h2>
 <p>
-The write to Postgres happens <strong>first</strong> (<code>ingest.py:61</code>);
+The write to Postgres happens <strong>first</strong> (<code>ingest.py:59</code>);
 classification and embedding run after, and their failures are logged but never
 fail the request.
 </p>
@@ -251,7 +251,7 @@ fail the request.
   <circle cx="106" cy="127" r="16" class="stepdot"/><text x="106" y="132" text-anchor="middle" class="t-step">2</text>
   <rect x="146" y="100" width="368" height="54" rx="10" class="svgok"/>
   <text x="160" y="122" class="t-main">INSERT row into Postgres</text>
-  <text x="160" y="144" class="t-code">services/ingest.py:61 — durable before any AI runs</text>
+  <text x="160" y="144" class="t-code">services/ingest.py:59 — durable before any AI runs</text>
 
   <path d="M270 154 L270 178" class="edge" marker-end="url(#arrowCap)"/>
   <text x="280" y="170" class="t-label">classify (skipped when type given)</text>
@@ -305,7 +305,7 @@ fail the request.
     </marker>
   </defs>
 </svg>
-<figcaption>Capture. The failure side-notes sit beside the steps they apply to; the commit happens once, at <code>ingest.py:65</code>, after both AI steps have had their chance.</figcaption>
+<figcaption>Capture. The failure side-notes sit beside the steps they apply to; the commit happens once, at <code>ingest.py:63</code>, after both AI steps have had their chance.</figcaption>
 </figure>
 
 <h2 id="search">4 · Flow: semantic search (<code>GET /search</code>)</h2>
@@ -436,7 +436,7 @@ generated <code>search_vector</code> column, ranked by <code>ts_rank</code>, wit
 
   <rect x="8" y="380" width="128" height="64" rx="10" class="svgfail"/>
   <text x="16" y="398" class="t-fail">✗ LLM down:</text>
-  <text x="16" y="436" class="t-fail">502 (main.py:40)</text>
+  <text x="16" y="436" class="t-fail">502 (main.py:40-41)</text>
 
   <defs>
     <marker id="arrowAsk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -512,7 +512,7 @@ generated <code>search_vector</code> column, ranked by <code>ts_rank</code>, wit
     </marker>
   </defs>
 </svg>
-<figcaption>Mutations. The vector store is a cache over Postgres: every inconsistency is repairable by re-running <code>brain reindex</code> (<code>cli.py:40</code>).</figcaption>
+<figcaption>Mutations. The vector store is a cache over Postgres: every inconsistency is repairable by re-running <code>brain reindex</code> (<code>cli.py:34</code>).</figcaption>
 </figure>
 
 <h2 id="model">7 · Data model</h2>
@@ -520,20 +520,20 @@ generated <code>search_vector</code> column, ranked by <code>ts_rank</code>, wit
 One table, <code>memory_items</code> (<code>db/models.py:56</code>), created by
 migration <code>5e756509fb53_create_memory_items_table</code>. Enum values are
 stored as CHECK-constrained VARCHARs, not native Postgres enums, so adding a
-value is a migration, not a type change (<code>models.py:41-49</code>).
+value is a migration, not a type change (<code>models.py:46-55</code>).
 </p>
 
 <table>
 <thead><tr><th>column</th><th>type</th><th>rules</th></tr></thead>
 <tbody>
-<tr><td><code>id</code></td><td>UUID PK</td><td><code>uuid4</code> default (<code>models.py:81</code>)</td></tr>
+<tr><td><code>id</code></td><td>UUID PK</td><td><code>uuid4</code> default (<code>models.py:88</code>)</td></tr>
 <tr><td><code>raw_text</code></td><td>TEXT</td><td>required; ≤ 10 000 chars at the API layer (<code>schemas.py</code>)</td></tr>
 <tr><td><code>source</code></td><td>VARCHAR(64)</td><td>required, default <code>'manual'</code>; free-form — future adapters (Gmail, Slack…) write their own value</td></tr>
 <tr><td><code>type</code></td><td>VARCHAR(32)</td><td>nullable; CHECK in <code>task · decision · note · event · reference · idea</code> (<code>db/enums.py:14</code>)</td></tr>
 <tr><td><code>project</code></td><td>VARCHAR(128)</td><td>nullable, free-form tag</td></tr>
-<tr><td><code>importance</code></td><td>INTEGER</td><td>nullable; CHECK 1–5 (<code>db/enums.py:6-7</code>)</td></tr>
+<tr><td><code>importance</code></td><td>INTEGER</td><td>nullable; CHECK 1–5 (<code>db/enums.py:8-9</code>)</td></tr>
 <tr><td><code>actionability</code></td><td>VARCHAR(32)</td><td>nullable; CHECK in <code>none · later · now</code> (<code>db/enums.py:25</code>)</td></tr>
-<tr><td><code>confidence</code></td><td>FLOAT</td><td>nullable; CHECK 0.0–1.0 (<code>db/enums.py:28-29</code>)</td></tr>
+<tr><td><code>confidence</code></td><td>FLOAT</td><td>nullable; CHECK 0.0–1.0 (<code>db/enums.py:10-11</code>)</td></tr>
 <tr><td><code>status</code></td><td>VARCHAR(32)</td><td>default <code>inbox</code>; CHECK in <code>inbox · filed · needs_review</code> (<code>db/enums.py:33-38</code>)</td></tr>
 <tr><td><code>search_vector</code></td><td>TSVECTOR</td><td>generated always as <code>to_tsvector('english', raw_text)</code>, stored (<code>models.py:96-99</code>); GIN index <code>ix_memory_items_search_vector</code> (<code>models.py:74-78</code>)</td></tr>
 <tr><td><code>created_at</code> / <code>updated_at</code></td><td>TIMESTAMPTZ</td><td>server default <code>now()</code>; <code>updated_at</code> bumps on update (<code>models.py:101-107</code>)</td></tr>
@@ -575,7 +575,7 @@ Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
   <td><strong>LLM</strong> (claude_sdk / anthropic)</td>
   <td>works — no LLM in the write path</td>
   <td>works — rerank is Jev, not the LLM client</td>
-  <td><code>502 LLM unavailable</code> (<code>main.py:40-42</code>)</td>
+  <td><code>502 LLM unavailable</code> (<code>main.py:40-41</code>)</td>
 </tr>
 <tr>
   <td><strong>Postgres</strong></td>
