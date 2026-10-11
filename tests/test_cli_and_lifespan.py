@@ -1,6 +1,8 @@
 """CLI (brain reindex) and app-lifespan tests."""
 
 from datetime import UTC, datetime
+from functools import lru_cache
+from typing import Any
 
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
@@ -103,16 +105,48 @@ def test_app_lifespan_closes_shared_clients(monkeypatch):
         def close(self) -> None:
             closed.append(self._name)
 
-    monkeypatch.setattr(deps, "_jev_client", lambda: FakeClient("jev"))
-    monkeypatch.setattr(deps, "_item_indexer", lambda: FakeClient("indexer"))
-    monkeypatch.setattr(deps, "_llm_client", lambda: FakeClient("llm"))
-    monkeypatch.setattr(deps, "_embedder", lambda: FakeClient("embedder"))
-    monkeypatch.setattr(deps, "_vector_store", lambda: FakeClient("qdrant"))
+    def cached(name: str) -> Any:
+        @lru_cache
+        def factory() -> FakeClient:
+            return FakeClient(name)
+
+        return factory
+
+    monkeypatch.setattr(deps, "_jev_client", cached("jev"))
+    monkeypatch.setattr(deps, "_item_indexer", cached("indexer"))
+    monkeypatch.setattr(deps, "_llm_client", cached("llm"))
+    monkeypatch.setattr(deps, "_embedder", cached("embedder"))
+    monkeypatch.setattr(deps, "_vector_store", cached("qdrant"))
+
+    # Simulate first use during the app's lifetime: each factory has a cached instance.
+    for factory in (
+        deps._jev_client,
+        deps._item_indexer,
+        deps._llm_client,
+        deps._embedder,
+        deps._vector_store,
+    ):
+        factory()
 
     with TestClient(create_app()):
         pass
 
     assert sorted(closed) == ["embedder", "indexer", "jev", "llm", "qdrant"]
+
+
+def test_shutdown_does_not_build_uncached_clients(monkeypatch):
+    """close_shared_clients must not construct clients that were never used."""
+
+    def explosive() -> FakeEmbedder:
+        raise AssertionError("shutdown built a client that was never used")
+
+    monkeypatch.setattr(deps, "_jev_client", lru_cache(explosive))
+    monkeypatch.setattr(deps, "_item_indexer", lru_cache(explosive))
+    monkeypatch.setattr(deps, "_llm_client", lru_cache(explosive))
+    monkeypatch.setattr(deps, "_embedder", lru_cache(explosive))
+    monkeypatch.setattr(deps, "_vector_store", lru_cache(explosive))
+
+    deps.close_shared_clients()  # no exception: nothing cached, nothing built
 
 
 def test_item_indexer_is_app_lifetime(monkeypatch):

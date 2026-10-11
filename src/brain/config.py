@@ -4,6 +4,7 @@ TLDR: single source of truth for configuration; no secrets in code.
 """
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -14,7 +15,13 @@ from brain.ai.ask import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_MAX_TOKENS,
 )
-from brain.ai.embedder import DEFAULT_EMBEDDING_MODEL, DEFAULT_OPENAI_TIMEOUT_S, DEFAULT_OPENAI_URL
+from brain.ai.claude_sdk import DEFAULT_SDK_TIMEOUT_S
+from brain.ai.embedder import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_FASTEMBED_MODEL,
+    DEFAULT_OPENAI_TIMEOUT_S,
+    DEFAULT_OPENAI_URL,
+)
 from brain.ai.jev import DEFAULT_BASE_URL as DEFAULT_JEV_BASE_URL
 from brain.ai.jev import DEFAULT_MODEL as DEFAULT_JEV_MODEL
 from brain.ai.jev import DEFAULT_TIMEOUT_S as DEFAULT_JEV_TIMEOUT_S
@@ -43,18 +50,29 @@ class Settings(BaseSettings):
     jev_model: str = DEFAULT_JEV_MODEL
     jev_timeout_ms: int = int(DEFAULT_JEV_TIMEOUT_S * 1000)
 
-    # OpenAI embeddings
+    # Provider selection (local dev defaults need no API keys)
+    llm_provider: Literal["claude_sdk", "anthropic"] = "claude_sdk"
+    embedder_provider: Literal["fastembed", "openai"] = "fastembed"
+
+    # OpenAI embeddings (used when embedder_provider="openai")
     openai_api_key: SecretStr | None = None
     openai_base_url: str = DEFAULT_OPENAI_URL
     openai_embedding_model: str = DEFAULT_EMBEDDING_MODEL
     openai_timeout_s: float = DEFAULT_OPENAI_TIMEOUT_S
 
-    # Anthropic LLM
+    # Local embeddings (used when embedder_provider="fastembed", the default)
+    fastembed_model: str = DEFAULT_FASTEMBED_MODEL
+
+    # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
     anthropic_base_url: str = DEFAULT_ANTHROPIC_URL
     anthropic_model: str = DEFAULT_CLAUDE_MODEL
     anthropic_max_tokens: int = DEFAULT_MAX_TOKENS
     anthropic_timeout_s: float = DEFAULT_ANTHROPIC_TIMEOUT_S
+
+    # Claude Code login LLM (used when llm_provider="claude_sdk", the default)
+    claude_sdk_model: str | None = None
+    claude_sdk_timeout_s: float = DEFAULT_SDK_TIMEOUT_S
 
 
 @lru_cache

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -13,6 +13,7 @@ from ._http import post_json
 DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OPENAI_TIMEOUT_S = 30.0
+DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
 FAKE_EMBED_DIM = 64
 _GRAM = re.compile(r"[a-z0-9]+")
 
@@ -102,6 +103,56 @@ class OpenAIEmbedder:
             return [float(component) for component in vector]
         except (TypeError, ValueError, KeyError, IndexError) as exc:
             raise EmbedderError(f"malformed embedding response: {exc!r}") from exc
+
+
+class FastEmbedEmbedder:
+    """Strategy producing local, offline embeddings via the fastembed library.
+
+    The model (default ``BAAI/bge-small-en-v1.5``, dim 384) is downloaded on
+    first use and cached by fastembed; afterwards it runs fully offline. Load
+    or inference failures raise :class:`EmbedderError`.
+    """
+
+    def __init__(self, model: str = DEFAULT_FASTEMBED_MODEL) -> None:
+        self._model = model
+        self._backend = self._load_model(model)
+        self._dim: int | None = None
+
+    @staticmethod
+    def _load_model(model: str) -> Any:
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:
+            raise EmbedderError(
+                "fastembed is not installed; install it to use EMBEDDER_PROVIDER=fastembed"
+            ) from exc
+        try:
+            return TextEmbedding(model_name=model)
+        except Exception as exc:
+            # Deliberate boundary: fastembed/model downloads raise many types
+            # (network, onnxruntime, OSError); callers only see EmbedderError.
+            raise EmbedderError(f"failed to load fastembed model {model!r}: {exc}") from exc
+
+    @property
+    def dim(self) -> int:
+        """Vector size of the loaded model (probed once)."""
+        if self._dim is None:
+            self._dim = len(self.embed(""))
+        return self._dim
+
+    def close(self) -> None:
+        """No-op: the model is plain in-process memory."""
+
+    def embed(self, text: str) -> list[float]:
+        """Return the embedding vector for ``text``."""
+        try:
+            vectors = list(self._backend.embed([text]))
+        except Exception as exc:
+            # Boundary as above: normalize every fastembed failure.
+            raise EmbedderError(f"fastembed embedding failed: {exc}") from exc
+        if not vectors:
+            raise EmbedderError("fastembed returned no vectors")
+        return [float(component) for component in vectors[0]]
 
 
 class FakeEmbedder:

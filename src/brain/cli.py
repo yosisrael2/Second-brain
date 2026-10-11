@@ -11,6 +11,7 @@ from brain.ai.embedder import Embedder, EmbedderError
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
 from brain.config import get_settings
 from brain.db.session import SessionLocal
+from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
@@ -55,14 +56,7 @@ def _reindex(
                 timeout_s=settings.qdrant_timeout_s,
             )
         if live_embedder is None:
-            from brain.ai.embedder import OpenAIEmbedder  # late import keeps CLI startup light
-
-            live_embedder = OpenAIEmbedder(
-                api_key=_secret(settings.openai_api_key),
-                model=settings.openai_embedding_model,
-                base_url=settings.openai_base_url,
-                timeout_s=settings.openai_timeout_s,
-            )
+            live_embedder = build_embedder(settings)
         if repo is None:
             repo = ItemsRepository(SessionLocal())
         indexer = QdrantItemIndexer(live_embedder, live_store)

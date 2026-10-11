@@ -42,6 +42,7 @@ client ──> api/routes      (thin routers: HTTP in/out, no business logic)
 ```
 src/brain/
 ├── config.py            # env-based settings (pydantic-settings)
+├── factories.py         # provider factories: LLM/embedder by LLM_PROVIDER/EMBEDDER_PROVIDER
 ├── main.py              # FastAPI app factory + ASGI entrypoint (app = create_app())
 ├── cli.py               # `brain` CLI (reindex: rebuild Qdrant from Postgres)
 ├── schemas.py           # pydantic request/response models
@@ -131,10 +132,16 @@ if it is down). Wiring tests run fully offline (`tests/test_wiring.py`).
 ## AI layer and the `brain` CLI
 
 Auto-classification on `POST /items` (Jev), semantic `/search` (embeddings +
-Qdrant + rerank), and grounded `/ask` (Anthropic) are optional at runtime:
-with their API keys unset the app still captures and keyword-searches —
-degradations and failure modes are documented in
-[docs/ai-layer.md](docs/ai-layer.md).
+Qdrant + rerank), and grounded `/ask` are optional at runtime: with their API
+keys unset the app still captures and keyword-searches — degradations and
+failure modes are documented in [docs/ai-layer.md](docs/ai-layer.md).
+
+**Default providers need no API keys**: the LLM runs on your local Claude Code
+login (`claude_agent_sdk`, check with `claude -p ok` — run `claude` and
+`/login` if needed) and embeddings run locally via `fastembed`
+(`BAAI/bge-small-en-v1.5`, 384 dims; the model downloads once on first use).
+Switch back to keyed providers with `LLM_PROVIDER=anthropic` /
+`EMBEDDER_PROVIDER=openai` (see `.env.example`).
 
 Rebuild the vector index from Postgres (covers items that missed indexing
 while Jev/Qdrant were down, and purges ghost vectors for items no longer in
@@ -150,14 +157,16 @@ before ranking), so deep offsets approximate rather than globally rank — fine
 for MVP top-k use.
 
 The shared AI clients are app-lifetime singletons built in
-`src/brain/api/deps.py` and closed on shutdown via the app lifespan.
+`src/brain/api/deps.py` (implementations picked by `LLM_PROVIDER` /
+`EMBEDDER_PROVIDER` in `src/brain/factories.py`) and closed on shutdown via
+the app lifespan. If the Qdrant collection was built with a different
+embedder than the active one, indexing fails with a clear message — run
+`brain reindex` to drop and rebuild it.
 
-The shared AI clients are app-lifetime singletons built in
-`src/brain/api/deps.py` and closed on shutdown via the app lifespan.
+## Dogfood checklist (live run without API keys)
 
-## Dogfood checklist (live run with real keys)
-
-Exact steps to exercise the AI features against real services:
+Exact steps to exercise the AI features with ONLY a Jev key and your Claude
+Code login:
 
 ```bash
 # 1. Infrastructure + schema (Postgres + Qdrant 1.19.1, matching qdrant-client)
@@ -165,11 +174,14 @@ docker compose up -d
 curl -s localhost:6333/healthz          # -> "healthz check passed"
 alembic upgrade head
 
-# 2. Real keys in .env (gitignored); minimum for full behavior:
-#    JEV_API_KEY=<typesafe key>  OPENAI_API_KEY=<sk-...>  ANTHROPIC_API_KEY=<sk-ant-...>
-cp .env.example .env    # then fill the three keys
+# 2. Keys: JEV_API_KEY in .env (gitignored) — optional but needed for
+#    classification/rerank. LLM + embeddings come from your Claude Code
+#    login and local fastembed; no OPENAI_API_KEY / ANTHROPIC_API_KEY needed.
+cp .env.example .env    # then fill JEV_API_KEY
+claude -p ok            # verifies the Claude Code login; run `claude` + /login if it fails
 
-# 3. Run the API
+# 3. Run the API (first /search or /items call downloads the fastembed model,
+#    ~130MB, cached in ~/.cache/fastembed — afterwards fully offline)
 uvicorn brain.main:app --port 8000
 
 # 4. Capture with auto-classification (Jev fills type/importance/actionability,
@@ -179,11 +191,11 @@ curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
 # expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
 #             "confidence": 0.0-1.0, "status": "filed" (>=0.9) or "needs_review" (0.5-0.9)
 
-# 5. Semantic search (embeddings -> Qdrant -> Jev rerank)
+# 5. Semantic search (fastembed -> Qdrant -> Jev rerank)
 curl -s 'localhost:8000/search?q=renew+certificate&limit=5'
 # expect 200: array of items with float "score" (null only in keyword-fallback mode)
 
-# 6. Grounded answer with citations
+# 6. Grounded answer with citations (via your Claude Code login)
 curl -s -X POST localhost:8000/ask -H 'Content-Type: application/json' \
   -d '{"question": "what do I need to renew?"}'
 # expect 200: {"answer": "...[<item-id>]...", "cited_ids": ["<item-id>"], "sources": [...]}
@@ -193,10 +205,12 @@ brain reindex
 # expect: "indexed N item(s) into collection 'brain_items"' and exit 0
 ```
 
-Degradation reference (all verified by tests): keys unset -> `/items` still
-returns 201 with `type: null, status: inbox`; `/search` returns keyword hits
-with `score: null`; `/ask` returns 502; `brain reindex` exits 1 with a clear
-message.
+Degradation reference (all verified by tests): Jev unset -> `/items` still
+returns 201 with `type: null, status: inbox`; Jev rerank down -> original
+order; `claude` CLI not logged in -> `/ask` returns 502; `brain reindex`
+exits 1 with a clear message. Fully keyless run (no JEV_API_KEY either):
+capture still works, `/search` scores real fastembed vectors without rerank
+reordering, `/ask` still answers from your login.
 
 ## Setup
 
@@ -231,6 +245,8 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `APP_ENV`      | `dev`                                                  | runtime environment |
 | `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:5432/brain` | Postgres (SQLAlchemy URL) |
 | `QDRANT_URL`   | `http://localhost:6333`                                | Qdrant API endpoint |
+| `LLM_PROVIDER` | `claude_sdk`                                           | `claude_sdk` (local login) or `anthropic` |
+| `EMBEDDER_PROVIDER` | `fastembed`                                       | `fastembed` (local) or `openai` |
 
 All settings live in `Settings` (`src/brain/config.py`); AI-layer variables
 (keys as `SecretStr`, base URLs, models, timeouts) are listed in

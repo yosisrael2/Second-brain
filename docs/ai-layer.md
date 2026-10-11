@@ -2,8 +2,23 @@
 
 TLDR: classify free text into typed memory-item fields, embed it, search it in
 Qdrant, rerank hits, and answer questions over them with citations. Every
-external service (Jev, OpenAI, Anthropic, Qdrant) sits behind an interface so
-tests run fully offline.
+external service (Jev, OpenAI, Anthropic, Qdrant, the local Claude Code
+login) sits behind an interface so tests run fully offline.
+
+## Providers (Factory)
+
+Implementations are selected by two `Settings` fields and built in
+`src/brain/factories.py` (shared by the API composition root and the CLI):
+
+| Concern | `Settings` field | Default | Alternatives |
+| ------- | ---------------- | ------- | ------------ |
+| LLM | `llm_provider` | `claude_sdk` — `ClaudeSdkLLMClient` via your local Claude Code login, no API key | `anthropic` — `ClaudeLLMClient` (needs `ANTHROPIC_API_KEY`) |
+| Embeddings | `embedder_provider` | `fastembed` — `FastEmbedEmbedder`, local, 384 dims | `openai` — `OpenAIEmbedder` (needs `OPENAI_API_KEY`) |
+
+Both `ClaudeSdkLLMClient` and `FastEmbedEmbedder` run fully offline (after
+fastembed's one-time model download) and neither reads credentials — the SDK
+uses whatever login the `claude` CLI has; we never touch credential files or
+tokens.
 
 ## Modules
 
@@ -11,10 +26,11 @@ tests run fully offline.
 | ------ | ---------------- | ------- |
 | `jev.py` | `JevClient` — typed-decision API adapter (`choice`, `score`, `score_batch`, `decide`) | Adapter |
 | `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus`; `JevClassifier` adapter. Enums come from `brain.db.enums` (single shared definition) | Service / Adapter |
-| `embedder.py` | `Embedder` protocol; `OpenAIEmbedder` (network) and `FakeEmbedder` (deterministic, offline) | Strategy |
-| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError` | Repository / Adapter |
+| `embedder.py` | `Embedder` protocol; `OpenAIEmbedder` (network), `FastEmbedEmbedder` (local fastembed), `FakeEmbedder` (deterministic, offline) | Strategy |
+| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError`; `ensure_collection` rejects a dim mismatch (remedy: `brain reindex`) | Repository / Adapter |
 | `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering; `JevReranker` adapter | Strategy |
 | `ask.py` | `LLMClient` protocol; `ClaudeLLMClient`, `FakeLLMClient`; `answer(question, context_items)` → `{answer, cited_ids}` | Strategy |
+| `claude_sdk.py` | `ClaudeSdkLLMClient` — single-turn, tool-less Claude Code session (`allowed_tools=[]`, `max_turns=1`); auth = local login, no env overrides; SDK errors → `LLMError` | Adapter / Strategy |
 
 ## Behavior details
 
@@ -69,15 +85,20 @@ Revisit only if real production traffic shows a need.
 
 | Variable | Default | Used by |
 | -------- | ------- | ------- |
+| `LLM_PROVIDER` | `claude_sdk` | provider Factory (`factories.py`) |
+| `EMBEDDER_PROVIDER` | `fastembed` | provider Factory (`factories.py`) |
+| `CLAUDE_SDK_MODEL` | — (unset = login default) | `ClaudeSdkLLMClient` |
+| `CLAUDE_SDK_TIMEOUT_S` | `120` | `ClaudeSdkLLMClient` |
+| `FASTEMBED_MODEL` | `BAAI/bge-small-en-v1.5` (dim 384) | `FastEmbedEmbedder` |
 | `JEV_API_KEY` | — (optional; unset = fail-closed fallback) | `JevClient` |
 | `JEV_BASE_URL` | `https://api.typesafe.ai/v1/systemone` | `JevClient` |
 | `JEV_MODEL` | `jev-latest` | `JevClient` |
 | `JEV_TIMEOUT_MS` | `5000` (int; pydantic-validated) | `JevClient` |
-| `OPENAI_API_KEY` | — (optional; unset = keyword fallback) | `OpenAIEmbedder` |
+| `OPENAI_API_KEY` | — (optional; only when `EMBEDDER_PROVIDER=openai`) | `OpenAIEmbedder` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | `OpenAIEmbedder` |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (dim 1536) | `OpenAIEmbedder` |
 | `OPENAI_TIMEOUT_S` | `30` | `OpenAIEmbedder` |
-| `ANTHROPIC_API_KEY` | — (optional; unset = `/ask` returns 502) | `ClaudeLLMClient` |
+| `ANTHROPIC_API_KEY` | — (optional; only when `LLM_PROVIDER=anthropic`; otherwise `/ask` uses the local login) | `ClaudeLLMClient` |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com/v1` | `ClaudeLLMClient` |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | `ClaudeLLMClient` |
 | `ANTHROPIC_MAX_TOKENS` | `1024` | `ClaudeLLMClient` |
@@ -97,10 +118,12 @@ and are only sent as auth headers.
 The layer is wired into the app on this branch (see also README):
 
 - **Composition root**: `src/brain/api/deps.py` builds app-lifetime clients
-  (`JevClient`, `OpenAIEmbedder`, `ClaudeLLMClient`, `QdrantVectorStore`) from
-  `Settings` as cached factories, assembles the services per request via
+  (`JevClient`, embedder, LLM client, `QdrantVectorStore`) from `Settings` as
+  cached factories (implementations picked by the provider Factory in
+  `src/brain/factories.py`), assembles the services per request via
   `Depends`, and exposes `close_shared_clients()` — called by the app lifespan
-  on shutdown.
+  on shutdown (only factories already used are closed; shutdown never builds
+  new clients).
 - **IngestService** (`services/ingest.py`): `POST /items` persists first, then
   classifies (fills only unset fields, routes by confidence), then indexes the
   text via `ItemIndexer` (`services/indexing.py`, ensures the collection at
@@ -126,7 +149,9 @@ The layer is wired into the app on this branch (see also README):
   longer in Postgres — then re-embeds every item page by page; exits 1 with a
   clear message when embeddings or Qdrant are unavailable.
 - **Collections**: `QdrantVectorStore.ensure_collection` is called with the
-  embedder's `dim` (1536 for `text-embedding-3-small`).
+  active embedder's `dim` (384 for fastembed's `BAAI/bge-small-en-v1.5`, 1536
+  for `text-embedding-3-small`); an existing collection with a different dim
+  raises a clear `VectorStoreError` — run `brain reindex` to drop and rebuild.
 
 ## Tests
 
@@ -135,8 +160,9 @@ pytest tests/ai -v
 ```
 
 All tests are offline: HTTP is stubbed with `httpx.MockTransport`, Qdrant with
-an in-memory client, Jev/LLM with stub classes covering the three routing
-bands, Jev-failure fallbacks (classify + rerank), and citation presence.
-Endpoint wiring is covered by `tests/test_wiring.py` with fake-backed
-infrastructure; `tests/test_cli_and_lifespan.py` covers `brain reindex` and
-client shutdown.
+an in-memory client, the SDK with a fake `query_fn` (real SDK message DTOs),
+fastembed with a fake `TextEmbedding` module, Jev/LLM with stub classes
+covering the three routing bands, Jev-failure fallbacks (classify + rerank),
+and citation presence. Endpoint wiring is covered by `tests/test_wiring.py`
+with fake-backed infrastructure; `tests/test_cli_and_lifespan.py` covers
+`brain reindex` and client shutdown.

@@ -1,15 +1,17 @@
 """End-to-end wiring tests: routers + DI with fake-backed infrastructure."""
 
 import re
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
 from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
-from brain.ai.ask import FakeLLMClient
+from brain.ai.ask import ClaudeLLMClient, FakeLLMClient
 from brain.ai.classify import FALLBACK_CLASSIFICATION
-from brain.ai.embedder import FakeEmbedder
+from brain.ai.claude_sdk import ClaudeSdkLLMClient
+from brain.ai.embedder import FakeEmbedder, FastEmbedEmbedder, OpenAIEmbedder
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.api import deps
 from brain.api.deps import QdrantItemIndexer
@@ -203,3 +205,29 @@ def test_patch_with_broken_indexer_still_succeeds(wired):
     assert patched.status_code == 200  # update persisted despite index failure
     assert deleted.status_code == 204
     assert repo.items == {}
+
+
+def test_build_embedder_selects_by_provider():
+    from brain.config import Settings
+    from brain.factories import build_embedder
+
+    openai_embedder = build_embedder(Settings(embedder_provider="openai", openai_api_key=None))
+    assert isinstance(openai_embedder, OpenAIEmbedder)
+
+    with patch.object(FastEmbedEmbedder, "__init__", return_value=None) as fake_init:
+        fastembed_embedder = build_embedder(
+            Settings(embedder_provider="fastembed", fastembed_model="BAAI/bge-small-en-v1.5")
+        )
+    assert isinstance(fastembed_embedder, FastEmbedEmbedder)
+    fake_init.assert_called_once_with(model="BAAI/bge-small-en-v1.5")
+
+
+def test_build_llm_client_selects_by_provider():
+    from brain.config import Settings
+    from brain.factories import build_llm_client
+
+    anthropic_client = build_llm_client(Settings(llm_provider="anthropic"))
+    assert isinstance(anthropic_client, ClaudeLLMClient)
+
+    sdk_client = build_llm_client(Settings(llm_provider="claude_sdk"))
+    assert isinstance(sdk_client, ClaudeSdkLLMClient)

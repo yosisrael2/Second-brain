@@ -18,6 +18,16 @@ def test_ensure_collection_is_idempotent(store):
     assert store._client.collection_exists("test_items")  # noqa: SLF001
 
 
+def test_ensure_collection_rejects_dim_mismatch(store):
+    store.ensure_collection(dim=4)
+
+    with pytest.raises(VectorStoreError, match="brain reindex") as excinfo:
+        store.ensure_collection(dim=384)
+
+    assert "vector size 4" in str(excinfo.value)
+    assert "384" in str(excinfo.value)
+
+
 def test_upsert_and_search_roundtrip(store):
     store.ensure_collection(dim=4)
     store.upsert("near", [1.0, 0.0, 0.0, 0.0], {"text": "nearest"})

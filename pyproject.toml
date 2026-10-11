@@ -16,6 +16,10 @@ dependencies = [
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.3,<3",
     "qdrant-client>=1.12,<2",
+    # Default keyless providers: LLM via local Claude Code login,
+    # embeddings via fastembed (downloads its model on first run).
+    "claude-agent-sdk>=0.2.16,<0.3",
+    "fastembed>=0.6,<2",
 ]
 
 [project.optional-dependencies]

@@ -34,6 +34,10 @@ class LLMClient(Protocol):
         """Return the model's completion for ``prompt``."""
         ...
 
+    def close(self) -> None:
+        """Release underlying resources (may be a no-op)."""
+        ...
+
 
 class ClaudeLLMClient:
     """Strategy producing completions via the Anthropic Messages API.
@@ -116,6 +120,9 @@ class FakeLLMClient:
     def __init__(self, reply: str | Callable[[str], str] = "No relevant information.") -> None:
         self._reply = reply
         self.prompts: list[str] = []
+
+    def close(self) -> None:
+        """No-op: mirrors the real clients' lifecycle method."""
 
     def complete(self, prompt: str) -> str:
         self.prompts.append(prompt)

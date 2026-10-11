@@ -2,11 +2,13 @@
 
 import json
 import math
+import sys
+import types
 
 import httpx
 import pytest
 
-from brain.ai.embedder import EmbedderError, FakeEmbedder, OpenAIEmbedder
+from brain.ai.embedder import EmbedderError, FakeEmbedder, FastEmbedEmbedder, OpenAIEmbedder
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -137,3 +139,79 @@ def test_fake_embedder_satisfies_the_protocol():
 
     embedder: Embedder = FakeEmbedder()
     assert isinstance(embedder.embed("x"), list)
+
+
+class _FakeBackend:
+    """Stand-in for fastembed.TextEmbedding returning deterministic vectors."""
+
+    def __init__(self, dim: int = 3) -> None:
+        self._dim = dim
+        self.batched: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.batched.append(texts)
+        return [[float(len(text)), 0.5, -0.25][: self._dim] for text in texts]
+
+
+class TestFastEmbedEmbedder:
+    def test_embed_and_dim(self, monkeypatch):
+        backend = _FakeBackend(dim=3)
+
+        class FakeTextEmbedding:
+            def __init__(self, model_name: str) -> None:
+                assert model_name == "BAAI/bge-small-en-v1.5"
+                self._inner = backend
+
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                return self._inner.embed(texts)
+
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+        )
+        embedder = FastEmbedEmbedder()
+
+        assert embedder.embed("kubernetes rollout") == [18.0, 0.5, -0.25]
+        assert embedder.dim == 3  # probed lazily via one embed call
+        assert backend.batched[-1] == [""]  # the dim probe embedded one empty string
+
+    def test_missing_library_maps_to_embedder_error(self, monkeypatch):
+        original = sys.modules.pop("fastembed", None)
+        monkeypatch.setitem(sys.modules, "fastembed", None)  # import raises ImportError
+        try:
+            with pytest.raises(EmbedderError, match="fastembed is not installed"):
+                FastEmbedEmbedder()
+        finally:
+            if original is not None:
+                sys.modules["fastembed"] = original
+
+    def test_model_load_failure_maps_to_embedder_error(self, monkeypatch):
+        class BrokenTextEmbedding:
+            def __init__(self, model_name: str) -> None:
+                raise RuntimeError("download failed")
+
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=BrokenTextEmbedding)
+        )
+
+        with pytest.raises(EmbedderError, match="failed to load fastembed model"):
+            FastEmbedEmbedder()
+
+    def test_inference_failure_maps_to_embedder_error(self, monkeypatch):
+        class BrokenBackend:
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("onnx exploded")
+
+        class FakeTextEmbedding:
+            def __init__(self, model_name: str) -> None:
+                self._inner = BrokenBackend()
+
+            def embed(self, texts: list[str]) -> list[list[float]]:
+                return self._inner.embed(texts)
+
+        monkeypatch.setitem(
+            sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+        )
+        embedder = FastEmbedEmbedder()
+
+        with pytest.raises(EmbedderError, match="fastembed embedding failed"):
+            embedder.embed("text")

@@ -78,13 +78,29 @@ class QdrantVectorStore:
         self._client.close()
 
     def ensure_collection(self, dim: int) -> None:
-        """Create the collection with cosine distance unless it exists."""
+        """Create the collection with cosine distance; refuse a dim mismatch.
+
+        A collection built by a different embedder cannot serve this dim;
+        the remedy is a full rebuild via ``brain reindex`` (drops + recreates).
+        """
         with self._translated():
             if self._client.collection_exists(self._collection):
+                self._reject_dim_mismatch(dim)
                 return
             self._client.create_collection(
                 self._collection,
                 vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
+            )
+
+    def _reject_dim_mismatch(self, dim: int) -> None:
+        """Raise VectorStoreError if the existing collection has another size."""
+        info = self._client.get_collection(self._collection)
+        params = info.config.params.vectors
+        existing = params.size if isinstance(params, models.VectorParams) else None
+        if existing is not None and existing != dim:
+            raise VectorStoreError(
+                f"collection {self._collection!r} has vector size {existing} but the active "
+                f"embedder produces {dim}; run 'brain reindex' to rebuild the collection"
             )
 
     def upsert(self, item_id: str | int, vector: list[float], payload: Mapping[str, Any]) -> None:

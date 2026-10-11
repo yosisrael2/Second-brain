@@ -11,14 +11,15 @@ from fastapi import Depends
 from pydantic import SecretStr
 from sqlalchemy.orm import Session
 
-from brain.ai.ask import ClaudeLLMClient, LLMClient
+from brain.ai.ask import LLMClient
 from brain.ai.classify import JevClassifier
-from brain.ai.embedder import Embedder, OpenAIEmbedder
+from brain.ai.embedder import Embedder
 from brain.ai.jev import JevClient
 from brain.ai.rerank import JevReranker
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.config import get_settings
 from brain.db.session import get_db
+from brain.factories import build_embedder, build_llm_client
 from brain.repositories.items import ItemsRepository
 from brain.services.ask import AskService
 from brain.services.indexing import QdrantItemIndexer
@@ -45,28 +46,15 @@ def _jev_client() -> JevClient:
 
 
 @lru_cache
-def _embedder() -> OpenAIEmbedder:
-    """App-lifetime embedding client built from settings."""
-    settings = get_settings()
-    return OpenAIEmbedder(
-        api_key=_secret(settings.openai_api_key),
-        model=settings.openai_embedding_model,
-        base_url=settings.openai_base_url,
-        timeout_s=settings.openai_timeout_s,
-    )
+def _embedder() -> Embedder:
+    """App-lifetime embedder built from settings (provider-selectable)."""
+    return build_embedder(get_settings())
 
 
 @lru_cache
-def _llm_client() -> ClaudeLLMClient:
-    """App-lifetime LLM client built from settings."""
-    settings = get_settings()
-    return ClaudeLLMClient(
-        api_key=_secret(settings.anthropic_api_key),
-        model=settings.anthropic_model,
-        base_url=settings.anthropic_base_url,
-        max_tokens=settings.anthropic_max_tokens,
-        timeout_s=settings.anthropic_timeout_s,
-    )
+def _llm_client() -> LLMClient:
+    """App-lifetime LLM client built from settings (provider-selectable)."""
+    return build_llm_client(get_settings())
 
 
 @lru_cache
@@ -91,12 +79,15 @@ def _item_indexer() -> QdrantItemIndexer:
 
 
 def close_shared_clients() -> None:
-    """Close every cached AI client; called from the app lifespan on shutdown.
+    """Close every already-built cached AI client; app lifespan calls this on shutdown.
 
-    All close() implementations are idempotent.
+    Only factories with a cached instance are closed — shutdown never
+    constructs new clients (e.g. loading the fastembed model). All close()
+    implementations are idempotent.
     """
-    for client in (_jev_client(), _llm_client(), _item_indexer(), _embedder(), _vector_store()):
-        client.close()
+    for factory in (_jev_client, _llm_client, _item_indexer, _embedder, _vector_store):
+        if factory.cache_info().currsize:
+            factory().close()
 
 
 def get_embedder() -> Embedder:
