@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, Protocol
 
 import httpx
 
@@ -54,7 +55,10 @@ class ClaudeLLMClient:
         self._model = model or os.getenv("ANTHROPIC_MODEL") or DEFAULT_CLAUDE_MODEL
         self._api_key = api_key
         self._max_tokens = max_tokens
-        self._url = (base_url or os.getenv("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_URL).rstrip("/") + "/messages"
+        self._url = (
+            (base_url or os.getenv("ANTHROPIC_BASE_URL") or DEFAULT_ANTHROPIC_URL).rstrip("/")
+            + "/messages"
+        )
         self._timeout_s = timeout_s
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
 
@@ -92,7 +96,9 @@ class ClaudeLLMClient:
             if not isinstance(blocks, list):
                 raise TypeError("content is not a list")
             text = "".join(
-                block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text"
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "text"
             )
             if not text.strip():
                 raise ValueError("no non-empty text blocks")

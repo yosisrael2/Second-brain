@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .enums import Actionability, ItemStatus, ItemType
 from .jev import JevClient, JevClientProtocol, JevError, parse_choice, parse_score
@@ -83,7 +84,11 @@ def classify(
 
 def _build_questions(projects: Sequence[str] | None) -> dict[str, dict[str, Any]]:
     questions: dict[str, dict[str, Any]] = {
-        "type": {"type": "choice", "instructions": "What kind of item is this?", "criteria": TYPE_CRITERIA},
+        "type": {
+            "type": "choice",
+            "instructions": "What kind of item is this?",
+            "criteria": TYPE_CRITERIA,
+        },
         "importance": {
             "type": "score",
             "instructions": "How important is this item? Rubric levels are 1 (low) to 5 (high).",

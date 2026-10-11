@@ -24,7 +24,9 @@ class TestRequestShape:
             seen["url"] = str(request.url)
             seen["auth"] = request.headers.get("Authorization")
             seen["body"] = jev_questions_body(request)
-            return httpx.Response(200, json={"answers": {"q": {"option": "task", "confidence": 0.93}}})
+            return httpx.Response(
+                200, json={"answers": {"q": {"option": "task", "confidence": 0.93}}}
+            )
 
         jev = make_jev(handler, base_url="https://jev.example/v1/systemone")
         result = jev.choice("What is this?", ["task", "note"], "buy milk tomorrow")
@@ -49,7 +51,10 @@ class TestRequestShape:
         jev = make_jev(handler)
         jev.choice("Pick", {"a": "first option", "b": "second option"}, "state")
 
-        assert seen["body"]["questions"]["q"]["criteria"] == {"a": "first option", "b": "second option"}
+        assert seen["body"]["questions"]["q"]["criteria"] == {
+            "a": "first option",
+            "b": "second option",
+        }
 
 
 class TestScoreBatching:
@@ -62,7 +67,9 @@ class TestScoreBatching:
             return httpx.Response(200, json={"answers": answers})
 
         jev = make_jev(handler)
-        scores = jev.score_batch("Relevance?", ["irrelevant", "related"], ["c0 text", "c1 text", "c2 text"])
+        scores = jev.score_batch(
+            "Relevance?", ["irrelevant", "related"], ["c0 text", "c1 text", "c2 text"]
+        )
 
         assert isinstance(seen["body"]["state"], list)
         assert len(seen["body"]["questions"]) == 3

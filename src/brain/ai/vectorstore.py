@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Any, Mapping, Protocol
+from collections.abc import Mapping
+from typing import Any, Protocol
 
 from qdrant_client import QdrantClient, models
 
 DEFAULT_COLLECTION = "brain_items"
-_QDRANT_TIMEOUT_S = 10.0
+_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
 
 
 class VectorStoreError(RuntimeError):
@@ -57,7 +58,11 @@ class QdrantVectorStore:
         url = url or os.getenv("QDRANT_URL")
         if not url:
             raise VectorStoreError("no Qdrant URL: set QDRANT_URL (or pass url/client)")
-        return QdrantClient(url=url, api_key=api_key or os.getenv("QDRANT_API_KEY"), timeout=_QDRANT_TIMEOUT_S)
+        return QdrantClient(
+            url=url,
+            api_key=api_key or os.getenv("QDRANT_API_KEY"),
+            timeout=_QDRANT_TIMEOUT_S,
+        )
 
     def ensure_collection(self, dim: int) -> None:
         """Create the collection with cosine distance unless it exists."""
@@ -77,7 +82,9 @@ class QdrantVectorStore:
 
     def search(self, vector: list[float], k: int = 5) -> list[dict[str, Any]]:
         """Return the ``k`` nearest items, best match first."""
-        result = self._client.query_points(self._collection, query=vector, limit=k, with_payload=True)
+        result = self._client.query_points(
+            self._collection, query=vector, limit=k, with_payload=True
+        )
         return [
             {
                 "id": (point.payload or {}).get("id", point.id),

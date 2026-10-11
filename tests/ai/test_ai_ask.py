@@ -98,7 +98,7 @@ class TestClaudeLLMClient:
         assert seen["version"] == "2023-06-01"
         assert seen["body"]["model"] == "claude-sonnet-4-5"
         assert seen["body"]["messages"] == [{"role": "user", "content": "which port?"}]
-        assert text == "Port 8000."  # non-text blocks skipped, texts joined  # non-text blocks skipped, texts joined
+        assert text == "Port 8000."  # non-text blocks skipped, texts joined
 
     def test_model_env_override(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_MODEL", "claude-opus-4-6")

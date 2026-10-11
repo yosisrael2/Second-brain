@@ -58,6 +58,14 @@ parallel and come back in `answers`. `score_batch` bundles candidates as a
 list state with per-index questions. Malformed payloads raise `JevError`.
 Error messages never include the API key.
 
+### Retry policy
+
+Deliberate: no automatic retries on Jev/OpenAI/Anthropic/Qdrant calls. Every
+client fails fast (bounded timeouts) and surfaces a typed error; callers own
+recovery. `classify` and `rerank` degrade gracefully (inbox fallback /
+original order), so a transient Jev blip never blocks capture or search.
+Revisit only if M1 traffic shows a real need.
+
 ## Configuration / env vars
 
 | Variable | Default | Used by |

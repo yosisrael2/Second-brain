@@ -5,7 +5,9 @@ from brain.ai.rerank import rerank
 
 
 class StubJev:
-    def __init__(self, scores: list[JevScore] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self, scores: list[JevScore] | None = None, error: Exception | None = None
+    ) -> None:
         self._scores = scores or []
         self._error = error
         self.calls: list[tuple] = []

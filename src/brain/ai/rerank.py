@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from .ask import item_text
 from .jev import JevClient, JevClientProtocol, JevError
@@ -44,5 +45,5 @@ def rerank(
     except JevError as exc:
         logger.warning("rerank: jev unavailable (%s); keeping original order", exc)
         return list(candidates)[:top_n]
-    ranked = sorted(zip(scores, candidates), key=lambda pair: -pair[0].score)
+    ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0].score)
     return [candidate for _, candidate in ranked][:top_n]

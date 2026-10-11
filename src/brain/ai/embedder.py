@@ -47,7 +47,10 @@ class OpenAIEmbedder:
     ) -> None:
         self._model = model
         self._api_key = api_key
-        self._url = (base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_URL).rstrip("/") + "/embeddings"
+        self._url = (
+            (base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_URL).rstrip("/")
+            + "/embeddings"
+        )
         self._timeout_s = timeout_s
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
 

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 import httpx
 
@@ -46,7 +47,9 @@ class JevClientProtocol(Protocol):
         """Run one or more questions against one state in a single API call."""
         ...
 
-    def score_batch(self, question: str, levels: Sequence[str], states: Sequence[Any]) -> list[JevScore]:
+    def score_batch(
+        self, question: str, levels: Sequence[str], states: Sequence[Any]
+    ) -> list[JevScore]:
         """Score many states against one question in a single API call."""
         ...
 
@@ -75,6 +78,8 @@ def parse_choice(answer: Any) -> JevChoice:
     confidence_raw = answer.get("confidence")
     if confidence_raw is None:
         confidence_raw = probabilities.get(option)
+    if confidence_raw is None:
+        raise JevError("malformed choice answer: no usable 'confidence'")
     try:
         confidence = float(confidence_raw)
     except (TypeError, ValueError) as exc:
@@ -92,7 +97,9 @@ def _parse_probabilities(raw: Any) -> dict[str, float]:
         try:
             probabilities[str(key)] = float(value)
         except (TypeError, ValueError) as exc:
-            raise JevError(f"malformed choice answer: probability for {key!r} is not a number") from exc
+            raise JevError(
+                f"malformed choice answer: probability for {key!r} is not a number"
+            ) from exc
     return probabilities
 
 
@@ -167,7 +174,9 @@ class JevClient:
         """Ask one "score" question; ``levels`` is ordered low -> high."""
         return self.score_batch(question, levels, [state])[0]
 
-    def score_batch(self, question: str, levels: Sequence[str], states: Sequence[Any]) -> list[JevScore]:
+    def score_batch(
+        self, question: str, levels: Sequence[str], states: Sequence[Any]
+    ) -> list[JevScore]:
         """Score many candidates against one question in a single API call.
 
         Candidates travel as one list under ``state``; each question pins its
