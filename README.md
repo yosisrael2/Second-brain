@@ -33,8 +33,9 @@ client ──> api/routes      (thin routers: HTTP in/out, no business logic)
 - **Service layer**: all business logic lives in `src/brain/services/`.
 - **Factory**: `create_app()` in `src/brain/main.py` assembles the app;
   `create_engine_from_settings()` builds the DB engine from config.
-- **Strategy (planned)**: `src/brain/ai/` hosts future Embedder/LLMClient
-  implementations behind abstractions — owned by the AI/integrations track.
+- `src/brain/ai/` hosts the Strategy implementations (Embedder/LLMClient/Jev
+  classification, vector search, rerank, grounded Q&A) behind abstractions —
+  owned by the AI/integrations track; see [docs/ai-layer.md](docs/ai-layer.md).
 
 ## Folder layout
 
@@ -147,11 +148,18 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:5432/brain` | Postgres (SQLAlchemy URL) |
 | `QDRANT_URL`   | `http://localhost:6333`                                | Qdrant API endpoint |
 
+AI-layer variables (`JEV_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+`QDRANT_COLLECTION`, timeouts, base URLs) are documented in
+[docs/ai-layer.md](docs/ai-layer.md). None are required to boot the app;
+`classify`/`rerank` fall back gracefully when Jev is unconfigured.
+
 ## Tests
 
 ```bash
 pytest            # unit + API tests
 pytest -v         # verbose
+ruff check src tests   # lint (E, F, I, B, UP; config in pyproject [tool.ruff])
+mypy src/brain/ai      # type check (strict-ish; config in pyproject [tool.mypy])
 ```
 
 `tests/test_health.py` needs no infrastructure. DB-backed tests
