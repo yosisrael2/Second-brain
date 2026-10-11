@@ -48,7 +48,12 @@ class QdrantItemIndexer:
         self._ensured = False
 
     def index(self, item: MemoryItem) -> None:
-        """Embed and upsert the item's vector + payload."""
+        """Embed and upsert the item's vector + payload.
+
+        The once-per-process collection check is deliberately racy: two
+        concurrent first indexes may both call ``ensure_collection`` — the
+        store call is idempotent, so the worst case is one redundant call.
+        """
         vector = self._embedder.embed(item.raw_text)
         if not self._ensured:
             self._store.ensure_collection(len(vector))

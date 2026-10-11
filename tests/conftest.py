@@ -1,20 +1,71 @@
-"""Shared pytest fixtures."""
+"""Shared pytest fixtures.
 
-from collections.abc import Iterator
-from pathlib import Path
+SAFETY: the suite never touches a developer's real database. DATABASE_URL is
+forced to a ``*_test`` database (created on demand); any non-test URL fails
+fast, and the destructive fixtures double-check the engine URL before deleting.
+"""
 
-import pytest
-from alembic import command
-from alembic.config import Config
-from fastapi.testclient import TestClient
-from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+import os
 
-from brain.config import get_settings
-from brain.db.session import engine
-from brain.main import create_app
+_TEST_DB_URL = "postgresql+psycopg://brain:brain@localhost:5432/brain_test"
+
+# The env var wins over .env in pydantic-settings, so this pins the suite to
+# the test database unless the caller already chose a *_test one.
+_env_url = os.environ.get("DATABASE_URL")
+if _env_url is not None and not _env_url.rsplit("/", 1)[-1].split("?")[0].endswith("_test"):
+    raise RuntimeError(
+        "refusing to run tests against non-test database "
+        f"{_env_url.rsplit('/', 1)[-1]!r}; point DATABASE_URL at a *_test database"
+    )
+os.environ.setdefault("DATABASE_URL", _TEST_DB_URL)
+
+from collections.abc import Iterator  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import psycopg  # noqa: E402
+import pytest  # noqa: E402
+from alembic import command  # noqa: E402
+from alembic.config import Config  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.exc import OperationalError  # noqa: E402
+
+from brain.config import get_settings  # noqa: E402
+from brain.db.session import engine  # noqa: E402
+from brain.main import create_app  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _database_name(url: str) -> str:
+    """Extract the database name from a SQLAlchemy/psycopg URL."""
+    return url.rsplit("/", 1)[-1].split("?")[0]
+
+
+def assert_test_database(url: str) -> None:
+    """Refuse destructive fixtures unless the URL's database name ends in _test."""
+    if not _database_name(url).endswith("_test"):
+        raise RuntimeError(
+            f"refusing destructive fixture: {url!r} is not a *_test database"
+        )
+
+
+def _database_url() -> str:
+    """The URL of the engine the suite actually uses (Settings-resolved)."""
+    return get_settings().database_url
+
+
+def _ensure_test_database() -> None:
+    """CREATE DATABASE the test db (idempotent) on the same server."""
+    url = _database_url()
+    db_name = _database_name(url)
+    admin_url = url.rsplit("/", 1)[0].replace("postgresql+psycopg", "postgresql") + "/postgres"
+    with psycopg.connect(admin_url, autocommit=True, connect_timeout=3) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (db_name,)
+        ).fetchone()
+        if exists is None:
+            conn.execute(f'CREATE DATABASE "{db_name}"')
 
 
 @pytest.fixture(name="client")
@@ -32,20 +83,29 @@ def client_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
 
 @pytest.fixture(scope="session", name="database")
-def database_fixture() -> None:
-    """Ensure Postgres is reachable and migrated; skip DB-backed tests otherwise."""
+def database_fixture() -> Iterator[None]:
+    """Point the suite at the *_test database and migrate it; skip without Postgres."""
     try:
+        _ensure_test_database()  # connects to the admin db; creates *_test if missing
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
     except OperationalError as exc:
         pytest.skip(f"Postgres unavailable - run `docker compose up -d` ({exc})")
+    assert_test_database(_database_url())
+    _ensure_test_database()
     _run_migrations()
+    yield
 
 
 @pytest.fixture(name="clean_items")
 def clean_items_fixture(database: None) -> Iterator[None]:
-    """Delete all memory items after the test, isolating DB-backed tests."""
+    """Delete all memory items after the test, isolating DB-backed tests.
+
+    Guarded at the point of destruction: the DELETE only runs when the engine
+    actually in use points at a ``*_test`` database — never the dev DB.
+    """
     yield
+    assert_test_database(str(engine.url))
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM memory_items"))
 

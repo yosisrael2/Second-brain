@@ -62,6 +62,49 @@ def test_create_with_explicit_type_skips_classification():
     assert classifier.calls == []  # classifier not even invoked
 
 
+def test_create_never_overwrites_explicit_status():
+    classifier = StubClassifier(FULL_CLASSIFICATION)  # conf 0.95 would route to filed
+    service = make_service(classifier)
+
+    item = service.create(payload(status="needs_review"))
+
+    assert item.status is ItemStatus.NEEDS_REVIEW  # caller's value kept
+    assert item.type is ItemType.TASK  # classification still fills the rest
+    assert item.importance == 4
+
+
+def test_create_never_overwrites_explicit_importance():
+    classifier = StubClassifier(FULL_CLASSIFICATION)  # importance 4
+    service = make_service(classifier)
+
+    item = service.create(payload(importance=2))
+
+    assert item.importance == 2  # caller's value kept
+    assert item.type is ItemType.TASK
+    assert item.actionability is Actionability.NOW  # unsent field still filled
+
+
+def test_create_never_overwrites_explicit_actionability_and_confidence():
+    classifier = StubClassifier(FULL_CLASSIFICATION)  # NOW / 0.95
+    service = make_service(classifier)
+
+    item = service.create(payload(actionability="later", confidence=0.5))
+
+    assert item.actionability is Actionability.LATER  # caller's values kept
+    assert item.confidence == pytest.approx(0.5)
+    assert item.type is ItemType.TASK
+    assert item.status is ItemStatus.FILED  # status not sent -> routed by Jev confidence
+
+
+def test_create_never_overwrites_explicit_null_project():
+    classifier = StubClassifier({**FULL_CLASSIFICATION, "project": "payments"})
+    service = make_service(classifier)
+
+    item = service.create(payload(project=None))
+
+    assert item.project is None  # explicitly sent null is respected
+
+
 def test_create_with_classify_flag_false_keeps_item_raw():
     classifier = StubClassifier(FULL_CLASSIFICATION)
     service = make_service(classifier)

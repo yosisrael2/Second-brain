@@ -170,3 +170,46 @@ def test_offset_pages_through_ranked_results():
     assert page_two[0].item.id in {item.id for item in items}
     assert reranker.last_candidates is not None
     assert len(reranker.last_candidates) == 2  # limit + offset fetched before paging
+
+
+def test_load_items_preserves_rank_order_with_one_query():
+    """get_many feeds one IN-query; results come back in rerank order."""
+    repo = FakeRepository()
+    items = seed(repo, "kubernetes rollout runbook", "banana bread recipe")
+    store = QdrantVectorStore(client=QdrantClient(":memory:"))
+    index_into(store, repo)
+    service = make_service(repo, store=store)
+
+    hits = service.search("kubernetes", limit=2)
+
+    assert [hit.item.id for hit in hits] == [items[0].id, items[1].id]
+    assert hits[0].score is not None
+
+
+def test_load_items_skips_ids_missing_from_postgres():
+    """Vectors for deleted items are skipped, not errors (ghost tolerance)."""
+    repo = FakeRepository()
+    (item,) = seed(repo, "kubernetes rollout runbook")
+    store = QdrantVectorStore(client=QdrantClient(":memory:"))
+    index_into(store, repo)
+    # A ghost vector: indexed id that no longer exists in Postgres.
+    store.upsert("11111111-1111-1111-1111-111111111111", [1.0] * 8, {"id": "ghost"})
+    service = make_service(repo, store=store)
+
+    hits = service.search("kubernetes", limit=5)
+
+    assert [hit.item.id for hit in hits] == [item.id]
+
+
+def test_load_items_skips_unparseable_payload_ids():
+    """A corrupt payload id is skipped and logged, never a 500."""
+    repo = FakeRepository()
+    (item,) = seed(repo, "kubernetes rollout runbook")
+    store = QdrantVectorStore(client=QdrantClient(":memory:"))
+    index_into(store, repo)
+    store.upsert("garbage", [1.0] * 8, {"id": "garbage", "text": "corrupt payload"})
+    service = make_service(repo, store=store)
+
+    hits = service.search("kubernetes", limit=5)
+
+    assert [hit.item.id for hit in hits] == [item.id]

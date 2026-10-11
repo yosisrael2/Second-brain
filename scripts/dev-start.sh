@@ -10,25 +10,32 @@ cd "$ROOT"
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 PORT="${PORT:-8000}"
+FORCE_PORT=0
 RELOAD=1
 REINDEX=0
-LOG=".dev/uvicorn.log"
-PID_FILE=".dev/uvicorn.pid"
+# Overridable for tests so a test run never touches the real .dev state.
+LOG="${DEV_LOG_FILE:-.dev/uvicorn.log}"
+PID_FILE="${DEV_PID_FILE:-.dev/uvicorn.pid}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/dev-start.sh [--no-reload] [--reindex] [--help]
+Usage: scripts/dev-start.sh [--no-reload] [--reindex] [--force-port] [--help]
 
 Starts postgres + qdrant (docker compose), applies migrations, then runs
 uvicorn in the background. State (pid, log) lives in .dev/.
 
+Self-healing: a previous instance of our uvicorn (pid file or orphan on the
+port) is stopped automatically, so running dev-start twice just restarts.
+
   --no-reload   run uvicorn without --reload
   --reindex     run 'brain reindex' after migrations
+  --force-port  kill a FOREIGN process holding the port without asking
+                (never docker/rancher/colima proxies or infra ports)
   --help        show this help
 
 Environment: PORT (default 8000), COMPOSE_PROJECT_NAME (default
 second-brain-dev, .env may set it), DOCKER_CONTEXT (falls back to the
-rancher-desktop context).
+rancher-desktop context), HEALTH_TIMEOUT_S (default 30).
 EOF
 }
 
@@ -135,14 +142,58 @@ migrate() {
   .venv/bin/alembic upgrade head || die "alembic failed"
 }
 
+free_app_port() {
+  # Make sure $PORT is free for the app: stop OUR holders automatically, ask
+  # (or require --force-port) for foreign ones, never touch protected ones.
+  local listener pid cmd answer
+  listener="$(port_listener "$PORT")"
+  if [ -z "$listener" ]; then
+    say "port $PORT: free"
+    return 0
+  fi
+  pid="$(printf '%s\n' "$listener" | head -1 | awk '{print $2}')"
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  say "port $PORT is held by pid $pid: $cmd"
+  if [ "$PORT" = "$(pg_port)" ] || [ "$PORT" = "$(qdrant_port)" ]; then
+    die "port $PORT is an infrastructure port (postgres/qdrant); never killed. Choose another PORT."
+  fi
+  if is_protected_holder "$cmd"; then
+    die "port $PORT is held by a protected process (pid $pid): $cmd — never killed. Choose another PORT."
+  fi
+  if printf '%s' "$cmd" | grep -q "uvicorn brain.main:app"; then
+    say "port $PORT: held by our app (pid $pid) — stopping it"
+    kill_tree "$pid"
+  elif [ "$FORCE_PORT" -eq 1 ]; then
+    say "port $PORT: killing foreign holder (pid $pid) (--force-port)"
+    kill_tree "$pid"
+  elif [ -t 0 ]; then
+    printf 'kill pid %s (%s)? [y/N] ' "$pid" "$cmd"
+    read -r answer || answer=""
+    if [[ "$answer" =~ ^[yY]$ ]]; then
+      kill_tree "$pid"
+    else
+      die "port $PORT stays busy; stop pid $pid manually or pass --force-port"
+    fi
+  else
+    die "port $PORT is held by pid $pid ($cmd); refusing to kill non-interactively. Stop it manually or pass --force-port"
+  fi
+  for _ in $(seq 1 20); do
+    if [ -z "$(port_listener "$PORT")" ]; then
+      say "port $PORT: free"
+      return 0
+    fi
+    sleep 0.5
+  done
+  die "port $PORT still busy after TERM+KILL (holder was pid $pid: $cmd)"
+}
+
 start_server() {
   mkdir -p .dev
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     die "already running (pid $(cat "$PID_FILE")); use scripts/dev-stop.sh first"
   fi
   if [ -n "$(port_listener "$PORT")" ]; then
-    port_listener "$PORT" | awk '{print "  held by pid", $2}' >&2
-    die "port $PORT is busy"
+    die "port $PORT is still busy (unresolved holder)"  # pragma-ish: free_app_port guarantees free
   fi
   local reload_flag=""
   [ "$RELOAD" -eq 1 ] && reload_flag="--reload"
@@ -153,7 +204,8 @@ start_server() {
 
 wait_for_health() {
   local base="http://127.0.0.1:${PORT}"
-  for _ in $(seq 1 30); do
+  local timeout="${HEALTH_TIMEOUT_S:-30}"
+  for _ in $(seq 1 "$timeout"); do
     if curl -sf "$base/health" >/dev/null 2>&1; then
       say "health: OK"
       say "API:      $base"
@@ -169,14 +221,18 @@ wait_for_health() {
     fi
     sleep 1
   done
+  # Never leave a half-started server behind.
+  kill_tree "$(cat "$PID_FILE")"
+  rm -f "$PID_FILE"
   tail -5 "$LOG" >&2
-  die "server did not become healthy within 30s"
+  die "server did not become healthy within ${timeout}s (stopped it)"
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-reload) RELOAD=0 ;;
     --reindex) REINDEX=1 ;;
+    --force-port) FORCE_PORT=1 ;;
     --help) usage; exit 0 ;;
     *) usage >&2; die "unknown flag: $1" ;;
   esac
@@ -188,6 +244,8 @@ check_python_env
 check_env_file
 resolve_compose_project >/dev/null
 say "compose project: ${COMPOSE_PROJECT_NAME}"
+stop_uvicorn_app "$PID_FILE" "$PORT"
+free_app_port
 start_infra
 migrate
 if [ "$REINDEX" -eq 1 ]; then

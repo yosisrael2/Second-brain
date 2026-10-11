@@ -78,13 +78,39 @@ class SearchService:
         return [SearchHit(item=item, score=None) for item in items]
 
     def _load_items(self, ranked: Sequence[Mapping[str, Any]]) -> list[SearchHit]:
-        """Resolve ranked candidate ids to stored items, skipping deleted ones."""
+        """Resolve ranked candidate ids to stored items, skipping unusable ones.
+
+        Candidates whose payload id is not a UUID (corrupt/legacy payload) and
+        ids no longer in Postgres are skipped; rank order is preserved.
+        """
+        by_id = {
+            item.id: item
+            for item in self._repo.get_many(_parse_uuids(ranked))
+        }
         hits: list[SearchHit] = []
         for candidate in ranked:
-            item = self._repo.get(uuid.UUID(str(candidate["id"])))
+            parsed = candidate_id(candidate)
+            item = by_id.get(parsed) if parsed is not None else None
             if item is not None:
                 hits.append(SearchHit(item=item, score=_as_score(candidate.get("vector_score"))))
         return hits
+
+
+def candidate_id(candidate: Mapping[str, Any]) -> uuid.UUID | None:
+    """Parse a candidate's payload id; None when it is not a UUID."""
+    try:
+        return uuid.UUID(str(candidate.get("id")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_uuids(ranked: Sequence[Mapping[str, Any]]) -> list[uuid.UUID]:
+    ids: list[uuid.UUID] = []
+    for candidate in ranked:
+        parsed = candidate_id(candidate)
+        if parsed is not None:
+            ids.append(parsed)
+    return ids
 
 
 def _as_score(value: Any) -> float | None:

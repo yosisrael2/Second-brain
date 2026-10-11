@@ -8,6 +8,10 @@ from brain.ai.ask import LLMClient, answer
 from brain.services.search import SearchHit, SearchService
 
 DEFAULT_TOP_K = 5
+# Each source is truncated in the LLM prompt only; the API response keeps the
+# full raw_text. Bounds prompt size (top_k x raw_text can otherwise reach
+# ~50k chars) and blunts cost/latency surprises.
+SOURCE_PROMPT_MAX_CHARS = 2000
 
 
 @dataclass(frozen=True)
@@ -34,7 +38,10 @@ class AskService:
     def ask(self, question: str) -> AskResult:
         """Answer ``question`` from the top-k most relevant memory items."""
         hits = self._search.search(question, limit=self._top_k)
-        context = [{"id": str(hit.item.id), "text": hit.item.raw_text} for hit in hits]
+        context = [
+            {"id": str(hit.item.id), "text": hit.item.raw_text[:SOURCE_PROMPT_MAX_CHARS]}
+            for hit in hits
+        ]
         result = answer(question, context, llm=self._llm)
         return AskResult(
             answer=result["answer"],

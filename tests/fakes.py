@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,6 +30,9 @@ class FakeRepository:
 
     def get(self, item_id: uuid.UUID) -> MemoryItem | None:
         return self.items.get(item_id)
+
+    def get_many(self, item_ids: Sequence[uuid.UUID]) -> list[MemoryItem]:
+        return [self.items[item_id] for item_id in item_ids if item_id in self.items]
 
     def list(
         self,
