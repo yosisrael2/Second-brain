@@ -230,6 +230,7 @@ scripts/dev-start.sh             # preflight (docker, venv, .env, jev/claude sta
                                  # compose up + health wait, alembic, uvicorn on :8000
 scripts/dev-start.sh --reindex   # also rebuild the vector collection first
 scripts/dev-start.sh --no-reload # production-ish uvicorn (no file watching)
+scripts/dev-start.sh --force-port# kill a FOREIGN port holder without asking
 scripts/dev-stop.sh              # stop uvicorn (pid file)
 scripts/dev-stop.sh --down       # also stop postgres + qdrant containers
 scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
@@ -237,6 +238,16 @@ scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
 
 Behavior worth knowing:
 
+- **Self-healing restart** — running `dev-start.sh` when our uvicorn is
+  already running (pid file or orphan on the port) stops it first (TERM,
+  wait, KILL escalation — the same shared logic `dev-stop.sh` uses) and
+  starts fresh. Running it twice in a row is safe and just restarts.
+- **Port holders** — if the app port is held by a FOREIGN process, the
+  script shows pid + command and asks `kill it? [y/N]` (refusing by default
+  when non-interactive); `--force-port` kills without asking. Protected
+  processes are NEVER killed: docker/rancher/colima/vpnkit proxies,
+  anything on 5432/6333 (those are the reuse path below), pid 1, or the
+  script's own shell.
 - **Stable compose project** — both scripts resolve `COMPOSE_PROJECT_NAME`
   identically (`scripts/lib.sh`: real environment > `.env` > default
   `second-brain-dev`) and print it before any docker call, so a stop can never
@@ -252,10 +263,10 @@ Behavior worth knowing:
   and checks the `claude` CLI is installed (no LLM round-trip — if `/ask`
   returns 502, run `claude` once and `/login`). `JEV_BASE_URL` is optional —
   the default works.
-- **State** — pid + log live under `.dev/` (gitignored). Starting twice is
-  safe: it refuses with the running pid. A busy port is refused with the
-  holder named. `PORT` overrides the default 8000. Stopping kills the whole
-  uvicorn tree (no orphans under `--reload`).
+- **State** — pid + log live under `.dev/` (gitignored). A busy port is
+  never silently taken over (see self-healing above). `PORT` overrides the
+  default 8000. Stopping kills the whole uvicorn tree (no orphans under
+  `--reload`).
 - **Data purge** — `scripts/dev-stop.sh --purge-data` deletes the resolved
   project's docker volumes (all items + vectors), naming the project and each
   volume in the confirmation prompt (`PURGE` to proceed).
@@ -318,8 +329,15 @@ mypy src/brain/ai      # type check (strict-ish; config in pyproject [tool.mypy]
 
 `tests/test_health.py` needs no infrastructure. DB-backed tests
 (`tests/test_items.py`) need the docker-compose Postgres running (they apply
-Alembic migrations to the configured `DATABASE_URL` and clean the table after
-each test; they skip with a hint if Postgres is unreachable).
+Alembic migrations and clean the table after each test; they skip with a hint
+if Postgres is unreachable).
+
+The suite NEVER touches a developer's database: `tests/conftest.py` pins
+`DATABASE_URL` to a separate `brain_test` database (created on demand),
+refuses to run at all against a non-`*_test` URL, and the destructive
+`clean_items` teardown double-checks the engine URL in use before deleting.
+`tests/test_db_isolation.py` proves the point: it seeds a marker row in the
+dev database, runs the DB-backed suite, and asserts the marker survives.
 
 ## Adding a feature
 
