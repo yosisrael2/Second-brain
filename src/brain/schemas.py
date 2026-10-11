@@ -1,0 +1,66 @@
+"""Pydantic schemas: API request/response contracts and validation."""
+
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from brain.db.enums import (
+    CONFIDENCE_MAX,
+    CONFIDENCE_MIN,
+    IMPORTANCE_MAX,
+    IMPORTANCE_MIN,
+    Actionability,
+    ItemStatus,
+    ItemType,
+)
+
+RAW_TEXT_MAX_LENGTH = 10_000
+SOURCE_MAX_LENGTH = 64
+PROJECT_MAX_LENGTH = 128
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+
+
+class ItemCreate(BaseModel):
+    """Payload for POST /items."""
+
+    raw_text: str = Field(min_length=1, max_length=RAW_TEXT_MAX_LENGTH)
+    source: str = Field(default="manual", min_length=1, max_length=SOURCE_MAX_LENGTH)
+    type: ItemType | None = None
+    project: str | None = Field(default=None, min_length=1, max_length=PROJECT_MAX_LENGTH)
+    importance: int | None = Field(default=None, ge=IMPORTANCE_MIN, le=IMPORTANCE_MAX)
+    actionability: Actionability | None = None
+    confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
+    status: ItemStatus = ItemStatus.INBOX
+
+
+class ItemUpdate(BaseModel):
+    """Partial payload for PATCH /items/{id}; absent fields stay unchanged."""
+
+    raw_text: str | None = Field(default=None, min_length=1, max_length=RAW_TEXT_MAX_LENGTH)
+    source: str | None = Field(default=None, min_length=1, max_length=SOURCE_MAX_LENGTH)
+    type: ItemType | None = None
+    project: str | None = Field(default=None, min_length=1, max_length=PROJECT_MAX_LENGTH)
+    importance: int | None = Field(default=None, ge=IMPORTANCE_MIN, le=IMPORTANCE_MAX)
+    actionability: Actionability | None = None
+    confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
+    status: ItemStatus | None = None
+
+
+class ItemRead(BaseModel):
+    """A memory item as returned by the API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    raw_text: str
+    source: str
+    type: ItemType | None
+    project: str | None
+    importance: int | None
+    actionability: Actionability | None
+    confidence: float | None
+    status: ItemStatus
+    created_at: datetime
+    updated_at: datetime
