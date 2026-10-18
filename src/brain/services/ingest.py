@@ -73,11 +73,16 @@ class IngestService:
     def reindex(self, batch_size: int = 500) -> int:
         """Full vector rebuild from Postgres; returns the number indexed.
 
-        Purges the existing collection first, so ghost vectors (items deleted
-        or missing from Postgres) are removed. Intended for the ``brain
-        reindex`` CLI; raises EmbedderError/VectorStoreError on infrastructure
-        failure (the CLI turns that into a clean exit code).
+        Probes the embedder first, so an unreachable embedder raises
+        :class:`EmbedderError` before the collection is dropped (a failed
+        rebuild never destroys the existing vectors). Then purges the
+        collection — removing ghost vectors for items deleted or missing
+        from Postgres — and re-embeds + upserts one whole DB batch per
+        embed/upsert round-trip. Intended for the ``brain reindex`` CLI;
+        raises EmbedderError/VectorStoreError on infrastructure failure (the
+        CLI turns that into a clean exit code).
         """
+        self._indexer.probe()  # fail before the destructive purge
         self._indexer.purge()
         offset = 0
         indexed = 0
@@ -91,9 +96,7 @@ class IngestService:
             )
             if not batch:
                 return indexed
-            for item in batch:
-                self._indexer.index(item)
-                indexed += 1
+            indexed += self._indexer.index_batch(batch)
             offset += len(batch)
 
     def _apply_classification(self, item: MemoryItem, *, explicit: frozenset[str]) -> None:

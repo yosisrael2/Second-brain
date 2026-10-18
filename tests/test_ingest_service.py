@@ -6,10 +6,11 @@ from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 from brain import schemas
 from brain.ai.classify import FALLBACK_CLASSIFICATION
-from brain.ai.embedder import FakeEmbedder
+from brain.ai.embedder import EmbedderError, FakeEmbedder
 from brain.ai.jev import JevError
 from brain.ai.vectorstore import QdrantVectorStore, VectorStoreError
 from brain.db.enums import Actionability, ItemStatus, ItemType
+from brain.db.models import MemoryItem
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 
@@ -158,6 +159,127 @@ def test_index_failure_never_blocks_capture():
 
     assert item.id in repo.items  # captured anyway
     assert item.status is ItemStatus.FILED  # classification still applied
+
+
+class _CountingEmbedder:
+    """Embedder spy counting single vs batched embed calls (delegates to inner)."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.single_calls = 0
+        self.batch_calls = 0
+        self.batch_sizes: list[int] = []
+
+    def embed(self, text: str) -> list[float]:
+        self.single_calls += 1
+        return self._inner.embed(text)  # type: ignore[attr-defined]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        self.batch_calls += 1
+        self.batch_sizes.append(len(texts))
+        return self._inner.embed_batch(texts)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._inner.close()  # type: ignore[attr-defined]
+
+
+class _CountingStore:
+    """VectorStore spy counting upsert shapes (delegates to an inner store)."""
+
+    def __init__(self, inner: QdrantVectorStore) -> None:
+        self._inner = inner
+        self.upsert_single_calls = 0
+        self.upsert_many_calls = 0
+        self.upsert_many_sizes: list[int] = []
+        self.delete_collection_calls = 0
+
+    def ensure_collection(self, dim: int) -> None:
+        self._inner.ensure_collection(dim)
+
+    def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
+        self.upsert_single_calls += 1
+        self._inner.upsert(item_id, vector, payload)
+
+    def upsert_many(self, points: list[tuple[str, list[float], dict]]) -> None:
+        self.upsert_many_calls += 1
+        self.upsert_many_sizes.append(len(points))
+        for item_id, vector, payload in points:
+            self._inner.upsert(item_id, vector, payload)
+
+    def delete(self, item_id: str) -> None:
+        self._inner.delete(item_id)
+
+    def delete_collection(self) -> None:
+        self.delete_collection_calls += 1
+        self._inner.delete_collection()
+
+    def search(self, vector: list[float], k: int = 5) -> list[dict]:
+        return self._inner.search(vector, k)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def test_reindex_uses_one_embed_and_one_upsert_per_db_batch():
+    """Reindex batching: one embed call + one upsert call per DB batch.
+
+    With 5 items and batch_size=2 there must be exactly 3 embed calls
+    (sizes 2, 2, 1) and 3 upserts (sizes 2, 2, 1) — plus the single-probe
+    embed before the purge — never one embed+upsert pair per item.
+    """
+    repo = FakeRepository()
+    for i in range(5):
+        repo.add(MemoryItem(raw_text=f"note number {i}"))
+    store = _CountingStore(QdrantVectorStore(client=QdrantClient(":memory:")))
+    embedder = _CountingEmbedder(FakeEmbedder(dim=8))
+    indexer = QdrantItemIndexer(embedder, store)
+    service = IngestService(repo, StubClassifier(FULL_CLASSIFICATION), indexer)
+
+    indexed = service.reindex(batch_size=2)
+
+    assert indexed == 5
+    assert embedder.batch_calls == 3  # one embed per DB batch
+    assert embedder.batch_sizes == [2, 2, 1]
+    assert embedder.single_calls == 1  # the pre-purge probe only
+    assert store.upsert_many_calls == 3  # one upsert per DB batch
+    assert store.upsert_many_sizes == [2, 2, 1]
+    assert store.upsert_single_calls == 0
+    assert store.delete_collection_calls == 1
+    # Final state identical to the per-item path: every item is retrievable.
+    probe = FakeEmbedder(dim=8)
+    hits = store._inner.search(probe.embed("note number 3"), k=10)
+    assert len(hits) == 5
+
+
+def test_reindex_embedder_failure_before_purge_leaves_collection_untouched():
+    """An EmbedderError in reindex must hit before the collection is dropped."""
+    repo = FakeRepository()
+    good = FakeEmbedder(dim=8)
+    store = QdrantVectorStore(client=QdrantClient(":memory:"))
+    existing = repo.add(MemoryItem(raw_text="already indexed note"))
+    store.ensure_collection(8)
+    store.upsert(
+        str(existing.id), good.embed("already indexed note"), {"id": str(existing.id)}
+    )
+
+    class BrokenEmbedder:
+        def embed(self, text: str) -> list[float]:
+            raise EmbedderError("embedder down")
+
+        def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            raise EmbedderError("embedder down")
+
+        def close(self) -> None: ...
+
+    indexer = QdrantItemIndexer(BrokenEmbedder(), store)  # type: ignore[arg-type]
+    service = IngestService(repo, StubClassifier(FULL_CLASSIFICATION), indexer)
+
+    with pytest.raises(EmbedderError):
+        service.reindex(batch_size=10)
+
+    # The collection was NOT purged: the pre-existing vector is still there.
+    hits = store.search(good.embed("already indexed note"), k=5)
+    assert [hit["id"] for hit in hits] == [str(existing.id)]
 
 
 def test_reindex_purges_ghosts_and_indexes_every_item():

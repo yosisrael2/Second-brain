@@ -5,7 +5,8 @@ import json
 import httpx
 import pytest
 
-from brain.ai.jev import DEFAULT_BASE_URL, JevClient, JevError, parse_choice, parse_score
+from brain.ai.jev import JevClient, JevError, parse_choice, parse_score
+from brain.config import DEFAULT_JEV_BASE_URL
 
 
 def make_jev(handler, api_key="test-key", **kwargs) -> JevClient:
@@ -154,4 +155,4 @@ class TestParsing:
 
 def test_default_base_url_matches_server_js():
     jev = JevClient(api_key="k")
-    assert jev._base_url == DEFAULT_BASE_URL  # noqa: SLF001 - config assertion
+    assert jev._base_url == DEFAULT_JEV_BASE_URL  # noqa: SLF001 - config assertion

@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Protocol
 
 from qdrant_client import QdrantClient, models
 
 from brain.config import DEFAULT_QDRANT_COLLECTION, DEFAULT_QDRANT_TIMEOUT_S
-
-# Canonical defaults live in brain.config; re-exported for convenience.
-DEFAULT_COLLECTION = DEFAULT_QDRANT_COLLECTION
 
 
 class VectorStoreError(RuntimeError):
@@ -28,6 +25,12 @@ class VectorStore(Protocol):
 
     def upsert(self, item_id: str | int, vector: list[float], payload: Mapping[str, Any]) -> None:
         """Insert or replace one item; ``payload`` is stored alongside it."""
+        ...
+
+    def upsert_many(
+        self, points: Sequence[tuple[str | int, list[float], Mapping[str, Any]]]
+    ) -> None:
+        """Insert or replace many items in one store round-trip."""
         ...
 
     def delete(self, item_id: str | int) -> None:
@@ -62,7 +65,7 @@ class QdrantVectorStore:
         self,
         url: str | None = None,
         api_key: str | None = None,
-        collection: str = DEFAULT_COLLECTION,
+        collection: str = DEFAULT_QDRANT_COLLECTION,
         timeout_s: int = DEFAULT_QDRANT_TIMEOUT_S,
         client: QdrantClient | None = None,
     ) -> None:
@@ -107,11 +110,26 @@ class QdrantVectorStore:
 
     def upsert(self, item_id: str | int, vector: list[float], payload: Mapping[str, Any]) -> None:
         """Insert or replace one item under a deterministic point id."""
-        stored_payload = dict(payload)
-        stored_payload.setdefault("id", item_id)
-        point = models.PointStruct(id=_point_id(item_id), vector=vector, payload=stored_payload)
+        self.upsert_many([(item_id, vector, payload)])
+
+    def upsert_many(
+        self, points: Sequence[tuple[str | int, list[float], Mapping[str, Any]]]
+    ) -> None:
+        """Insert or replace many items in a single Qdrant call.
+
+        Same payload/id handling as :meth:`upsert`, applied to each entry;
+        the whole batch travels as one client call.
+        """
+        structs = [
+            models.PointStruct(
+                id=_point_id(item_id),
+                vector=vector,
+                payload={**dict(payload), "id": payload.get("id", item_id)},
+            )
+            for item_id, vector, payload in points
+        ]
         with self._translated():
-            self._client.upsert(self._collection, points=[point])
+            self._client.upsert(self._collection, points=structs)
 
     def delete(self, item_id: str | int) -> None:
         """Remove one item's vector; deleting a missing id is not an error."""

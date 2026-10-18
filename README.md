@@ -371,27 +371,25 @@ dev database, runs the DB-backed suite, and asserts the marker survives.
 
 ## Next steps
 
-For the next worker. Items marked **landed in PR #3** are on `feature/mvp-hardening`
-(also not on main yet — PR #3 is stacked on PR #1). Anything marked
-**PROPOSAL** is an idea, not a decided behavior.
+For the next worker. Anything marked **PROPOSAL** is an idea, not a decided
+behavior.
 
-### 1. In progress — `feature/mvp-hardening` (not on main yet)
+### 1. Landed — hardening (PR #3 + follow-ups)
 
-| Item | Why | Where | Acceptance hint |
-| --- | --- | --- | --- |
-| Reindex batching | reindex embeds+upserts one item per call (~2N round-trips) | `src/brain/services/ingest.py`, `src/brain/services/indexing.py` | one embed + one upsert per DB batch; identical final state; 1k items reindex in seconds |
-| Embedder probe before purge | purge-then-fail leaves the collection empty | `src/brain/services/ingest.py` (`reindex`) | EmbedderError before purge leaves the collection untouched |
-| Search N+1 → get_many — **landed in PR #3** | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
-| Delete dead `ItemsService.create` — **landed in PR #3** | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
-| UUID guard in `_load_items` — **landed in PR #3** | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
-| Deterministic list ordering (secondary sort on id) — **landed in PR #3** | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
-| Qdrant healthcheck in compose — **landed in PR #3** | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
-| dev-start self-healing restart — **landed in PR #3** | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
-| Test DB isolation — **landed in PR #3** | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
-| Seed-demo script — **landed in PR #3** | fresh clone has an empty DB | `scripts/` | `scripts/seed-demo.sh` fills a few example items |
-| `/ask` source truncation — **landed in PR #3** | a 10k-char item can blow the prompt | `src/brain/services/ask.py`, `src/brain/ai/ask.py` | per-source prompt budget enforced |
-| Config shim removal | ai modules re-export config defaults nobody imports | `src/brain/ai/jev.py` (same pattern in ask/embedder) | grep shows no shim imports |
-| `rerank(jev=...)` required | optional param + ValueError guard for a required dep | `src/brain/ai/rerank.py` | signature requires `jev`; guard deleted |
+All of the hardening items below are merged into the hardening branch and
+submitted to main in one PR:
+
+- Landed in PR #3: search N+1 → `get_many`; dead `ItemsService.create` deleted;
+  UUID guard in `_load_items`; deterministic list ordering; Qdrant healthcheck
+  in compose; dev-start self-healing restart; test DB isolation; seed-demo
+  script; `/ask` source truncation.
+- Landed on top of PR #3: **reindex batching** (one `embed_batch` + one
+  `upsert_many` per DB batch, identical final Qdrant state), **embedder probe
+  before purge** (an EmbedderError in `reindex` now hits before the collection
+  is dropped), removal of the config-default re-export shims in `ai/`
+  (`brain.config` is the single source), and `rerank(jev=...)` made a required
+  dependency (the ValueError guard is gone).
+
 
 ### 2. Known limitations / tech debt (on main)
 
@@ -452,8 +450,8 @@ from that distribution.
 
 ### 5. Where to start tomorrow
 
-1. Review + merge PR #1 (this branch), then PR #2 (`feature/mvp-docs-html`).
-2. Finish `feature/mvp-hardening` — biggest bang: reindex batching (section 1, rows 1-2).
-3. Add the CI workflow (section 2) so everything above gets enforced automatically.
-4. Start the dogfood week (section 4) with real notes.
-5. Slice the first Phase-4 ticket (section 3) once the hardening branch lands.
+1. Review + merge the open hardening PR (section 1 — PR #3's work plus
+   reindex batching, the embedder probe, and the ai-layer cleanups).
+2. Add the CI workflow (section 2) so everything above gets enforced automatically.
+3. Start the dogfood week (section 4) with real notes.
+4. Slice the first Phase-4 ticket (section 3) once hardening has landed.

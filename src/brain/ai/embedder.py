@@ -1,9 +1,8 @@
-"""Embedding strategies: OpenAI-backed and a deterministic offline fake."""
-
 from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 import httpx
@@ -37,6 +36,14 @@ class Embedder(Protocol):
 
     def embed(self, text: str) -> list[float]:
         """Return the embedding vector for ``text``."""
+        ...
+
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+        """Return the embedding vectors for ``texts``, one per input, in order.
+
+        Implementations should issue a single backend call for the whole
+        batch (this is what ``brain reindex`` batching relies on).
+        """
         ...
 
     def close(self) -> None:
@@ -86,7 +93,14 @@ class OpenAIEmbedder:
         response = self._post(self._api_key, text)
         return self._extract_vector(response)
 
-    def _post(self, api_key: str, text: str) -> httpx.Response:
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+        """Return one embedding per input text, in order, from a single request."""
+        if not self._api_key:
+            raise EmbedderError("no API key configured for embeddings (OPENAI_API_KEY)")
+        response = self._post(self._api_key, list(texts))
+        return self._extract_vectors(response)
+
+    def _post(self, api_key: str, text: str | list[str]) -> httpx.Response:
         return post_json(
             self._http,
             self._url,
@@ -96,6 +110,19 @@ class OpenAIEmbedder:
             context="embedding",
             timeout_s=self._timeout_s,
         )
+
+    @staticmethod
+    def _extract_vectors(response: httpx.Response) -> list[list[float]]:
+        try:
+            data = response.json()["data"]
+            if not isinstance(data, list) or not data:
+                raise TypeError("embedding response has no 'data' entries")
+            return [
+                [float(component) for component in entry["embedding"]]
+                for entry in data
+            ]
+        except (TypeError, ValueError, KeyError, IndexError) as exc:
+            raise EmbedderError(f"malformed embedding response: {exc!r}") from exc
 
     @staticmethod
     def _extract_vector(response: httpx.Response) -> list[float]:
@@ -157,6 +184,19 @@ class FastEmbedEmbedder:
             raise EmbedderError("fastembed returned no vectors")
         return [float(component) for component in vectors[0]]
 
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+        """Return one embedding per input text, in order, in one model call."""
+        try:
+            vectors = list(self._backend.embed(list(texts)))
+        except Exception as exc:
+            # Boundary as above: normalize every fastembed failure.
+            raise EmbedderError(f"fastembed embedding failed: {exc}") from exc
+        if len(vectors) != len(texts):
+            raise EmbedderError(
+                f"fastembed returned {len(vectors)} vectors for {len(texts)} inputs"
+            )
+        return [[float(component) for component in vector] for vector in vectors]
+
 
 class FakeEmbedder:
     """Deterministic offline Embedder strategy for tests.
@@ -185,6 +225,10 @@ class FakeEmbedder:
             sign = 1.0 if digest[4] % 2 == 0 else -1.0
             vector[index] += sign
         return _normalize(vector)
+
+    def embed_batch(self, texts: Sequence[str]) -> list[list[float]]:
+        """Return the per-item embeddings, in order (same vectors as ``embed``)."""
+        return [self.embed(text) for text in texts]
 
     @staticmethod
     def _features(text: str) -> set[str]:

@@ -133,7 +133,7 @@
 
 <div class="principle">
   <strong>Jev decides, LLMs write, the DB remembers.</strong>
-  Jev (the TypeSafe decision API, <code>ai/jev.py:123</code>, default model
+  Jev (the TypeSafe decision API, <code>ai/jev.py:118</code>, default model
   <code>jev-latest</code>) makes the judgment calls — what an item <em>is</em>, how
   confident the classification is, which search candidates matter. Claude writes the
   answers, in a tool-less sandbox with no access to your machine. Postgres is the
@@ -224,12 +224,12 @@ and the AI layer (Jev, embedders, vector store, LLM clients).
     </marker>
   </defs>
 </svg>
-<figcaption>Routers are thin (<code>routes/*.py</code>); business logic lives in <code>services/</code>; <code>repositories/</code> owns SQL; <code>ai/</code> isolates every external model call behind small Protocols (<code>services/ingest.py:20</code>, <code>services/search.py:19</code>, <code>services/indexing.py:16</code>). Everything is built at startup by <code>factories.py:16,28</code> from <code>config.Settings</code>, cached app-lifetime via <code>lru_cache</code> in <code>api/deps.py</code>, and closed on shutdown (<code>deps.py:75</code>). The CLI lives in <code>cli.py:34</code> (<code>brain reindex</code>).</figcaption>
+<figcaption>Routers are thin (<code>routes/*.py</code>); business logic lives in <code>services/</code>; <code>repositories/</code> owns SQL; <code>ai/</code> isolates every external model call behind small Protocols (<code>services/ingest.py:20</code>, <code>services/search.py:19</code>, <code>services/indexing.py:21</code>). Everything is built at startup by <code>factories.py:16,28</code> from <code>config.Settings</code>, cached app-lifetime via <code>lru_cache</code> in <code>api/deps.py</code>, and closed on shutdown (<code>deps.py:75</code>). The CLI lives in <code>cli.py:34</code> (<code>brain reindex</code>).</figcaption>
 </figure>
 
 <h2 id="capture">3 · Flow: capture (<code>POST /items</code>)</h2>
 <p>
-The write to Postgres happens <strong>first</strong> (<code>ingest.py:59</code>);
+The write to Postgres happens <strong>first</strong> (<code>ingest.py:66</code>);
 classification and embedding run after, and their failures are logged but never
 fail the request.
 </p>
@@ -250,7 +250,7 @@ fail the request.
   <circle cx="48" cy="128" r="14" class="stepdot"/><text x="48" y="133" text-anchor="middle" class="t-step">2</text>
   <rect x="24" y="100" width="592" height="56" rx="10" class="svgok"/>
   <text x="72" y="126" class="t-main">INSERT row into Postgres</text>
-  <text x="72" y="146" class="t-code">services/ingest.py:59 — durable before any AI runs</text>
+  <text x="72" y="146" class="t-code">services/ingest.py:66 — durable before any AI runs</text>
 
   <path d="M320 156 L320 176" class="edge" marker-end="url(#arrowCap)"/>
   <text x="332" y="172" class="t-label">classify — skipped when type given</text>
@@ -259,11 +259,11 @@ fail the request.
   <rect x="24" y="180" width="592" height="76" rx="10" class="svgai"/>
   <text x="72" y="206" class="t-main">Jev classify — the judgment call</text>
   <text x="72" y="226" class="t-code">type · importance · actionability · confidence</text>
-  <text x="72" y="246" class="t-code">services/ingest.py:92 · ai/jev.py:123</text>
+  <text x="72" y="246" class="t-code">services/ingest.py:112 · ai/jev.py:118</text>
 
   <rect x="24" y="264" width="592" height="52" rx="10" class="svgfail"/>
   <text x="40" y="286" class="t-fail">✗ Jev down → warning logged; fields stay empty</text>
-  <text x="40" y="306" class="t-failsub">item stays in inbox (services/ingest.py:98)</text>
+  <text x="40" y="306" class="t-failsub">item stays in inbox (services/ingest.py:114)</text>
 
   <path d="M320 316 L320 336" class="edge" marker-end="url(#arrowCap)"/>
   <text x="332" y="332" class="t-label">route(confidence)</text>
@@ -280,7 +280,7 @@ fail the request.
   <circle cx="48" cy="468" r="14" class="stepdot"/><text x="48" y="473" text-anchor="middle" class="t-step">5</text>
   <rect x="24" y="440" width="592" height="56" rx="10" class="svgai"/>
   <text x="72" y="466" class="t-main">Embedder.embed(raw_text) → vector</text>
-  <text x="72" y="486" class="t-code">services/indexing.py:50 — default: fastembed, runs locally</text>
+  <text x="72" y="486" class="t-code">services/indexing.py:70 — default: fastembed, runs locally</text>
 
   <path d="M320 496 L320 516" class="edge" marker-end="url(#arrowCap)"/>
   <text x="332" y="512" class="t-label">upsert</text>
@@ -288,11 +288,11 @@ fail the request.
   <circle cx="48" cy="548" r="14" class="stepdot"/><text x="48" y="553" text-anchor="middle" class="t-step">6</text>
   <rect x="24" y="520" width="592" height="56" rx="10" class="svgai"/>
   <text x="72" y="546" class="t-main">VectorStore.upsert(point) → Qdrant</text>
-  <text x="72" y="566" class="t-code">ai/vectorstore.py:108 — collection ensured on first write</text>
+  <text x="72" y="566" class="t-code">ai/vectorstore.py:85 — collection ensured on first write</text>
 
   <rect x="24" y="584" width="592" height="52" rx="10" class="svgfail"/>
   <text x="40" y="606" class="t-fail">✗ embedder / Qdrant down → logged, never blocks</text>
-  <text x="40" y="626" class="t-failsub">brain reindex repairs later (services/ingest.py:114)</text>
+  <text x="40" y="626" class="t-failsub">brain reindex repairs later (services/ingest.py:135)</text>
 
   <path d="M320 636 L320 656" class="edge" marker-end="url(#arrowCap)"/>
   <text x="332" y="652" class="t-label">201 always</text>
@@ -306,7 +306,7 @@ fail the request.
     </marker>
   </defs>
 </svg>
-<figcaption>Capture. The failure side-notes sit directly below the steps they apply to; the commit happens once, at <code>ingest.py:63</code>, after both AI steps have had their chance.</figcaption>
+<figcaption>Capture. The failure side-notes sit directly below the steps they apply to; the commit happens once, at <code>ingest.py:70</code>, after both AI steps have had their chance.</figcaption>
 </figure>
 
 <h2 id="search">4 · Flow: semantic search (<code>GET /search</code>)</h2>
@@ -338,7 +338,7 @@ fail the request.
   <circle cx="48" cy="256" r="14" class="stepdot"/><text x="48" y="261" text-anchor="middle" class="t-step">3</text>
   <rect x="24" y="228" width="592" height="56" rx="10" class="svgai"/>
   <text x="72" y="254" class="t-main">Qdrant ANN → top (limit + offset) candidates</text>
-  <text x="72" y="274" class="t-code">ai/vectorstore.py:129</text>
+  <text x="72" y="274" class="t-code">ai/vectorstore.py:147</text>
 
   <path d="M320 284 L320 304" class="edge" marker-end="url(#arrowSea)"/>
   <text x="332" y="300" class="t-label">rerank (Jev)</text>
@@ -346,7 +346,7 @@ fail the request.
   <circle cx="48" cy="336" r="14" class="stepdot"/><text x="48" y="341" text-anchor="middle" class="t-step">4</text>
   <rect x="24" y="308" width="592" height="56" rx="10" class="svgai"/>
   <text x="72" y="334" class="t-main">JevReranker reorders candidates</text>
-  <text x="72" y="354" class="t-code">one batched Jev call, most relevant first · ai/rerank.py:55</text>
+  <text x="72" y="354" class="t-code">one batched Jev call, most relevant first · ai/rerank.py:41</text>
 
   <rect x="24" y="372" width="592" height="40" rx="10" class="svgfail"/>
   <text x="40" y="398" class="t-fail">✗ Jev down → keep vector order (ai/rerank.py:47)</text>
@@ -445,7 +445,7 @@ fail the request.
 <figure>
 <svg viewBox="0 0 640 538" role="img" aria-labelledby="mut-t mut-d">
   <title id="mut-t">Update, delete and reindex flows</title>
-  <desc id="mut-d">PATCH updates the Postgres row and re-embeds only if an indexed field changed. DELETE removes the row and its vector. The brain reindex CLI purges the Qdrant collection and rebuilds it from Postgres.</desc>
+  <desc id="mut-d">PATCH updates the Postgres row and re-embeds only if an indexed field changed. DELETE removes the row and its vector. The brain reindex CLI probes the embedder, purges the Qdrant collection, and rebuilds it from Postgres with one batched embed + upsert per DB batch.</desc>
 
   <text x="24" y="26" class="t-head">PATCH /items/{id}</text>
   <rect x="24" y="36" width="300" height="52" rx="10" class="svgbox"/>
@@ -483,7 +483,7 @@ fail the request.
 
   <rect x="356" y="114" width="260" height="52" rx="10" class="svgai"/>
   <text x="372" y="136" class="t-main">VectorStore.remove(id)</text>
-  <text x="372" y="156" class="t-code">indexing.py:58</text>
+  <text x="372" y="156" class="t-code">indexing.py:112</text>
 
   <path d="M486 170 L486 188" class="edge" marker-end="url(#arrowMut)"/>
   <rect x="356" y="192" width="260" height="44" rx="10" class="svgok"/>
@@ -494,9 +494,9 @@ fail the request.
 
   <text x="24" y="408" class="t-head">brain reindex — the self-healing path</text>
   <rect x="24" y="418" width="592" height="104" rx="10" class="svgbox"/>
-  <text x="40" y="442" class="t-code">1 · purge: drop + recreate the collection (indexing.py:62)</text>
-  <text x="40" y="464" class="t-code">2 · page through every memory_items row in batches</text>
-  <text x="40" y="486" class="t-code">3 · embed + upsert each item</text>
+  <text x="40" y="442" class="t-code">1 · probe embedder; failure leaves collection intact (ingest.py:88)</text>
+  <text x="40" y="464" class="t-code">2 · purge: drop + recreate the collection (indexing.py:116)</text>
+  <text x="40" y="486" class="t-code">3 · per DB batch: one embed + one upsert (indexing.py:83)</text>
   <text x="40" y="508" class="t-code">4 · exit 0 · failure → 'PARTIAL; rerun' exit 1 (cli.py:66-77)</text>
 
   <defs>
@@ -548,19 +548,19 @@ Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
 <tbody>
 <tr>
   <td><strong>Jev</strong> (classify / rerank)</td>
-  <td>item saved unclassified, stays <code>inbox</code>; warning logged (<code>ingest.py:98</code>)</td>
+  <td>item saved unclassified, stays <code>inbox</code>; warning logged (<code>ingest.py:114</code>)</td>
   <td>results in vector order, unreranked (<code>ai/rerank.py:47</code>)</td>
   <td>works — /ask never calls Jev</td>
 </tr>
 <tr>
   <td><strong>Qdrant</strong></td>
-  <td>row saved without vector; warning logged (<code>ingest.py:114</code>); <code>brain reindex</code> repairs</td>
+  <td>row saved without vector; warning logged (<code>ingest.py:135</code>); <code>brain reindex</code> repairs</td>
   <td>keyword FTS fallback, <code>score: null</code> (<code>search.py:59</code>)</td>
   <td>works with fallback sources (fewer / rougher)</td>
 </tr>
 <tr>
   <td><strong>Embedder</strong></td>
-  <td>same as Qdrant — no vector is produced (<code>ingest.py:114</code>)</td>
+  <td>same as Qdrant — no vector is produced (<code>ingest.py:135</code>)</td>
   <td>same keyword fallback (<code>search.py:59</code>)</td>
   <td>same as Qdrant</td>
 </tr>
@@ -581,7 +581,7 @@ Routing: <code>route()</code> maps confidence ≥ 0.90 → <code>filed</code>,
 
 <p class="refs">
 No API keys at all? The stack still runs: fastembed embeds locally
-(<code>ai/embedder.py:111</code>), and the README's dogfood checklist exercises
+(<code>ai/embedder.py:138</code>), and the README's dogfood checklist exercises
 capture → keyword search with zero keys configured.
 </p>
 

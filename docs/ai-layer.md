@@ -26,9 +26,9 @@ tokens.
 | ------ | ---------------- | ------- |
 | `jev.py` | `JevClient` — typed-decision API adapter (`choice`, `score`, `score_batch`, `decide`) | Adapter |
 | `classify.py` | `classify(text)` → `{type, project, importance, actionability, confidence}`; `route(confidence)` → `ItemStatus`; `JevClassifier` adapter. Enums come from `brain.db.enums` (single shared definition) | Service / Adapter |
-| `embedder.py` | `Embedder` protocol; `OpenAIEmbedder` (network), `FastEmbedEmbedder` (local fastembed), `FakeEmbedder` (deterministic, offline) | Strategy |
-| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError`; `ensure_collection` rejects a dim mismatch (remedy: `brain reindex`) | Repository / Adapter |
-| `rerank.py` | `rerank(question, candidates, top_n)` — Jev-scored relevance ordering; `JevReranker` adapter | Strategy |
+| `embedder.py` | `Embedder` protocol (`embed`, `embed_batch`); `OpenAIEmbedder` (network), `FastEmbedEmbedder` (local fastembed), `FakeEmbedder` (deterministic, offline) | Strategy |
+| `vectorstore.py` | `VectorStore` protocol; `QdrantVectorStore` (`ensure_collection`, `upsert`, `upsert_many`, `delete`, `delete_collection`, `search`); qdrant failures surface as `VectorStoreError`; `ensure_collection` rejects a dim mismatch (remedy: `brain reindex`) | Repository / Adapter |
+| `rerank.py` | `rerank(question, candidates, jev, top_n)` — Jev-scored relevance ordering (`jev` is a required dependency); `JevReranker` adapter | Strategy |
 | `ask.py` | `LLMClient` protocol; `ClaudeLLMClient`, `FakeLLMClient`; `answer(question, context_items)` → `{answer, cited_ids}` | Strategy |
 | `claude_sdk.py` | `ClaudeSdkLLMClient` — single-turn, tool-less Claude Code session (`tools=[]` → `--tools ''`, `setting_sources=[]`, `strict_mcp_config=True`, scratch `cwd`); auth = local login, no env overrides; SDK errors → `LLMError` | Adapter / Strategy |
 
@@ -160,10 +160,12 @@ The layer is wired into the app on this branch (see also README):
 - **AskService** (`services/ask.py`): `POST /ask` searches top-k and answers
   via `LLMClient` with `[id]` citations. LLM failures raise `LLMError`, mapped
   to HTTP 502 by the router layer.
-- **CLI**: `brain reindex` (`src/brain/cli.py`) does a full rebuild — it purges
-  the Qdrant collection first, which also removes ghost vectors for items no
-  longer in Postgres — then re-embeds every item page by page; exits 1 with a
-  clear message when embeddings or Qdrant are unavailable.
+- **CLI**: `brain reindex` (`src/brain/cli.py`) does a full rebuild — it probes
+  the embedder first (an embedder failure leaves the collection untouched),
+  then purges the Qdrant collection, which also removes ghost vectors for
+  items no longer in Postgres — then re-embeds and upserts one whole DB batch
+  per round-trip (`Embedder.embed_batch` + `VectorStore.upsert_many`); exits 1
+  with a clear message when embeddings or Qdrant are unavailable.
 - **Collections**: `QdrantVectorStore.ensure_collection` is called with the
   active embedder's `dim` (384 for fastembed's `BAAI/bge-small-en-v1.5`, 1536
   for `text-embedding-3-small`); an existing collection with a different dim

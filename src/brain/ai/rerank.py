@@ -24,20 +24,19 @@ DEFAULT_TOP_N = 5
 def rerank(
     question: str,
     candidates: Sequence[Mapping[str, Any]],
+    jev: JevClientProtocol,
     top_n: int = DEFAULT_TOP_N,
-    jev: JevClientProtocol | None = None,
 ) -> list[Mapping[str, Any]]:
     """Return up to ``top_n`` candidates, most relevant first.
 
-    Each candidate is a mapping with ``id`` and ``text`` keys. Scores come
+    Each candidate is a mapping with ``id`` and ``text`` keys; ``jev`` is the
+    required scoring dependency (build one in the DI factory). Scores come
     from one batched Jev call. If Jev is unreachable or returns malformed
     data, the candidates are returned in their original order (trust the
     vector search ranking); this function never raises.
     """
     if not candidates:
         return []
-    if jev is None:
-        raise ValueError("rerank requires a Jev client; build one in the DI factory")
     try:
         scores = jev.score_batch(
             f"How relevant is this candidate to the question: {question}",
@@ -64,4 +63,4 @@ class JevReranker:
         top_n: int = DEFAULT_TOP_N,
     ) -> list[Mapping[str, Any]]:
         """Rerank ``candidates`` by Jev-scored relevance to ``question``."""
-        return rerank(question, candidates, top_n, self.jev)
+        return rerank(question, candidates, self.jev, top_n)
