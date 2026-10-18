@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from brain.config import DEFAULT_SDK_TIMEOUT_S
 
-from .ask import LLMError
+from .ask import Completion, LLMError
 
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions
@@ -70,17 +70,7 @@ class ClaudeSdkLLMClient:
         self._model = model
         self._timeout_s = timeout_s
         self._query_fn = query_fn if query_fn is not None else _sdk_query
-        self._answered_model: str | None = None
         self._scratch_dir = Path(scratch_dir) if scratch_dir else self._make_scratch_dir()
-
-    @property
-    def model(self) -> str | None:
-        """Model that answered the last call (SDK-reported, else configured).
-
-        Falls back to the configured value when the SDK messages do not carry
-        one, and to ``None`` when nothing is configured (CLI default).
-        """
-        return self._answered_model or self._model
 
     @staticmethod
     def _make_scratch_dir() -> Path:
@@ -90,7 +80,7 @@ class ClaudeSdkLLMClient:
         """Remove the scratch dir (idempotent; missing dirs are ignored)."""
         shutil.rmtree(self._scratch_dir, ignore_errors=True)
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the model's completion for ``prompt``.
 
         Uses ``asyncio.run`` internally: do NOT call from inside a running
@@ -109,7 +99,7 @@ class ClaudeSdkLLMClient:
         except _sdk_error_types() as exc:
             raise LLMError(f"claude sdk failed: {type(exc).__name__}: {exc}") from exc
 
-    async def _collect_text(self, prompt: str) -> str:
+    async def _collect_text(self, prompt: str) -> Completion:
         from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
 
         options = ClaudeAgentOptions(
@@ -131,11 +121,12 @@ class ClaudeSdkLLMClient:
                 )
                 if message.model:
                     answered_model = message.model
-        self._answered_model = answered_model
         text = "".join(texts).strip()
         if not text:
             raise LLMError("claude sdk returned no text")
-        return text
+        # Per-call data, never stored on the client: the shared app-lifetime
+        # singleton must not let concurrent requests observe each other's model.
+        return Completion(text, model=answered_model or self._model)
 
 
 def _sdk_query(*, prompt: str, options: ClaudeAgentOptions | None) -> AsyncIterator[Any]:

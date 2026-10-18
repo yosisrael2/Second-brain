@@ -37,7 +37,7 @@ def test_complete_returns_joined_assistant_text():
     )
     client = ClaudeSdkLLMClient(query_fn=fake)
 
-    assert client.complete("What is 2+2?") == "The 4"
+    assert client.complete("What is 2+2?").text == "The 4"
 
 
 def test_complete_configures_a_locked_down_single_turn_session(tmp_path):

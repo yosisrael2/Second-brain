@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -33,20 +34,23 @@ class LLMError(RuntimeError):
     """An LLM request failed or returned an unusable payload."""
 
 
+@dataclass(frozen=True)
+class Completion:
+    """A model reply plus the model that produced it (None when unattributed).
+
+    Carried per call — never stored on the (shared, app-lifetime) client — so
+    concurrent requests cannot observe each other's model.
+    """
+
+    text: str
+    model: str | None = None
+
+
 class LLMClient(Protocol):
     """Strategy interface for text generation backends."""
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the model's completion for ``prompt``."""
-        ...
-
-    @property
-    def model(self) -> str | None:
-        """The model that answered the most recent ``complete`` call.
-
-        ``None`` when the backend does not expose it (e.g. the Claude Code
-        CLI default with no ``CLAUDE_SDK_MODEL`` configured).
-        """
         ...
 
     def close(self) -> None:
@@ -75,26 +79,21 @@ class ClaudeLLMClient:
         self._max_tokens = max_tokens
         self._url = base_url.rstrip("/") + "/messages"
         self._timeout_s = timeout_s
-        self._answered_model: str | None = None
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
-
-    @property
-    def model(self) -> str | None:
-        """Model that answered the last call (API-reported, else configured)."""
-        return self._answered_model
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool."""
         self._http.close()
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the model's completion for ``prompt``."""
         if not self._api_key:
             raise LLMError("no API key configured for the LLM (ANTHROPIC_API_KEY)")
         logger.info("llm: provider=anthropic model=%s", self._model)
         response = self._post(self._api_key, prompt)
-        self._answered_model = self._extract_model(response) or self._model
-        return self._extract_text(response)
+        return Completion(
+            self._extract_text(response), self._extract_model(response) or self._model
+        )
 
     @staticmethod
     def _extract_model(response: httpx.Response) -> str | None:
@@ -161,11 +160,10 @@ class FakeLLMClient:
     def close(self) -> None:
         """No-op: mirrors the real clients' lifecycle method."""
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         self.prompts.append(prompt)
-        if callable(self._reply):
-            return self._reply(prompt)
-        return self._reply
+        text = self._reply(prompt) if callable(self._reply) else self._reply
+        return Completion(text, model=self.model)
 
 
 def item_text(item: Mapping[str, Any]) -> str:
@@ -196,11 +194,11 @@ def answer(
     answered (None when the backend does not expose one). LLM failures raise
     :class:`LLMError`; callers own the fallback policy.
     """
-    answer_text = llm.complete(build_prompt(question, context_items))
+    completion = llm.complete(build_prompt(question, context_items))
     return {
-        "answer": answer_text,
-        "cited_ids": extract_cited_ids(answer_text, context_items),
-        "model": getattr(llm, "model", None),
+        "answer": completion.text,
+        "cited_ids": extract_cited_ids(completion.text, context_items),
+        "model": completion.model,
     }
 
 

@@ -91,7 +91,7 @@ class TestClaudeLLMClient:
             )
 
         client = ClaudeLLMClient(api_key="k", transport=httpx.MockTransport(handler))
-        text = client.complete("which port?")
+        text = client.complete("which port?").text
 
         assert seen["url"].endswith("/v1/messages")
         assert seen["key_header"] == "k"
