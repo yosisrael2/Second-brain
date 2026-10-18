@@ -45,7 +45,14 @@ class IngestService:
         self._indexer = indexer
 
     def create(self, data: schemas.ItemCreate, classify: bool = True) -> MemoryItem:
-        """Create a memory item, classify it on request, and index it."""
+        """Create a memory item, classify it on request, and index it.
+
+        Classification (when ``classify`` and the caller did not send ``type``)
+        fills ONLY the fields the caller did not explicitly send — an explicit
+        ``status``/``importance``/``actionability``/``confidence``/``project``
+        is never overwritten (``model_fields_set`` distinguishes sent from
+        defaulted fields).
+        """
         item = MemoryItem(
             raw_text=data.raw_text,
             source=data.source,
@@ -58,7 +65,7 @@ class IngestService:
         )
         self._repo.add(item)
         if classify:
-            self._apply_classification(item)
+            self._apply_classification(item, explicit=frozenset(data.model_fields_set))
         self._index(item)
         self._repo.commit()
         return item
@@ -89,9 +96,14 @@ class IngestService:
                 indexed += 1
             offset += len(batch)
 
-    def _apply_classification(self, item: MemoryItem) -> None:
-        """Fill unclassified fields from the classifier; never raises."""
-        if item.type is not None:
+    def _apply_classification(self, item: MemoryItem, *, explicit: frozenset[str]) -> None:
+        """Fill unclassified fields from the classifier; never raises.
+
+        Fields the caller explicitly sent are left untouched (only ``type``
+        absent triggers classification at all); ``status`` is routed only when
+        the caller did not send one.
+        """
+        if "type" in explicit or item.type is not None:
             return  # caller classified the item explicitly; respect that
         try:
             result = self._classifier.classify(item.raw_text)
@@ -101,11 +113,16 @@ class IngestService:
         if result["type"] is None:
             return  # classifier fallback: nothing to apply
         item.type = result["type"]
-        item.project = result["project"]
-        item.importance = result["importance"]
-        item.actionability = result["actionability"]
-        item.confidence = result["confidence"]
-        item.status = route(result["confidence"])
+        if "project" not in explicit:
+            item.project = result["project"]
+        if "importance" not in explicit:
+            item.importance = result["importance"]
+        if "actionability" not in explicit:
+            item.actionability = result["actionability"]
+        if "confidence" not in explicit:
+            item.confidence = result["confidence"]
+        if "status" not in explicit:
+            item.status = route(result["confidence"])
 
     def _index(self, item: MemoryItem) -> None:
         """Index the item; index failures defer to ``reindex`` (never block)."""

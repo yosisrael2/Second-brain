@@ -8,6 +8,7 @@ cd "$ROOT"
 # shellcheck disable=SC1091  # dynamic path: lib.sh sits next to this script
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+PORT="${PORT:-8000}"
 PID_FILE=".dev/uvicorn.pid"
 DOWN=0
 PURGE=0
@@ -30,44 +31,11 @@ EOF
 say() { printf '%s\n' "$*"; }
 die() { printf 'dev-stop: %s\n' "$*" >&2; exit 1; }
 
-is_our_server() {
-  # $1 = pid; true when the process is the uvicorn this script started.
-  local cmd
-  cmd="$(ps -p "$1" -o command= 2>/dev/null || true)"
-  [[ "$cmd" == *uvicorn*brain.main:app* ]]
-}
-
 stop_server() {
-  if [ ! -f "$PID_FILE" ]; then
-    say "uvicorn: not running (no pid file)"
-    return 0
-  fi
-  local pid
-  pid="$(cat "$PID_FILE")"
-  if ! is_our_server "$pid"; then
-    local cmd
-    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    say "uvicorn: pid $pid in $PID_FILE is not our server (now: ${cmd:-<gone>}); leaving it alone"
-    rm -f "$PID_FILE"
-    return 0
-  fi
-  # Kill the whole tree first (uvicorn --reload runs a child worker), then the
-  # supervisor; escalate to SIGKILL only if something survives.
-  pkill -TERM -P "$pid" 2>/dev/null || true
-  kill -TERM "$pid" 2>/dev/null || true
-  local _
-  for _ in $(seq 1 20); do
-    if ! kill -0 "$pid" 2>/dev/null; then break; fi
-    if ! pgrep -P "$pid" >/dev/null 2>&1 && ! kill -0 "$pid" 2>/dev/null; then break; fi
-    sleep 0.5
-  done
-  if kill -0 "$pid" 2>/dev/null || pgrep -P "$pid" >/dev/null 2>&1; then
-    say "uvicorn: pid $pid survived TERM; sending SIGKILL to the tree"
-    pkill -KILL -P "$pid" 2>/dev/null || true
-    kill -KILL "$pid" 2>/dev/null || true
-  fi
-  rm -f "$PID_FILE"
-  say "uvicorn: stopped"
+  # Shared app-stop logic (pid file + orphans on PORT) lives in lib.sh so
+  # dev-start's self-healing restart behaves identically. App only — never
+  # containers or volumes (those are --down / --purge-data below).
+  stop_uvicorn_app "$PID_FILE" "$PORT"
 }
 
 stop_compose() {

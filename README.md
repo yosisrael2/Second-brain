@@ -200,7 +200,8 @@ claude -p ok            # verifies the Claude Code login; run `claude` + /login 
 uvicorn brain.main:app --port 8000
 
 # 4. Capture with auto-classification (Jev fills type/importance/actionability,
-#    confidence, and routes by confidence)
+#    confidence, and routes by confidence; fields you sent explicitly in the
+#    payload are never overwritten — classification only fills what's missing)
 curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
   -d '{"raw_text": "Renew the TLS certificate before Friday"}'
 # expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
@@ -236,6 +237,7 @@ scripts/dev-start.sh             # preflight (docker, venv, .env, jev/claude sta
                                  # compose up + health wait, alembic, uvicorn on :8000
 scripts/dev-start.sh --reindex   # also rebuild the vector collection first
 scripts/dev-start.sh --no-reload # production-ish uvicorn (no file watching)
+scripts/dev-start.sh --force-port# kill a FOREIGN port holder without asking
 scripts/dev-stop.sh              # stop uvicorn (pid file)
 scripts/dev-stop.sh --down       # also stop postgres + qdrant containers
 scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
@@ -243,6 +245,16 @@ scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
 
 Behavior worth knowing:
 
+- **Self-healing restart** — running `dev-start.sh` when our uvicorn is
+  already running (pid file or orphan on the port) stops it first (TERM,
+  wait, KILL escalation — the same shared logic `dev-stop.sh` uses) and
+  starts fresh. Running it twice in a row is safe and just restarts.
+- **Port holders** — if the app port is held by a FOREIGN process, the
+  script shows pid + command and asks `kill it? [y/N]` (refusing by default
+  when non-interactive); `--force-port` kills without asking. Protected
+  processes are NEVER killed: docker/rancher/colima/vpnkit proxies,
+  anything on 5432/6333 (those are the reuse path below), pid 1, or the
+  script's own shell.
 - **Stable compose project** — both scripts resolve `COMPOSE_PROJECT_NAME`
   identically (`scripts/lib.sh`: real environment > `.env` > default
   `second-brain-dev`) and print it before any docker call, so a stop can never
@@ -258,10 +270,10 @@ Behavior worth knowing:
   and checks the `claude` CLI is installed (no LLM round-trip — if `/ask`
   returns 502, run `claude` once and `/login`). `JEV_BASE_URL` is optional —
   the default works.
-- **State** — pid + log live under `.dev/` (gitignored). Starting twice is
-  safe: it refuses with the running pid. A busy port is refused with the
-  holder named. `PORT` overrides the default 8000. Stopping kills the whole
-  uvicorn tree (no orphans under `--reload`).
+- **State** — pid + log live under `.dev/` (gitignored). A busy port is
+  never silently taken over (see self-healing above). `PORT` overrides the
+  default 8000. Stopping kills the whole uvicorn tree (no orphans under
+  `--reload`).
 - **Data purge** — `scripts/dev-stop.sh --purge-data` deletes the resolved
   project's docker volumes (all items + vectors), naming the project and each
   volume in the confirmation prompt (`PURGE` to proceed).
@@ -324,8 +336,15 @@ mypy src/brain/ai      # type check (strict-ish; config in pyproject [tool.mypy]
 
 `tests/test_health.py` needs no infrastructure. DB-backed tests
 (`tests/test_items.py`) need the docker-compose Postgres running (they apply
-Alembic migrations to the configured `DATABASE_URL` and clean the table after
-each test; they skip with a hint if Postgres is unreachable).
+Alembic migrations and clean the table after each test; they skip with a hint
+if Postgres is unreachable).
+
+The suite NEVER touches a developer's database: `tests/conftest.py` pins
+`DATABASE_URL` to a separate `brain_test` database (created on demand),
+refuses to run at all against a non-`*_test` URL, and the destructive
+`clean_items` teardown double-checks the engine URL in use before deleting.
+`tests/test_db_isolation.py` proves the point: it seeds a marker row in the
+dev database, runs the DB-backed suite, and asserts the marker survives.
 
 ## Adding a feature
 
@@ -352,8 +371,9 @@ each test; they skip with a hint if Postgres is unreachable).
 
 ## Next steps
 
-For the next worker. Items in section 1 are **in progress on `feature/mvp-hardening` and NOT on main yet**.
-Anything marked **PROPOSAL** is an idea, not a decided behavior.
+For the next worker. Items marked **landed in PR #3** are on `feature/mvp-hardening`
+(also not on main yet — PR #3 is stacked on PR #1). Anything marked
+**PROPOSAL** is an idea, not a decided behavior.
 
 ### 1. In progress — `feature/mvp-hardening` (not on main yet)
 
@@ -361,15 +381,15 @@ Anything marked **PROPOSAL** is an idea, not a decided behavior.
 | --- | --- | --- | --- |
 | Reindex batching | reindex embeds+upserts one item per call (~2N round-trips) | `src/brain/services/ingest.py`, `src/brain/services/indexing.py` | one embed + one upsert per DB batch; identical final state; 1k items reindex in seconds |
 | Embedder probe before purge | purge-then-fail leaves the collection empty | `src/brain/services/ingest.py` (`reindex`) | EmbedderError before purge leaves the collection untouched |
-| Search N+1 → get_many | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
-| Delete dead `ItemsService.create` | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
-| UUID guard in `_load_items` | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
-| Deterministic list ordering (secondary sort on id) | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
-| Qdrant healthcheck in compose | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
-| dev-start self-healing restart | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
-| Test DB isolation | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
-| Seed-demo script | fresh clone has an empty DB | `scripts/` | `scripts/seed-demo.sh` fills a few example items |
-| `/ask` source truncation | a 10k-char item can blow the prompt | `src/brain/services/ask.py`, `src/brain/ai/ask.py` | per-source prompt budget enforced |
+| Search N+1 → get_many — **landed in PR #3** | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
+| Delete dead `ItemsService.create` — **landed in PR #3** | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
+| UUID guard in `_load_items` — **landed in PR #3** | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
+| Deterministic list ordering (secondary sort on id) — **landed in PR #3** | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
+| Qdrant healthcheck in compose — **landed in PR #3** | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
+| dev-start self-healing restart — **landed in PR #3** | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
+| Test DB isolation — **landed in PR #3** | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
+| Seed-demo script — **landed in PR #3** | fresh clone has an empty DB | `scripts/` | `scripts/seed-demo.sh` fills a few example items |
+| `/ask` source truncation — **landed in PR #3** | a 10k-char item can blow the prompt | `src/brain/services/ask.py`, `src/brain/ai/ask.py` | per-source prompt budget enforced |
 | Config shim removal | ai modules re-export config defaults nobody imports | `src/brain/ai/jev.py` (same pattern in ask/embedder) | grep shows no shim imports |
 | `rerank(jev=...)` required | optional param + ValueError guard for a required dep | `src/brain/ai/rerank.py` | signature requires `jev`; guard deleted |
 
