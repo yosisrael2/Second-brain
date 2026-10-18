@@ -5,6 +5,11 @@
 
 LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# User-facing log line: plain stdout. Defined HERE so lib.sh is self-sufficient
+# when sourced alone (tests/tools source it in a bare `bash -c`): an undefined
+# `say` falls through to macOS /usr/bin/say and SPEAKS the message aloud.
+say() { printf '%s\n' "$*"; }
+
 # Resolve the docker CLI (falls back to the Rancher Desktop context).
 resolve_docker() {
   DOCKER=(docker)

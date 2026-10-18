@@ -59,6 +59,19 @@ def test_scripts_pass_shellcheck_when_installed():
         assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_lib_sh_defines_say_as_a_function():
+    """lib.sh sourced alone must own `say` as a shell function.
+
+    lib.sh calls say() but the snippets that source it (e.g. tests, tools)
+    do not define it; an undefined say falls through to macOS /usr/bin/say,
+    which SPEAKS the log message aloud through the speakers.
+    """
+    result = _bash_snippet(f"cd {REPO_ROOT} && source scripts/lib.sh && type -t say")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "function"
+
+
 def test_dev_start_help_exits_zero_without_side_effects():
     result = _bash("dev-start.sh", "--help")
 
