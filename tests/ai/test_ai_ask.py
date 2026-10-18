@@ -96,7 +96,7 @@ class TestClaudeLLMClient:
         assert seen["url"].endswith("/v1/messages")
         assert seen["key_header"] == "k"
         assert seen["version"] == "2023-06-01"
-        assert seen["body"]["model"] == "claude-sonnet-4-5"
+        assert seen["body"]["model"] == "claude-sonnet-5-5"
         assert seen["body"]["messages"] == [{"role": "user", "content": "which port?"}]
         assert text == "Port 8000."  # non-text blocks skipped, texts joined
 

@@ -79,8 +79,10 @@ class AskQuestion(BaseModel):
 
 
 class AskAnswer(BaseModel):
-    """Response for POST /ask: answer, cited item ids, and the sources used."""
+    """Response for POST /ask: answer, cited item ids, the sources used, and
+    the model that answered (None when the backend does not expose one)."""
 
     answer: str
     cited_ids: list[str]
     sources: list[SearchResultRead]
+    model: str | None = None

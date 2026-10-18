@@ -18,4 +18,6 @@ def ask(
     """Answer a question from the most relevant memory items, with citations."""
     result = service.ask(data.question)
     sources = [to_result_read(hit) for hit in result.sources]
-    return schemas.AskAnswer(answer=result.answer, cited_ids=result.cited_ids, sources=sources)
+    return schemas.AskAnswer(
+        answer=result.answer, cited_ids=result.cited_ids, sources=sources, model=result.model
+    )

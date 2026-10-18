@@ -17,6 +17,7 @@ class AskResult:
     answer: str
     cited_ids: list[str] = field(default_factory=list)
     sources: list[SearchHit] = field(default_factory=list)
+    model: str | None = None
 
 
 class AskService:
@@ -40,4 +41,5 @@ class AskService:
             answer=result["answer"],
             cited_ids=result["cited_ids"],
             sources=hits,
+            model=result["model"],
         )

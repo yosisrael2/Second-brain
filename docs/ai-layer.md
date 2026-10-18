@@ -61,8 +61,13 @@ tokens.
 
 - Builds a prompt listing each context item as `- [id] text` and instructs the
   model to cite ids in square brackets.
-- Returns `{"answer": str, "cited_ids": [...]}` where `cited_ids` are the
-  context ids actually cited in the answer text.
+- Returns `{"answer": str, "cited_ids": [...], "model": str | None}` where
+  `cited_ids` are the context ids actually cited in the answer text and
+  `model` is the model that actually answered — read from the backend's
+  response (`AssistantMessage.model` for the claude_sdk provider, the
+  Messages API response `model` field for anthropic), falling back to the
+  configured value, else `None` (CLI default, unconfigured). Each LLM call
+  also logs `provider` + requested model (or `cli-default`) at INFO.
 - LLM failures raise `LLMError`; callers own the fallback policy.
 
 ### Security model of /ask (claude_sdk provider)
@@ -103,7 +108,7 @@ Revisit only if real production traffic shows a need.
 | -------- | ------- | ------- |
 | `LLM_PROVIDER` | `claude_sdk` | provider Factory (`factories.py`) |
 | `EMBEDDER_PROVIDER` | `fastembed` | provider Factory (`factories.py`) |
-| `CLAUDE_SDK_MODEL` | — (unset = login default) | `ClaudeSdkLLMClient` |
+| `CLAUDE_SDK_MODEL` | — (unset = login default; e.g. `claude-haiku-5-5` for faster /ask, `claude-sonnet-5-5` for quality) | `ClaudeSdkLLMClient` |
 | `CLAUDE_SDK_TIMEOUT_S` | `120` | `ClaudeSdkLLMClient` |
 | `FASTEMBED_MODEL` | `BAAI/bge-small-en-v1.5` (dim 384) | `FastEmbedEmbedder` |
 | `JEV_API_KEY` | — (optional; unset = fail-closed fallback) | `JevClient` |
@@ -116,7 +121,7 @@ Revisit only if real production traffic shows a need.
 | `OPENAI_TIMEOUT_S` | `30` | `OpenAIEmbedder` |
 | `ANTHROPIC_API_KEY` | — (optional; only when `LLM_PROVIDER=anthropic`; otherwise `/ask` uses the local login) | `ClaudeLLMClient` |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com/v1` | `ClaudeLLMClient` |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-5` | `ClaudeLLMClient` |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | `ClaudeLLMClient` |
 | `ANTHROPIC_MAX_TOKENS` | `1024` | `ClaudeLLMClient` |
 | `ANTHROPIC_TIMEOUT_S` | `60` | `ClaudeLLMClient` |
 | `QDRANT_URL` | `http://localhost:6333` | `QdrantVectorStore` |

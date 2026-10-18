@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
@@ -16,6 +17,8 @@ from brain.config import (
 )
 
 from ._http import post_json
+
+logger = logging.getLogger(__name__)
 
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -35,6 +38,15 @@ class LLMClient(Protocol):
 
     def complete(self, prompt: str) -> str:
         """Return the model's completion for ``prompt``."""
+        ...
+
+    @property
+    def model(self) -> str | None:
+        """The model that answered the most recent ``complete`` call.
+
+        ``None`` when the backend does not expose it (e.g. the Claude Code
+        CLI default with no ``CLAUDE_SDK_MODEL`` configured).
+        """
         ...
 
     def close(self) -> None:
@@ -63,7 +75,13 @@ class ClaudeLLMClient:
         self._max_tokens = max_tokens
         self._url = base_url.rstrip("/") + "/messages"
         self._timeout_s = timeout_s
+        self._answered_model: str | None = None
         self._http = httpx.Client(timeout=timeout_s, transport=transport)
+
+    @property
+    def model(self) -> str | None:
+        """Model that answered the last call (API-reported, else configured)."""
+        return self._answered_model
 
     def close(self) -> None:
         """Release the underlying HTTP connection pool."""
@@ -73,8 +91,19 @@ class ClaudeLLMClient:
         """Return the model's completion for ``prompt``."""
         if not self._api_key:
             raise LLMError("no API key configured for the LLM (ANTHROPIC_API_KEY)")
+        logger.info("llm: provider=anthropic model=%s", self._model)
         response = self._post(self._api_key, prompt)
+        self._answered_model = self._extract_model(response) or self._model
         return self._extract_text(response)
+
+    @staticmethod
+    def _extract_model(response: httpx.Response) -> str | None:
+        """Best-effort model id from the API response (None when absent)."""
+        try:
+            model = response.json().get("model")
+        except Exception:  # noqa: BLE001 - text extraction reports malformed payloads
+            return None
+        return model if isinstance(model, str) and model else None
 
     def _post(self, api_key: str, prompt: str) -> httpx.Response:
         return post_json(
@@ -120,8 +149,13 @@ class FakeLLMClient:
     ``prompts`` records every prompt it was given.
     """
 
-    def __init__(self, reply: str | Callable[[str], str] = "No relevant information.") -> None:
+    def __init__(
+        self,
+        reply: str | Callable[[str], str] = "No relevant information.",
+        model: str | None = "fake-llm",
+    ) -> None:
         self._reply = reply
+        self.model = model
         self.prompts: list[str] = []
 
     def close(self) -> None:
@@ -157,12 +191,17 @@ def answer(
 ) -> dict[str, Any]:
     """Answer ``question`` from ``context_items``, citing item ids.
 
-    Returns ``{answer, cited_ids}`` where ``cited_ids`` lists every context
-    item id referenced in the answer text. LLM failures raise
+    Returns ``{answer, cited_ids, model}`` where ``cited_ids`` lists every context
+    item id referenced in the answer text and ``model`` is the model that
+    answered (None when the backend does not expose one). LLM failures raise
     :class:`LLMError`; callers own the fallback policy.
     """
     answer_text = llm.complete(build_prompt(question, context_items))
-    return {"answer": answer_text, "cited_ids": extract_cited_ids(answer_text, context_items)}
+    return {
+        "answer": answer_text,
+        "cited_ids": extract_cited_ids(answer_text, context_items),
+        "model": getattr(llm, "model", None),
+    }
 
 
 def extract_cited_ids(answer_text: str, context_items: Sequence[Mapping[str, Any]]) -> list[str]:

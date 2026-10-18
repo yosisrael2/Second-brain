@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
 DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com/v1"
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-5"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_ANTHROPIC_TIMEOUT_S = 60.0
 DEFAULT_SDK_TIMEOUT_S = 120.0

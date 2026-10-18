@@ -9,6 +9,7 @@ and we never read, copy, or log credentials.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
@@ -21,6 +22,8 @@ from .ask import LLMError
 
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions
+
+logger = logging.getLogger(__name__)
 
 # The full ask prompt (question, sources, citation rules) rides in the system
 # prompt; the user turn only nudges the model to answer it.
@@ -67,7 +70,17 @@ class ClaudeSdkLLMClient:
         self._model = model
         self._timeout_s = timeout_s
         self._query_fn = query_fn if query_fn is not None else _sdk_query
+        self._answered_model: str | None = None
         self._scratch_dir = Path(scratch_dir) if scratch_dir else self._make_scratch_dir()
+
+    @property
+    def model(self) -> str | None:
+        """Model that answered the last call (SDK-reported, else configured).
+
+        Falls back to the configured value when the SDK messages do not carry
+        one, and to ``None`` when nothing is configured (CLI default).
+        """
+        return self._answered_model or self._model
 
     @staticmethod
     def _make_scratch_dir() -> Path:
@@ -84,6 +97,7 @@ class ClaudeSdkLLMClient:
         event loop (call from a worker thread instead — FastAPI sync routes
         already run in one).
         """
+        logger.info("llm: provider=claude_sdk model=%s", self._model or "cli-default")
         try:
             return asyncio.run(
                 asyncio.wait_for(self._collect_text(prompt), timeout=self._timeout_s)
@@ -109,11 +123,15 @@ class ClaudeSdkLLMClient:
             cwd=str(self._scratch_dir),
         )
         texts: list[str] = []
+        answered_model: str | None = None
         async for message in self._query_fn(prompt=_USER_TURN, options=options):
             if isinstance(message, AssistantMessage):
                 texts.extend(
                     block.text for block in message.content if isinstance(block, TextBlock)
                 )
+                if message.model:
+                    answered_model = message.model
+        self._answered_model = answered_model
         text = "".join(texts).strip()
         if not text:
             raise LLMError("claude sdk returned no text")
