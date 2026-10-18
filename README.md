@@ -327,6 +327,11 @@ mypy src/brain/ai      # type check (strict-ish; config in pyproject [tool.mypy]
 Alembic migrations to the configured `DATABASE_URL` and clean the table after
 each test; they skip with a hint if Postgres is unreachable).
 
+CI runs the same commands on every PR and push to main (GitHub Actions,
+`.github/workflows/ci.yml`): ruff, mypy, shellcheck, and pytest against
+Postgres 16 + Qdrant service containers — no API keys or Claude login
+needed (the suite uses fakes and mock transports, never live providers).
+
 ## Adding a feature
 
 1. Model changes: edit `src/brain/db/models.py`, then
@@ -381,7 +386,6 @@ Anything marked **PROPOSAL** is an idea, not a decided behavior.
 | Rerank reorders, score stays cosine | expose the rerank score alongside the vector score | `src/brain/ai/rerank.py`, `src/brain/services/search.py` |
 | Offset pagination is approximate | `/search` and reindex assume a quiet window; concurrent writes shift pages | `src/brain/services/search.py`, `src/brain/services/ingest.py` |
 | No auth | single user, localhost only — never expose publicly | `src/brain/main.py` |
-| No CI | add GitHub Actions: ruff, mypy, pytest (postgres+qdrant services), shellcheck | `.github/workflows/` (to create) |
 | Status transitions not enforced | any PATCH can set any status; no inbox→filed workflow rules | `src/brain/db/models.py`, `src/brain/services/items.py` |
 | No retries/backoff | external calls fail fast by design; revisit when an adapter needs resilience | `src/brain/ai/_http.py` |
 | fastembed first-run download | ~130MB model download on first capture/search, then offline | `src/brain/ai/embedder.py` |
