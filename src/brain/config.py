@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8
+    # Candidates fetched for the reranker before truncating to ask_top_k.
+    # Reranking is cheap relative to the LLM call, and the reranker can only
+    # surface what reaches it: a Hebrew email corpus scores an English
+    # question ~0.2 cosine (TALAN email measured at vector rank 23 of 47 —
+    # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
+    # ~4x documents.
+    ask_recall_pool: int = 32
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None

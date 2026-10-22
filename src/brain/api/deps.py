@@ -154,5 +154,9 @@ def get_ask_service(
     """Provide an AskService wired to search and the shared LLM client."""
     settings = get_settings()
     return AskService(
-        search, llm, top_k=settings.ask_top_k, tz=ZoneInfo(settings.timezone)
+        search,
+        llm,
+        top_k=settings.ask_top_k,
+        recall_pool=settings.ask_recall_pool,
+        tz=ZoneInfo(settings.timezone),
     )
