@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
     # ~4x documents.
     ask_recall_pool: int = 32
+    # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
+    # in-process worker switch. The worker stays OFF in A1 — the queue is
+    # durable and drained by `brain enrich` / tests; A2 flips it on with the
+    # real extractor (never blocks the capture reply either way).
+    enrichment_daily_cap: int = 100
+    enrichment_worker_enabled: bool = False
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
