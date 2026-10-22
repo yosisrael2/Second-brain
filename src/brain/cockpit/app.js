@@ -102,6 +102,7 @@ async function refreshAll() {
     }).catch(() => {}),
     api("/ops/flow").then((flow) => {
       state.flow = flow;
+      renderKpis();
       if (state.tab === "flow") renderFlow();
     }).catch(() => console.debug("flow refresh failed")),
   ];
@@ -137,17 +138,47 @@ function renderOverall() {
   badge.className = `badge ${health.overall}`;
   const degraded = (health.degraded || []).join(", ");
   badge.title = degraded ? `degraded/down: ${degraded}` : "all components ok";
+  const buildDot = $("build-dot");
+  buildDot.className = `dot ${health.overall}`;
   const apiDetails = health.components?.api?.details;
   $("sha").textContent = apiDetails?.version ? `@${String(apiDetails.version).slice(0, 7)}` : "";
 }
 
+// ---------- KPI row (computed from the live /ops/flow payload) ----------
+
+// Pure derivation so the served page's own code can be tested (tests execute
+// this function via node). Disabled nodes are legend-only, matching the mock.
+function statusCounts(nodes) {
+  const counts = { ok: 0, "not probed": 0, degraded: 0, down: 0 };
+  for (const node of nodes || []) {
+    if (node.status in counts) counts[node.status] += 1;
+  }
+  return counts;
+}
+
+function renderKpis() {
+  if (!state.flow) return;
+  const counts = statusCounts(state.flow.nodes);
+  for (const [status, count] of Object.entries(counts)) {
+    $(`kpi-${status.replace(" ", "")}`).textContent = String(count);
+  }
+}
+
 // ---------- flow tab ----------
 
-// Desktop layout: columns are pipeline stages (0 = inputs, 1 = processing,
-// 2 = AI/stores); the infrastructure band is separated underneath with no
-// arrows. Phone: one vertical top->bottom stack with downward arrows.
+// Desktop layout follows the approved mock: 240x64 cards, 408px column pitch,
+// 112px row pitch, stage labels above the grid, infrastructure band separated
+// underneath with no arrows. Phone: vertical top->bottom stack.
 const STAGE_LABELS = ["Inputs", "Processing", "AI / Stores"];
 const STATUS_CLASS = { "not probed": "notprobed" };
+
+const NODE_W = 240;
+const NODE_H = 64;
+const COL_PITCH = 408;
+const ROW_PITCH = 112;
+const FIRST_ROW_Y = 48;
+// Exit/enter anchor positions as a fraction of card height, by degree.
+const ANCHOR_FRACS = { 1: [0.5], 2: [0.3, 0.7], 3: [0.25, 0.5, 0.75] };
 
 const TRACE_PATHS = {
   capture: ["api->ingest", "parser->ingest", "ingest->jev", "ingest->postgres",
@@ -222,33 +253,33 @@ function layoutNodes(nodes, phone) {
     pos.set("__laneX", { x: W - 8, y: 0, w: 0, h: 0 });
     return { width: W, height: y + 2, pos };
   }
-  const colW = 212, rowH = 74, padX = 12, padY = 30, infraGap = 40;
-  const width = padX * 2 + 3 * colW;
-  pos.set("__labels", { x: padX, y: padY - 14, w: 0, h: 0 });
-  // Flow nodes first; the infra band starts BELOW the tallest column's last
-  // node (+gap) so it can never overlap a flow node.
+  const width = 2 * COL_PITCH + NODE_W;
+  pos.set("__labels", { x: 0, y: 16, w: 0, h: 0 });
+  // Flow nodes first; the infrastructure band starts BELOW the tallest
+  // column's last node (+ heading + divider gap) so they can never overlap.
   let infraTop = 0;
   for (const node of nodes.filter((n) => n.band !== "infra")) {
-    const y = padY + node.row * rowH + 10;
+    const y = FIRST_ROW_Y + node.row * ROW_PITCH;
     pos.set(node.id, {
-      x: padX + node.column * colW + 8,
+      x: node.column * COL_PITCH,
       y,
-      w: colW - 36,
-      h: 50,
+      w: NODE_W,
+      h: NODE_H,
     });
-    infraTop = Math.max(infraTop, y + 50);
+    infraTop = Math.max(infraTop, y + NODE_H);
   }
-  infraTop += infraGap;
+  const dividerY = infraTop + 44;
+  const infraY = dividerY + 28;
   for (const node of nodes.filter((n) => n.band === "infra")) {
     pos.set(node.id, {
-      x: padX + node.column * colW + 8,
-      y: infraTop,
-      w: colW - 36,
-      h: 50,
+      x: node.column * COL_PITCH,
+      y: infraY,
+      w: NODE_W,
+      h: NODE_H,
     });
   }
-  const height = infraTop + 50 + 12;
-  pos.set("__dividerY", { x: padX, y: infraTop - 20, w: width - 2 * padX, h: 0 });
+  const height = infraY + NODE_H + 4;
+  pos.set("__dividerY", { x: 0, y: dividerY, w: width, h: 0 });
   return { width, height, pos };
 }
 
@@ -258,7 +289,7 @@ function flowDecorations(flow, pos, width) {
   if (labels) {
     STAGE_LABELS.forEach((label, index) => {
       const text = svgEl("text", {
-        class: "stage-label", x: labels.x + index * 212 + 8, y: labels.y,
+        class: "stage-label", x: index * COL_PITCH, y: labels.y,
       });
       text.textContent = label;
       els.push(text);
@@ -266,13 +297,13 @@ function flowDecorations(flow, pos, width) {
   }
   const divider = pos.get("__dividerY");
   if (divider) {
+    const text = svgEl("text", { class: "stage-label", x: divider.x, y: divider.y - 16 });
+    text.textContent = "Infrastructure";
+    els.push(text);
     els.push(svgEl("line", {
       x1: divider.x, y1: divider.y, x2: divider.x + divider.w, y2: divider.y,
       class: "infra-divider",
     }));
-    const text = svgEl("text", { class: "stage-label", x: divider.x, y: divider.y - 5 });
-    text.textContent = "Infrastructure";
-    els.push(text);
   }
   return els;
 }
@@ -291,7 +322,7 @@ function svgEl(tag, attrs, ...children) {
   return node;
 }
 
-function edgeGeometry(edge, pos, phone) {
+function edgeGeometry(edge, pos, phone, anchors) {
   const from = pos.get(edge.from);
   const to = pos.get(edge.to);
   if (!from || !to) return null;
@@ -317,46 +348,72 @@ function edgeGeometry(edge, pos, phone) {
       label: { x: a2.x, y: midY, anchor: "middle" },
     };
   }
-  const sameColumn = Math.abs(from.x - to.x) < 4;
+  const sameColumn = from.x === to.x;
   if (sameColumn) {
+    // Straight vertical between the shared anchor points.
     const downward = to.y > from.y;
     const a = nodeAnchor(from, downward ? "bottom" : "top");
     const b = nodeAnchor(to, downward ? "top" : "bottom");
     const midY = (a.y + b.y) / 2;
-    // Label BESIDE the line, pulled toward the source — away from the tip.
     return {
-      d: `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`,
-      label: { x: a.x + 16, y: a.y + (b.y - a.y) * 0.35, anchor: "start" },
+      d: `M ${a.x} ${a.y} L ${b.x} ${b.y}`,
+      label: { x: a.x + 8, y: midY + 4, anchor: "start" },
     };
   }
-  const a = nodeAnchor(from, "right");
-  const b = nodeAnchor(to, "left");
-  const midX = (a.x + b.x) / 2;
-  const c1 = { x: midX, y: a.y }, c2 = { x: midX, y: b.y };
-  // Label at t=0.4 — on the curve but well clear of the arrowhead.
-  const at = bezierPoint(a, c1, c2, b, 0.4);
-  return {
-    d: `M ${a.x} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x} ${b.y}`,
-    label: { x: at.x, y: at.y - 8, anchor: "middle" },
+  // Orthogonal right-angle route: leave the source's right edge, run
+  // horizontally down a per-edge bend lane in the column gap, turn
+  // vertically, then enter the target's left edge.
+  const a = {
+    x: from.x + from.w,
+    y: from.y + from.h * anchors.exitFrac,
   };
-}
-
-// Point at parameter t of a cubic bezier.
-function bezierPoint(a, c1, c2, b, t) {
-  const u = 1 - t;
+  const b = { x: to.x, y: to.y + to.h * anchors.enterFrac };
+  const bendX = a.x + 28 + anchors.bendIndex * 20;
   return {
-    x: (u * u * u) * a.x + 3 * (u * u) * t * c1.x + 3 * u * (t * t) * c2.x + (t * t * t) * b.x,
-    y: (u * u * u) * a.y + 3 * (u * u) * t * c1.y + 3 * u * (t * t) * c2.y + (t * t * t) * b.y,
+    d: `M ${a.x} ${a.y} L ${bendX} ${a.y} L ${bendX} ${b.y} L ${b.x} ${b.y}`,
+    label: { x: (a.x + bendX) / 2, y: a.y - 6, anchor: "middle" },
   };
 }
 
 function flowEdges(flow, pos, phone, width, height) {
+  // Deterministic stagger: edges leaving/entering the same card get distinct
+  // anchor rows; edges crossing the same column gap get distinct bend lanes.
+  const exitCount = new Map(), enterCount = new Map(), lanesPerGap = new Map();
+  for (const edge of flow.edges) {
+    const from = pos.get(edge.from), to = pos.get(edge.to);
+    if (!from || !to) continue;
+    exitCount.set(edge.from, (exitCount.get(edge.from) || 0) + 1);
+    enterCount.set(edge.to, (enterCount.get(edge.to) || 0) + 1);
+    if (!phone && from.x !== to.x) {
+      lanesPerGap.set(from.x, (lanesPerGap.get(from.x) || 0) + 1);
+    }
+  }
+  const seen = { exit: new Map(), enter: new Map(), lane: new Map() };
   const els = [];
   for (const edge of flow.edges) {
     // Phone: readability over completeness — idle grey edges and infra
     // hops are dropped; only traffic/problems stay.
     if (phone && edge.count === 0 && edge.status === "grey") continue;
-    const geo = edgeGeometry(edge, pos, phone);
+    const from = pos.get(edge.from), to = pos.get(edge.to);
+    if (!from || !to) continue;
+    let anchors = null;
+    if (!phone) {
+      const exitIdx = seen.exit.get(edge.from) || 0;
+      seen.exit.set(edge.from, exitIdx + 1);
+      const enterIdx = seen.enter.get(edge.to) || 0;
+      seen.enter.set(edge.to, enterIdx + 1);
+      let bendIndex = 0;
+      if (from.x !== to.x) {
+        bendIndex = seen.lane.get(from.x) || 0;
+        seen.lane.set(from.x, bendIndex + 1);
+      }
+      anchors = {
+        exitFrac: (ANCHOR_FRACS[Math.min(exitCount.get(edge.from), 3)] || ANCHOR_FRACS[3])[exitIdx],
+        enterFrac: (ANCHOR_FRACS[Math.min(enterCount.get(edge.to), 3)] || ANCHOR_FRACS[3])[enterIdx],
+        bendIndex,
+      };
+    }
+    const geo = edgeGeometry(edge, pos, phone, anchors);
     if (!geo) continue;
     const path = svgEl("path", {
       class: `flow-edge edge-${edge.status.replace(" ", "")}${edge.active ? " active" : ""}`,
@@ -394,6 +451,7 @@ function flowNodes(flow, pos) {
   return flow.nodes.map((node) => {
     const p = pos.get(node.id);
     const statusClass = STATUS_CLASS[node.status] || node.status;
+    const notProbed = statusClass === "notprobed";
     const group = svgEl("g", {
       class: `flow-node st-${statusClass}`, "data-node": node.id,
     });
@@ -403,17 +461,27 @@ function flowNodes(flow, pos) {
       if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
     });
     group.append(svgEl("rect", {
-      class: "body", x: p.x, y: p.y, width: p.w, height: p.h, rx: 10,
+      class: "body", x: p.x, y: p.y, width: p.w, height: p.h, rx: 14,
     }));
-    const label = svgEl("text", { class: "label", x: p.x + 12, y: p.y + 20 });
+    // Status dot: 10px solid disc, or a small dashed circle when not probed.
+    if (notProbed) {
+      group.append(svgEl("circle", {
+        class: "dot-dashed", cx: p.x + 23, cy: p.y + p.h / 2, r: 4,
+      }));
+    } else {
+      group.append(svgEl("circle", {
+        class: "dot-solid", cx: p.x + 23, cy: p.y + p.h / 2, r: 5,
+      }));
+    }
+    const label = svgEl("text", { class: "label", x: p.x + 40, y: p.y + p.h / 2 - 3 });
     label.textContent = node.label;
     group.append(label);
-    const sub = svgEl("text", { class: "sub", x: p.x + 12, y: p.y + p.h - 8 });
-    const latency = node.latency_ms != null ? ` · ${node.latency_ms}ms` : "";
-    sub.textContent = `${node.status}${latency}`;
+    const sub = svgEl("text", { class: "sub", x: p.x + 40, y: p.y + p.h / 2 + 15 });
+    sub.textContent = node.status;
     group.append(sub);
     const title = svgEl("title");
-    title.textContent = node.summary || node.component;
+    const latency = node.latency_ms != null ? ` · ${node.latency_ms}ms` : "";
+    title.textContent = `${node.summary || node.component}${latency}`;
     group.append(title);
     return group;
   });
@@ -650,14 +718,27 @@ async function openInspector(itemId) {
 
 // ---------- tabs + refresh loop ----------
 
+const TAB_NAMES = ["flow", "health", "events", "stats", "debug"];
+
+function tabFromHash() {
+  const name = decodeURIComponent(location.hash.replace("#", ""));
+  return TAB_NAMES.includes(name) ? name : "flow";
+}
+
 function switchTab(name) {
   state.tab = name;
+  history.replaceState(null, "", `#${name}`);
   for (const tab of document.querySelectorAll(".tab")) {
-    tab.classList.toggle("is-active", tab.dataset.tab === name);
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle("is-active", active);
+    if (active) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
   }
   for (const panel of document.querySelectorAll(".tab-panel")) {
     panel.classList.toggle("is-active", panel.id === `tab-${name}`);
   }
+  const title = $("page-title");
+  if (title) title.textContent = name.charAt(0).toUpperCase() + name.slice(1);
   refreshAll();
 }
 
@@ -668,7 +749,6 @@ function tick() {
     state.countdown = REFRESH_MS / 1000;
     refreshAll();
   }
-  $("refresh-in").textContent = `${state.countdown}s`;
 }
 
 function init() {
@@ -710,10 +790,16 @@ function init() {
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => switchTab(tab.dataset.tab));
   }
+  window.addEventListener("hashchange", () => {
+    if (tabFromHash() !== state.tab) switchTab(tabFromHash());
+  });
+  const intervalLabel = () => `every ${REFRESH_MS / 1000}s`;
+  $("refresh-in").textContent = intervalLabel();
   $("pause-btn").addEventListener("click", () => {
     state.paused = !state.paused;
-    $("pause-btn").textContent = state.paused ? "▶ Resume" : "⏸ Pause";
-    $("refresh-in").textContent = state.paused ? "paused" : `${state.countdown}s`;
+    $("pause-btn").classList.toggle("is-paused", state.paused);
+    $("pause-label").textContent = state.paused ? "Resume" : "Pause";
+    $("refresh-in").textContent = state.paused ? "paused" : intervalLabel();
   });
   $("theme-btn").addEventListener("click", () => {
     const root = document.documentElement;
@@ -752,7 +838,7 @@ function init() {
     resizeTimer = setTimeout(() => { if (state.tab === "flow") renderFlow(); }, 150);
   });
 
-  refreshAll();
+  switchTab(tabFromHash());
   setInterval(tick, 1000);
 }
 
