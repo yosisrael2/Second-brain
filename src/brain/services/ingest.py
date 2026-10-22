@@ -62,6 +62,8 @@ class IngestService:
             actionability=data.actionability,
             confidence=data.confidence,
             status=data.status,
+            occurred_at=data.occurred_at,
+            meta=data.meta,
         )
         self._repo.add(item)
         if classify:

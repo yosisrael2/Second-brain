@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 from brain.ai.ask import LLMError
 from brain.api import deps
-from brain.api.routes import ask, health, items, search
+from brain.api.routes import ask, capture, health, items, search
 from brain.config import get_settings
 from brain.services.items import ItemNotFound
 
@@ -25,6 +25,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title=get_settings().app_name, lifespan=lifespan)
     app.include_router(health.router)
     app.include_router(items.router)
+    app.include_router(capture.router)
     app.include_router(search.router)
     app.include_router(ask.router)
     app.add_exception_handler(ItemNotFound, _handle_item_not_found)  # type: ignore[arg-type]

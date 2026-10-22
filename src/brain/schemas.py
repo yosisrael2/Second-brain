@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +34,10 @@ class ItemCreate(BaseModel):
     actionability: Actionability | None = None
     confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
     status: ItemStatus = ItemStatus.INBOX
+    # When the captured thing happened (None = unknown); format-specific
+    # extraction result (email headers, WhatsApp messages, event fields).
+    occurred_at: datetime | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class ItemUpdate(BaseModel):
@@ -62,6 +67,8 @@ class ItemRead(BaseModel):
     actionability: Actionability | None
     confidence: float | None
     status: ItemStatus
+    occurred_at: datetime | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
@@ -86,3 +93,26 @@ class AskAnswer(BaseModel):
     cited_ids: list[str]
     sources: list[SearchResultRead]
     model: str | None = None
+
+
+KindHint = Literal["auto", "email", "whatsapp", "calendar", "note"]
+
+
+class CaptureRequest(BaseModel):
+    """Payload for POST /capture: a pasted text to parse and capture."""
+
+    text: str = Field(min_length=1, max_length=RAW_TEXT_MAX_LENGTH)
+    # Values mirror brain.services.paste.KINDS plus "auto" (detect).
+    kind_hint: KindHint = "auto"
+    split: bool = Field(
+        default=False,
+        description="Split multi-message pastes (WhatsApp threads) into one item per message",
+    )
+
+
+class CaptureResponse(BaseModel):
+    """Response for POST /capture: detected kind, extraction summary, items."""
+
+    kind: str
+    extracted: dict[str, Any]
+    items: list[ItemRead]
