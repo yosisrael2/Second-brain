@@ -653,3 +653,112 @@ def test_enrich_cli_refuses_the_live_store(
             cli.main(["enrich", "--limit", "1"])
     finally:
         get_settings.cache_clear()
+
+
+# --- review round 2: identity threshold + best-match --------------------------
+
+
+def test_different_same_day_reminders_stay_two_children(world: World):
+    """Red (round 2): short same-day reminders must not merge at 0.3-0.6.
+
+    'חולצה לבנה' vs 'להביא סרגל' measures 0.40 and 'Bring a reading book' vs
+    'Bring a ruler' 0.61 — both cleared the old eval-pairing threshold and
+    one child silently disappeared.
+    """
+    body = "לזכור: חולצה לבנה 22.10 ולהביא סרגל 22.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="חולצה לבנה", quote="חולצה לבנה 22.10", when_raw="22.10"
+        ),
+        ChildCandidate(
+            kind="reminder", title="להביא סרגל", quote="להביא סרגל 22.10", when_raw="22.10"
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2  # two DIFFERENT reminders, same day
+    titles = sorted(row.raw_text for row in _children(world.session))
+    assert titles == ["חולצה לבנה", "להביא סרגל"]
+
+
+def test_different_english_reminders_stay_two_children(world: World):
+    """Red (round 2): 'Bring a reading book' vs 'Bring a ruler' = 0.61."""
+    body = "Bring a reading book on 22.10 and bring a ruler on 22.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="Bring a reading book",
+            quote="Bring a reading book on 22.10", when_raw="22.10",
+        ),
+        ChildCandidate(
+            kind="reminder", title="Bring a ruler",
+            quote="bring a ruler on 22.10", when_raw="22.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2
+
+
+def test_reworded_duplicate_still_matches_at_the_stricter_threshold(world: World):
+    """The reworded dialogue (0.83) still matches at 0.7 — same single child."""
+    body = "דיאלוג בנות ביום שני 19.10 איסוף 13:35"
+    source = _capture(world.repo, body, source="email")
+    v1 = ChildCandidate(
+        kind="event", title="דיאלוג בנות איסוף 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    service = world.with_extractor(CountingExtractor([v1]))
+    service.enqueue(source)
+    service.run_once(NOW)
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    v2 = ChildCandidate(
+        kind="event", title="דיאלוג בנות, איסוף 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    report = world.with_extractor(CountingExtractor([v2])).run_once(NOW)
+    assert report.children_created == 0
+    assert report.children_updated == 1
+    assert len(_children(world.session)) == 1
+
+
+def test_of_two_qualifying_children_the_most_similar_is_updated(world: World):
+    """Red (round 2): several qualifying children -> the MOST similar updates."""
+    body = "דיאלוג בנות כיתה ב2 ביום שני 19.10 איסוף 13:35"
+    source = _capture(world.repo, body, source="email")
+    base = ChildCandidate(
+        kind="event", title="דיאלוג בנות כיתה ב2", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    service = world.with_extractor(CountingExtractor([base]))
+    service.enqueue(source)
+    service.run_once(NOW)
+    # a second child, clearly a DIFFERENT thing (sim to child 1 = 0.38 < 0.7)
+    other = ChildCandidate(
+        kind="event", title="אספת מורים כיתה ג3", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    service2 = world.with_extractor(CountingExtractor([other]))
+    service2.run_once(NOW)
+    assert len(_children(world.session)) == 2
+
+    # now re-propose a title clearly closest to the SECOND child: it must
+    # update THAT one (higher similarity), not the first-iterated match
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    # sim to child 2 = 0.73 (>= 0.7), sim to child 1 = 0.32 -> the MOST
+    # similar (child 2) must be the one updated
+    closer = ChildCandidate(
+        kind="event", title="אספת מורים כיתה ג3 מיוחדת ביותר", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    report = world.with_extractor(CountingExtractor([closer])).run_once(NOW)
+    assert report.children_created == 0
+    assert report.children_updated == 1
+    titles = sorted(row.raw_text for row in _children(world.session))
+    assert "אספת מורים כיתה ג3 מיוחדת ביותר" in titles  # child 2 was updated
+    assert "דיאלוג בנות כיתה ב2" in titles  # child 1 untouched

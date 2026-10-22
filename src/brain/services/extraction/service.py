@@ -35,7 +35,6 @@ from sqlalchemy.orm import Session
 from brain import ops
 from brain.db.enums import ItemStatus, ItemType
 from brain.db.models import EnrichmentJob, ItemSource, MemoryItem
-from brain.services.eval_extraction import DEFAULT_TITLE_THRESHOLD
 from brain.services.extraction import dates as xdates
 from brain.services.extraction.base import Extractor, StubExtractor
 from brain.services.extraction.candidates import ChildCandidate
@@ -47,9 +46,16 @@ logger = logging.getLogger(__name__)
 
 _JOB_STATES = ("queued", "running", "done", "failed")
 _BUDGETS = ("daily", "backfill")
-# Re-run identity (items 18+30): same title wording within this ratio — the
-# SAME threshold constant the eval harness uses, never a second number.
-_TITLE_THRESHOLD = DEFAULT_TITLE_THRESHOLD
+# Re-run identity (items 18+30): 'is this the same real-world thing' is a
+# STRICTER question than the eval harness's gold-pairing (which already
+# filters by type/date/applies_to and picks the best pair greedily), so the
+# threshold shares the FUNCTION with the eval but NOT its number
+# (DEFAULT_TITLE_THRESHOLD = 0.3). Measured failure mode at 0.3-0.6:
+# 'חולצה לבנה' vs 'להביא סרגל' = 0.40, 'Bring a reading book' vs
+# 'Bring a ruler' = 0.61 — two DIFFERENT same-day reminders that must stay
+# two children. 0.7 keeps those apart while the reworded duplicate
+# ('דיאלוג בנות 13:35' vs 'דיאלוג בנות, איסוף 13:35' = 0.83) still matches.
+_CHILD_IDENTITY_THRESHOLD = 0.7
 # timed children match within one hour of resolved start (delta item 18)
 _TIMED_MATCH_WINDOW = timedelta(hours=1)
 
@@ -384,10 +390,9 @@ class EnrichmentService:
         - the resolved date is the same — timed children within ±1h;
           dateless children only match dateless ones;
         - the resolved applies_to SET is the same;
-        - the title similarity >= the eval harness's threshold (an LLM
-          rewording 'דיאלוג בנות 13:35' vs 'דיאלוג בנות, איסוף 13:35' still
-          matches — one shared similarity function with the eval, never a
-          second one).
+        - the title similarity >= _CHILD_IDENTITY_THRESHOLD (stricter than
+          the eval pairing threshold — see the constant's comment; the
+          FUNCTION is shared with the eval, only the number differs).
         """
         if child.type is None or child.type.value != candidate.kind:
             return False
@@ -406,7 +411,7 @@ class EnrichmentService:
             # different KNOWN audiences (Rona vs Noa) never match.
             if stored != {"unknown"}:
                 return False
-        return title_similarity(child.raw_text, candidate.title) >= _TITLE_THRESHOLD
+        return title_similarity(child.raw_text, candidate.title) >= _CHILD_IDENTITY_THRESHOLD
 
     def _store_child(
         self,
@@ -426,15 +431,24 @@ class EnrichmentService:
         candidate = resolved.candidate
         moment = resolved.start or resolved.due
         kind = ItemType(candidate.kind)  # validated child kind (spec section 2)
-        for child in existing_children.values():
-            if not self._same_child(candidate, moment, resolved.applies_to, child):
-                continue
-            if child.child_state == "dropped":
+        matches = [
+            child
+            for child in existing_children.values()
+            if self._same_child(candidate, moment, resolved.applies_to, child)
+        ]
+        if matches:
+            # several children may qualify; the MOST similar one is the same
+            # real-world thing (review round 2) — the others stay untouched
+            best = max(
+                matches,
+                key=lambda child: title_similarity(child.raw_text, candidate.title),
+            )
+            if best.child_state == "dropped":
                 return "skipped"  # remembered rejection: never reappears (item 30)
-            if child.child_state == "kept":
+            if best.child_state == "kept":
                 return "skipped"  # user acted: immutable (item 18)
             # untouched proposed child: update in place
-            self._apply_candidate_to_item(child, resolved, source, run_id)
+            self._apply_candidate_to_item(best, resolved, source, run_id)
             self._repo.commit()
             return "updated"
         child = MemoryItem(
