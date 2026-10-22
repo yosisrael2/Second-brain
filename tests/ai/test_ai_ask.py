@@ -196,12 +196,22 @@ class TestConflictRule:
 
         assert CONFLICT_RULES in llm.prompts[0]
 
-    def test_conflict_rule_demands_both_quotes_newer_source_and_no_invention(self):
+    def test_conflict_rule_demands_both_quotes_and_no_invention(self):
         assert "conflict" in CONFLICT_RULES
-        assert "newer" in CONFLICT_RULES
         assert "both" in CONFLICT_RULES
         # the rule must not let the model pick a winner on its own
         assert "never" in CONFLICT_RULES and "invent" in CONFLICT_RULES.lower()
+
+    def test_conflict_rule_does_not_judge_newer_from_the_when_line(self):
+        # The per-source When line is the EVENT time (occurred_at), not when
+        # the source was sent — a stale calendar entry can carry a LATER event
+        # date than a fresh message. The rule must therefore never ask the
+        # model to decide which source is newer from it; real sent-times
+        # belong to the reconciliation work (design items 37/41).
+        sentences = [s.strip() for s in CONFLICT_RULES.split(".") if s.strip()]
+        newer = [s for s in sentences if "newer" in s]
+        assert len(newer) == 1, "'newer' may appear only in the do-not-claim sentence"
+        assert "do not claim" in newer[0]
 
     def test_conflict_rule_reaches_the_model_with_disagreeing_sources(self):
         llm = FakeLLMClient()
@@ -211,9 +221,7 @@ class TestConflictRule:
         prompt = llm.prompts[0]
         # both disagreeing sources are present for the model to quote
         assert "[cal-1]" in prompt and "[wa-2]" in prompt
-        prompt = llm.prompts[0]
-        # both disagreeing sources are present for the model to quote
-        assert "[cal-1]" in prompt and "[wa-2]" in prompt
+        assert CONFLICT_RULES in prompt
         assert CONFLICT_RULES in prompt
 
 

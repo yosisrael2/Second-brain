@@ -36,7 +36,8 @@ CONFLICT_RULES = (
     "If two sources give different values for the same attribute (time, end "
     "time, place, or date) of what is evidently the same event, treat that as "
     "a conflict: open the answer with the conflict, quote both versions and "
-    "cite both source ids, and say which source is newer. Never answer "
+    "cite both source ids. If a source says when it was sent or updated, "
+    "mention that; otherwise do not claim which one is newer. Never answer "
     '"no conflict" in that case, and never invent which value is correct.'
 )
 
