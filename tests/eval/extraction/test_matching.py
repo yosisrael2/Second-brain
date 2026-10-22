@@ -1,5 +1,7 @@
 """Matching + validation behavior of the extraction eval engine (synthetic rows)."""
 
+from zoneinfo import ZoneInfo
+
 import pytest
 
 from brain.services.eval_extraction import EvalError, evaluate, format_aggregate
@@ -262,3 +264,45 @@ def test_missing_required_field_rejected():
 def test_bad_datetime_rejected():
     with pytest.raises(EvalError, match="datetime"):
         evaluate([row(start="not-a-date")], [])
+
+
+def test_aware_datetime_converted_to_local_wall_clock():
+    # user decision: CONVERT, don't reject — offset-bearing values are
+    # converted to the configured local zone and made naive
+    jerusalem = ZoneInfo("Asia/Jerusalem")
+    # (a) summer: UTC+3 — 06:00Z == 09:00 local
+    out = agg(
+        [row(start="2026-10-19T09:00:00")],
+        [row(child_id="p1", start="2026-10-19T06:00:00+00:00")],
+        tz=jerusalem,
+    )
+    assert "matched: 1" in out
+    assert "date_exact_match_rate: 1.0" in out
+    # (b) after Israel leaves summer time (Sun 25 Oct 2026): UTC+2 — proves
+    # the conversion is real ZoneInfo, not a fixed offset
+    out = agg(
+        [row(start="2026-10-28T15:00:00")],
+        [row(child_id="p1", start="2026-10-28T13:00:00+00:00")],
+        tz=jerusalem,
+    )
+    assert "matched: 1" in out
+    assert "date_exact_match_rate: 1.0" in out
+    # (c) mixed aware pred / naive gold must not raise TypeError
+    out = agg(
+        [row(start="2026-10-19T09:00:00")],
+        [row(child_id="p1", start="2026-10-19T06:00:00+00:00")],
+        tz=jerusalem,
+    )
+    assert "matched: 1" in out
+
+
+def test_all_day_inferred_from_effective_field_only():
+    # start (timed, present) is the effective date: the date-only due must NOT
+    # make this child all-day
+    gold = row(start="2026-10-19T09:00:00", due="2026-11-01")
+    del gold["all_day"]
+    pred = row(child_id="p1", start="2026-10-19T09:00:00")
+    del pred["all_day"]
+    out = agg([gold], [pred])
+    assert "matched: 1" in out
+    assert "date_exact_match_rate: 1.0" in out  # both timed, same minute

@@ -8,7 +8,7 @@ import tempfile
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from brain.ai.embedder import Embedder, EmbedderError
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
@@ -81,6 +81,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=DEFAULT_TITLE_THRESHOLD,
         help="Minimum title similarity for a match (default 0.3)",
     )
+    eval_extraction.add_argument(
+        "--timezone",
+        default=None,
+        help="Zone for converting offset-bearing start/due values "
+        "(default: Settings.timezone from TIMEZONE)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
@@ -133,7 +139,14 @@ def _eval_extraction(args: argparse.Namespace) -> int:
         gold = load_jsonl(args.gold)
         pred = load_jsonl(args.pred)
         sidecar = load_email_texts(args.emails) if args.emails else None
-        result = evaluate(gold, pred, email_texts=sidecar, title_threshold=args.title_threshold)
+        zone_name = args.timezone or get_settings().timezone
+        try:
+            zone = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise EvalError(f"unknown timezone {zone_name!r}: {exc}") from exc
+        result = evaluate(
+            gold, pred, email_texts=sidecar, title_threshold=args.title_threshold, tz=zone
+        )
     except EvalError as exc:
         print(f"eval-extraction failed: {exc}", file=sys.stderr)
         return 1

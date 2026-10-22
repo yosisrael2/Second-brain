@@ -126,6 +126,36 @@ def test_missing_required_field_fails_cleanly(capsys, tmp_path):
     assert "failed" in capsys.readouterr().err
 
 
+def test_aware_pred_runs_via_cli_default_timezone(capsys):
+    # an offset-bearing pred is converted to the configured local zone, not rejected
+    pred = Path(__file__).parent / "fixtures" / "pred_aware_tiny.jsonl"
+    pred.write_text(
+        '{"email_id": "school-01", "child_id": "p1", "type": "event", '
+        '"title": "כינוס באמפי", "start": "2026-10-17T21:00:00+00:00", '
+        '"all_day": true, "applies_to": "itamar"}\n',
+        encoding="utf-8",
+    )
+    rc = cli.main(["eval-extraction", "--gold", str(GOLD), "--pred", str(pred), "--aggregate-only"])
+    assert rc == 0
+
+
+def test_invalid_timezone_fails_cleanly(capsys):
+    rc = cli.main(
+        [
+            "eval-extraction",
+            "--gold",
+            str(GOLD),
+            "--pred",
+            str(PRED),
+            "--timezone",
+            "Not/AZone",
+            "--aggregate-only",
+        ]
+    )
+    assert rc == 1
+    assert "failed" in capsys.readouterr().err
+
+
 def test_emails_sidecar_feeds_grounding(capsys, tmp_path):
     sidecar = tmp_path / "emails.jsonl"
     sidecar.write_text(

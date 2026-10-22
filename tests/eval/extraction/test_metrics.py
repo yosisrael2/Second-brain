@@ -3,7 +3,7 @@
 from brain.services.eval_extraction import evaluate, format_aggregate, write_report
 
 
-def rel_row(child_id, target=None, **over):
+def rel_row(child_id, target=None, relation_kind="supersedes", **over):
     base = {
         "email_id": "e1",
         "child_id": child_id,
@@ -14,7 +14,7 @@ def rel_row(child_id, target=None, **over):
         "applies_to": "rona",
     }
     if target:
-        base["relation"] = {"kind": "supersedes", "target": target}
+        base["relation"] = {"kind": relation_kind, "target": target}
     base.update(over)
     return base
 
@@ -85,13 +85,70 @@ def test_date_conflict_missed_when_pred_unmatched():
     assert "date_conflict_recall: 0.0" in format_aggregate(evaluate(gold, pred))
 
 
-def test_notes_fallback_applies_to_gold_only():
-    gold = [rel_row("g1", notes="weekday disagrees with the date (date_conflict)")]
-    pred = [rel_row("p1", notes="weekday disagrees with the date (date_conflict)")]
+def test_date_conflict_never_set_from_notes():
+    # the substring fallback is gone: only the explicit boolean field flags it
+    gold = [
+        rel_row("g1", notes="no date_conflict here at all"),
+        rel_row("g2", notes="weekday disagrees with the date (date_conflict)"),
+    ]
+    pred = [rel_row("p1"), rel_row("p2")]
     out = format_aggregate(evaluate(gold, pred))
-    # gold flagged via notes -> denominator 1; pred NOT flagged (notes ignored) -> recall 0
-    assert "date_conflict_gold: 1" in out
-    assert "date_conflict_recall: 0.0" in out
+    assert "date_conflict_gold: 0" in out
+    assert "date_conflict_recall: n/a" in out
+
+
+def test_derived_pred_without_quote_is_not_a_grounding_failure():
+    # design item 22: derived items cite the facts they derive from and carry
+    # no direct quote; they must not drag grounding_rate down
+    gold = [
+        rel_row(
+            "g1",
+            title="fact one",
+            source_quote="the source fact text",
+            email_text="the source fact text. another fact",
+        ),
+        rel_row(
+            "g2",
+            title="fact two",
+            source_quote="another fact",
+            email_text="the source fact text. another fact",
+        ),
+    ]
+    pred = [
+        rel_row("p1", title="fact one", source_quote="the source fact text"),
+        rel_row("p2", title="fact two", target="p1", relation_kind="derived_from", source_quote=""),
+        rel_row(
+            "p3",
+            title="fact two",
+            target="p1",
+            relation_kind="derived_from",
+            source_quote="another fact",
+        ),
+        rel_row("p4", title="qzx jvkw plmnb", source_quote=""),
+    ]
+    out = format_aggregate(evaluate(gold, pred))
+    assert "grounding_derived: 1" in out
+    assert "grounding_denominator: 3" in out  # p1, p3 (derived WITH quote), p4
+    assert "grounding_grounded: 2" in out  # p1, p3
+    assert "grounding_rate: 0.6667" in out  # p4's empty quote is still a failure
+
+
+def test_derived_pred_reported_without_quote(tmp_path):
+    gold = [
+        rel_row(
+            "g1",
+            title="fact two",
+            source_quote="another fact",
+            email_text="another fact",
+        )
+    ]
+    pred = [
+        rel_row("p2", title="fact two", target="p1", relation_kind="derived_from", source_quote="")
+    ]
+    path = tmp_path / "report.md"
+    write_report(evaluate(gold, pred), path)
+    text = path.read_text(encoding="utf-8")
+    assert "derived — no direct quote" in text
 
 
 def test_aggregate_only_output_has_no_text_or_ids():

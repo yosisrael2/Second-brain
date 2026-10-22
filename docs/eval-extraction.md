@@ -9,12 +9,13 @@ they consume the aggregate metrics this harness prints.
 ```bash
 brain eval-extraction --gold gold.jsonl --pred pred.jsonl --aggregate-only
 brain eval-extraction --gold gold.jsonl --pred pred.jsonl --report out/report.md
+brain eval-extraction --gold gold.jsonl --pred pred.jsonl --timezone Asia/Jerusalem
 ```
 
 Exit 0 on a successful run (the scores themselves are never an exit
-condition); exit 1 with a clear message on unreadable inputs or schema
+condition); exit 1 with a clear message on unreadable inputs, schema
 violations (invalid JSON line, missing required field, duplicate child_id,
-unparseable date).
+unparseable date) or an invalid --timezone.
 
 ## Input format (JSONL)
 
@@ -27,22 +28,33 @@ ignored, so the labeling schema can grow without breaking the harness.
 | `child_id`      | yes      | unique within one file; relation targets refer to these                |
 | `type`          | yes      | free string (`event`, `task`, `reminder`, `fact`, ...); compared case-insensitively |
 | `title`         | yes      | source language (Hebrew or English)                                   |
-| `start`         | no       | ISO local wall-clock (`2026-10-19T13:35:00`); date-only implies all-day |
+| `start`         | no       | ISO local wall-clock (`2026-10-19T13:35:00`); offset-bearing values are converted to the local zone (see Timezones); a date-only effective date implies all-day |
 | `end`           | no       | carried, not scored                                                    |
-| `all_day`       | no       | explicit flag; a date-only `start`/`due` implies true                  |
+| `all_day`       | no       | explicit flag; a date-only EFFECTIVE date (`start` if present, else `due`) implies true |
 | `due`           | no       | tasks: used as the matching date when `start` is absent                |
 | `applies_to`    | no       | JSON string (`"rona"`, `"rona, itamar"`, `"me"`, `"nobody"`, `"unknown"`, empty) or JSON list of strings (`["Rona", "me"]`) — both normalize to the same token set; any other type is an error |
 | `importance`    | no       | carried, not scored                                                    |
 | `actionability` | no       | carried, not scored                                                    |
 | `source_quote`  | no       | verbatim text from the source email (verified for preds)               |
 | `relation`      | no       | `{"kind": "supersedes", "target": "<child_id>"}`, or `"supersedes:<child_id>"` |
-| `date_conflict` | no       | boolean; gold rows may alternatively flag it in `notes`                |
+| `date_conflict` | no       | boolean — the ONLY signal, gold and pred alike (words in `notes` never set it) |
 | `notes`         | no       | free text                                                              |
 | `email_text`    | no       | gold rows only: the full source text used for grounding checks         |
 
 Email text for the grounding check: the first non-empty `email_text` per
 `email_id` among gold rows, overridable per email by a sidecar file
 `--emails emails.jsonl` with rows of `{"email_id", "email_text"}`.
+
+## Timezones
+
+The schema is local wall-clock. A `start`/`due` WITH a UTC offset is
+converted to the configured local zone and then made naive; a value without
+an offset is taken as local wall-clock as written. The zone comes from
+`Settings.timezone` (env `TIMEZONE`; `--timezone` overrides; an invalid zone
+exits 1). Conversion — never a fixed offset — keeps day and ±1h comparisons
+correct across DST changes (e.g. Israel leaves summer time on Sun 25 Oct
+2026). `evaluate()` takes the zone as an explicit `tz` keyword so the engine
+stays pure.
 
 ## Matching (deterministic, documented)
 
@@ -91,8 +103,11 @@ rate has no denominator):
   to '-', whitespace collapsed, casefolded
   — one shared implementation in `src/brain/services/textnorm.py`). Preds
   whose email text is unknown are counted in `grounding_unverifiable` and
-  excluded from the denominator (surfaced, never silently dropped). An empty
-  quote is never grounded.
+  excluded from the denominator (surfaced, never silently dropped). Derived
+  preds (relation kind `derived_from`) with an empty quote are excluded too
+  (`grounding_derived`): they cite the facts they derive from and have no
+  direct quote (design item 22); a derived pred that does carry a quote is
+  verified normally. An empty quote on any other pred is still a failure.
 - `relation_<kind>_[gold|reproduced|unresolvable|rate]`: a gold relation
   (kind, target) is reproduced only when both endpoints matched AND the pred
   matched to the source carries the same kind pointing at the pred matched to
@@ -100,7 +115,8 @@ rate has no denominator):
   with the wrong target does not count). Relations whose gold target is not
   labeled are `unresolvable` and excluded from the rate.
 - `date_conflict_[gold|reproduced|recall]`: gold children flagged
-  `date_conflict` whose matched pred is flagged too.
+  `date_conflict` whose matched pred is flagged too. The explicit boolean
+  field is the only signal, gold and pred alike — notes text never sets it.
 
 ## Output modes
 

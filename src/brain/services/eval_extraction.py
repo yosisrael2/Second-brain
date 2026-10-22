@@ -12,7 +12,7 @@ INPUT FORMAT (one JSON object per line; unknown extra fields are ignored):
 
     {"email_id": "...", "child_id": "...", "type": "event|task|reminder|fact|...",
      "title": "...",                       # source language (Hebrew or English)
-     "start": "2026-10-19T13:35:00",       # ISO local wall-clock; optional
+     "start": "2026-10-19T13:35:00",       # ISO local wall-clock; optional (offsets are converted)
      "end": null, "all_day": true,         # all_day rows carry a date-only start
      "due": "2026-11-01",                  # tasks: due when no start
      "applies_to": "rona",                 # "rona, itamar" | ["Rona", "me"] | "me" | "nobody"
@@ -46,12 +46,12 @@ MATCHING (deterministic, documented):
   nothing is silently coerced to a default, because a silent fallback (e.g.
   applies_to -> unknown) would let every row match every prediction.
 - Children with no date at all (standing facts) match only other dateless
-  children of the same email. A date-only ISO start/due (e.g. "2026-11-01",
-  no time part) implies an all-day child unless an explicit all_day field
-  says otherwise, so a gold label written as a bare date still matches a
-  prediction that resolved a time for the same day (and counts as
-  date-inexact).
-  children of the same email, by title + applies_to.
+  children of the same email. A date-only EFFECTIVE date (the `start` if
+  present, else the `due`; no time part) implies an all-day child unless an
+  explicit all_day field says otherwise, so a gold label written as a bare
+  date still matches a prediction that resolved a time for the same day (and
+  counts as date-inexact). A timed start is never made all-day by a
+  date-only due.
 - Assignment: greedy over all gate-compatible pairs, best title similarity
   first (ties broken by gold then pred child_id — fully deterministic). Title
   similarity is max(SequenceMatcher ratio, token Jaccard) over normalized
@@ -72,13 +72,25 @@ METRICS (all printed as `key: value` lines):
   text / pred children with known email text. Preds whose email text is
   unknown are counted separately (grounding_unverifiable) and excluded from
   the rate — a data gap is not the model's fault, but it is surfaced.
+  Derived preds (relation kind derived_from) with an empty source_quote are
+  also excluded (grounding_derived): design item 22 says derived items cite
+  the facts they derive from and have no direct quote. A derived pred that
+  DOES carry a quote is verified normally; an empty quote on any other pred
+  is still a failure.
 - relation reproduction per kind (e.g. supersedes/same_as/derived_from): a
   gold relation (kind, target=G2) is reproduced only if the pred matched to
   its source carries the same kind AND targets the pred matched to G2
   (direction-agnostic: the link may be recorded on either child).
 - date_conflict_recall: gold children flagged date_conflict whose matched
-  pred is flagged too. Gold rows may fall back to the word appearing in
-  `notes`; pred rows must use the boolean field.
+  pred is flagged too. The explicit boolean field is the ONLY signal — for
+  gold and pred alike (a word inside free-text notes never sets it).
+
+TIMEZONES: the schema is local wall-clock. A start/due WITH a UTC offset is
+converted to the configured local zone and then made naive; a value without
+an offset is taken as local wall-clock as written. The zone comes from the
+caller: the CLI passes Settings.timezone (env TIMEZONE; --timezone
+overrides; an invalid zone exits 1), while evaluate() takes it as an
+explicit `tz` keyword (default UTC) so this module stays pure.
 
 OUTPUT CONTRACTS:
 - `--aggregate-only` prints ONLY `key: value` numbers (n/a where a rate has
@@ -98,11 +110,13 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from brain.services.textnorm import normalize, quote_in_source
 
 TIME_TOLERANCE = timedelta(hours=1)
 DEFAULT_TITLE_THRESHOLD = 0.3
+_UTC = ZoneInfo("UTC")  # default tz for direct evaluate() callers; the CLI passes Settings.timezone
 
 
 class EvalError(Exception):
@@ -162,6 +176,7 @@ class GroundStat:
     grounded: int = 0
     denominator: int = 0
     unverifiable: int = 0
+    derived: int = 0  # derived_from preds with no direct quote (design item 22)
 
 
 @dataclass
@@ -178,7 +193,7 @@ class EvalResult:
     applies_pred_unknown: int
     relations: dict[str, RelStat]
     grounding: GroundStat
-    grounding_by_pred: dict[str, bool | None] = field(default_factory=dict)
+    grounding_by_pred: dict[str, bool | str | None] = field(default_factory=dict)
     conflict_gold: int = 0
     conflict_reproduced: int = 0
 
@@ -228,16 +243,26 @@ def _req_str(row: dict[str, Any], key: str, side: str, idx: int) -> str:
     return value.strip()
 
 
-def _opt_datetime(row: dict[str, Any], key: str, side: str, idx: int) -> datetime | None:
+def _opt_datetime(
+    row: dict[str, Any], key: str, side: str, idx: int, tz: ZoneInfo
+) -> datetime | None:
     value = row.get(key)
     if value is None or value == "":
         return None
     if not isinstance(value, str):
         raise EvalError(f"{side} row {idx}: {key} must be an ISO string")
     try:
-        return datetime.fromisoformat(value.strip())
+        parsed = datetime.fromisoformat(value.strip())
     except ValueError as exc:
         raise EvalError(f"{side} row {idx}: bad datetime {value!r}: {exc}") from exc
+    if parsed.tzinfo is not None:
+        # The schema is local wall-clock. An offset-bearing value is CONVERTED
+        # to the configured local zone (user decision, replaces an earlier
+        # reject-approach) and then made naive; a naive value is taken as
+        # local wall-clock as written. Converting (never a fixed offset)
+        # keeps day and ±1h comparisons correct across DST changes.
+        parsed = parsed.astimezone(tz).replace(tzinfo=None)
+    return parsed
 
 
 def _opt_int(row: dict[str, Any], key: str, side: str, idx: int) -> int | None:
@@ -344,7 +369,7 @@ def _parse_applies_to(row: dict[str, Any], side: str, idx: int) -> tuple[frozens
     return tokens, applies_raw
 
 
-def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
+def _parse_child(row: dict[str, Any], side: str, idx: int, tz: ZoneInfo) -> Child:
     tokens, applies_raw = _parse_applies_to(row, side, idx)
     notes = _opt_str(row, "notes", side, idx)
     email_text = _opt_str(row, "email_text", side, idx)
@@ -353,8 +378,14 @@ def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
     if explicit_all_day is not None:
         all_day = explicit_all_day
     else:
-        # A date-only ISO start/due (no time part) implies an all-day child.
-        all_day = _is_date_only(row.get("start")) or _is_date_only(row.get("due"))
+        # A date-only EFFECTIVE date (start if present, else due; no time
+        # part) implies an all-day child — a timed start is never made
+        # all-day by a date-only due.
+        start_value = row.get("start")
+        effective_raw = (
+            start_value if isinstance(start_value, str) and start_value.strip() else row.get("due")
+        )
+        all_day = _is_date_only(effective_raw)
     actionability = _opt_str(row, "actionability", side, idx) or None
     source_quote = _opt_str(row, "source_quote", side, idx)
     explicit_conflict = _opt_bool(row, "date_conflict", side, idx)
@@ -363,8 +394,8 @@ def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
         child_id=_req_str(row, "child_id", side, idx),
         type=_req_str(row, "type", side, idx).casefold(),
         title=_req_str(row, "title", side, idx),
-        start=_opt_datetime(row, "start", side, idx),
-        due=_opt_datetime(row, "due", side, idx),
+        start=_opt_datetime(row, "start", side, idx, tz),
+        due=_opt_datetime(row, "due", side, idx, tz),
         all_day=all_day,
         applies_to=tokens,
         applies_raw=applies_raw,
@@ -372,11 +403,11 @@ def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
         actionability=actionability,
         source_quote=source_quote,
         relation=relation,
-        # Gold rows only: the notes text may flag a date_conflict. Preds must
-        # use the explicit boolean field (a pred note mentioning the word is
-        # not a claim the pipeline verified).
-        date_conflict=explicit_conflict is True
-        or (side == "gold" and "date_conflict" in notes.casefold()),
+        # date_conflict is the explicit boolean field only — for gold and pred
+        # alike. A word inside free-text notes is not a claim anyone verified
+        # (a substring match there was exactly the silent coercion this
+        # harness must not do).
+        date_conflict=explicit_conflict is True,
         notes=notes,
         email_text=email_text,
     )
@@ -437,10 +468,17 @@ def evaluate(
     *,
     email_texts: dict[str, str] | None = None,
     title_threshold: float = DEFAULT_TITLE_THRESHOLD,
+    tz: ZoneInfo = _UTC,
 ) -> EvalResult:
-    """Match pred children to gold children per email and compute all metrics."""
-    gold = [_parse_child(row, "gold", i) for i, row in enumerate(gold_rows)]
-    pred = [_parse_child(row, "pred", i) for i, row in enumerate(pred_rows)]
+    """Match pred children to gold children per email and compute all metrics.
+
+    ``tz`` is an explicit keyword (the module stays pure — no settings
+    lookups here): offset-bearing start/due values are converted to this
+    zone and made naive; naive values are taken as local wall-clock. The CLI
+    passes Settings.timezone (env TIMEZONE, --timezone overrides).
+    """
+    gold = [_parse_child(row, "gold", i, tz) for i, row in enumerate(gold_rows)]
+    pred = [_parse_child(row, "pred", i, tz) for i, row in enumerate(pred_rows)]
     _check_unique(gold, "gold")
     _check_unique(pred, "pred")
 
@@ -536,11 +574,23 @@ def evaluate(
                 stat.reproduced += 1
                 break
 
-    grounding_by_pred: dict[str, bool | None] = {}
+    grounding_by_pred: dict[str, bool | str | None] = {}
     grounded = 0
     denominator = 0
     unverifiable = 0
+    derived = 0
     for child in pred:
+        if (
+            child.relation is not None
+            and child.relation[0] == "derived_from"
+            and not child.source_quote.strip()
+        ):
+            # Design item 22: a derived item cites the facts it derives from
+            # and carries no direct source quote — exclude it from the
+            # grounding denominator instead of counting it as a failure.
+            grounding_by_pred[child.child_id] = "derived"
+            derived += 1
+            continue
         text = texts.get(child.email_id)
         if text is None:
             grounding_by_pred[child.child_id] = None
@@ -571,7 +621,12 @@ def evaluate(
         applies_ok=applies_ok,
         applies_pred_unknown=applies_pred_unknown,
         relations=relations,
-        grounding=GroundStat(grounded=grounded, denominator=denominator, unverifiable=unverifiable),
+        grounding=GroundStat(
+            grounded=grounded,
+            denominator=denominator,
+            unverifiable=unverifiable,
+            derived=derived,
+        ),
         grounding_by_pred=grounding_by_pred,
         conflict_gold=len(conflicted),
         conflict_reproduced=conflict_reproduced,
@@ -642,6 +697,7 @@ def format_aggregate(result: EvalResult) -> str:
         f"grounding_grounded: {result.grounding.grounded}",
         f"grounding_denominator: {result.grounding.denominator}",
         f"grounding_unverifiable: {result.grounding.unverifiable}",
+        f"grounding_derived: {result.grounding.derived}",
     ]
     for kind, stat in sorted(result.relations.items()):
         checkable = stat.gold - stat.unresolvable
@@ -716,7 +772,9 @@ def write_report(
             lines += ["### Matched", ""]
             for m in email_matches:
                 verdict = result.grounding_by_pred.get(m.pred.child_id)
-                if verdict is None:
+                if verdict == "derived":
+                    quote_line = "quote: derived — no direct quote"
+                elif verdict is None:
                     quote_line = "quote: unverifiable (no email text)"
                 elif verdict:
                     quote_line = f"quote: verified — {m.pred.source_quote!r}"
