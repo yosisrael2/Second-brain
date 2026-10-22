@@ -26,6 +26,12 @@ class ClassifierProto(Protocol):
     def classify(self, text: str) -> dict[str, Any]: ...
 
 
+class EnrichmentEnqueuerProto(Protocol):
+    """Interface IngestService needs from the enrichment queue (Strategy)."""
+
+    def enqueue(self, item: MemoryItem) -> Any: ...
+
+
 class IngestService:
     """Captures memory items; Jev/index failures never block capture.
 
@@ -42,10 +48,16 @@ class IngestService:
         repo: ItemsRepositoryProto,
         classifier: ClassifierProto,
         indexer: ItemIndexerProto,
+    *,
+    enrichment: EnrichmentEnqueuerProto | None = None,
     ) -> None:
         self._repo = repo
         self._classifier = classifier
         self._indexer = indexer
+        # Optional enrichment hook (PR A1): after a capture commits, a
+        # qualifying parent is queued for extraction. enqueue() is a fast
+        # INSERT/None — the capture reply path is unchanged (spec section 2).
+        self._enrichment = enrichment
 
     def create(self, data: schemas.ItemCreate, classify: bool = True) -> MemoryItem:
         """Create a memory item, classify it on request, and index it.
@@ -94,6 +106,11 @@ class IngestService:
         with ops.span("ingest", "persist", edge="ingest->postgres") as span:
             self._repo.commit()
             span.detail = {"item_id": str(item.id), "chars": len(item.raw_text)}
+        if self._enrichment is not None:
+            try:
+                self._enrichment.enqueue(item)
+            except Exception as exc:  # noqa: BLE001 — never fail the capture
+                logger.warning("ingest: enrichment enqueue failed (%s)", exc)
         return item
 
     def _dedupe_snapshot(self, existing: MemoryItem) -> MemoryItem:

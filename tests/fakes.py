@@ -49,6 +49,7 @@ class FakeRepository:
         status: Any = None,
         limit: int,
         offset: int,
+        include_children: bool = False,
     ) -> list[MemoryItem]:
         items = [
             item
@@ -56,6 +57,12 @@ class FakeRepository:
             if (item_type is None or item.type == item_type)
             and (project is None or item.project == project)
             and (status is None or item.status == status)
+            # item 19: proposed/dropped children are unlisted by default
+            and (
+                include_children
+                or item.child_state is None
+                or item.child_state == "kept"
+            )
         ]
         items.sort(key=lambda item: item.created_at, reverse=True)
         return items[offset : offset + limit]
