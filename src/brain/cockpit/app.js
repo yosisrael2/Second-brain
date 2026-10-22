@@ -106,6 +106,9 @@ async function refreshAll() {
     }).catch(() => console.debug("flow refresh failed")),
   ];
   if (state.tab === "events") jobs.push(refreshEvents().catch(() => {}));
+  if (state.tab === "memory" && window.MemoryTab) {
+    jobs.push(window.MemoryTab.refresh().catch(() => {}));
+  }
   if (state.tab === "stats") {
     jobs.push(api("/ops/stats").then((stats) => {
       state.stats = stats;

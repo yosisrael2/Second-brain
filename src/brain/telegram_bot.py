@@ -63,6 +63,7 @@ from brain.config import Settings, unwrap_secret
 from brain.schemas import ItemUpdate
 from brain.services.ask import AskResult
 from brain.services.ingest import IngestService
+from brain.services.memory import MemoryError
 from brain.services.paste import parse as parse_paste
 
 logger = logging.getLogger(__name__)
@@ -113,12 +114,15 @@ CB_NEXT = "n"  # n:<offset>            -> next inbox card
 CB_OPEN = "o"  # o:<token>:<index>     -> show a cited item card
 CB_WA_JOIN = "w1"  # w1:<token>        -> save WhatsApp thread as one item
 CB_WA_SPLIT = "wm"  # wm:<token>      -> save one item per message
+CB_MEM_DEL = "m"  # m:<token>:<index> -> remove one memory fact (soft delete)
 
 BOT_COMMANDS = (
     ("ask", "Ask your memory a question"),
     ("search", "Semantic search"),
     ("review", "Review inbox items"),
     ("recent", "Show the last 10 items"),
+    ("profile", "Your kids and remembered facts"),
+    ("remember", "Remember a fact: /remember <text>"),
     ("status", "Component health"),
     ("help", "How to use the bot"),
 )
@@ -131,6 +135,7 @@ EVENT_REVIEW = "review"
 EVENT_CALLBACK = "callback"
 EVENT_DOCUMENT = "document"
 EVENT_REJECTED_USER = "rejected_user"
+EVENT_MEMORY = "memory"
 EVENT_ERROR = "error"
 
 # Exit codes (launchd contract; see module docstring).
@@ -274,6 +279,7 @@ class BotServices:
     items: Any  # ItemsService
     search: Any  # SearchService
     ask: Any  # AskService
+    memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -291,8 +297,10 @@ def _live_services_factory() -> ServicesFactory:
     def factory() -> Generator[BotServices, None, None]:
         from brain.db.session import SessionLocal  # noqa: PLC0415
         from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+        from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
         from brain.services.ask import AskService  # noqa: PLC0415
         from brain.services.items import ItemsService  # noqa: PLC0415
+        from brain.services.memory import MemoryService  # noqa: PLC0415
         from brain.services.search import SearchService  # noqa: PLC0415
 
         session = SessionLocal()
@@ -317,6 +325,7 @@ def _live_services_factory() -> ServicesFactory:
                     deps.get_llm_client(),
                     memory_block=memory.compact_block,
                 ),
+                memory=memory,
             )
         finally:
             session.close()
@@ -415,6 +424,10 @@ class TelegramBot:
             return self.review()
         if command == "/recent":
             return self.recent()
+        if command == "/profile":
+            return self.profile()
+        if command == "/remember":
+            return self.remember(argument)
         return self.capture(stripped, forward=forward)
 
     # -- capture ----------------------------------------------------------------
@@ -736,6 +749,122 @@ class TelegramBot:
             keyboard=self._open_buttons([str(item.id) for item in items]),
         )
 
+    # -- memory (profile + remember) -------------------------------------------
+
+    _KID_FACT_ORDER = ("gender", "school", "grade", "class", "teacher")
+
+    def profile(self) -> Reply:
+        """Kids first (gender/class/grade/teacher), then remembered facts.
+
+        Lines are numbered to match the ✖ buttons (soft delete; history kept).
+        Fact ids ride in the pending registry so callback data stays < 64B.
+        """
+        with self._services_factory() as services:
+            memory = getattr(services, "memory", None)
+            if memory is None:
+                return Reply("Memory layer is not installed yet.")
+            # MemoryService.overview returns a LIST of entity dicts
+            entities = memory.overview(status="confirmed", q=None)
+        persons = [
+            e for e in entities if e.get("kind") == "person" and e.get("facts")
+        ]
+        # kids (persons carrying a kid-fact) first, then the rest by name
+        persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
+        lines = ["👤 <b>Profile</b>"]
+        fact_ids: list[str] = []
+        for entity in persons:
+            facts = entity.get("facts", [])
+            if entity.get("name") == "me":
+                lines.append("")
+                lines.append("🧠 <b>Remembered</b>")
+                for fact in facts:
+                    fact_ids.append(str(fact["id"]))
+                    predicate = _esc(fact.get("predicate", "note"))
+                    lines.append(
+                        f"{len(fact_ids)}. • {predicate}: {_one_line(fact.get('value'), 80)}"
+                    )
+                continue
+            lines.append("")
+            lines.append(f"🧒 <b>{_esc(entity.get('name', '?'))}</b>")
+            by_predicate = {f["predicate"]: f for f in facts}
+            summary = " · ".join(
+                str(by_predicate[p]["value"])
+                for p in self._KID_FACT_ORDER
+                if p in by_predicate and by_predicate[p].get("value")
+            )
+            if summary:
+                lines.append(_esc(summary))
+            for predicate, fact in by_predicate.items():
+                fact_ids.append(str(fact["id"]))
+                lines.append(
+                    f"{len(fact_ids)}. {_esc(predicate)}: {_one_line(fact.get('value'), 80)}"
+                )
+        if not fact_ids:
+            return Reply(
+                "👤 Profile is empty.\n"
+                "Kids are set up once via the seed CLI:\n"
+                "  brain memory seed-kid --name Rona --gender girl --school <school> "
+                "--grade 5 --class <class> --teacher <teacher>\n"
+                "/remember <text> stores a free-text note (not kid facts)."
+            )
+        return Reply(text="\n".join(lines), keyboard=self._memory_remove_buttons(fact_ids))
+
+    @staticmethod
+    def _is_kid(entity: dict) -> bool:
+        """A person carrying at least one kid-fact (grade/class/gender/teacher)."""
+        kid_predicates = {"gender", "grade", "class", "teacher"}
+        return any(f.get("predicate") in kid_predicates for f in entity.get("facts", []))
+
+    def _memory_remove_buttons(self, fact_ids: list[str]) -> list[list[tuple[str, str]]]:
+        """Numbered ✖ buttons (rows of 4), numbered like the profile lines."""
+        token = self.registry.put(
+            Pending(ids=tuple(uuid_mod.UUID(fid) for fid in fact_ids))
+        )
+        buttons = [
+            (f"✖ {n}", f"{CB_MEM_DEL}:{token}:{n - 1}")
+            for n in range(1, len(fact_ids) + 1)
+        ]
+        return [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
+
+    def _remove_profile_fact(self, pending: Pending, index: int) -> Reply:
+        """Soft-delete one profile fact, then re-render the card in place."""
+        if not 0 <= index < len(pending.ids):
+            return Reply("Unknown action — the button is stale or invalid.")
+        with self._services_factory() as services:
+            memory = getattr(services, "memory", None)
+            if memory is None:
+                return Reply("Memory layer is not installed yet.")
+            try:
+                memory.delete_fact(pending.ids[index])
+            except KeyError:
+                return Reply("⌛ That fact was already removed.")
+            except MemoryError:
+                return Reply("⌛ That fact was already removed.")
+        return self.profile_reply(notice="🗑 Removed (history kept).")
+
+    def profile_reply(self, notice: str | None = None) -> Reply:
+        """Re-render the profile card (edit-in-place after a removal)."""
+        reply = self.profile()
+        text = f"{notice}\n{reply.text}" if notice else reply.text
+        return Reply(text=text, keyboard=reply.keyboard, edit=True)
+
+    def remember(self, text: str) -> Reply:
+        """Store a free-text fact on the 'me' entity (confirmed)."""
+        if not text:
+            return Reply("Usage: /remember <fact> — e.g. /remember Itamar plays basketball")
+        with self._services_factory() as services:
+            memory = getattr(services, "memory", None)
+            if memory is None:
+                return Reply("Memory layer is not installed yet.")
+            fact = memory.remember(text)
+        record_event(
+            "telegram",
+            EVENT_MEMORY,
+            ok=True,
+            detail={"fact_id": str((fact or {}).get("id", "")), "chars": len(text)},
+        )
+        return Reply(f"🧠 <b>Remembered</b>\n{_one_line(text, 300)}")
+
     def status(self) -> Reply:
         """Component health from the cockpit (no event: /status is not data ops)."""
         lines = _ops_status_lines()
@@ -759,7 +888,7 @@ class TelegramBot:
             "👋 Second Brain bot ready.\n"
             "Paste an email / WhatsApp thread / calendar event — I'll capture it.\n"
             "Any question ending in '?' goes to /ask.\n"
-            "Commands: /search, /ask, /review, /recent, /status, /help"
+            "Commands: /search, /ask, /review, /recent, /profile, /remember, /status, /help"
         )
 
     def help_text(self) -> Reply:
@@ -771,6 +900,8 @@ class TelegramBot:
             "/ask <question> — ask the memory\n"
             "/review — walk the inbox one card at a time\n"
             "/recent — last 10 items\n"
+            "/profile — your kids and remembered facts (with remove buttons)\n"
+            "/remember <fact> — remember something about your world\n"
             "/status — component health (cockpit)\n"
             "/start — this greeting"
         )
@@ -786,13 +917,13 @@ class TelegramBot:
         try:
             if prefix == CB_NEXT:
                 return self.review(int(rest))
-            if prefix in (CB_TYPE_APPLY, CB_OPEN):
+            if prefix in (CB_TYPE_APPLY, CB_OPEN, CB_MEM_DEL):
                 token, _, arg = rest.partition(":")
             elif prefix in (CB_UNDO, CB_FILE, CB_DELETE, CB_TYPE, CB_WA_JOIN, CB_WA_SPLIT):
                 token, arg = rest, ""
             else:
                 return Reply("Unknown action — the button is stale or invalid.")
-            if prefix == CB_OPEN:
+            if prefix in (CB_OPEN, CB_MEM_DEL):
                 index = int(arg)
         except ValueError:
             return Reply("Unknown action — the button is stale or invalid.")
@@ -814,6 +945,8 @@ class TelegramBot:
             return self._card_reply(pending, notice=f"📁 Filed {changed} item(s).")
         if prefix == CB_OPEN:
             return self._open_card(pending, index)
+        if prefix == CB_MEM_DEL:
+            return self._remove_profile_fact(pending, index)
         if prefix == CB_UNDO:
             return self._delete_items(pending, undo=True)
         return self._delete_items(pending, undo=False)  # CB_DELETE
