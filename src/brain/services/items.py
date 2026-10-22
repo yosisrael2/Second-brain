@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Protocol
 
 from brain import schemas
@@ -55,6 +56,10 @@ class ItemsRepositoryProto(Protocol):
     ) -> Sequence[MemoryItem]: ...
 
     def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]: ...
+
+    def by_occurrence(
+        self, *, start: datetime, end: datetime, limit: int
+    ) -> Sequence[MemoryItem]: ...
 
     def delete(self, item: MemoryItem) -> None: ...
 
@@ -135,6 +140,12 @@ class ItemsService:
     def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
         """Full-text keyword search over raw_text, best match first."""
         return self._repo.search(query=query, limit=limit, offset=offset)
+
+    def in_occurrence_range(
+        self, *, start: datetime, end: datetime, limit: int
+    ) -> Sequence[MemoryItem]:
+        """Every item occurring inside [start, end), soonest first."""
+        return self._repo.by_occurrence(start=start, end=end, limit=limit)
 
     def delete(self, item_id: uuid.UUID) -> None:
         """Delete the item with the given id (and its vector, when indexed)."""

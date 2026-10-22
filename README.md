@@ -209,7 +209,14 @@ failure modes are documented in [docs/ai-layer.md](docs/ai-layer.md).
 **Default providers need no API keys**: the LLM runs on your local Claude Code
 login (`claude_agent_sdk`, check with `claude -p ok` — run `claude` and
 `/login` if needed) and embeddings run locally via `fastembed`
-(`BAAI/bge-small-en-v1.5`, 384 dims; the model downloads once on first use).
+(`minishlab/potion-multilingual-128M`, 256 dims, multilingual — Hebrew + English;
+the model downloads once on first use).
+
+> **Migrating from the old English-only embedder (bge-small-en-v1.5)?** The
+> vector dimension changed (384 -> 256): the first write fails with the
+> "collection built with a different embedder" guard. Run `brain reindex`
+> once — it drops and rebuilds the collection from Postgres (the source of
+> truth).
 Switch back to keyed providers with `LLM_PROVIDER=anthropic` /
 `EMBEDDER_PROVIDER=openai` (see `.env.example`).
 

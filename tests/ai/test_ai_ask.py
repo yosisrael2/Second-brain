@@ -175,5 +175,7 @@ def test_build_prompt_shapes_sources_as_bracketed_lines():
     prompt = build_prompt("q", ITEMS)
     lines = prompt.splitlines()
     assert lines[0] == "Question: q"
-    assert lines[2] == "Sources:"
-    assert lines[3].startswith("- [item-1]")
+    assert lines[2].startswith("Current date/time:")  # grounds relative dates
+    assert "Source times below are in this timezone." in lines[2]
+    assert lines[4] == "Sources:"
+    assert lines[5].startswith("- [item-1]")

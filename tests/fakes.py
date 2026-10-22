@@ -66,6 +66,16 @@ class FakeRepository:
         matches.sort(key=lambda item: item.created_at, reverse=True)
         return matches[offset : offset + limit]
 
+    def by_occurrence(self, *, start, end, limit: int) -> list[MemoryItem]:
+        """Items whose occurred_at falls inside [start, end), soonest first."""
+        matches = [
+            item
+            for item in self.items.values()
+            if item.occurred_at is not None and start <= item.occurred_at < end
+        ]
+        matches.sort(key=lambda item: (item.occurred_at, item.id))
+        return matches[:limit]
+
     def delete(self, item: MemoryItem) -> None:
         self.items.pop(item.id, None)
 

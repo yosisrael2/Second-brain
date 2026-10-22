@@ -7,7 +7,9 @@ import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -175,10 +177,37 @@ def item_text(item: Mapping[str, Any]) -> str:
     return json.dumps(item, default=str)
 
 
-def build_prompt(question: str, context_items: Sequence[Mapping[str, Any]]) -> str:
-    """Render the answer prompt: question, bracketed sources, citation rules."""
-    lines = [f"Question: {question}", "", "Sources:"]
-    lines += [f"- [{item['id']}] {item_text(item)}" for item in context_items if item.get("id")]
+def build_prompt(
+    question: str,
+    context_items: Sequence[Mapping[str, Any]],
+    *,
+    now: datetime | None = None,
+    tz: ZoneInfo | None = None,
+) -> str:
+    """Render the answer prompt: question, dated sources, citation rules.
+
+    ``now`` (the caller's current instant) and ``tz`` are rendered into the
+    prompt so relative expressions ("this week", "Friday") ground against
+    the user's real clock — and the per-source When is already local.
+    """
+    instant = now or datetime.now(UTC)
+    zone = tz or ZoneInfo("UTC")
+    local = instant.astimezone(zone)
+    lines = [
+        f"Question: {question}",
+        "",
+        f"Current date/time: {local:%a} {local.day} {local:%b} {local.year} "
+        f"{local:%H:%M} ({zone.key}). Source times below are in this timezone.",
+        "",
+        "Sources:",
+    ]
+    lines += [
+        f"- [{item['id']}] (When: {item['when']}) {item_text(item)}"
+        if item.get("when")
+        else f"- [{item['id']}] {item_text(item)}"
+        for item in context_items
+        if item.get("id")
+    ]
     lines += ["", CITATION_RULES]
     return "\n".join(lines)
 
@@ -187,6 +216,9 @@ def answer(
     question: str,
     context_items: Sequence[Mapping[str, Any]],
     llm: LLMClient,
+    *,
+    now: datetime | None = None,
+    tz: ZoneInfo | None = None,
 ) -> dict[str, Any]:
     """Answer ``question`` from ``context_items``, citing item ids.
 
@@ -195,7 +227,7 @@ def answer(
     answered (None when the backend does not expose one). LLM failures raise
     :class:`LLMError`; callers own the fallback policy.
     """
-    completion = llm.complete(build_prompt(question, context_items))
+    completion = llm.complete(build_prompt(question, context_items, now=now, tz=tz))
     return {
         "answer": completion.text,
         "cited_ids": extract_cited_ids(completion.text, context_items),
