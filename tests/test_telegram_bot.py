@@ -529,3 +529,71 @@ class TestCli:
         with caplog.at_level(logging.ERROR, logger="brain.telegram_bot"):
             assert telegram_bot.run(settings) == 0
         assert "telegram bot disabled (no token)" in caplog.text
+
+    def test_run_configures_stderr_logging(self, capsys):
+        """run() installs a stderr root handler BEFORE logging anything, so a
+        launchd job (no logging config of its own) still captures the startup
+        line and errors in StandardErrorPath."""
+        import logging
+        import sys
+
+        from brain import telegram_bot
+
+        root = logging.getLogger()
+        saved_handlers, saved_level = root.handlers[:], root.level
+        root.handlers = []  # simulate a bare launchd process
+        try:
+            settings = telegram_bot.Settings(TELEGRAM_BOT_TOKEN=None, _env_file=None)
+            assert telegram_bot.run(settings) == 0
+            stderr_handlers = [
+                h
+                for h in root.handlers
+                if isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+            ]
+            assert stderr_handlers, "run() left the root logger without a stderr handler"
+        finally:
+            root.handlers[:] = saved_handlers
+            root.setLevel(saved_level)
+
+
+class TestSingleInstanceLock:
+    """One getUpdates poller per repo, enforced in-process: exclusive flock on
+    .dev/telegram.lock; the second instance exits 78 (no 409 restart loop)."""
+
+    def test_second_acquire_reports_the_first_pid(self):
+        import os
+
+        from brain import telegram_bot
+
+        first, other = telegram_bot._acquire_instance_lock()
+        assert first is not None and other is None
+        try:
+            second, holder = telegram_bot._acquire_instance_lock()
+            assert second is None, "second flock must lose"
+            assert holder == os.getpid()
+        finally:
+            first.close()  # releases the lock (and lets other tests acquire)
+
+    def test_run_exits_78_when_another_instance_holds_the_lock(self, caplog, monkeypatch):
+        import logging
+        import os
+
+        from brain import telegram_bot
+
+        lock, _ = telegram_bot._acquire_instance_lock()
+        try:
+            def _fail_build(_settings):
+                raise AssertionError("build_bot must not run in a second instance")
+
+            monkeypatch.setattr(telegram_bot, "build_bot", _fail_build)
+            settings = telegram_bot.Settings(
+                TELEGRAM_BOT_TOKEN="123:placeholder",
+                TELEGRAM_ALLOWED_USER_IDS="1",
+                _env_file=None,
+            )
+            with caplog.at_level(logging.ERROR, logger="brain.telegram_bot"):
+                assert telegram_bot.run(settings) == telegram_bot.EXIT_CONFIG
+            assert "another bot instance is running" in caplog.text
+            assert f"pid {os.getpid()}" in caplog.text
+        finally:
+            lock.close()
