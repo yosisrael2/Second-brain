@@ -67,6 +67,11 @@
 
 * { box-sizing: border-box; }
 
+/* The [hidden] attribute must always win: author display rules (e.g.
+ * .memory-add-entity's flex) otherwise override the UA default and hidden
+ * elements (forms, drawer, toast) stay visible. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg-page);
