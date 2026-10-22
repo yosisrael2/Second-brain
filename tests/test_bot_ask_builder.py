@@ -67,6 +67,7 @@ class TestBuilder:
     def test_when_lines_render_in_local_time(self, monkeypatch):
         """An item at 09:00 Israel time must render '... 09:00', not 06:00."""
         from datetime import datetime
+        from zoneinfo import ZoneInfo
 
         from brain.ai.ask import FakeLLMClient
         from brain.api.deps import build_ask_service
@@ -75,7 +76,9 @@ class TestBuilder:
         for _ in _jerusalem_settings(monkeypatch):
             service = build_ask_service(object(), FakeLLMClient(reply="x"))
             item = MemoryItem(raw_text="x", status="filed")
-            item.occurred_at = datetime(2026, 10, 23, 9, 0)
+            # aware datetime: _when_of must render it in the SERVICE's tz on
+            # any machine (a naive datetime would be read in the system zone)
+            item.occurred_at = datetime(2026, 10, 23, 9, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
             item.meta = {}
             when = service._when_of(item)
             assert when is not None and when.endswith("09:00"), when
