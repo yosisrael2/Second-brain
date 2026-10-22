@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Brain — Cockpit</title>
+<link rel="stylesheet" href="/cockpit/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+<script>
+  // Apply stored theme before first paint (no flash).
+  const stored = localStorage.getItem("cockpit-theme");
+  if (stored) document.documentElement.dataset.theme = stored;
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-icon">🧠</span>
+    <span class="brand-name">Second Brain</span>
+    <span id="overall" class="badge" title="overall status">…</span>
+    <span id="sha" class="sha" title="deployed git sha"></span>
+  </div>
+  <div class="topbar-actions">
+    <span id="refresh-in" class="refresh-in" title="seconds until next refresh"></span>
+    <button id="pause-btn" class="btn btn-ghost" title="pause / resume auto-refresh (5s)">⏸ Pause</button>
+    <button id="theme-btn" class="btn btn-ghost" title="toggle light / dark">🌗</button>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab is-active" data-tab="flow" role="tab">Flow</button>
+  <button class="tab" data-tab="health" role="tab">Health</button>
+  <button class="tab" data-tab="events" role="tab">Events</button>
+  <button class="tab" data-tab="stats" role="tab">Stats</button>
+  <button class="tab" data-tab="debug" role="tab">Debug</button>
+</nav>
+
+<main>
+  <!-- FLOW -->
+  <section id="tab-flow" class="tab-panel is-active">
+    <div class="legend">
+      <span class="legend-item"><i class="dot ok"></i> ok</span>
+      <span class="legend-item"><i class="dot degraded"></i> degraded</span>
+      <span class="legend-item"><i class="dot down"></i> down</span>
+      <span class="legend-item"><i class="dot disabled"></i> disabled</span>
+      <span class="legend-item"><i class="dot" style="background:var(--panel);border:1.5px dashed var(--disabled)"></i> not probed</span>
+      <span class="legend-sep"></span>
+      <span class="legend-item"><i class="edge-sample edge-green"></i> green</span>
+      <span class="legend-item"><i class="edge-sample edge-amber"></i> amber (some errors)</span>
+      <span class="legend-item"><i class="edge-sample edge-red"></i> red (failing / target down)</span>
+      <span class="legend-item"><i class="edge-sample edge-grey"></i> grey (no traffic)</span>
+      <span class="legend-item">↯ animated = traffic in the last 60s</span>
+    </div>
+    <div id="flow-wrap" class="flow-wrap"><svg id="flow" aria-label="data flow diagram"></svg></div>
+    <div id="flow-note" class="flow-note"></div>
+  </section>
+
+  <!-- HEALTH -->
+  <section id="tab-health" class="tab-panel">
+    <div id="health-grid" class="health-grid"></div>
+  </section>
+
+  <!-- EVENTS -->
+  <section id="tab-events" class="tab-panel">
+    <div class="events-controls">
+      <label>component
+        <select id="events-component">
+          <option value="">all</option>
+        </select>
+      </label>
+      <label class="checkbox"><input type="checkbox" id="events-errors"> errors only</label>
+      <button id="events-prev" class="btn btn-ghost">← newer</button>
+      <button id="events-next" class="btn btn-ghost">older →</button>
+      <span id="events-pageinfo" class="pageinfo"></span>
+    </div>
+    <div id="events-table" class="events-table"></div>
+  </section>
+
+  <!-- STATS -->
+  <section id="tab-stats" class="tab-panel">
+    <h2>Component activity (24h / 7d)</h2>
+    <div id="stats-components" class="stats-grid"></div>
+    <h2>Classification confidence</h2>
+    <div id="stats-histogram" class="histogram"></div>
+    <h2>Item status shares</h2>
+    <div id="stats-status" class="status-shares"></div>
+  </section>
+
+  <!-- DEBUG -->
+  <section id="tab-debug" class="tab-panel">
+    <div class="debug-grid">
+      <div class="debug-card">
+        <h3>Capture trace <span class="hint">dry-run — saves nothing</span></h3>
+        <textarea id="trace-capture-text" rows="4" placeholder="paste text to trace through parse → classify → embed → qdrant"></textarea>
+        <button id="trace-capture-btn" class="btn">Run capture trace</button>
+        <div id="trace-capture-out" class="steps"></div>
+      </div>
+      <div class="debug-card">
+        <h3>Search trace</h3>
+        <input id="trace-search-q" type="text" placeholder="search query — embed → candidates → rerank → fallback">
+        <button id="trace-search-btn" class="btn">Run search trace</button>
+        <div id="trace-search-out" class="steps"></div>
+      </div>
+      <div class="debug-card">
+        <h3>Ask trace <span class="hint warn">runs the real LLM (costs tokens)</span></h3>
+        <input id="trace-ask-q" type="text" placeholder="question">
+        <button id="trace-ask-btn" class="btn">Run ask trace</button>
+        <div id="trace-ask-out" class="steps"></div>
+      </div>
+      <div class="debug-card">
+        <h3>Item inspector <span class="hint">by id — from events, or paste a uuid</span></h3>
+        <input id="inspector-id" type="text" placeholder="item uuid">
+        <button id="inspector-btn" class="btn">Open item</button>
+        <div id="inspector-out" class="inspector"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/cockpit/app.js"></script>
+</body>
+</html>

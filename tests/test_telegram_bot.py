@@ -6,6 +6,7 @@ exception types (skipped when the optional `telegram` extra is missing).
 """
 
 import asyncio
+import importlib
 import logging
 import uuid
 from contextlib import contextmanager
@@ -359,9 +360,37 @@ class TestCore:
 
     def test_status_without_cockpit(self, monkeypatch):
         _Events().install(monkeypatch)
+        # feature/cockpit ships brain.ops; simulate the pre-cockpit install by
+        # making the shim's optional import fail.
+        real_import = importlib.import_module
+
+        def no_ops(name: str, *args: object, **kwargs: object) -> object:
+            if name == "brain.ops":
+                raise ImportError(f"simulated: {name}")
+            return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(importlib, "import_module", no_ops)
         core, _ = _core()
 
         assert core.route("/status", 111).text == "cockpit not installed yet"
+
+    def test_status_with_cockpit_installed(self, monkeypatch):
+        """Zero-change pickup: with brain.ops present, /status shows components."""
+        _Events().install(monkeypatch)
+        from brain.ops import health as ops_health
+
+        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
+            "components": {
+                "postgres": {"status": "ok", "summary": "3 items"},
+                "qdrant": {"status": "down", "summary": "unreachable"},
+            }
+        })
+        core, _ = _core()
+        reply = core.route("/status", 111)
+        assert "brain: degraded" in reply.text
+        assert "postgres" in reply.text and "qdrant" in reply.text
+        # the shim contract: component_status returns (name, ok, summary) tuples
+        assert ops_health.run_health_checks  # sanity: attribute exists
 
     def test_start_and_help(self, monkeypatch):
         _Events().install(monkeypatch)

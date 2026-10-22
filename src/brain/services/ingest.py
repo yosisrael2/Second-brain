@@ -6,7 +6,7 @@ import logging
 from datetime import datetime
 from typing import Any, Protocol
 
-from brain import schemas
+from brain import ops, schemas
 from brain.ai.classify import route
 from brain.ai.embedder import EmbedderError
 from brain.ai.jev import JevError
@@ -69,9 +69,17 @@ class IngestService:
         )
         self._repo.add(item)
         if classify:
-            self._apply_classification(item, explicit=frozenset(data.model_fields_set))
+            with ops.span("ingest", "classify", edge="ingest->jev") as span:
+                self._apply_classification(item, explicit=frozenset(data.model_fields_set))
+                span.detail = {
+                    "item_id": str(item.id),
+                    "chars": len(item.raw_text),
+                    "confidence": item.confidence,
+                }
         self._index(item)
-        self._repo.commit()
+        with ops.span("ingest", "persist", edge="ingest->postgres") as span:
+            self._repo.commit()
+            span.detail = {"item_id": str(item.id), "chars": len(item.raw_text)}
         return item
 
     def capture_parsed(

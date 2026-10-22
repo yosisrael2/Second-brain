@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Computed,
     DateTime,
@@ -125,4 +126,45 @@ class MemoryItem(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class OpsEvent(Base):
+    """One recorded ops occurrence (request, classify call, hop, error...).
+
+    Framework-free ops layer table: rows carry ids/counts/error types only —
+    never secrets and never item bodies (see the cockpit spec).
+    """
+
+    __tablename__ = "ops_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    component: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    edge: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+
+    __table_args__ = (Index("ix_ops_events_component_ts", "component", "ts"),)
+
+
+class OpsHeartbeat(Base):
+    """Latest liveness signal per long-running component (bot, service...)."""
+
+    __tablename__ = "ops_heartbeats"
+
+    component: Mapped[str] = mapped_column(String(32), primary_key=True)
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )

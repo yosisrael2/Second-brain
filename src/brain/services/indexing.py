@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Protocol
 
+from brain import ops
 from brain.ai.embedder import Embedder
 from brain.ai.vectorstore import VectorStore
 from brain.db.models import MemoryItem
@@ -74,11 +75,14 @@ class QdrantItemIndexer:
         concurrent first indexes may both call ``ensure_collection`` — the
         store call is idempotent, so the worst case is one redundant call.
         """
-        vector = self._embedder.embed(item.raw_text)
+        with ops.span("ingest", "embed", edge="ingest->embedder") as span:
+            vector = self._embedder.embed(item.raw_text)
+            span.detail = {"item_id": str(item.id), "chars": len(item.raw_text)}
         if not self._ensured:
             self._store.ensure_collection(len(vector))
             self._ensured = True
-        self._store.upsert(str(item.id), vector, self._payload_for(item))
+        with ops.span("ingest", "upsert", edge="embedder->qdrant"):
+            self._store.upsert(str(item.id), vector, self._payload_for(item))
 
     def index_batch(self, items: Sequence[MemoryItem]) -> int:
         """Embed and upsert a whole DB batch in one embed + one upsert call.
@@ -89,15 +93,18 @@ class QdrantItemIndexer:
         """
         if not items:
             return 0
-        vectors = self._embedder.embed_batch([item.raw_text for item in items])
+        with ops.span("ingest", "embed_batch", edge="ingest->embedder") as span:
+            vectors = self._embedder.embed_batch([item.raw_text for item in items])
+            span.detail = {"items": len(items)}
         if not self._ensured:
             self._store.ensure_collection(len(vectors[0]))
             self._ensured = True
-        self._store.upsert_many(
-            [
-                (str(item.id), vector, self._payload_for(item))
-                for item, vector in zip(items, vectors, strict=True)
-            ]
+        with ops.span("ingest", "upsert_many", edge="embedder->qdrant"):
+            self._store.upsert_many(
+                [
+                    (str(item.id), vector, self._payload_for(item))
+                    for item, vector in zip(items, vectors, strict=True)
+                ]
         )
         return len(items)
 
