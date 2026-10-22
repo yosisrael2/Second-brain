@@ -53,6 +53,7 @@ class ItemsRepositoryProto(Protocol):
         status: ItemStatus | None,
         limit: int,
         offset: int,
+        include_children: bool = False,
     ) -> Sequence[MemoryItem]: ...
 
     def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]: ...
@@ -127,6 +128,7 @@ class ItemsService:
         status: ItemStatus | None,
         limit: int,
         offset: int,
+        include_children: bool = False,
     ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status."""
         return self._repo.list(
@@ -135,6 +137,7 @@ class ItemsService:
             status=status,
             limit=limit,
             offset=offset,
+            include_children=include_children,
         )
 
     def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:

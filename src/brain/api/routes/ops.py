@@ -6,6 +6,7 @@ POST /ops/trace/capture     dry-run: parse -> classify -> embed -> qdrant (no sa
 GET  /ops/trace/search?q=   embedding -> candidates -> rerank order -> fallback
 POST /ops/trace/ask         sources -> prompt sizes -> LLM -> answer+citations
 GET  /ops/item/{id}         item inspector (row, vector presence, events)
+GET  /ops/enrichment        extraction queue depth + today's cap usage (PR A1)
 GET  /ops/events            paginated event log (component/ok/since filters)
 GET  /ops/stats             24h/7d stats + confidence histogram + status shares
 GET  /ops/flow              flow-diagram nodes/edges with live status
@@ -80,6 +81,27 @@ def post_trace_ask(payload: dict[str, Any]) -> dict[str, Any]:
     if not question:
         raise HTTPException(status_code=422, detail="question is required")
     return ops_traces.trace_ask(question)
+
+
+@router.get("/ops/enrichment")
+def get_ops_enrichment() -> dict[str, Any]:
+    """Extraction queue snapshot (PR A1, brief item 5): depth + cap usage."""
+    from datetime import UTC
+
+    from brain.db.session import SessionLocal
+    from brain.repositories.items import ItemsRepository
+    from brain.services.extraction.service import EnrichmentService
+
+    now = datetime.now(tz=UTC)
+    with SessionLocal() as session:
+        service = EnrichmentService(
+            ItemsRepository(session), session
+        )
+        return {
+            "queue_depth": service.queue_depth(),
+            "cap_used_today": service.cap_used_today(now),
+            "cap_limit": get_settings().enrichment_daily_cap,
+        }
 
 
 @router.get("/ops/events")
