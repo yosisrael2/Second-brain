@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from brain.ai.embedder import Embedder, EmbedderError
@@ -14,6 +17,15 @@ from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
+from brain.services.eval_extraction import (
+    DEFAULT_TITLE_THRESHOLD,
+    EvalError,
+    evaluate,
+    format_aggregate,
+    load_email_texts,
+    load_jsonl,
+    write_report,
+)
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsRepositoryProto
@@ -38,6 +50,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
     )
+    eval_extraction = subparsers.add_parser(
+        "eval-extraction",
+        help="Score predicted extraction children against gold labels",
+    )
+    eval_extraction.add_argument(
+        "--gold", required=True, help="Gold children JSONL (manager-owned labels)"
+    )
+    eval_extraction.add_argument(
+        "--pred", required=True, help="Predicted children JSONL (same schema)"
+    )
+    eval_extraction.add_argument(
+        "--emails",
+        default=None,
+        help="Optional sidecar JSONL of {email_id, email_text} for grounding checks",
+    )
+    eval_extraction.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Print ONLY the numbers (no titles/quotes/ids) — for the extraction developer",
+    )
+    eval_extraction.add_argument(
+        "--report",
+        default=None,
+        help="Full per-child report path (full mode; defaults to a temp-dir file)",
+    )
+    eval_extraction.add_argument(
+        "--title-threshold",
+        type=float,
+        default=DEFAULT_TITLE_THRESHOLD,
+        help="Minimum title similarity for a match (default 0.3)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
@@ -46,6 +89,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _telegram(whoami_hint=args.whoami_hint)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
+    if args.command == "eval-extraction":
+        return _eval_extraction(args)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
 
@@ -72,6 +117,36 @@ def _telegram(whoami_hint: bool) -> int:
     from brain.telegram_bot import run as run_bot  # noqa: PLC0415  (deferred import)
 
     return run_bot(get_settings())
+
+
+def _eval_extraction(args: argparse.Namespace) -> int:
+    """Score predicted children against gold labels; returns a process exit code.
+
+    Exit 0 on a successful run (the scores themselves are not an exit
+    condition); exit 1 on unreadable inputs or schema violations. In
+    --aggregate-only mode stdout carries ONLY numbers (safe to share with the
+    extraction developer); full mode also writes a per-child markdown report
+    (titles, quotes, ids — manager only), defaulting to a temp-dir file so a
+    sensitive report never silently lands in the repo.
+    """
+    try:
+        gold = load_jsonl(args.gold)
+        pred = load_jsonl(args.pred)
+        sidecar = load_email_texts(args.emails) if args.emails else None
+        result = evaluate(gold, pred, email_texts=sidecar, title_threshold=args.title_threshold)
+    except EvalError as exc:
+        print(f"eval-extraction failed: {exc}", file=sys.stderr)
+        return 1
+    print(format_aggregate(result))
+    if args.aggregate_only:
+        return 0
+    report_path = args.report
+    if report_path is None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        report_path = str(Path(tempfile.gettempdir()) / f"eval-extraction-report-{stamp}.md")
+    written = write_report(result, report_path, gold_path=str(args.gold), pred_path=str(args.pred))
+    print(f"full report written to {written}")
+    return 0
 
 
 def _reindex(

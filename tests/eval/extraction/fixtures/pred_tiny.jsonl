@@ -1,0 +1,5 @@
+{"email_id": "school-01", "child_id": "p1", "type": "event", "title": "כינוס באמפי", "start": "2026-10-18", "all_day": true, "applies_to": "itamar", "source_quote": "כינוס שאילת גשמים יתקיים ביום א'"}
+{"email_id": "school-01", "child_id": "p2", "type": "reminder", "title": "White shirt day", "start": "2026-10-22", "all_day": true, "applies_to": "itamar", "source_quote": "wear a white shirt"}
+{"email_id": "school-01", "child_id": "p3", "type": "task", "title": "Volunteer for aviation week", "due": "2026-11-01", "applies_to": "me", "source_quote": "parents who want to volunteer for aviation week should reply by November 1"}
+{"email_id": "school-02", "child_id": "p4", "type": "fact", "title": "Tuesday ends 12:55 from November", "start": "2026-11-03", "all_day": true, "applies_to": "rona", "source_quote": "יסתיים יום ג' בשעה 12:55"}
+{"email_id": "school-02", "child_id": "p5", "type": "task", "title": "Hallucinated task", "due": "2026-11-02", "applies_to": "me", "source_quote": "no such sentence anywhere"}
