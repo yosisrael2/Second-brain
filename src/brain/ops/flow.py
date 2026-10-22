@@ -61,9 +61,6 @@ EDGES: list[dict[str, str]] = [
     {"from": "ask", "to": "llm", "hop": "ask->llm"},
 ]
 
-_HOPS = {edge["hop"] for edge in EDGES}
-
-
 def flow_payload() -> dict[str, Any]:
     """Nodes + edges with live status, summaries and per-hop stats."""
     health = ops_health.run_health_checks()

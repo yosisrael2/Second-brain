@@ -19,7 +19,6 @@ import subprocess
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -231,14 +230,6 @@ def _safe_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
     return safe
 
 
-def utcnow() -> datetime:
-    """Aware UTC now (test seam)."""
-    return datetime.now(UTC)
-
-
-def retention_cutoff(max_age_days: int = RETENTION_DAYS) -> datetime:
-    """Timestamp older than which events are pruned."""
-    return utcnow() - timedelta(days=max_age_days)
 
 
 def component_status() -> list[tuple[str, bool, str]]:

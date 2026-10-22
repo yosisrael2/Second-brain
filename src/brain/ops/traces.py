@@ -44,10 +44,6 @@ def _session_services() -> tuple[Any, Any, Any]:
     return session, search, AskService(search, deps.get_llm_client())
 
 
-def _fmt(value: float | None) -> float | None:
-    return round(float(value), 4) if value is not None else None
-
-
 def trace_capture(text: str) -> dict[str, Any]:
     """Paste detection → Jev classification → embedding → Qdrant neighbours."""
     from brain.ai.classify import route  # noqa: PLC0415

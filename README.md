@@ -56,10 +56,13 @@ src/brain/
 ├── main.py              # FastAPI app factory + ASGI entrypoint (app = create_app())
 ├── cli.py               # `brain` CLI (reindex: rebuild Qdrant from Postgres)
 ├── schemas.py           # pydantic request/response models
+├── ops/                 # cockpit ops layer: events/heartbeats/spans, health,
+│                        #   flow graph, traces, stats (used by API + bot shim)
+├── cockpit/             # dashboard static assets (vanilla JS/CSS, no build)
 ├── ai/                  # AI integrations (owned by AI/integrations track)
 ├── api/
 │   ├── deps.py          # FastAPI dependency providers (service composition)
-│   └── routes/          # thin routers: health.py, items.py, search.py, ask.py
+│   └── routes/          # thin routers: health.py, items.py, search.py, ask.py, ops.py
 ├── services/            # business logic: items, ingest, search, ask
 ├── repositories/        # data access: items.py
 └── db/
@@ -76,6 +79,8 @@ tests/
 ├── test_wiring.py       # /items /search /ask with fake-backed infra
 ├── test_ingest_service.py / test_search_service.py / test_ask_service.py
 ├── test_cli_and_lifespan.py
+├── test_ops_core.py / test_ops_health.py / test_ops_flow.py
+├── test_ops_traces.py / test_ops_routes.py   # cockpit + ops layer
 ├── test_dev_scripts.py  # dev-start.sh/dev-stop.sh syntax + --help contracts
 └── ai/                  # AI-layer unit tests (offline)
 ```
@@ -140,6 +145,60 @@ curl -X POST localhost:27800/ask -H 'Content-Type: application/json' \
 Tests: `tests/test_items.py` (needs the compose Postgres; skipped with a hint
 if it is down). Wiring tests run fully offline (`tests/test_wiring.py`).
 
+## Cockpit (ops dashboard)
+
+`http://127.0.0.1:27800/cockpit/` — one local dashboard showing whether every
+part of Second Brain is connected and healthy. Served by the API itself
+(localhost-only binding), vanilla JS/CSS under `src/brain/cockpit/` — no CDN,
+no build step. Auto-refreshes every 5s (pausable), light + dark, laptop +
+phone widths.
+
+Tabs:
+
+- **Flow** — the live data-flow graph (Telegram/API -> parser -> ingest ->
+  Jev/Postgres/embedder -> Qdrant/rerank/LLM, plus Docker/background/disk).
+  Edges are green (healthy), amber (some errors), red (failing or target
+  down) or grey (no traffic in 15 min); animated dashes = traffic in the
+  last 60s. Click a node to jump to its health card.
+- **Health** — per-component status (`ok` / `degraded` / `down` / `disabled`)
+  with details; expensive probes (embedder/jev/llm cost tokens) run only via
+  the "Run probe" button, never on auto-refresh.
+- **Events** — the `ops_events` log (component, kind, ok, latency, edge,
+  bounded JSON detail), filterable + paginated, errors highlighted.
+- **Stats** — per-component call counts/error rates/p50/p95 (24h + 7d),
+  classification-confidence histogram, item status shares.
+- **Debug** — dry-run traces (capture: parse -> classify -> embed ->
+  neighbours, saves nothing; search: embed -> candidates -> rerank order ->
+  fallback decision) and the item inspector (DB row + vector payload + item
+  events). The ask trace runs the real LLM (labeled, user-initiated).
+
+Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
+
+| Method | Path                  | Behavior                                                        |
+| ------ | --------------------- | --------------------------------------------------------------- |
+| GET    | `/ops/health`         | Cheap per-component checks (cached 5s; probes never run here)   |
+| POST   | `/ops/probe/{c}`      | On-demand probe; 404 for unknown components                     |
+| GET    | `/ops/flow`           | Flow-graph nodes/edges with live status + per-hop stats         |
+| GET    | `/ops/events`         | Event log; filters `component`, `ok`, `since`; `limit`/`offset` |
+| GET    | `/ops/item/{id}`      | Item inspector (row + vector payload + item events)             |
+| GET    | `/ops/stats`          | 24h/7d stats + confidence histogram + status shares             |
+| POST   | `/ops/trace/capture`  | Capture dry-run — never writes                                   |
+| GET    | `/ops/trace/search?q=`| Search pipeline trace (before/after rerank, fallback decision)  |
+| POST   | `/ops/trace/ask`      | Ask trace — runs the real LLM (user-initiated)                  |
+
+Privacy contract: the ops layer never records secrets (tokens appear only as
+`set`/`unset` + last 4 chars) and never note bodies — events/traces carry
+item ids, lengths and error types; item text appears only in the inspector
+you explicitly open for one item. Events are pruned after 7 days.
+
+Instrumentation lives in the services (not the routes): ingest spans
+`ingest->jev`, `ingest->postgres`, `ingest->embedder`, `embedder->qdrant`;
+search spans `search->embedder/qdrant/rerank`; ask spans `ask->search/llm`;
+the Telegram bot writes its own events + heartbeat through the
+`brain.ops` shim it already had. `GET /health`-class api requests are
+recorded by a middleware that skips `/ops` and `/cockpit` paths (so the
+dashboard's own polling does not flood the log).
+
 ## AI layer and the `brain` CLI
 
 Auto-classification on `POST /items` (Jev), semantic `/search` (embeddings +
@@ -172,7 +231,9 @@ for MVP top-k use.
 `brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
 `pip install -e '.[telegram]'`). Plain messages are captured through the same
 paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent` and
-`/status` reuse the same services as the API in-process. Access is
+`/status` reuse the same services as the API in-process (with feature/cockpit
+installed, `/status` shows live per-component health via the `brain.ops`
+shim — zero bot changes; without it the bot degrades to a stub reply). Access is
 allowlist-only: with `TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS`
 (comma-separated ids) is required — anyone else gets no reply (their id is
 logged once at INFO). `brain telegram --whoami-hint` explains how to find
