@@ -318,9 +318,14 @@ class TestRecentAndCommands:
         for i in range(12):
             repo.add(MemoryItem(id=uuid.uuid4(), raw_text=f"item {i}", source="note"))
         reply = core.route("/recent", 111)
-        assert "12" not in reply.text.split("last")[0]  # header, not all items
-        assert "item 11" in reply.text and "item 2" in reply.text  # last 10
-        assert "item 0" not in reply.text and "item 1\n" not in reply.text
+        lines = reply.text.splitlines()
+        assert lines[0] == "🕘 Last 10 item(s):"  # header says 10, not 12
+        bullets = [line for line in lines[1:] if line.startswith("•")]
+        assert len(bullets) == 10
+        # exactly the 10 newest (items 2..11), oldest two dropped; order comes
+        # from created_at DESC, which is deterministic across the 12 inserts
+        shown = sorted(line.split(" — ", 1)[1] for line in bullets)
+        assert shown == sorted(f"item {i}" for i in range(2, 12))
 
     def test_bot_commands_registered_at_startup(self, monkeypatch):
         core, _ = make_core()
