@@ -501,7 +501,7 @@ class TelegramBot:
             ok=True,
             detail={"item_ids": list(result.cited_ids), "chars": len(result.answer)},
         )
-        text = result.answer
+        text = _esc(result.answer)
         if result.model:
             text += f"\n\n— {_esc(result.model)}"
         return Reply(text=text, keyboard=self._open_buttons(result.cited_ids))
@@ -792,12 +792,46 @@ def _inline_keyboard(rows: list[list[tuple[str, str]]] | None) -> Any:
 
 
 async def _send(tg: Any, chat_id: int, reply: Reply) -> None:
-    await tg.send_message(
-        chat_id=chat_id,
-        text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
-        parse_mode="HTML",
-        reply_markup=_inline_keyboard(reply.keyboard),
-    )
+    """Send a reply; never lose it to an HTML-parse rejection.
+
+    On a Telegram BadRequest about parse entities the same text is resent
+    with tags stripped and parse_mode=None, and an ops event records the
+    fallback — a reply must never be silently lost.
+    """
+    try:
+        await tg.send_message(
+            chat_id=chat_id,
+            text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
+            parse_mode="HTML",
+            reply_markup=_inline_keyboard(reply.keyboard),
+        )
+    except Exception as exc:  # noqa: BLE001  (fallback only for parse-entity errors)
+        if not _is_parse_entity_error(exc):
+            raise
+        record_event(
+            "telegram",
+            EVENT_ERROR,
+            ok=False,
+            detail={"error": f"reply fallback: {type(exc).__name__}: {exc!s}"[:200]},
+        )
+        await tg.send_message(
+            chat_id=chat_id,
+            text=_strip_html(reply.text)[:TELEGRAM_REPLY_MAX_CHARS],
+            parse_mode=None,
+            reply_markup=_inline_keyboard(reply.keyboard),
+        )
+
+
+def _is_parse_entity_error(exc: BaseException) -> bool:
+    """True for Telegram BadRequest 'Can't parse entities' (any PTB version)."""
+    return type(exc).__name__ == "BadRequest" and "parse entities" in str(exc).lower()
+
+
+def _strip_html(text: str) -> str:
+    """Unescape then drop tags: the plain-text fallback of an HTML reply."""
+    import re  # noqa: PLC0415
+
+    return re.sub(r"<[^>]*>", "", html.unescape(text))
 
 
 def _forward_info(message: Any) -> dict[str, Any] | None:
