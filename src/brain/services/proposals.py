@@ -23,9 +23,8 @@ Implements delta items 19/20/D2/D4/D7 (PR C) on top of the A1 model:
   will create those) renders struck-through with a restore marker —
   no relation logic here, only the rendering hook.
 
-Kind emoji map by the STORED child type (ItemType; the spec's "reminder"
-is a task with a deadline and "fact" is note/reference — the child's own
-type is what the card shows).
+Kind emoji map by the STORED child type (the spec's mapping: 📅 event,
+✔️ task, 🔔 reminder, ℹ️ fact; legacy types keep sensible fallbacks).
 
 All card text is HTML-escaped here; callback data stays < 64 bytes because
 child ids ride the bot's pending registry (only the short token + an index
@@ -44,9 +43,13 @@ from sqlalchemy.orm import Session
 from brain.db.models import MemoryItem
 from brain.services.extraction.dates import combine_local, extract_clock, resolve_when
 
+# The spec's mapping by the STORED child type (A1 round 1 added
+# 'reminder' and 'fact' to ItemType); legacy types keep fallbacks.
 CHILD_EMOJI = {
     "event": "📅",
     "task": "✔️",
+    "reminder": "🔔",
+    "fact": "ℹ️",
     "note": "ℹ️",
     "reference": "ℹ️",
     "decision": "🧭",
@@ -239,7 +242,9 @@ def _source_sent_local(source: MemoryItem, tz: ZoneInfo) -> datetime:
 
 # --- the 48h ping (D7) ---------------------------------------------------------------
 
-_PING_TYPES = ("task",)  # the spec's tasks/reminders; children store ItemType
+# D7: tasks AND reminders due within the window (spec); legacy children
+# of other types never ping.
+_PING_TYPES = ("task", "reminder")
 
 
 def due_proposed_children(
@@ -249,7 +254,7 @@ def due_proposed_children(
     stmt = (
         select(MemoryItem)
         .where(MemoryItem.child_state == "proposed")
-        .where(MemoryItem.type == "task")
+        .where(MemoryItem.type.in_(_PING_TYPES))
         .where(MemoryItem.occurred_at.is_not(None))
         .order_by(MemoryItem.occurred_at.asc())
     )

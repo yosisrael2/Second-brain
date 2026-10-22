@@ -396,6 +396,13 @@ class TestDuePings:
         self._task(repo, when=NOW + timedelta(hours=24), type_="event")  # not a task
         assert due_proposed_children(_session_of(repo), NOW, TZ) == []
 
+    def test_reminders_due_within_48h_ping_too(self, world):
+        repo, _session, _memory = world
+        self._task(repo, when=NOW + timedelta(hours=24), type_="reminder")
+        due = due_proposed_children(_session_of(repo), NOW, TZ)
+        assert len(due) == 1
+        assert due[0].type == "reminder"
+
     def test_ping_fires_once_then_never_again(self, world):
         repo, _session, _memory = world
         child = self._task(repo, when=NOW + timedelta(hours=24))
