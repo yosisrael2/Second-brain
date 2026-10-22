@@ -7,6 +7,7 @@ Health check adapters are injectable (`HealthContext`); these tests drive
 import pytest
 from sqlalchemy import text
 
+from brain import ops
 from brain.db.session import engine
 from brain.ops import health as ops_health
 
@@ -52,7 +53,7 @@ class TestHealthEndpoint:
         assert expected <= set(body["components"].keys())
         for component in expected:
             entry = body["components"][component]
-            assert entry["status"] in {"ok", "degraded", "down", "disabled"}
+            assert entry["status"] in {"ok", "degraded", "down", "disabled", "not probed"}
             assert "summary" in entry and "checked_at" in entry
 
     def test_qdrant_down_marks_overall_degraded(self, client, ops_tables):
@@ -112,6 +113,77 @@ class TestProbes:
 
     def test_unknown_component_probe_is_404(self, client, ops_tables):
         assert client.post("/ops/probe/nope").status_code == 404
+
+    def test_probe_records_an_ops_event(self, client, ops_tables, monkeypatch):
+        """A probe is evidence: it must land in ops_events (proves the component)."""
+        from brain.ai.ask import Completion
+        from brain.api import deps
+
+        class FakeLLM:
+            def complete(self, prompt: str) -> Completion:
+                return Completion(text="OK", model="fake")
+
+        monkeypatch.setattr(deps, "get_llm_client", lambda: FakeLLM())
+        client.post("/ops/probe/llm")
+        recent = ops.recent_event("llm", ok=True)
+        assert recent is not None and recent["kind"] == "probe"
+
+
+class TestNotProbed:
+    """Config-only components show "not probed" until a probe or real traffic."""
+
+    def test_llm_without_traffic_or_probe_is_not_probed(self, client, ops_tables, monkeypatch):
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        entry = body["components"]["llm"]
+        assert entry["status"] == "not probed"
+        assert "probe" in entry["summary"].lower()
+
+    def test_llm_with_recent_failed_call_is_degraded(self, client, ops_tables, monkeypatch):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                "VALUES ('ask', 'llm', false, 'ask->llm', '{}')"
+            ))
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        assert body["components"]["llm"]["status"] == "degraded"
+
+    def test_llm_with_recent_successful_traffic_is_ok(self, client, ops_tables, monkeypatch):
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                "VALUES ('ask', 'llm', true, 'ask->llm', '{}')"
+            ))
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        assert body["components"]["llm"]["status"] == "ok"
+
+    def test_embedder_not_loaded_is_not_probed(self, client, ops_tables, monkeypatch):
+        ctx = _healthy_ctx()
+        ctx.embedder = lambda: {"provider": "fastembed", "model": "BAAI/bge-small-en-v1.5",
+                                "loaded": False}
+        ops_health._default_context = lambda: ctx  # type: ignore[assignment]
+        ops_health.reset_cache()
+        body = client.get("/ops/health").json()
+        assert body["components"]["embedder"]["status"] == "not probed"
+
+    def test_embedder_with_recent_traffic_is_ok(self, client, ops_tables, monkeypatch):
+        ctx = _healthy_ctx()
+        ctx.embedder = lambda: {"provider": "fastembed", "model": "BAAI/bge-small-en-v1.5",
+                                "loaded": False}
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                "VALUES ('search', 'embed', true, 'search->embedder', '{}')"
+            ))
+        ops_health._default_context = lambda: ctx  # type: ignore[assignment]
+        ops_health.reset_cache()
+        body = client.get("/ops/health").json()
+        assert body["components"]["embedder"]["status"] == "ok"
 
 
 class TestSecrets:

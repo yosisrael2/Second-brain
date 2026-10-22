@@ -19,30 +19,35 @@ _WINDOW_MINUTES = 15
 _ACTIVE_SECONDS = 60
 
 # Component → node mapping: a node's status mirrors its component's health.
+# Columns are pipeline STAGES (left -> right): inputs, processing, AI/stores.
+# The infrastructure band (row 5) is drawn separated underneath, no arrows.
 NODES: list[dict[str, Any]] = [
-    # Inputs (left)
+    # Stage 1 — inputs (left column)
     {"id": "telegram", "label": "Telegram", "column": 0, "row": 0, "component": "telegram"},
-    {"id": "api", "label": "API /items,/capture", "column": 0, "row": 1, "component": "api"},
-    {"id": "search", "label": "Search", "column": 0, "row": 2, "component": "api"},
-    {"id": "ask", "label": "Ask", "column": 0, "row": 3, "component": "llm"},
-    # Processing (middle)
-    {"id": "telegram_bot", "label": "Telegram bot", "column": 1, "row": 0, "component": "telegram"},
+    {"id": "telegram_bot", "label": "Telegram bot", "column": 0, "row": 1, "component": "telegram"},
+    {"id": "api", "label": "API /items,/capture", "column": 0, "row": 2, "component": "api"},
+    # Stage 2 — processing (middle column)
+    {"id": "parser", "label": "Paste parser", "column": 1, "row": 0, "component": "api"},
     {"id": "ingest", "label": "Ingest", "column": 1, "row": 1, "component": "api"},
-    {"id": "parser", "label": "Paste parser", "column": 2, "row": 0, "component": "api"},
-    {"id": "embedder", "label": "Embedder", "column": 2, "row": 1, "component": "embedder"},
-    {"id": "jev", "label": "Jev classify", "column": 2, "row": 2, "component": "jev"},
-    # Stores / AI (right)
-    {"id": "postgres", "label": "Postgres", "column": 4, "row": 0, "component": "postgres"},
-    {"id": "qdrant", "label": "Qdrant", "column": 4, "row": 1, "component": "qdrant"},
-    {"id": "rerank", "label": "Jev rerank", "column": 4, "row": 2, "component": "jev"},
-    {"id": "llm", "label": "LLM", "column": 2, "row": 3, "component": "llm"},
-    # Infrastructure row (underneath)
-    {"id": "docker", "label": "Docker", "column": 0, "row": 4, "component": "docker"},
+    {"id": "search", "label": "Search", "column": 1, "row": 2, "component": "api"},
+    {"id": "ask", "label": "Ask", "column": 1, "row": 3, "component": "llm"},
+    # Stage 3 — AI / stores (right column)
+    {"id": "jev", "label": "Jev classify", "column": 2, "row": 0, "component": "jev"},
+    {"id": "postgres", "label": "Postgres", "column": 2, "row": 1, "component": "postgres"},
+    {"id": "embedder", "label": "Embedder", "column": 2, "row": 2, "component": "embedder"},
+    {"id": "qdrant", "label": "Qdrant", "column": 2, "row": 3, "component": "qdrant"},
+    {"id": "rerank", "label": "Jev rerank", "column": 2, "row": 4, "component": "jev"},
+    {"id": "llm", "label": "LLM", "column": 2, "row": 5, "component": "llm"},
+    # Infrastructure band — separated at the bottom, NO arrows
+    {
+        "id": "docker", "label": "Docker",
+        "column": 0, "row": 5, "component": "docker", "band": "infra",
+    },
     {
         "id": "background", "label": "Background services",
-        "column": 1, "row": 4, "component": "background",
+        "column": 1, "row": 5, "component": "background", "band": "infra",
     },
-    {"id": "disk", "label": "Disk", "column": 2, "row": 4, "component": "disk"},
+    {"id": "disk", "label": "Disk", "column": 2, "row": 5, "component": "disk", "band": "infra"},
 ]
 
 EDGES: list[dict[str, str]] = [

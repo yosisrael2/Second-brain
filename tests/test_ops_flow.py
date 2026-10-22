@@ -97,7 +97,7 @@ class TestFlowEndpoint:
         returned_edges = {(edge["from"], edge["to"]) for edge in body["edges"]}
         assert {(e["from"], e["to"]) for e in EDGES} <= returned_edges
         for node in body["nodes"]:
-            assert node["status"] in {"ok", "degraded", "down", "disabled"}
+            assert node["status"] in {"ok", "degraded", "down", "disabled", "not probed"}
             assert "summary" in node
         for edge in body["edges"]:
             assert edge["status"] in {"green", "amber", "red", "grey"}

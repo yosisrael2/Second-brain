@@ -103,6 +103,16 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
     if component == "embedder":
         if not raw.get("provider"):
             return _entry("disabled", "no embedder provider", raw)
+        proven = raw.get("loaded", False) or (
+            ops.recent_event("ingest", edge="ingest->embedder") is not None
+            or ops.recent_event(edge="search->embedder") is not None
+        )
+        if not proven:
+            return _entry(
+                "not probed",
+                f"{raw['provider']} configured — not proven yet",
+                raw,
+            )
         suffix = f" · {raw['model']}" if raw.get("model") else ""
         return _entry("ok", f"{raw['provider']}{suffix}", raw)
     if component == "jev":
@@ -111,8 +121,14 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         return _entry("ok", f"key set · {raw.get('model', '?')}", raw)
     if component == "llm":
         provider = raw.get("provider", "?")
-        model = f" · {raw['model']}" if raw.get("model") else ""
-        return _entry("ok", f"{provider}{model}", raw)
+        activity = ops.recent_event("llm") or ops.recent_event(edge="ask->llm")
+        if activity is not None and activity.get("ok") is False:
+            return _entry("degraded", f"{provider} — last call failed", raw)
+        if activity is not None:
+            return _entry("ok", f"{provider} · answered {activity['kind']}", raw)
+        return _entry(
+            "not probed", f"{provider} configured — run a probe to verify", raw
+        )
     if component == "telegram":
         if not raw.get("token_set", False):
             return _entry("disabled", "TELEGRAM_BOT_TOKEN unset", raw)
@@ -334,9 +350,9 @@ def _embedder_check() -> dict[str, Any]:
         from brain.api import deps  # noqa: PLC0415
 
         embedder = deps.get_embedder()
-        loaded = getattr(embedder, "_model", None) is not None or getattr(
-            embedder, "_client", None
-        ) is not None
+        # fastembed loads its model in __init__ (model resident = proven);
+        # keyed providers are proven by traffic (checked in _derive_status).
+        loaded = getattr(embedder, "_backend", None) is not None
     except Exception:  # noqa: BLE001
         pass
     return {
@@ -475,6 +491,12 @@ def run_probe(component: str, ctx: HealthContext | None = None) -> dict[str, Any
             }[component]
             result = {"check": _safe(adapter)}
         latency = round((time.perf_counter() - started) * 1000, 1)
+        # Record the probe so config-only components become "proven" (never raises).
+        ops.record_event(
+            component, "probe", bool(result.get("ok", True)), latency_ms=latency,
+            detail={k: result[k] for k in ("summary", "dims", "model", "confidence")
+                    if result.get(k) is not None},
+        )
         return {"component": component, "ok": result.get("ok", True),
                 "latency_ms": latency, **result, "checked_at": _now()}
     except Exception as exc:  # noqa: BLE001  (probes report failures, never raise)

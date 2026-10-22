@@ -203,6 +203,42 @@ def latest_event(component: str, *, ok: bool | None = None) -> dict[str, Any] | 
         return None
 
 
+def recent_event(
+    component: str | None = None,
+    *,
+    edge: str | None = None,
+    ok: bool | None = None,
+    within_s: int = 900,
+) -> dict[str, Any] | None:
+    """Most recent event matching the filters inside the window (None if none).
+
+    Used to distinguish "proven healthy by real traffic" from "merely
+    configured": health shows some components as ``not probed`` until an
+    event (or an explicit probe) provides evidence.
+    """
+    try:
+        query = (
+            "SELECT ts, kind, ok, latency_ms, edge, detail FROM ops_events "
+            "WHERE ts > now() - make_interval(secs => :w)"
+        )
+        params: dict[str, Any] = {"w": within_s}
+        if component is not None:
+            query += " AND component = :c"
+            params["c"] = component[:32]
+        if edge is not None:
+            query += " AND edge = :e"
+            params["e"] = edge[:64]
+        if ok is not None:
+            query += " AND ok = :ok"
+            params["ok"] = ok
+        query += " ORDER BY ts DESC LIMIT 1"
+        with _get_engine().connect() as conn:
+            row = conn.execute(text(query), params).mappings().first()
+        return dict(row) if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def git_sha() -> str | None:
     """Best-effort short git sha (None outside a repo / when git is missing)."""
     try:
@@ -247,7 +283,8 @@ def component_status() -> list[tuple[str, bool, str]]:
         return []
     lines: list[tuple[str, bool, str]] = []
     for name, entry in health.get("components", {}).items():
-        ok = entry.get("status") in {"ok", "disabled"}
-        summary = entry.get("summary") or entry.get("status", "?")
+        status = entry.get("status")
+        ok = status in {"ok", "disabled", "not probed"}
+        summary = entry.get("summary") or status or "?"
         lines.append((name, ok, summary))
     return lines

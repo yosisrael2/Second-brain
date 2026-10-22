@@ -25,6 +25,7 @@ const state = {
   flow: null,
   events: { events: [], total: 0, offset: 0, limit: 25 },
   stats: null,
+  traceHighlight: null,
   eventFilters: { component: "", errorsOnly: false },
 };
 
@@ -142,6 +143,31 @@ function renderOverall() {
 
 // ---------- flow tab ----------
 
+// Desktop layout: columns are pipeline stages (0 = inputs, 1 = processing,
+// 2 = AI/stores); the infrastructure band is separated underneath with no
+// arrows. Phone: one vertical top->bottom stack with downward arrows.
+const STAGE_LABELS = ["Inputs", "Processing", "AI / Stores"];
+const STATUS_CLASS = { "not probed": "notprobed" };
+
+const TRACE_PATHS = {
+  capture: ["api->ingest", "parser->ingest", "ingest->jev", "ingest->postgres",
+            "ingest->embedder", "embedder->qdrant"],
+  search: ["search->embedder", "search->qdrant", "search->rerank"],
+  ask: ["ask->search", "ask->llm"],
+};
+
+function setTraceHighlight(kind) {
+  state.traceHighlight = kind && TRACE_PATHS[kind] ? TRACE_PATHS[kind] : null;
+  if (state.tab === "flow") renderFlow();
+}
+
+function applyTraceHighlight() {
+  const hops = state.traceHighlight || [];
+  for (const path of document.querySelectorAll("#flow .flow-edge")) {
+    path.classList.toggle("hl", hops.includes(path.dataset.hop));
+  }
+}
+
 function renderFlow() {
   const flow = state.flow;
   if (!flow) return;
@@ -149,90 +175,204 @@ function renderFlow() {
   const phone = window.innerWidth < 700;
   const { width, height, pos } = layoutNodes(flow.nodes, phone);
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.replaceChildren(...flowEdges(flow, pos, phone), ...flowNodes(flow, pos));
+  svg.replaceChildren(
+    svgEl("defs", {}, ...arrowMarkers()),
+    ...flowEdges(flow, pos, phone),
+    ...(phone ? [] : flowDecorations(flow, pos, width)),
+    ...flowNodes(flow, pos),
+  );
 
   const degraded = flow.degraded || [];
   $("flow-note").textContent = degraded.length
     ? `attention: ${degraded.join(", ")}`
     : "all hops healthy · click a node to open its health card";
+  applyTraceHighlight();
+}
+
+function arrowMarkers() {
+  // One arrowhead marker per edge color; fills use the same CSS vars as the
+  // edge strokes so light/dark stay in sync.
+  return ["green", "amber", "red", "grey", "notprobed"].map((status) => {
+    const marker = svgEl("marker", {
+      id: `arrow-${status}`, viewBox: "0 0 10 10", refX: "9", refY: "5",
+      markerWidth: "6.5", markerHeight: "6.5", orient: "auto-start-reverse",
+    });
+    marker.append(svgEl("path", { d: "M 0 0 L 10 5 L 0 10 z", class: `marker-fill edge-${status}` }));
+    return marker;
+  });
 }
 
 function layoutNodes(nodes, phone) {
   const pos = new Map();
   if (phone) {
-    // vertical stack, inputs first (column asc, then row)
-    const ordered = [...nodes].sort((a, b) => a.column - b.column || a.row - b.row);
-    const rowH = 64;
-    ordered.forEach((node, index) => {
-      pos.set(node.id, { x: 14, y: 16 + index * rowH, w: 168, h: 46 });
-    });
-    return { width: 196, height: 16 + ordered.length * rowH, pos };
+    const ordered = [...nodes].sort((a, b) =>
+      (a.band === "infra") - (b.band === "infra") || a.column - b.column || a.row - b.row);
+    const W = Math.max(320, Math.min(window.innerWidth, 700)) - 16;
+    const boxW = W - 42; // right lane reserved for skip-edge routing
+    const rowH = 56;
+    let y = 12;
+    for (const node of ordered) {
+      if (node.band === "infra" && pos.get("__dividerY") === undefined) {
+        y += 24;
+        pos.set("__dividerY", { x: 0, y: y - 10, w: 0, h: 0 });
+      }
+      pos.set(node.id, { x: 8, y, w: boxW, h: 42 });
+      y += rowH;
+    }
+    pos.set("__laneX", { x: W - 8, y: 0, w: 0, h: 0 });
+    return { width: W, height: y + 2, pos };
   }
-  const colW = 200, rowH = 92, padX = 16, padY = 14;
-  let maxCol = 0, maxRow = 0;
+  const colW = 212, rowH = 74, padX = 12, padY = 30, infraGap = 52;
+  let maxRow = 0;
+  for (const node of nodes) maxRow = Math.max(maxRow, node.row);
+  const width = padX * 2 + 3 * colW;
+  const height = padY + (maxRow + 1) * rowH + infraGap + 46;
+  pos.set("__labels", { x: padX, y: padY - 14, w: 0, h: 0 });
+  let infraTop = null;
   for (const node of nodes) {
-    maxCol = Math.max(maxCol, node.column);
-    maxRow = Math.max(maxRow, node.row);
-  }
-  // column x positions: pack used columns left-to-right
-  const usedCols = [...new Set(nodes.map((n) => n.column))].sort((a, b) => a - b);
-  const colIndex = new Map(usedCols.map((c, i) => [c, i]));
-  const width = padX * 2 + usedCols.length * colW;
-  const height = padY * 2 + (maxRow + 1) * rowH;
-  for (const node of nodes) {
-    const c = colIndex.get(node.column);
+    const isInfra = node.band === "infra";
+    const y = padY + node.row * rowH + 10 + (isInfra ? infraGap : 0);
+    if (isInfra && (infraTop === null || y - 26 < infraTop)) infraTop = y - 26;
     pos.set(node.id, {
-      x: padX + c * colW + 10,
-      y: padY + node.row * rowH + 12,
-      w: colW - 32,
-      h: rowH - 28,
+      x: padX + node.column * colW + 8,
+      y,
+      w: colW - 36,
+      h: 50,
     });
   }
+  if (infraTop !== null) pos.set("__dividerY", { x: padX, y: infraTop, w: width - 2 * padX, h: 0 });
   return { width, height, pos };
 }
 
-function nodeAnchor(pos, side) {
-  const { x, y, w, h } = pos;
-  return side === "left" ? { x, y: y + h / 2 }
-       : side === "right" ? { x: x + w, y: y + h / 2 }
-       : side === "top" ? { x: x + w / 2, y }
-       : { x: x + w / 2, y: y + h };
+function flowDecorations(flow, pos, width) {
+  const els = [];
+  const labels = pos.get("__labels");
+  if (labels) {
+    STAGE_LABELS.forEach((label, index) => {
+      const text = svgEl("text", {
+        class: "stage-label", x: labels.x + index * 212 + 8, y: labels.y,
+      });
+      text.textContent = label;
+      els.push(text);
+    });
+  }
+  const divider = pos.get("__dividerY");
+  if (divider) {
+    els.push(svgEl("line", {
+      x1: divider.x, y1: divider.y, x2: divider.x + divider.w, y2: divider.y,
+      class: "infra-divider",
+    }));
+    const text = svgEl("text", { class: "stage-label", x: divider.x, y: divider.y - 5 });
+    text.textContent = "Infrastructure";
+    els.push(text);
+  }
+  return els;
 }
 
-function svgEl(tag, attrs) {
+function nodeAnchor(p, side) {
+  return side === "left" ? { x: p.x, y: p.y + p.h / 2 }
+       : side === "right" ? { x: p.x + p.w, y: p.y + p.h / 2 }
+       : side === "top" ? { x: p.x + p.w / 2, y: p.y }
+       : { x: p.x + p.w / 2, y: p.y + p.h };
+}
+
+function svgEl(tag, attrs, ...children) {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
   for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+  for (const child of children) node.append(child);
   return node;
 }
 
+function edgeGeometry(edge, pos, phone) {
+  const from = pos.get(edge.from);
+  const to = pos.get(edge.to);
+  if (!from || !to) return null;
+  if (phone) {
+    const lane = pos.get("__laneX");
+    if (lane && Math.abs(to.y - from.y) > 70) {
+      // Skip edge (target not adjacent): leave the source to the right, run
+      // through the lane beside the boxes, enter the target from the right.
+      const laneX = lane.x;
+      const a = nodeAnchor(from, "right");
+      const b = nodeAnchor(to, "right");
+      return {
+        d: `M ${a.x} ${a.y} C ${laneX} ${a.y}, ${laneX} ${b.y}, ${b.x} ${b.y}`,
+        mid: bezierMid(a, { x: laneX, y: a.y }, { x: laneX, y: b.y }, b),
+      };
+    }
+    const downward = to.y > from.y;
+    const a = nodeAnchor(from, downward ? "bottom" : "top");
+    const b = nodeAnchor(to, downward ? "top" : "bottom");
+    const midY = (a.y + b.y) / 2;
+    return {
+      d: `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`,
+      mid: bezierMid(a, { x: a.x, y: midY }, { x: b.x, y: midY }, b),
+    };
+  }
+  const sameColumn = Math.abs(from.x - to.x) < 4;
+  if (sameColumn) {
+    const downward = to.y > from.y;
+    const a = nodeAnchor(from, downward ? "bottom" : "top");
+    const b = nodeAnchor(to, downward ? "top" : "bottom");
+    const midY = (a.y + b.y) / 2;
+    return {
+      d: `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`,
+      mid: bezierMid(a, { x: a.x, y: midY }, { x: b.x, y: midY }, b),
+    };
+  }
+  const a = nodeAnchor(from, "right");
+  const b = nodeAnchor(to, "left");
+  const midX = (a.x + b.x) / 2;
+  return {
+    d: `M ${a.x} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x} ${b.y}`,
+    mid: bezierMid(a, { x: midX, y: a.y }, { x: midX, y: b.y }, b),
+  };
+}
+
+// Point at t=0.5 of a cubic bezier: (A + 3·C1 + 3·C2 + B) / 8.
+function bezierMid(a, c1, c2, b) {
+  return {
+    x: (a.x + 3 * c1.x + 3 * c2.x + b.x) / 8,
+    y: (a.y + 3 * c1.y + 3 * c2.y + b.y) / 8,
+  };
+}
+
 function flowEdges(flow, pos, phone) {
-  return flow.edges.map((edge) => {
-    const from = pos.get(edge.from);
-    const to = pos.get(edge.to);
-    if (!from || !to) return svgEl("path", { class: "flow-edge" });
-    const a = nodeAnchor(from, phone ? "bottom" : "right");
-    const b = nodeAnchor(to, phone ? "top" : "left");
-    const midX = (a.x + b.x) / 2;
-    const d = phone
-      ? `M ${a.x} ${a.y} C ${a.x} ${(a.y + b.y) / 2}, ${b.x} ${(a.y + b.y) / 2}, ${b.x} ${b.y}`
-      : `M ${a.x} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x} ${b.y}`;
+  const els = [];
+  for (const edge of flow.edges) {
+    const geo = edgeGeometry(edge, pos, phone);
+    if (!geo) continue;
     const path = svgEl("path", {
-      class: `flow-edge edge-${edge.status}${edge.active ? " active" : ""}`,
-      d,
+      class: `flow-edge edge-${edge.status.replace(" ", "")}${edge.active ? " active" : ""}`,
+      d: geo.d,
+      "marker-end": `url(#arrow-${edge.status.replace(" ", "")})`,
     });
+    path.dataset.hop = edge.hop;
     const title = svgEl("title");
     title.textContent = `${edge.hop} — ${edge.status}` +
       (edge.count ? ` · ${edge.count} calls/15m · p50 ${edge.p50 ?? "?"}ms` : " · no traffic/15m") +
       (edge.last_error ? ` · last error: ${jsonPreview(edge.last_error, 120)}` : "");
     path.append(title);
-    return path;
-  });
+    els.push(path);
+    const label = svgEl("text", { class: "flow-elabel", x: geo.mid.x, y: geo.mid.y - 4 });
+    label.textContent = edgeLabel(edge);
+    els.push(label);
+  }
+  return els;
+}
+
+function edgeLabel(edge) {
+  if (!edge.count) return "idle";
+  return `${edge.count} · ${edge.p50 != null ? `${Math.round(edge.p50)}ms` : "?"}`;
 }
 
 function flowNodes(flow, pos) {
   return flow.nodes.map((node) => {
     const p = pos.get(node.id);
-    const group = svgEl("g", { class: "flow-node", "data-node": node.id });
+    const statusClass = STATUS_CLASS[node.status] || node.status;
+    const group = svgEl("g", {
+      class: `flow-node st-${statusClass}`, "data-node": node.id,
+    });
     group.addEventListener("click", () => {
       switchTab("health");
       const card = document.querySelector(`[data-component="${node.component}"]`);
@@ -241,15 +381,10 @@ function flowNodes(flow, pos) {
     group.append(svgEl("rect", {
       class: "body", x: p.x, y: p.y, width: p.w, height: p.h, rx: 10,
     }));
-    const dot = svgEl("circle", {
-      cx: p.x + 14, cy: p.y + 15, r: 5,
-      fill: { ok: "var(--ok)", degraded: "var(--degraded)", down: "var(--down)", disabled: "var(--disabled)" }[node.status] || "var(--disabled)",
-    });
-    group.append(dot);
-    const label = svgEl("text", { class: "label", x: p.x + 26, y: p.y + 19 });
+    const label = svgEl("text", { class: "label", x: p.x + 12, y: p.y + 20 });
     label.textContent = node.label;
     group.append(label);
-    const sub = svgEl("text", { class: "sub", x: p.x + 10, y: p.y + p.h - 8 });
+    const sub = svgEl("text", { class: "sub", x: p.x + 12, y: p.y + p.h - 8 });
     const latency = node.latency_ms != null ? ` · ${node.latency_ms}ms` : "";
     sub.textContent = `${node.status}${latency}`;
     group.append(sub);
@@ -424,6 +559,7 @@ async function runCaptureTrace() {
       body: JSON.stringify({ text }),
     });
     renderSteps($("trace-capture-out"), body);
+    setTraceHighlight("capture");
   } catch (error) { toast(`capture trace failed: ${error.message}`); }
 }
 
@@ -433,6 +569,7 @@ async function runSearchTrace() {
   try {
     const body = await api(`/ops/trace/search?q=${encodeURIComponent(query)}`);
     renderSteps($("trace-search-out"), body);
+    setTraceHighlight("search");
   } catch (error) { toast(`search trace failed: ${error.message}`); }
 }
 
@@ -445,6 +582,7 @@ async function runAskTrace() {
       body: JSON.stringify({ question }),
     });
     renderSteps($("trace-ask-out"), body);
+    setTraceHighlight("ask");
   } catch (error) { toast(`ask trace failed: ${error.message}`); }
 }
 
@@ -510,6 +648,19 @@ function tick() {
 }
 
 function init() {
+  // Test hooks: ?hl=capture|search|ask pre-highlights a trace path;
+  // ?measure=1 reports layout widths via console + title (no visual change).
+  const params = new URLSearchParams(location.search);
+  if (params.get("hl")) setTraceHighlight(params.get("hl"));
+  if (params.get("measure")) {
+    const report = () => {
+      const w = document.documentElement.scrollWidth;
+      document.title = `w=${w}`;
+      console.info(`scrollWidth=${w}`);
+    };
+    setTimeout(report, 300);
+    setTimeout(report, 3000);
+  }
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => switchTab(tab.dataset.tab));
   }
