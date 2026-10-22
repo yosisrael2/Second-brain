@@ -816,8 +816,8 @@ def test_llm_extractor_maps_canned_json_to_candidates(world: World):
     # the prompt carries the sent time, the memory block and the injection fence
     # (the timezone name depends on the runner's local zone — assert structure)
     prompt = llm.prompts[0]
-    assert "<<<BEGIN_EMAIL>>>" in prompt and "<<<END_EMAIL>>>" in prompt
-    assert "The email was SENT at:" in prompt
+    assert "<<<BEGIN_SOURCE>>>" in prompt and "<<<END_SOURCE>>>" in prompt
+    assert "The message was SENT at:" in prompt
     assert "Memory context (confirmed kid profiles" in prompt
 
 
@@ -888,16 +888,24 @@ def test_prompt_version_recorded_in_extraction_meta(world: World):
 
 
 def test_derived_child_skips_grounding_and_records_the_link(world: World):
-    """Item 22: derived children may have an empty quote; the link is stored."""
-    source = _capture(world.repo, "הגישו טופס הרשמה עד 1.11", source="email")
+    """Item 22: a FACT plus memory implies a concrete derived TASK.
+
+    The spec's own example: a schedule change (fact) -> a task to pick the
+    kid up at the new time, due when the change applies. Derived children
+    may have an empty quote; the link is stored in extraction_meta.
+    """
+    body = "מיום ראשון 1.11 יוצאת כיתה ב2 ב-12:55 במקום 13:35"
+    source = _capture(world.repo, body, source="email")
     candidates = [
         ChildCandidate(
-            kind="task", title="להגיש טופס הרשמה",
-            quote="הגישו טופס הרשמה עד 1.11", when_raw="1.11", due=True,
+            kind="fact", title="מיום 1.11 יוצאת כיתה ב2 ב-12:55",
+            quote="מיום ראשון 1.11 יוצאת כיתה ב2 ב-12:55", when_raw="1.11",
+            audience={"school": "ברקת", "grades": "2"},
         ),
         ChildCandidate(
-            kind="reminder", title="הגישו את הטופס עד ה-1.11",
+            kind="task", title="לאסוף את רונה ב-12:55 מיום 1.11",
             quote="", when_raw="1.11", due=True, derived_from="0",
+            audience={"named_kids": ["Rona"]},
         ),
     ]
     service = world.with_extractor(CountingExtractor(candidates))
@@ -910,4 +918,5 @@ def test_derived_child_skips_grounding_and_records_the_link(world: World):
         if row.extraction_meta.get("derived_from") is not None
     ]
     assert len(derived) == 1
+    assert derived[0].type.value == "task"  # derived = a TASK, not a reminder
     assert derived[0].extraction_meta["derived_from"] == "0"
