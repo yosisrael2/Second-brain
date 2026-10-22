@@ -52,10 +52,29 @@ class Keychain:
     def store(self, account: str, secret: str) -> None:
         """Create or update the item (``-U`` upsert) via ``security -i`` stdin.
 
-        The secret goes on stdin, not argv.
+        The command line travels on STDIN, so the secret is never in any
+        process argv (``ps`` shows only ``security -i``). The secret must be
+        ON the command line (quoted): a bare trailing ``-w`` in -i mode
+        fails with 'unknown error' (verified on the real login keychain —
+        the fake runner cannot prove this). Secrets containing whitespace
+        or double quotes cannot be represented in that mini-parser and are
+        rejected rather than silently corrupted (real OAuth tokens are
+        URL-safe and never contain either).
         """
-        command = f"add-generic-password -U -s {self._service} -a {account} -w\n"
-        code, out = self._runner(["security", "-i"], stdin=command + secret + "\n")
+        if (
+            not secret
+            or any(ch in secret for ch in ('"', "\n", "\r"))
+            or len(secret.split()) != 1
+        ):
+            raise KeychainError(
+                "refusing to store: the secret contains whitespace or quotes "
+                "(real OAuth tokens never do — refusing beats silent corruption)"
+            )
+        command = (
+            f"add-generic-password -U -s {self._service} -a {account} "
+            f'-w "{secret}"\n'
+        )
+        code, out = self._runner(["security", "-i"], stdin=command)
         if code != 0:
             raise KeychainError(
                 f"keychain store failed (exit {code}): {out.strip()[:200] or 'unknown error'}"

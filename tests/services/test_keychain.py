@@ -32,9 +32,22 @@ class TestStore:
         args, stdin = runner.calls[0]
         assert args[:2] == ["security", "-i"]
         assert "1//refresh-token-value" not in " ".join(args)
-        assert "1//refresh-token-value" in stdin
+        # The secret rides ON the command line (quoted) INSIDE stdin: a bare
+        # trailing '-w' fails on the real keychain ('unknown error', verified).
+        assert '-w "1//refresh-token-value"' in stdin
         assert "add-generic-password" in stdin
         assert "-U" in stdin  # upsert: re-consent replaces the token
+
+    def test_store_rejects_secrets_the_stdin_parser_cannot_carry(self):
+        # whitespace or quotes cannot survive the -i mini-parser unquoted:
+        # refuse rather than silently corrupt (real OAuth tokens never do this)
+        runner = FakeRunner()
+        kc = Keychain(runner=runner)
+        with pytest.raises(KeychainError):
+            kc.store("default", "two words")
+        with pytest.raises(KeychainError):
+            kc.store("default", 'has"quote')
+        assert runner.calls == []
 
     def test_store_failure_raises(self):
         runner = FakeRunner([(1, "secHS: User interaction is not allowed.")])
