@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from brain import ops
 from brain.ai.embedder import Embedder, EmbedderError
 from brain.ai.vectorstore import VectorStore, VectorStoreError
 from brain.db.models import MemoryItem
@@ -54,11 +55,17 @@ class SearchService:
     def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
         """Return up to ``limit`` items best matching ``query``."""
         try:
-            vector = self._embedder.embed(query)
-            raw_hits = self._store.search(vector, k=limit + offset)
+            with ops.span("search", "embed", edge="search->embedder"):
+                vector = self._embedder.embed(query)
+            with ops.span("search", "qdrant", edge="search->qdrant"):
+                raw_hits = self._store.search(vector, k=limit + offset)
         except (EmbedderError, VectorStoreError):
             logger.warning(
                 "search: semantic search unavailable; falling back to keywords", exc_info=True
+            )
+            ops.record_event(
+                "search", "keyword_fallback", ok=True,
+                detail={"reason": "semantic unavailable", "query_chars": len(query)},
             )
             return self._keyword_fallback(query, limit=limit, offset=offset)
         candidates = [
@@ -69,7 +76,8 @@ class SearchService:
             }
             for raw_hit in raw_hits
         ]
-        ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
+        with ops.span("search", "rerank", edge="search->rerank"):
+            ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
         return self._load_items(ranked[offset : offset + limit])
 
     def _keyword_fallback(self, query: str, *, limit: int, offset: int) -> list[SearchHit]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from brain import ops
 from brain.ai.ask import LLMClient, answer
 from brain.services.search import SearchHit, SearchService
 
@@ -38,12 +39,15 @@ class AskService:
 
     def ask(self, question: str) -> AskResult:
         """Answer ``question`` from the top-k most relevant memory items."""
-        hits = self._search.search(question, limit=self._top_k)
+        with ops.span("ask", "search", edge="ask->search"):
+            hits = self._search.search(question, limit=self._top_k)
         context = [
             {"id": str(hit.item.id), "text": hit.item.raw_text[:SOURCE_PROMPT_MAX_CHARS]}
             for hit in hits
         ]
-        result = answer(question, context, llm=self._llm)
+        with ops.span("ask", "llm", edge="ask->llm") as span:
+            result = answer(question, context, llm=self._llm)
+            span.detail = {"model": result["model"], "cited": len(result["cited_ids"])}
         return AskResult(
             answer=result["answer"],
             cited_ids=result["cited_ids"],
