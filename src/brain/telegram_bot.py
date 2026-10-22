@@ -752,22 +752,22 @@ class TelegramBot:
 
     _KID_FACT_ORDER = ("gender", "school", "grade", "class", "teacher")
 
-    def _memory_service(self) -> Any:
-        """The MemoryService for one update, or None when PR 0 is absent."""
-        with self._services_factory() as services:
-            return getattr(services, "memory", None)
-
     def profile(self) -> Reply:
         """Kids first (gender/class/grade/teacher), then remembered facts.
 
         Every fact line gets a numbered ✖ button (soft delete; history kept).
         Fact ids ride in the pending registry so callback data stays < 64B.
         """
-        memory = self._memory_service()
-        if memory is None:
-            return Reply("Memory layer is not installed yet.")
-        overview = memory.overview(status="confirmed", q=None)
-        persons = [e for e in overview.get("entities", []) if e.get("kind") == "person"]
+        with self._services_factory() as services:
+            memory = getattr(services, "memory", None)
+            if memory is None:
+                return Reply("Memory layer is not installed yet.")
+            overview = memory.overview(status="confirmed", q=None)
+        persons = [
+            e
+            for e in overview.get("entities", [])
+            if e.get("kind") == "person" and e.get("facts")
+        ]
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
         lines = ["👤 <b>Profile</b>"]
@@ -775,9 +775,8 @@ class TelegramBot:
         for entity in persons:
             facts = entity.get("facts", [])
             if entity.get("name") == "me":
-                if facts:
-                    lines.append("")
-                    lines.append("🧠 <b>Remembered</b>")
+                lines.append("")
+                lines.append("🧠 <b>Remembered</b>")
                 for fact in facts:
                     fact_ids.append(str(fact["id"]))
                     predicate = _esc(fact.get("predicate", "note"))
@@ -844,11 +843,11 @@ class TelegramBot:
         """Store a free-text fact on the 'me' entity (confirmed)."""
         if not text:
             return Reply("Usage: /remember <fact> — e.g. /remember Itamar plays basketball")
-        memory = self._memory_service()
-        if memory is None:
-            return Reply("Memory layer is not installed yet.")
         with self._services_factory() as services:
-            fact = services.memory.remember(text)
+            memory = getattr(services, "memory", None)
+            if memory is None:
+                return Reply("Memory layer is not installed yet.")
+            fact = memory.remember(text)
         record_event(
             "telegram",
             EVENT_MEMORY,

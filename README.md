@@ -62,9 +62,9 @@ src/brain/
 ├── ai/                  # AI integrations (owned by AI/integrations track)
 ├── api/
 │   ├── deps.py          # FastAPI dependency providers (service composition)
-│   └── routes/          # thin routers: health.py, items.py, search.py, ask.py, ops.py
-├── services/            # business logic: items, ingest, search, ask
-├── repositories/        # data access: items.py
+│   └── routes/          # thin routers: health.py, items.py, search.py, ask.py, ops.py, memory.py
+├── services/            # business logic: items, ingest, search, ask, memory
+├── repositories/        # data access: items.py, memory.py
 └── db/
     ├── enums.py         # shared enums + FTS constant (single definition)
     ├── base.py          # DeclarativeBase + naming convention
@@ -145,6 +145,66 @@ curl -X POST localhost:27800/ask -H 'Content-Type: application/json' \
 Tests: `tests/test_items.py` (needs the compose Postgres; skipped with a hint
 if it is down). Wiring tests run fully offline (`tests/test_wiring.py`).
 
+## Memory layer API
+
+Durable, confirmed knowledge about the user's world, separate from the
+capture stream: **entities** (person / group / place / org, with aliases)
+and **versioned facts** (subject → predicate → object/value, with
+`valid_from`/`valid_to` and `proposed → confirmed → rejected` status).
+Notes are WHAT HAPPENED; memory is WHAT IS TRUE. Storage lives in
+`entities` / `entity_aliases` / `memory_facts` (migration
+`b7c2d5e8f1a4`); the business rules live in `brain/services/memory.py`
+(`kids()`, `set_kid()`, `remember()`, `compact_block()` for the ask prompt,
+`resolve_applies_to()`), the HTTP surface in `brain/api/routes/memory.py`.
+
+**Facts are never edited in place**: PATCH closes the old version
+(`valid_to=now`) and opens a new one chained via `supersedes_id` — history
+is kept. DELETE is soft (`status=rejected`, `valid_to=now`); the row stays
+queryable via the history endpoint and disappears from the overview.
+Confirm only moves a fact from `proposed` to `confirmed` (409 otherwise).
+Every fact carries `provenance` (where it came from: `user` or a source
+item + quote) — extraction (PR A) will insert proposals through the same
+schema.
+
+**Endpoints** (router: `src/brain/api/routes/memory.py`, service:
+`src/brain/services/memory.py`):
+
+| Method | Path                        | Behavior                                                          |
+| ------ | --------------------------- | ----------------------------------------------------------------- |
+| GET    | `/memory`                   | Entities with their current facts, grouped; `?status=proposed` for the inbox (empty groups dropped), `?q=` filters by name/alias/fact value |
+| POST   | `/memory/entities`          | Create an entity (`kind`, `name`, optional `aliases`); 201, or the existing identical entity |
+| PATCH  | `/memory/entities/{id}`     | Rename; 404 if missing                                            |
+| DELETE | `/memory/entities/{id}`     | Hard delete (cascades aliases + its facts); 404 if missing        |
+| POST   | `/memory/facts`             | Add a fact; `status=confirmed` (default) or `proposed`; 404 unknown subject, 422 without object/value |
+| PATCH  | `/memory/facts/{id}`        | Edit = close old version + open new (returns the new version); 404 if missing |
+| DELETE | `/memory/facts/{id}`        | Soft delete (rejected, `valid_to=now`, history kept); 409 if already closed |
+| POST   | `/memory/facts/{id}/confirm`| `proposed → confirmed` in place; 409 when not proposed            |
+| GET    | `/memory/facts/{id}/history`| The version chain, oldest first                                   |
+
+Example:
+
+```bash
+curl -X POST localhost:27800/memory/entities -H 'Content-Type: application/json' \
+  -d '{"kind": "person", "name": "Rona", "aliases": ["רונה"]}'
+curl -X POST localhost:27800/memory/facts -H 'Content-Type: application/json' \
+  -d '{"subject_id": "<entity-id>", "predicate": "grade", "value": "5"}'
+curl 'localhost:27800/memory?status=confirmed'          # grouped overview
+curl 'localhost:27800/memory?status=proposed'           # the Proposed inbox
+curl -X PATCH localhost:27800/memory/facts/<fact-id> -H 'Content-Type: application/json' \
+  -d '{"value": "6"}'                                   # new version, old one closed
+curl -X POST localhost:27800/memory/facts/<fact-id>/confirm
+curl 'localhost:27800/memory/facts/<fact-id>/history'   # the version chain
+```
+
+Tests: `tests/test_memory_api.py` (every route + the versioning semantics),
+`tests/services/test_memory.py` (the core service), and the bot memory
+commands in `tests/test_telegram_memory.py`.
+
+In the **Telegram bot**: `/profile` shows the kids (gender/class/grade/
+teacher) and remembered facts with one ✖ button per fact (soft delete,
+history kept); `/remember <text>` stores a confirmed free-text fact on the
+`me` entity.
+
 ## Cockpit (ops dashboard)
 
 `http://127.0.0.1:27800/cockpit/` — one local dashboard showing whether every
@@ -171,6 +231,11 @@ Tabs:
   neighbours, saves nothing; search: embed -> candidates -> rerank order ->
   fallback decision) and the item inspector (DB row + vector payload + item
   events). The ask trace runs the real LLM (labeled, user-initiated).
+- **Memory** — the memory layer (entities + versioned facts): kids first,
+  search, add/rename/delete entities, add/inline-edit/soft-delete facts,
+  a "Proposed" inbox (✅ confirm / ❌ reject), and a per-fact history drawer
+  showing every version with its provenance (source item + quote; item ids
+  open in the Debug inspector).
 
 Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 
@@ -269,10 +334,10 @@ for MVP top-k use.
 
 `brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
 `pip install -e '.[telegram]'`). Plain messages are captured through the same
-paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent` and
-`/status` reuse the same services as the API in-process (with feature/cockpit
-installed, `/status` shows live per-component health via the `brain.ops`
-shim — zero bot changes; without it the bot degrades to a stub reply). Access is
+paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent`,
+`/profile` and `/remember` use the same services as the API in-process; with
+feature/cockpit installed, `/status` shows live per-component health via the `brain.ops`
+shim — zero bot changes; without it the bot degrades to a stub reply. Access is
 allowlist-only: with `TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS`
 (comma-separated ids) is required — anyone else gets no reply (their id is
 logged once at INFO). `brain telegram --whoami-hint` explains how to find
@@ -296,7 +361,9 @@ Interaction details:
   TYPING indicator while waiting and answers with the model name plus one
   "Open" button per cited item.
 - `/review` walks the inbox one card at a time (File / Type / Delete / Next);
-  `/recent` lists the last 10 items; bot commands are registered via
+  `/recent` lists the last 10 items; `/profile` shows the kids + remembered
+  facts with a ✖ remove button per fact; `/remember <text>` stores a
+  confirmed free-text fact; bot commands are registered via
   `set_my_commands` at startup.
 - documents: `.ics` files are captured as calendar items; other files,
   photos and voice get a "not supported yet" reply.
