@@ -193,7 +193,11 @@ class EnrichmentService:
 
     def queue_depth(self) -> int:
         """Jobs waiting to run right now (ops: queue depth)."""
-        return self._session.query(EnrichmentJob).filter(EnrichmentJob.state == "queued").count()
+        return (
+            self._session.query(EnrichmentJob)
+            .filter(EnrichmentJob.state == "queued")
+            .count()
+        )
 
     def cap_used_today(self, now: datetime) -> int:
         """LLM extractions charged to TODAY's daily budget (D5 accounting)."""
@@ -408,15 +412,11 @@ class EnrichmentService:
     # --- storage + diff (item 18, item 30) ----------------------------------
 
     def _children_of(self, source_id: uuid.UUID) -> dict[uuid.UUID, MemoryItem]:
-        rows = (
-            self._session.execute(
-                select(MemoryItem)
-                .join(ItemSource, ItemSource.child_id == MemoryItem.id)
-                .where(ItemSource.source_id == source_id)
-            )
-            .scalars()
-            .all()
-        )
+        rows = self._session.execute(
+            select(MemoryItem)
+            .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+            .where(ItemSource.source_id == source_id)
+        ).scalars().all()
         return {row.id: row for row in rows}
 
     @staticmethod
@@ -507,7 +507,9 @@ class EnrichmentService:
         )
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
-        self._session.add(ItemSource(child_id=child.id, source_id=source.id, quote=candidate.quote))
+        self._session.add(
+            ItemSource(child_id=child.id, source_id=source.id, quote=candidate.quote)
+        )
         existing_children[child.id] = child  # visible to later candidates this run
         self._repo.commit()
         self._index_child(child)
@@ -540,7 +542,9 @@ class EnrichmentService:
         # an extra quote, not a second link row (UNIQUE(child_id, source_id))
         link = (
             self._session.query(ItemSource)
-            .filter(ItemSource.child_id == child.id, ItemSource.source_id == source.id)
+            .filter(
+                ItemSource.child_id == child.id, ItemSource.source_id == source.id
+            )
             .one_or_none()
         )
         if link is not None and link.quote != resolved.candidate.quote:

@@ -34,6 +34,7 @@ travel in the callback).
 from __future__ import annotations
 
 import html
+import logging
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -42,6 +43,8 @@ from sqlalchemy.orm import Session
 
 from brain.db.models import MemoryItem
 from brain.services.extraction.dates import combine_local, extract_clock, resolve_when
+
+logger = logging.getLogger(__name__)
 
 # The spec's mapping by the STORED child type (A1 round 1 added
 # 'reminder' and 'fact' to ItemType); legacy types keep fallbacks.
@@ -186,6 +189,7 @@ def apply_fix(
     when_raw: str,
     source: MemoryItem | None,
     tz_name: str,
+    indexer=None,
 ) -> MemoryItem:
     """✏️ Fix: minimal edit (title + date) re-validated by the A1 date rules.
 
@@ -193,6 +197,11 @@ def apply_fix(
     ``extraction_meta["user_edited"]=True``, so a re-run never overwrites it.
     A weekday that contradicts its own date keeps the child ``date_conflict``
     with both readings (item 2b) — never silently "fixed".
+
+    ``indexer`` (optional): the Fix changes ``raw_text`` (the title), so the
+    child's vector is re-embedded after the commit — a stale vector would
+    miss the corrected title in search. Indexing failure is logged and never
+    fails the Fix (the same policy as capture).
     """
     if not title or not title.strip():
         raise FixError("the title cannot be empty")
@@ -230,6 +239,14 @@ def apply_fix(
 
     child.status = ItemStatus.NEEDS_REVIEW if conflict else child.status
     repo.commit()
+    if indexer is not None:
+        try:
+            indexer.index(child)
+        except Exception as exc:  # noqa: BLE001 — same fallback policy as ingest
+            logger.warning(
+                "proposals: re-indexing fixed child %s failed (%s); deferred to 'brain reindex'",
+                child.id, exc,
+            )
     return child
 
 

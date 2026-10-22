@@ -1430,6 +1430,16 @@ async def poll_loop(
             await shutdown()
 
 
+def _item_indexer():
+    """The shared vector indexer (app-lifetime singleton), or None in tests."""
+    try:
+        from brain.api import deps  # noqa: PLC0415
+
+        return deps.get_item_indexer()
+    except Exception:  # noqa: BLE001 — no app context: skip re-indexing
+        return None
+
+
 def _repo_of(session):
     """An ItemsRepository bound to an existing session (proposal actions)."""
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415

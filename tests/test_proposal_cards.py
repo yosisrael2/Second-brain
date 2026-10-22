@@ -656,3 +656,67 @@ def _token_of(reply, prefix: str) -> str:
             if data.startswith(f"{prefix}:"):
                 return data.split(":")[1]
     raise AssertionError(f"no {prefix} button in {reply.keyboard}")
+
+
+class TestFixReindexes:
+    """A Fix changes raw_text (the title): the child's vector must be
+    re-embedded or a search for the corrected title misses it."""
+
+    @staticmethod
+    def _fake_indexer():
+        class FakeIndexer:
+            def __init__(self):
+                self.indexed = []
+
+            def index(self, item):
+                self.indexed.append(item.raw_text)
+
+            def remove(self, item_id):
+                pass
+
+        return FakeIndexer()
+
+    def test_fix_reindexes_the_updated_text(self, world):
+        repo, _session, _memory = world
+        source = _capture(repo, SOURCE_BODY)
+        child = repo.add(
+            MemoryItem(raw_text="Old title", source="email", type="task",
+                       child_state="proposed")
+        )
+        indexer = self._fake_indexer()
+        apply_fix(
+            repo, child, title="Corrected title", when_raw="",
+            source=source, tz_name=TZ, indexer=indexer,
+        )
+        assert indexer.indexed == ["Corrected title"]
+
+    def test_indexing_failure_never_fails_the_fix(self, world):
+        repo, _session, _memory = world
+        source = _capture(repo, SOURCE_BODY)
+        child = repo.add(
+            MemoryItem(raw_text="Old title", source="email", type="task",
+                       child_state="proposed")
+        )
+
+        class BrokenIndexer:
+            def index(self, item):
+                raise RuntimeError("qdrant down")
+
+        fixed = apply_fix(
+            repo, child, title="Corrected title", when_raw="",
+            source=source, tz_name=TZ, indexer=BrokenIndexer(),
+        )
+        assert fixed.raw_text == "Corrected title"  # the Fix landed anyway
+        assert fixed.child_state == "kept"
+
+    def test_no_indexer_still_fixes(self, world):
+        repo, _session, _memory = world
+        source = _capture(repo, SOURCE_BODY)
+        child = repo.add(
+            MemoryItem(raw_text="Old title", source="email", type="task",
+                       child_state="proposed")
+        )
+        fixed = apply_fix(
+            repo, child, title="T", when_raw="", source=source, tz_name=TZ, indexer=None
+        )
+        assert fixed.raw_text == "T"
