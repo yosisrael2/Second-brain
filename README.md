@@ -512,6 +512,10 @@ Behavior worth knowing:
   QDRANT_COLLECTION=brain_items_test uvicorn brain.main:app` — and stop it
   by its own PID or port (`kill $(lsof -ti tcp:<port>)`), never by pattern.
   Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store.
+  `scripts/dev-start.sh` deliberately does NOT set the flag: if it did, a
+  worktree running dev-start without `.env` would fall back to the live
+  defaults WITH permission. To run the dev stack against the live store, the
+  user opts in explicitly: `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
 
 ## Setup
 
