@@ -167,14 +167,23 @@ def _first_valid_date(year_hint: int, month: int, day: int) -> date | None:
 
 
 def _find_numeric_date(text: str, year_hint: int) -> date | None:
-    """DD.MM, DD/MM, DD.MM.YY(YY) — day-first, Israel-style."""
+    """DD.MM, DD/MM, DD.MM.YY(YY) — day-first, Israel-style.
+
+    Known accepted ambiguity: HH.MM times with MM <= 12 ('8.10', '12.55'
+    would not, MM>12 fails) parse as dates. Temporal hits only ADD
+    context ahead of the semantic hits, so a spurious day range costs a
+    little recall precision but never removes an answer.
+    """
     for match in _NUMERIC_DATE.finditer(text):
         before = text[match.start() - 1] if match.start() else ""
         after = text[match.end() : match.end() + 2]
         chain_continues = len(after) == 2 and after[0] in "./" and after[1].isdigit()
         if before in (".", "/") or chain_continues:
             continue  # inside a dotted run: version number, not a date
-        return _numeric_date_from(match, year_hint)
+        parsed = _numeric_date_from(match, year_hint)
+        if parsed is not None:
+            return parsed
+        # syntactic match but not a valid date (e.g. '12.55') — keep looking
     return None
 
 

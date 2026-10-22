@@ -142,3 +142,10 @@ def test_numeric_date_year_rollover_and_invalids() -> None:
     # fractions / version numbers are not dates
     assert _ranges("הציון הוא 3.14 נקודות") == []
     assert _ranges("גרסה 1.2.3 שוחררה") == []
+
+
+def test_invalid_first_match_does_not_block_a_later_valid_date() -> None:
+    """'12.55' is not a date; the loop must keep going and find '22.10'."""
+    assert _ranges("school ends at 12.55 instead of 13.35, from 22.10") == [
+        "Thu 22 Oct 00:00..Fri 23 Oct 00:00"
+    ]
