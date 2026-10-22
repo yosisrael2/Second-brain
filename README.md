@@ -61,8 +61,9 @@ linked to its section or doc.
 
 - Meaning extraction PR A1: data model + async enrichment of captured items
 - Memory-aware recall for kid questions (PR 0d)
-- Attachments (PR F1): Telegram images/PDFs through the attachment core
-- Gmail-label email source (PR F2): investigation done, awaiting authorization
+- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp
+- Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user
+- WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
 - Bot timezone fix
 
 **Planned**
@@ -70,7 +71,7 @@ linked to its section or doc.
 - PR A2: LLM extraction scored against the frozen gold set + held-out data
 - PR B: relations between items + duplicate handling
 - PR C: bot proposal cards (Keep / Fix / Drop) for classification review
-- PR D: WhatsApp source — allowlist, conversation grouping, triage, reconciliation, media
+- PR D: WhatsApp triage, reconciliation, media
 - Then: actions — approved items become Google Calendar events / tasks
 
 **Quality check** (22-23 Oct 2026, real questions): calendar questions **10/10**,
@@ -257,7 +258,7 @@ Example:
 
 ```bash
 curl -X POST localhost:27800/memory/entities -H 'Content-Type: application/json' \
-  -d '{"kind": "person", "name": "Rona", "aliases": ["רונה"]}'
+  -d '{"kind": "person", "name": "Dana", "aliases": ["דנה"]}'
 curl -X POST localhost:27800/memory/facts -H 'Content-Type: application/json' \
   -d '{"subject_id": "<entity-id>", "predicate": "grade", "value": "5"}'
 curl 'localhost:27800/memory?status=confirmed'          # grouped overview
@@ -582,7 +583,9 @@ Behavior worth knowing:
   `DATABASE_URL=postgresql+psycopg://brain:brain@localhost:27432/brain_test
   QDRANT_COLLECTION=brain_items_test uvicorn brain.main:app` — and stop it
   by its own PID or port (`kill $(lsof -ti tcp:<port>)`), never by pattern.
-  Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store.
+  Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store. To run
+  `dev-start.sh` against the real store you opt in explicitly with
+  `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
 
 ## Setup
 
