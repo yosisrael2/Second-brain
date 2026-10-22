@@ -184,6 +184,21 @@ def heartbeat_age_seconds(component: str) -> float | None:
         return None
 
 
+def heartbeat_detail(component: str) -> dict[str, Any] | None:
+    """The component's last heartbeat detail dict (None: never seen)."""
+    try:
+        with _get_engine().connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT detail FROM ops_heartbeats WHERE component = :c"
+                ),
+                {"c": component[:32]},
+            ).fetchone()
+        return dict(row[0]) if row and row[0] else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def latest_event(component: str, *, ok: bool | None = None) -> dict[str, Any] | None:
     """The component's most recent event (optionally filtered by ok)."""
     try:

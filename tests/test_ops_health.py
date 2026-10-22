@@ -14,12 +14,25 @@ from brain.ops import health as ops_health
 
 def _healthy_ctx() -> ops_health.HealthContext:
     return ops_health.HealthContext(
-        db=lambda: {"reachable": True, "latency_ms": 1.0, "drift": False,
-                    "items_by_status": {"inbox": 3}, "size": "8103 kB"},
-        qdrant=lambda: {"reachable": True, "collection": "brain_items",
-                        "vectors": 3, "items": 3, "dims_ok": True},
-        embedder=lambda: {"provider": "fastembed", "model": "BAAI/bge-small-en-v1.5",
-                          "loaded": True},
+        db=lambda: {
+            "reachable": True,
+            "latency_ms": 1.0,
+            "drift": False,
+            "items_by_status": {"inbox": 3},
+            "size": "8103 kB",
+        },
+        qdrant=lambda: {
+            "reachable": True,
+            "collection": "brain_items",
+            "vectors": 3,
+            "items": 3,
+            "dims_ok": True,
+        },
+        embedder=lambda: {
+            "provider": "fastembed",
+            "model": "BAAI/bge-small-en-v1.5",
+            "loaded": True,
+        },
         jev=lambda: {"configured": False},
         llm=lambda: {"provider": "claude_sdk", "model": None},
         telegram=lambda: {"token_set": True, "allowlist_set": True, "heartbeat_age_s": 4.0},
@@ -48,8 +61,18 @@ class TestHealthEndpoint:
         monkeypatch_ctx = _healthy_ctx()
         ops_health._default_context = lambda: monkeypatch_ctx  # type: ignore[assignment]
         body = client.get("/ops/health").json()
-        expected = {"api", "postgres", "qdrant", "embedder", "jev",
-                    "llm", "telegram", "docker", "background", "disk"}
+        expected = {
+            "api",
+            "postgres",
+            "qdrant",
+            "embedder",
+            "jev",
+            "llm",
+            "telegram",
+            "docker",
+            "background",
+            "disk",
+        }
         assert expected <= set(body["components"].keys())
         for component in expected:
             entry = body["components"][component]
@@ -66,8 +89,13 @@ class TestHealthEndpoint:
 
     def test_alembic_drift_is_degraded(self, client, ops_tables):
         ctx = _healthy_ctx()
-        ctx.db = lambda: {"reachable": True, "latency_ms": 1.0, "drift": True,
-                          "items_by_status": {}, "size": "1 kB"}
+        ctx.db = lambda: {
+            "reachable": True,
+            "latency_ms": 1.0,
+            "drift": True,
+            "items_by_status": {},
+            "size": "1 kB",
+        }
         ops_health._default_context = lambda: ctx  # type: ignore[assignment]
         body = client.get("/ops/health").json()
         assert body["components"]["postgres"]["status"] == "degraded"
@@ -75,7 +103,9 @@ class TestHealthEndpoint:
     def test_stale_telegram_heartbeat_is_degraded(self, client, ops_tables):
         ctx = _healthy_ctx()
         ctx.telegram = lambda: {
-            "token_set": True, "allowlist_set": True, "heartbeat_age_s": 400.0,
+            "token_set": True,
+            "allowlist_set": True,
+            "heartbeat_age_s": 400.0,
         }
         ops_health._default_context = lambda: ctx  # type: ignore[assignment]
         body = client.get("/ops/health").json()
@@ -102,9 +132,12 @@ class TestProbes:
 
     def test_llm_probe_runs_on_demand(self, client, ops_tables, monkeypatch):
         monkeypatch.setattr(
-            ops_health, "run_probe",
+            ops_health,
+            "run_probe",
             lambda component, ctx=None: {
-                "ok": True, "model": "claude-haiku-5-5", "latency_ms": 120.0,
+                "ok": True,
+                "model": "claude-haiku-5-5",
+                "latency_ms": 120.0,
             },
         )
         resp = client.post("/ops/probe/llm")
@@ -142,10 +175,12 @@ class TestNotProbed:
 
     def test_llm_with_recent_failed_call_is_degraded(self, client, ops_tables, monkeypatch):
         with engine.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
-                "VALUES ('ask', 'llm', false, 'ask->llm', '{}')"
-            ))
+            conn.execute(
+                text(
+                    "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                    "VALUES ('ask', 'llm', false, 'ask->llm', '{}')"
+                )
+            )
         ops_health.reset_cache()
         ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
         body = client.get("/ops/health").json()
@@ -153,10 +188,12 @@ class TestNotProbed:
 
     def test_llm_with_recent_successful_traffic_is_ok(self, client, ops_tables, monkeypatch):
         with engine.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
-                "VALUES ('ask', 'llm', true, 'ask->llm', '{}')"
-            ))
+            conn.execute(
+                text(
+                    "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                    "VALUES ('ask', 'llm', true, 'ask->llm', '{}')"
+                )
+            )
         ops_health.reset_cache()
         ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
         body = client.get("/ops/health").json()
@@ -164,8 +201,11 @@ class TestNotProbed:
 
     def test_embedder_not_loaded_is_not_probed(self, client, ops_tables, monkeypatch):
         ctx = _healthy_ctx()
-        ctx.embedder = lambda: {"provider": "fastembed", "model": "BAAI/bge-small-en-v1.5",
-                                "loaded": False}
+        ctx.embedder = lambda: {
+            "provider": "fastembed",
+            "model": "BAAI/bge-small-en-v1.5",
+            "loaded": False,
+        }
         ops_health._default_context = lambda: ctx  # type: ignore[assignment]
         ops_health.reset_cache()
         body = client.get("/ops/health").json()
@@ -173,13 +213,18 @@ class TestNotProbed:
 
     def test_embedder_with_recent_traffic_is_ok(self, client, ops_tables, monkeypatch):
         ctx = _healthy_ctx()
-        ctx.embedder = lambda: {"provider": "fastembed", "model": "BAAI/bge-small-en-v1.5",
-                                "loaded": False}
+        ctx.embedder = lambda: {
+            "provider": "fastembed",
+            "model": "BAAI/bge-small-en-v1.5",
+            "loaded": False,
+        }
         with engine.begin() as conn:
-            conn.execute(text(
-                "INSERT INTO ops_events (component, kind, ok, edge, detail) "
-                "VALUES ('search', 'embed', true, 'search->embedder', '{}')"
-            ))
+            conn.execute(
+                text(
+                    "INSERT INTO ops_events (component, kind, ok, edge, detail) "
+                    "VALUES ('search', 'embed', true, 'search->embedder', '{}')"
+                )
+            )
         ops_health._default_context = lambda: ctx  # type: ignore[assignment]
         ops_health.reset_cache()
         body = client.get("/ops/health").json()
@@ -213,15 +258,24 @@ class TestBackgroundComponent:
     @staticmethod
     def _ctx(background) -> ops_health.HealthContext:
         return ops_health.HealthContext(
-            db=lambda: {"reachable": True, "latency_ms": 1.0, "drift": False,
-                        "items_by_status": {}, "size": "1 kB"},
-            qdrant=lambda: {"reachable": True, "collection_exists": True,
-                            "vectors": 0, "items": 0, "dims_ok": True},
+            db=lambda: {
+                "reachable": True,
+                "latency_ms": 1.0,
+                "drift": False,
+                "items_by_status": {},
+                "size": "1 kB",
+            },
+            qdrant=lambda: {
+                "reachable": True,
+                "collection_exists": True,
+                "vectors": 0,
+                "items": 0,
+                "dims_ok": True,
+            },
             embedder=lambda: {"provider": "fastembed", "model": None, "loaded": False},
             jev=lambda: {"configured": False},
             llm=lambda: {"provider": "claude_sdk", "model": None},
-            telegram=lambda: {"token_set": False, "allowlist_set": False,
-                              "heartbeat_age_s": None},
+            telegram=lambda: {"token_set": False, "allowlist_set": False, "heartbeat_age_s": None},
             docker=lambda: {"available": False},
             disk=lambda: {"free_gb": 42.0},
             background=background,
@@ -346,3 +400,92 @@ class TestBackgroundComponent:
         agent = raw["details"]["agents"]["com.secondbrain.api"]
         assert agent["state"] == "running"
         assert agent["pid"] == 93202
+
+
+class TestEmailComponent:
+    """The email (Gmail label poller) component: configured via GMAIL_LABEL_ID,
+    token lives in the login keychain; states follow the poller's heartbeat."""
+
+    @staticmethod
+    def _ctx(email) -> ops_health.HealthContext:
+        return ops_health.HealthContext(
+            db=lambda: {
+                "reachable": True,
+                "latency_ms": 1.0,
+                "drift": False,
+                "items_by_status": {},
+                "size": "1 kB",
+            },
+            qdrant=lambda: {
+                "reachable": True,
+                "collection_exists": True,
+                "vectors": 0,
+                "items": 0,
+                "dims_ok": True,
+            },
+            embedder=lambda: {"provider": "fastembed", "model": None, "loaded": False},
+            jev=lambda: {"configured": False},
+            llm=lambda: {"provider": "claude_sdk", "model": None},
+            telegram=lambda: {"token_set": False, "allowlist_set": False, "heartbeat_age_s": None},
+            docker=lambda: {"available": False},
+            disk=lambda: {"free_gb": 42.0},
+            email=email,
+        )
+
+    def test_disabled_when_label_unset(self):
+        ctx = self._ctx(
+            lambda: {
+                "label_set": False,
+                "token_set": False,
+                "heartbeat_age_s": None,
+                "state": "disabled",
+            }
+        )
+        body = ops_health.run_health_checks(ctx, use_cache=False)
+        assert body["components"]["email"]["status"] == "disabled"
+
+    def test_needs_re_auth_is_degraded_with_exact_summary(self):
+        ctx = self._ctx(
+            lambda: {
+                "label_set": True,
+                "token_set": True,
+                "heartbeat_age_s": 4.0,
+                "state": "needs re-auth",
+            }
+        )
+        body = ops_health.run_health_checks(ctx, use_cache=False)
+        entry = body["components"]["email"]
+        assert entry["status"] == "degraded"
+        assert entry["summary"] == "needs re-auth"
+
+    def test_label_missing_is_degraded_with_exact_summary(self):
+        ctx = self._ctx(
+            lambda: {
+                "label_set": True,
+                "token_set": True,
+                "heartbeat_age_s": 4.0,
+                "state": "label missing",
+            }
+        )
+        body = ops_health.run_health_checks(ctx, use_cache=False)
+        entry = body["components"]["email"]
+        assert entry["status"] == "degraded"
+        assert entry["summary"] == "label missing"
+
+    def test_stale_heartbeat_is_down(self):
+        ctx = self._ctx(
+            lambda: {"label_set": True, "token_set": True, "heartbeat_age_s": 4000.0, "state": "ok"}
+        )
+        body = ops_health.run_health_checks(ctx, use_cache=False)
+        assert body["components"]["email"]["status"] == "down"
+
+    def test_fresh_healthy_poller_is_ok(self):
+        ctx = self._ctx(
+            lambda: {"label_set": True, "token_set": True, "heartbeat_age_s": 4.0, "state": "ok"}
+        )
+        body = ops_health.run_health_checks(ctx, use_cache=False)
+        assert body["components"]["email"]["status"] == "ok"
+
+    def test_email_in_default_health_payload(self, client, ops_tables):
+        body = client.get("/ops/health").json()
+        assert "email" in body["components"]

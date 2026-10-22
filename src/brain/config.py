@@ -117,6 +117,16 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
 
+    # Email source (F2): a read-only Gmail label poller. The label ID is an
+    # immutable Gmail label id (never its display name); the OAuth refresh
+    # token lives in the macOS login keychain (never here, never in .env).
+    # credentials_path points at the Desktop-client secret JSON OUTSIDE the
+    # repo (the gmail-auth helper needs it; the poller does not).
+    gmail_label_id: str = ""
+    gmail_query: str = ""
+    gmail_poll_interval_s: int = 60
+    gmail_credentials_path: str = ""
+
     @field_validator("telegram_allowed_user_ids")
     @classmethod
     def _validate_telegram_user_ids(cls, value: str) -> str:
