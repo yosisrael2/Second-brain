@@ -26,7 +26,7 @@ from alembic import op
 from brain.services.dedupe import content_fingerprint
 
 revision: str = "d2f6a9c4e7b1"
-down_revision: str | None = "c7d91e4a2b58"
+down_revision: str | None = "e8a3f7b9c4d2"  # was c7d91e4a2b58; PR #20 landed between
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
