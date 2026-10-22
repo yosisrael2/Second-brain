@@ -44,6 +44,7 @@ import asyncio
 import html
 import importlib
 import logging
+import re
 import secrets
 import sys
 import time
@@ -188,8 +189,8 @@ def _ops_status_lines() -> list[str] | None:
         if run is not None:
             health = run()
             lines = [
-                f"{icon.get(entry.get('status'), '⚪')} {name}: "
-                f"{entry.get('summary') or entry.get('status') or '?'}"
+                f"{icon.get(entry.get('status'), '⚪')} {_esc(name)}: "
+                f"{_esc(entry.get('summary') or entry.get('status') or '?')}"
                 for name, entry in health.get("components", {}).items()
             ]
             if lines:
@@ -207,7 +208,7 @@ def _ops_status_lines() -> list[str] | None:
             lines.append(entry)
         elif isinstance(entry, (tuple, list)) and len(entry) == 3:
             name, ok, summary = entry
-            lines.append(f"{'🟢' if ok else '🔴'} {name}: {summary}")
+            lines.append(f"{'🟢' if ok else '🔴'} {_esc(name)}: {_esc(summary)}")
     return lines or None
 
 
@@ -965,28 +966,62 @@ def _inline_keyboard(rows: list[list[tuple[str, str]]] | None) -> Any:
 
 
 async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None = None) -> None:
-    """Send a reply; edit ``message_id`` in place when the reply asks for it."""
-    edit = getattr(reply, "edit", False)
-    if edit and message_id is not None:
+    """Send a reply; edit in place when asked; never lose it to a parse rejection.
+
+    On a Telegram BadRequest about parse entities the same text is resent
+    with tags stripped and parse_mode=None, and an ops event records the
+    fallback — a reply must never be silently lost.
+    """
+    text = reply.text[:TELEGRAM_REPLY_MAX_CHARS]
+    markup = _inline_keyboard(reply.keyboard)
+    if getattr(reply, "edit", False) and message_id is not None:
         edit_message = getattr(tg, "edit_message_text", None)
         if edit_message is not None:
             try:
                 await edit_message(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
-                    parse_mode="HTML",
-                    reply_markup=_inline_keyboard(reply.keyboard),
+                    chat_id=chat_id, message_id=message_id, text=text,
+                    parse_mode="HTML", reply_markup=markup,
                 )
                 return
-            except Exception as exc:  # noqa: BLE001  (edit can fail: message too old)
+            except Exception as exc:  # noqa: BLE001
+                if _is_parse_entity_error(exc):
+                    record_event(
+                        "telegram", EVENT_ERROR, ok=False,
+                        detail={"error": f"edit fallback: {type(exc).__name__}: {exc!s}"[:200]},
+                    )
+                    await edit_message(
+                        chat_id=chat_id, message_id=message_id,
+                        text=_strip_html(text), parse_mode=None, reply_markup=markup,
+                    )
+                    return
                 logger.debug("telegram: edit_message_text failed, sending new (%s)", exc)
-    await tg.send_message(
-        chat_id=chat_id,
-        text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
-        parse_mode="HTML",
-        reply_markup=_inline_keyboard(reply.keyboard),
-    )
+    try:
+        await tg.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001  (fallback only for parse-entity errors)
+        if not _is_parse_entity_error(exc):
+            raise
+        record_event(
+            "telegram",
+            EVENT_ERROR,
+            ok=False,
+            detail={"error": f"reply fallback: {type(exc).__name__}: {exc!s}"[:200]},
+        )
+        await tg.send_message(
+            chat_id=chat_id,
+            text=_strip_html(text),
+            parse_mode=None,
+            reply_markup=markup,
+        )
+
+
+def _is_parse_entity_error(exc: BaseException) -> bool:
+    """True for Telegram BadRequest 'Can't parse entities' (any PTB version)."""
+    return type(exc).__name__ == "BadRequest" and "parse entities" in str(exc).lower()
+
+
+def _strip_html(text: str) -> str:
+    """Unescape then drop tags: the plain-text fallback of an HTML reply."""
+    return re.sub(r"<[^>]*>", "", html.unescape(text))
 
 
 def _forward_info(message: Any) -> dict[str, Any] | None:
