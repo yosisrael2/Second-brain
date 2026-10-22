@@ -1,5 +1,6 @@
 """FastAPI application factory and ASGI entrypoint."""
 
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -9,13 +10,19 @@ from fastapi.responses import JSONResponse
 from brain.ai.ask import LLMError
 from brain.api import deps
 from brain.api.routes import ask, capture, health, items, memory, ops, search
-from brain.config import get_settings
+from brain.config import assert_not_live_store, get_settings
 from brain.services.items import ItemNotFound
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Close the shared AI clients when the app shuts down."""
+    """Refuse a live-store startup without opt-in; close shared clients on shutdown."""
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
     yield
     deps.close_shared_clients()
 

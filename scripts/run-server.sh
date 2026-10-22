@@ -33,6 +33,9 @@ UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 }
 
 load_env_file  # fills unset vars from .env (DATABASE_URL, QDRANT_URL, ...); real env wins
+# The launchd path IS the real service: opt in to the live-store startup guard
+# (brain.config.assert_not_live_store refuses bare worktree uvicorns otherwise).
+export BRAIN_ALLOW_LIVE=1
 export PYTHONUNBUFFERED=1
 
 exec "$UVICORN" brain.main:app --host 127.0.0.1 --port "$PORT"
