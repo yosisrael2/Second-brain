@@ -22,6 +22,8 @@ dependencies = [
     "fastembed>=0.6,<2",
     # PDF text-layer extraction for attachments (item 44; BSD-3-Clause).
     "pypdf>=5,<7",
+    # Hebrew-calendar date conversion for extraction (delta item 2a).
+    "pyluach>=2.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -59,6 +61,12 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 disallow_any_generics = true
+
+[[tool.mypy.overrides]]
+# pyluach ships no type stubs and none are published (PR A1: Hebrew calendar
+# conversion for extraction, delta item 2a).
+module = "pyluach.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

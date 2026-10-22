@@ -91,3 +91,31 @@ def quote_in_source(quote: str, source: str) -> bool:
     """
     needle = normalize(quote)
     return bool(needle) and needle in normalize(source)
+
+
+def title_similarity(a: str, b: str) -> float:
+    """max(SequenceMatcher ratio, token Jaccard) over normalized titles.
+
+    Shared matcher (extraction re-runs + the eval harness must agree — PR #33
+    review round 1): SequenceMatcher handles near-identical strings and small
+    edits; token Jaccard handles word reordering. Both operate on this
+    module's normalizer output, so geresh/nikud/bidi/whitespace/case
+    differences never matter and Hebrew and English titles behave the same.
+    """
+    import re as _re  # noqa: PLC0415
+    from difflib import SequenceMatcher  # noqa: PLC0415
+
+    left, right = normalize(a), normalize(b)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    ratio = SequenceMatcher(None, left, right).ratio()
+    left_tokens = set(_re.findall(r"\S+", left))
+    right_tokens = set(_re.findall(r"\S+", right))
+    jaccard = (
+        len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+        if left_tokens and right_tokens
+        else 0.0
+    )
+    return max(ratio, jaccard)

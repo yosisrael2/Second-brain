@@ -107,12 +107,11 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from brain.services.textnorm import normalize, quote_in_source
+from brain.services.textnorm import quote_in_source, title_similarity
 
 TIME_TOLERANCE = timedelta(hours=1)
 DEFAULT_TITLE_THRESHOLD = 0.3
@@ -422,29 +421,6 @@ def _check_unique(children: list[Child], side: str) -> None:
 
 
 # ---- matching + metrics ------------------------------------------------------
-
-
-def title_similarity(a: str, b: str) -> float:
-    """max(SequenceMatcher ratio, token Jaccard) over normalized titles.
-
-    SequenceMatcher handles near-identical strings and small edits; token
-    Jaccard handles word reordering. Both operate on the shared normalizer's
-    output, so geresh/nikud/bidi/whitespace/case differences never matter and
-    Hebrew and English titles behave the same way.
-    """
-    left, right = normalize(a), normalize(b)
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    ratio = SequenceMatcher(None, left, right).ratio()
-    left_tokens, right_tokens = set(left.split()), set(right.split())
-    jaccard = (
-        len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-        if left_tokens and right_tokens
-        else 0.0
-    )
-    return max(ratio, jaccard)
 
 
 def _compatible(gold: Child, pred: Child) -> bool:

@@ -299,7 +299,6 @@ def _live_services_factory() -> ServicesFactory:
         from brain.db.session import SessionLocal  # noqa: PLC0415
         from brain.repositories.items import ItemsRepository  # noqa: PLC0415
         from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
-        from brain.services.ask import AskService  # noqa: PLC0415
         from brain.services.items import ItemsService  # noqa: PLC0415
         from brain.services.memory import MemoryService  # noqa: PLC0415
         from brain.services.search import SearchService  # noqa: PLC0415
@@ -321,7 +320,7 @@ def _live_services_factory() -> ServicesFactory:
                 ingest=IngestService(repo, deps.get_classifier(), deps.get_item_indexer()),
                 items=ItemsService(repo, deps.get_item_indexer()),
                 search=search,
-                ask=AskService(
+                ask=deps.build_ask_service(
                     search,
                     deps.get_llm_client(),
                     memory_block=memory.compact_block,

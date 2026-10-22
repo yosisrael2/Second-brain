@@ -6,6 +6,7 @@ POST /ops/trace/capture     dry-run: parse -> classify -> embed -> qdrant (no sa
 GET  /ops/trace/search?q=   embedding -> candidates -> rerank order -> fallback
 POST /ops/trace/ask         sources -> prompt sizes -> LLM -> answer+citations
 GET  /ops/item/{id}         item inspector (row, vector presence, events)
+GET  /ops/enrichment        extraction queue depth + today's cap usage (PR A1)
 GET  /ops/events            paginated event log (component/ok/since filters)
 GET  /ops/stats             24h/7d stats + confidence histogram + status shares
 GET  /ops/flow              flow-diagram nodes/edges with live status
@@ -93,6 +94,27 @@ def post_trace_ask(payload: dict[str, Any]) -> dict[str, Any]:
     if not question:
         raise HTTPException(status_code=422, detail="question is required")
     return ops_traces.trace_ask(question)
+
+
+@router.get("/ops/enrichment")
+def get_ops_enrichment() -> dict[str, Any]:
+    """Extraction queue snapshot (PR A1, brief item 5): depth + cap usage."""
+    from datetime import UTC
+
+    from brain.db.session import SessionLocal
+    from brain.repositories.items import ItemsRepository
+    from brain.services.extraction.service import EnrichmentService
+
+    now = datetime.now(tz=UTC)
+    with SessionLocal() as session:
+        service = EnrichmentService(
+            ItemsRepository(session), session
+        )
+        return {
+            "queue_depth": service.queue_depth(),
+            "cap_used_today": service.cap_used_today(now),
+            "cap_limit": get_settings().enrichment_daily_cap,
+        }
 
 
 @router.get("/ops/events")
@@ -225,6 +247,38 @@ def _item_events(item_id: str) -> list[dict[str, Any]]:
         event["ts"] = _iso(event["ts"])
         events.append(event)
     return events
+
+
+@router.get("/ops/whatsapp")
+def get_ops_whatsapp() -> dict[str, Any]:
+    """WhatsApp poller ops: last poll time + per-channel cursor and counts (PR D1)."""
+    with engine.connect() as conn:
+        rows = (
+            conn.execute(
+                text(
+                    "SELECT chat_jid, channel_name, cursor_utc, last_poll_at, last_message_at, "
+                    "messages_seen, conversations_created, conversations_updated "
+                    "FROM whatsapp_poll_state ORDER BY channel_name, chat_jid"
+                )
+            )
+            .mappings()
+            .all()
+        )
+    channels = [
+        {
+            "channel": row["channel_name"],
+            "chat_jid": row["chat_jid"],
+            "cursor_at": _iso(row["cursor_utc"]) if row["cursor_utc"] else None,
+            "last_poll_at": _iso(row["last_poll_at"]) if row["last_poll_at"] else None,
+            "last_message_at": _iso(row["last_message_at"]) if row["last_message_at"] else None,
+            "messages_seen": int(row["messages_seen"]),
+            "conversations_created": int(row["conversations_created"]),
+            "conversations_updated": int(row["conversations_updated"]),
+        }
+        for row in rows
+    ]
+    polls = [row["last_poll_at"] for row in rows if row["last_poll_at"] is not None]
+    return {"last_poll_at": _iso(max(polls)) if polls else None, "channels": channels}
 
 
 @router.get("/ops/stats")

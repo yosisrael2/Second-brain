@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -31,6 +32,8 @@ from brain.services.ingest import IngestService
 from brain.services.items import ItemsRepositoryProto
 from brain.services.paste import _calendar_one_liner
 
+logger = logging.getLogger(__name__)
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the brain CLI; returns a process exit code."""
@@ -46,9 +49,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print how to find your Telegram user id for TELEGRAM_ALLOWED_USER_IDS",
     )
+    whatsapp = subparsers.add_parser(
+        "whatsapp", help="Run the WhatsApp poller (bridge store -> conversations)"
+    )
+    whatsapp.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="Seconds between polls (default: WHATSAPP_POLL_INTERVAL_S, 30)",
+    )
+    whatsapp.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help="ISO instant to backfill from on first sight of a channel "
+        "(default: the live edge — history is NOT backfilled)",
+    )
     subparsers.add_parser(
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
+    )
+    enrich = subparsers.add_parser(
+        "enrich", help="Drain the enrichment queue (extraction PR A1)"
+    )
+    enrich.add_argument(
+        "--since",
+        default=None,
+        help="Backfill mode: enqueue every qualifying capture created since "
+        "this ISO date (D6: its own budget, does not consume today's cap)",
+    )
+    enrich.add_argument(
+        "--limit", type=int, default=20, help="Max parents to process this run"
+    )
+    enrich.add_argument(
+        "--budget", type=int, default=None, help="Override the cap for this run"
     )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
@@ -119,8 +153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _reindex(batch_size=args.batch_size)
     if args.command == "telegram":
         return _telegram(whoami_hint=args.whoami_hint)
+    if args.command == "whatsapp":
+        return _whatsapp(interval_s=args.interval, since=args.since)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
+    if args.command == "enrich":
+        return _enrich(since=args.since, limit=args.limit, budget=args.budget)
     if args.command == "memory":
         if args.memory_command == "seed-kid":
             return _memory_seed_kid(
@@ -154,6 +192,60 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
   5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
      people) and restart. Only those ids are ever answered.
 """
+
+
+def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
+    """Drain the enrichment queue; --since switches to backfill mode (D6)."""
+    import os  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store, get_settings  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+
+    settings = get_settings()
+    # Same live-store guard as the API lifespan (PR #31), which covers the
+    # app only — the CLI must not silently write the live store either.
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    with SessionLocal() as session:
+        repo = ItemsRepository(session)
+        service = EnrichmentService(
+            repo,
+            session,
+            daily_cap=budget if budget is not None else settings.enrichment_daily_cap,
+        )
+        if since is not None:
+            day = datetime.fromisoformat(since).replace(tzinfo=UTC)
+            queued = 0
+            for item in repo.list(
+                item_type=None, project=None, status=None,
+                limit=10_000, offset=0, include_children=False,
+            ):
+                if item.created_at < day:
+                    continue
+                if service.enqueue(item, budget="backfill") is not None:
+                    queued += 1
+            print(f"backfill: queued {queued} parent(s) since {since}")
+        report = service.run_once(
+            datetime.now(tz=UTC), limit=limit, backfill=since is not None
+        )
+        summary = " ".join(
+            f"{name}={getattr(report, name)}"
+            for name in (
+                "processed",
+                "children_created",
+                "children_updated",
+                "dropped_ungrounded",
+                "deferred_over_cap",
+                "failed",
+            )
+        )
+        print(f"enrichment: {summary}")
+    return 0
 
 
 def _memory_seed_kid(
@@ -212,6 +304,94 @@ def _telegram(whoami_hint: bool) -> int:
     from brain.telegram_bot import run as run_bot  # noqa: PLC0415  (deferred import)
 
     return run_bot(get_settings())
+
+
+def _whatsapp(interval_s: float | None, since: str | None) -> int:
+    """Run the WhatsApp poller: bridge store -> per-conversation source items.
+
+    Read-only against the bridge; cursor state lives in our DB (see
+    brain.services.whatsapp). Per-poll failures are logged and retried on the
+    next tick; Ctrl-C exits cleanly.
+    """
+    import time  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.ops import heartbeat, record_event  # noqa: PLC0415
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.repositories.whatsapp import WhatsAppStateRepository  # noqa: PLC0415
+    from brain.services.whatsapp import (  # noqa: PLC0415
+        BridgeStore,
+        PollerError,
+        WhatsAppPoller,
+    )
+
+    settings = get_settings()
+    if not settings.whatsapp_bridge_db.strip():
+        print("whatsapp: WHATSAPP_BRIDGE_DB is not configured; poller disabled", file=sys.stderr)
+        return 1
+    try:
+        bridge = BridgeStore(settings.whatsapp_bridge_db, naive_zone=settings.timezone)
+    except Exception as exc:
+        print(f"whatsapp: cannot open bridge store: {exc}", file=sys.stderr)
+        return 1
+
+    backfill: datetime | None = None
+    if since:
+        try:
+            backfill = datetime.fromisoformat(since)
+        except ValueError as exc:
+            print(f"whatsapp: --since must be an ISO instant: {exc}", file=sys.stderr)
+            return 1
+        if backfill.tzinfo is None:
+            backfill = backfill.replace(tzinfo=UTC)
+
+    interval = float(interval_s) if interval_s else settings.whatsapp_poll_interval_s
+    session = SessionLocal()
+    try:
+        poller = WhatsAppPoller(
+            bridge=bridge,
+            state=WhatsAppStateRepository(session),
+            items=ItemsRepository(session),
+            memory=MemoryRepository(session),
+            indexer=None,  # vectors come from 'brain reindex' when run as a side process
+            zone_name=settings.timezone,
+            gap_minutes=settings.whatsapp_gap_minutes,
+            overlap_minutes=settings.whatsapp_overlap_minutes,
+            backfill_since=backfill,
+            commit=True,
+        )
+    except PollerError as exc:
+        print(f"whatsapp: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"whatsapp: polling {bridge.path} every {interval:.0f}s (Ctrl-C to stop)")
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                results = poller.poll(now=datetime.now(UTC))
+                for result in results:
+                    if result.seen or result.created or result.updated:
+                        print(
+                            f"whatsapp: {result.channel}: +{result.seen} msgs, "
+                            f"{result.created} new / {result.updated} updated conversations"
+                        )
+                heartbeat("whatsapp", detail={"channels": len(results)})
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 — the loop outlives poll failures
+                logger.warning("whatsapp: poll cycle failed: %s", exc)
+                record_event(
+                    "whatsapp",
+                    "poll_cycle_error",
+                    ok=False,
+                    detail={"error": type(exc).__name__},
+                )
+            elapsed = time.monotonic() - started
+            time.sleep(max(0.5, interval - elapsed))
+    except KeyboardInterrupt:
+        print("whatsapp: stopped")
+    return 0
 
 
 def _eval_extraction(args: argparse.Namespace) -> int:
@@ -295,6 +475,7 @@ def _reindex(
             live_embedder.close()
     print(f"indexed {indexed} item(s) into collection '{settings.qdrant_collection}'")
     return 0
+
 
 class _NoopClassifier:
     """Classifier stand-in: reindex never classifies, only embeds."""

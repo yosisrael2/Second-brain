@@ -63,8 +63,13 @@ class ItemsRepository:
         status: ItemStatus | None,
         limit: int,
         offset: int,
+        include_children: bool = False,
     ) -> Sequence[MemoryItem]:
-        """List items newest-first, optionally filtered by type/project/status."""
+        """List items newest-first, optionally filtered by type/project/status.
+
+        ``include_children=True`` opts IN to extracted children (used by the
+        parent's child list); default listings never show them (item 19).
+        """
         stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
         if item_type is not None:
             stmt = stmt.where(MemoryItem.type == item_type)
@@ -72,6 +77,13 @@ class ItemsRepository:
             stmt = stmt.where(MemoryItem.project == project)
         if status is not None:
             stmt = stmt.where(MemoryItem.status == status)
+        # Meaning extraction (item 19): proposed children are SEARCHABLE but
+        # UNLISTED in /recent and /review until kept; dropped children stay
+        # hidden too. Kept children list normally.
+        if not include_children:
+            stmt = stmt.where(
+                MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept")
+            )
         return list(self._db.scalars(stmt.limit(limit).offset(offset)))
 
     def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
@@ -116,6 +128,10 @@ class ItemsRepository:
     def commit(self) -> None:
         """Commit the current transaction."""
         self._db.commit()
+
+    def rollback(self) -> None:
+        """Discard the current transaction (used by batch pollers on failure)."""
+        self._db.rollback()
 
     def refresh(self, item: MemoryItem) -> None:
         """Reload server-generated fields (e.g. updated_at) from the DB."""

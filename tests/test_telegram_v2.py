@@ -101,7 +101,9 @@ class TestCaptureKeyboards:
         assert submenu.keyboard is not None
         type_labels = [label for row in submenu.keyboard for label, _ in row]
         assert set(type_labels) == {
-            "✔️ Task", "⚖️ Decision", "📝 Note", "📅 Event", "🔗 Reference", "💡 Idea", "« Back",
+            "✔️ Task", "⚖️ Decision", "📝 Note", "📅 Event",
+            "🏷 reminder", "🏷 fact",  # extraction child kinds (PR A1)
+            "🔗 Reference", "💡 Idea", "« Back",
         }
 
         item_id = next(iter(repo.items))
