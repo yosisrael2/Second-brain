@@ -177,6 +177,9 @@ def _memory_seed_kid(
         attrs = ", ".join(f"{key} {value}" for key, value in kid.items() if key != "name")
         print(f"seeded {name}: {attrs}")
         return 0
+    except ValueError as exc:
+        print(f"seed-kid: {exc}", file=sys.stderr)
+        return 1
     finally:
         session.close()
 
@@ -190,11 +193,12 @@ def _memory_seed_channel(*, name: str, kind: str, applies_to: str) -> int:
     session = SessionLocal()
     try:
         service = MemoryService(MemoryRepository(session))
-        channel = service.add_entity("channel", name)
-        service.add_fact(channel["id"], "channel_kind", value=kind)
-        service.add_fact(channel["id"], "applies_to", value=applies_to)
+        service.set_channel(name, kind=kind, applies_to=applies_to)
         print(f"seeded channel {name}: kind {kind}, applies_to {applies_to}")
         return 0
+    except ValueError as exc:
+        print(f"seed-channel: {exc}", file=sys.stderr)
+        return 1
     finally:
         session.close()
 

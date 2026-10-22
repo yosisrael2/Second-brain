@@ -18,10 +18,14 @@ from brain.db.models import Entity, EntityAlias, MemoryFact
 from brain.repositories.memory import MemoryRepository, utcnow
 
 # Hebrew-letter numerals used in school emails ("כיתות ה-ו" = grades 5-6).
+# Note ל=30 and מ=40 in real Hebrew numerals — they are NOT grades here.
 HEBREW_DIGITS = {
     "א": 1, "ב": 2, "ג": 3, "ד": 4, "ה": 5, "ו": 6, "ז": 7, "ח": 8, "ט": 9,
-    "י": 10, "ל": 12, "מ": 13,
 }
+HEBREW_TENS = {"י": 10}
+# Compound forms after the tens letter: יא = 11, יב = 12.
+
+VALID_GENDERS = frozenset({"girl", "boy"})
 
 BLOCK_MAX_CHARS = 6000  # ~1500 tokens; hard cap, truncated with a marker
 
@@ -103,6 +107,10 @@ class MemoryService:
         An UNCHANGED attribute keeps its fact row (no history spam); a changed
         one closes the old version (valid_to=now) and opens a new row.
         """
+        if gender is not None and gender not in VALID_GENDERS:
+            raise ValueError(
+                f"gender must be one of {sorted(VALID_GENDERS)} (got {gender!r})"
+            )
         entity = self._ensure_entity(kind="person", name=name)
         provided = {
             "gender": gender,
@@ -137,6 +145,46 @@ class MemoryService:
             if kid["name"] == name:
                 return kid
         return {"name": name}
+
+    def set_channel(
+        self, name: str, *, kind: str, applies_to: str
+    ) -> dict[str, Any]:
+        """Create or update a channel's audience facts (versioned like set_kid).
+
+        ``applies_to`` must be a confirmed kid name (exact), 'me' or 'family';
+        anything else raises ValueError instead of silently mis-resolving.
+        Re-seeding the SAME value is a no-op; a different value closes the old
+        fact and opens a new one (supersedes_id), so history stays complete.
+        """
+        if applies_to != "me" and applies_to != "family":
+            kid_names = {kid["name"] for kid in self.kids()}
+            if applies_to not in kid_names:
+                raise ValueError(
+                    "applies_to must be a confirmed kid name (exact), 'me' or "
+                    f"'family' (got {applies_to!r}; known kids: {sorted(kid_names)})"
+                )
+        entity = self._ensure_entity(kind="channel", name=name)
+        for predicate, value in (("channel_kind", kind), ("applies_to", applies_to)):
+            current = self._current_confirmed_fact(entity.id, predicate)
+            if current is not None and current.value == value:
+                continue
+            supersedes = None
+            if current is not None:
+                self._repo.close_fact(current, at=utcnow())
+                supersedes = current.id
+            self._repo.add_fact(
+                MemoryFact(
+                    subject_id=entity.id,
+                    predicate=predicate,
+                    value=value,
+                    status="confirmed",
+                    valid_from=utcnow(),
+                    supersedes_id=supersedes,
+                    provenance={"source": "user"},
+                )
+            )
+        self._repo.commit()
+        return _entity_dict(entity, self._repo.aliases_for(entity.id))
 
     def remember(self, text: str) -> dict[str, Any]:
         """Store a confirmed free-text fact on 'me' (predicate 'note')."""
@@ -376,10 +424,19 @@ class MemoryService:
         return _entity_dict(entity, self._repo.aliases_for(entity.id))
 
     def delete_entity(self, entity_id: uuid.UUID) -> None:
-        """Hard-delete an entity (aliases + subject facts cascade)."""
+        """Hard-delete an entity (aliases + closed-fact history cascade).
+
+        Refuses while the entity still has ANY current fact (valid_to NULL,
+        any status): the user soft-deletes facts first — delete-with-history
+        (design item 31a), never a silent wipe of live memory.
+        """
         entity = self._repo.get_entity(entity_id)
         if entity is None:
             raise KeyError(entity_id)
+        if self._repo.current_facts(subject_ids=[entity.id]):
+            raise MemoryError(
+                "entity still has current facts — soft-delete them first"
+            )
         self._repo.delete_entity(entity)
         self._repo.commit()
 
@@ -414,10 +471,16 @@ class MemoryService:
         return _fact_dict(fact)
 
     def patch_fact(self, fact_id: uuid.UUID, **changes: Any) -> dict[str, Any]:
-        """Edit a fact = close the old version + open a new one (never in-place)."""
+        """Edit a fact = close the old version + open a new one (never in-place).
+
+        A CLOSED fact (superseded, or soft-deleted/rejected) must not be
+        edited: that would silently resurrect history. Raise instead.
+        """
         old = self._repo.get_fact(fact_id)
         if old is None:
             raise KeyError(fact_id)
+        if old.valid_to is not None:
+            raise MemoryError("cannot edit a closed fact (superseded or deleted)")
         now = utcnow()
         self._repo.close_fact(old, at=now)
         new = MemoryFact(
@@ -500,17 +563,26 @@ class MemoryService:
 
 
 def _parse_grades(raw: Any) -> set[str] | None:
-    """Grades as strings; accepts [5, 6], ['5','6'], '5-6' or Hebrew 'ה-ו'.
+    """Grades as strings; accepts [5, 6], ['5','6'], '5-6' or Hebrew forms.
 
+    Hebrew spellings pass through textnorm first, which unifies geresh (ה'),
+    gershayim and the maqaf/en-dash separators (ה־ו, ה–ו) into the plain
+    forms parsed below; quote marks are then stripped ('ה\'' -> ה = 5).
     Unparseable input returns None (the constraint is then 'unconfirmed',
     never 'incompatible' — we must not claim a kid does not apply just
     because we failed to read the range).
     """
+    from brain.services.textnorm import normalize  # noqa: PLC0415  (cheap, local)
+
+    _QUOTE_CHARS = "\"'׳״’”"
     if raw is None:
         return None
     if isinstance(raw, (list, tuple, set)):
-        return {str(item) for item in raw}
-    text = str(raw).strip()
+        return {
+            str(_hebrew_grade(normalize(str(item)).strip(_QUOTE_CHARS)) or item)
+            for item in raw
+        }
+    text = normalize(str(raw)).strip().strip(_QUOTE_CHARS)
     if not text:
         return None
     if "-" in text:
@@ -531,4 +603,6 @@ def _hebrew_grade(text: str) -> int | None:
         return int(cleaned)
     if len(cleaned) == 1 and cleaned in HEBREW_DIGITS:
         return HEBREW_DIGITS[cleaned]
+    if len(cleaned) == 2 and cleaned[0] in HEBREW_TENS and cleaned[1] in HEBREW_DIGITS:
+        return HEBREW_TENS[cleaned[0]] + HEBREW_DIGITS[cleaned[1]]
     return None
