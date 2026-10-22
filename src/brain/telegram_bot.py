@@ -373,6 +373,8 @@ class TelegramBot:
             extra_meta["forwarded"] = True
             if forward.get("sender"):
                 extra_meta["sender"] = forward["sender"]
+            if forward.get("sender_id") is not None:
+                extra_meta["sender_id"] = forward["sender_id"]
             occurred_at = forward.get("date")
         with self._services_factory() as services:
             items = services.ingest.capture_parsed(
@@ -799,14 +801,27 @@ async def _send(tg: Any, chat_id: int, reply: Reply) -> None:
 
 
 def _forward_info(message: Any) -> dict[str, Any] | None:
-    """Extract forward metadata from message.forward_origin (PTB v20+)."""
+    """Extract forward metadata from message.forward_origin (PTB v20+).
+
+    User origins carry the full ``sender_user`` — ``meta.sender`` prefers
+    ``@username``, falls back to "First Last", then ``user:<id>``; the
+    numeric id always lands in ``meta.sender_id``.
+    """
     origin = getattr(message, "forward_origin", None)
     if origin is None:
         return None
     sender: str | None = None
+    sender_id: int | None = None
     sender_user = getattr(origin, "sender_user", None)
     if sender_user is not None:
-        sender = f"user:{getattr(sender_user, 'id', '?')}"
+        sender_id = getattr(sender_user, "id", None)
+        username = getattr(sender_user, "username", None)
+        if username:
+            sender = f"@{username}"
+        else:
+            first = str(getattr(sender_user, "first_name", "") or "").strip()
+            last = str(getattr(sender_user, "last_name", "") or "").strip()
+            sender = " ".join(part for part in (first, last) if part) or f"user:{sender_id}"
     elif getattr(origin, "sender_user_name", None):
         sender = str(origin.sender_user_name).strip()
     else:
@@ -818,7 +833,11 @@ def _forward_info(message: Any) -> dict[str, Any] | None:
                 or getattr(chat, "username", None)
                 or f"chat:{getattr(chat, 'id', '?')}"
             )
-    return {"sender": sender, "date": getattr(origin, "date", None)}
+            sender_id = getattr(chat, "id", None)
+    meta: dict[str, Any] = {"sender": sender, "date": getattr(origin, "date", None)}
+    if sender_id is not None:
+        meta["sender_id"] = sender_id
+    return meta
 
 
 async def _download_text(tg: Any, document: Any) -> str:

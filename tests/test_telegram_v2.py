@@ -169,8 +169,39 @@ class TestForwardedMessages:
 
         item = next(iter(repo.items.values()))
         assert item.meta["forwarded"] is True
-        assert item.meta["sender"] == "user:42"
+        assert item.meta["sender"] == "user:42"  # bare id: no name/username on origin
+        assert item.meta["sender_id"] == 42
         assert item.source == "note"  # source stays the parsed kind
+
+    def test_forward_from_user_prefers_username(self, monkeypatch):
+        core, repo = make_core()
+        origin = SimpleNamespace(
+            type="user",
+            sender_user=SimpleNamespace(
+                id=42, first_name="Dana", last_name="Cohen", username="dana_c"
+            ),
+        )
+        update = self._forward_update(origin)
+
+        _handle(update, core)
+
+        item = next(iter(repo.items.values()))
+        assert item.meta["sender"] == "@dana_c"
+        assert item.meta["sender_id"] == 42
+
+    def test_forward_from_user_without_username_uses_full_name(self, monkeypatch):
+        core, repo = make_core()
+        origin = SimpleNamespace(
+            type="user",
+            sender_user=SimpleNamespace(id=7, first_name="Rami", last_name="K", username=None),
+        )
+        update = self._forward_update(origin)
+
+        _handle(update, core)
+
+        item = next(iter(repo.items.values()))
+        assert item.meta["sender"] == "Rami K"
+        assert item.meta["sender_id"] == 7
         assert item.meta["channel"] == "telegram"
 
     def test_forward_from_hidden_user_uses_the_name(self, monkeypatch):
