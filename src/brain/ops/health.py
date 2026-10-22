@@ -41,6 +41,7 @@ class HealthContext:
         telegram: Callable[[], dict[str, Any]] | None = None,
         docker: Callable[[], dict[str, Any]] | None = None,
         disk: Callable[[], dict[str, Any]] | None = None,
+        background: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -50,6 +51,7 @@ class HealthContext:
         self.telegram = telegram or _telegram_check
         self.docker = docker or _docker_check
         self.disk = disk or _disk_check
+        self.background = background or _background_check
 
 
 def reset_cache() -> None:
@@ -153,7 +155,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", f"unhealthy: {', '.join(unhealthy)}", raw)
         return _entry("ok", f"{len(services)} service(s)", raw)
     if component == "background":
-        return _entry("disabled", "launchd panels land with the background-service task", raw)
+        return _derive_background(raw)
     if component == "disk":
         free = raw.get("free_gb")
         if isinstance(free, (int, float)) and free < 5:
@@ -178,7 +180,7 @@ def run_health_checks(
         "llm": _safe(context.llm),
         "telegram": _safe(context.telegram),
         "docker": _safe(context.docker),
-        "background": {},
+        "background": _safe(context.background),
         "disk": _safe(context.disk),
     }
     components = {name: _derive_status(name, data) for name, data in raw.items()}
@@ -446,6 +448,80 @@ def _compose_project() -> str | None:
     import os  # noqa: PLC0415
 
     return os.environ.get("COMPOSE_PROJECT_NAME")
+
+
+# LaunchAgent labels managed by scripts/service.sh (the background-service pair).
+BACKGROUND_LABELS = ("com.secondbrain.api", "com.secondbrain.telegram")
+
+
+def _background_check() -> dict[str, Any]:
+    """Per-agent launchd status (launchctl print), never raises.
+
+    available=False means launchd itself is unusable (no binary / timeout) —
+    distinct from "agents simply not installed", where the agents map ends up
+    empty and the cockpit shows the background node as disabled.
+    """
+    import os  # noqa: PLC0415
+
+    agents: dict[str, dict[str, Any]] = {}
+    for label in BACKGROUND_LABELS:
+        try:
+            out = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return {"available": False, "agents": {}}
+        info: dict[str, Any] = {}
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                key, sep, value = line.strip().partition(" = ")
+                if not sep:
+                    continue
+                if key == "state":
+                    info["state"] = value.strip()
+                elif key == "pid":
+                    with_id = value.strip()
+                    if with_id.isdigit():
+                        info["pid"] = int(with_id)
+                elif key == "last exit code":
+                    with_id = value.strip()
+                    if with_id.lstrip("-").isdigit():
+                        info["last_exit"] = int(with_id)
+        agents[label] = info
+    return {"available": True, "agents": agents}
+
+
+def _derive_background(raw: dict[str, Any]) -> dict[str, Any]:
+    """Background-services node: launchd agents installed by service.sh.
+
+    Not installed / launchd unusable -> disabled (dev via dev-start is a valid
+    state, not an outage); installed and all running -> ok; partially running
+    -> degraded; installed and none running -> down.
+    """
+    if not raw.get("available", False):
+        return _entry("disabled", "launchd unavailable — background services not managed", raw)
+    agents: dict[str, Any] = raw.get("agents") or {}
+    installed = {label: info for label, info in agents.items() if info}
+    if not installed:
+        return _entry(
+            "disabled", "launchd agents not installed — scripts/service.sh install", raw
+        )
+    total = len(installed)
+    running = [label for label, info in installed.items() if info.get("state") == "running"]
+    stopped = [
+        f"{label.split('.')[-1]}: {info.get('state', '?')}"
+        + (f" (exit {info['last_exit']})" if info.get("last_exit") is not None else "")
+        for label, info in installed.items()
+        if info.get("state") != "running"
+    ]
+    if len(running) == total:
+        return _entry("ok", f"{total}/{total} agents running", raw)
+    if not running:
+        return _entry("down", f"0/{total} agents running — {', '.join(stopped)}", raw)
+    return _entry(
+        "degraded", f"{len(running)}/{total} agents running — {', '.join(stopped)}", raw
+    )
 
 
 def _disk_check() -> dict[str, Any]:
