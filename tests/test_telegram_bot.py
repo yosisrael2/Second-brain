@@ -276,7 +276,9 @@ class TestCore:
 
         reply = core.route("Read the RAG paper and take notes", 111)
 
-        assert reply.text.startswith("✅ <b>Saved</b> · 📝 Note")  # compact card header
+        # compact card header — the stub classifier files plain notes as tasks,
+        # and the header shows the classified type for note-source items
+        assert reply.text.startswith("✅ <b>Saved</b> · ✔️ Task")
         assert len(repo.items) == 1
         item = next(iter(repo.items.values()))
         assert item.meta["channel"] == "telegram"
@@ -423,7 +425,7 @@ class TestPollLoop:
         _run_poll(tg, core)
 
         assert len(tg.sent) == 1 and tg.sent[0]["chat_id"] == 555
-        assert "📝" in tg.sent[0]["text"]  # card header
+        assert "✔️ Task" in tg.sent[0]["text"]  # card header (classified type)
         assert len(repo.items) == 1
         assert events.heartbeats and events.heartbeats[0][1]["pending"] == 1
         assert events.events[0][0] == "capture"

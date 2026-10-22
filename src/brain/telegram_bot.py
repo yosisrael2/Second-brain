@@ -450,8 +450,6 @@ class TelegramBot:
             items = services.ingest.capture_parsed(
                 parsed, extra_meta=extra_meta, occurred_at=occurred_at
             )
-        token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
-        _ = token  # buttons are built by _capture_buttons; keep the registry warm
         record_event(
             "telegram",
             EVENT_CAPTURE,
@@ -503,9 +501,13 @@ class TelegramBot:
         return self._card_header(items) + "\n" + "\n".join(self._item_card(item) for item in items)
 
     def _kind_label(self, items: list[Any]) -> str:
-        source = getattr(items[0], "source", "note") if items else "note"
-        emoji = KIND_EMOJI.get(source, "📝")
-        return f"{emoji} {KIND_NAME.get(source, _esc(source))}"
+        """Source kind for email/whatsapp/calendar; classified type otherwise."""
+        item = items[0] if items else None
+        source = str(getattr(item, "source", "note") or "note")
+        if source in ("email", "whatsapp", "calendar"):
+            return f"{KIND_EMOJI.get(source, '📝')} {KIND_NAME.get(source, 'Note')}"
+        item_type = str(getattr(item, "type", "") or "note")
+        return f"{TYPE_EMOJI.get(item_type, '📝')} {KIND_NAME.get(item_type, 'Note')}"
 
     def _item_card(self, item: Any, indent: str = "") -> str:
         """Compact HTML card: text preview, existing fields, rating, status."""
@@ -540,10 +542,11 @@ class TelegramBot:
             lines.append(f"{indent}🔎 Needs review ({percent}%)")
         return "\n".join(lines)
 
-    @staticmethod
-    def _when_of(item: Any) -> str | None:
+    def _when_of(self, item: Any) -> str | None:
+        """When-line in the USER'S zone (occurred_at is aware UTC)."""
         if item.occurred_at is not None:
-            return item.occurred_at.strftime("%a %d %b %H:%M").replace(" 0", " ")
+            local = item.occurred_at.astimezone(self._timezone)
+            return f"{local:%a} {local.day} {local:%b} {local:%H:%M}"
         meta = item.meta or {}
         for key in ("start", "date"):
             if meta.get(key):

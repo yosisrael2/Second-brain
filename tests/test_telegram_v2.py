@@ -870,3 +870,61 @@ class TestHtmlSafety:
         assert "<b>Saved</b>" not in plain["text"]
         assert "Saved" in plain["text"] and "hello note" in plain["text"]
         assert any(e[0] == "error" and e[1] is False for e in events.events)  # ops record
+
+
+class TestReviewFixes:
+    """PR #17 review: local times on cards, type-aware kind labels, no dead registry put."""
+
+    def test_when_line_renders_in_the_user_timezone(self):
+        core, repo = make_core()
+        item = MemoryItem(
+            id=uuid.uuid4(),
+            raw_text="Board meeting",
+            source="calendar",
+            occurred_at=datetime(2026, 10, 27, 14, 0, tzinfo=UTC),
+        )
+        repo.add(item)
+        from brain.telegram_bot import Pending
+
+        reply = core._card_reply(Pending(ids=(item.id,)))
+
+        assert "When: Tue 27 Oct 16:00" in reply.text  # 14:00Z + 2h (IST after DST end)
+
+    def test_when_line_survives_the_october_dst_change(self):
+        core, repo = make_core()
+        before = MemoryItem(
+            id=uuid.uuid4(), raw_text="IDT event", source="calendar",
+            occurred_at=datetime(2026, 10, 24, 13, 0, tzinfo=UTC),  # +03:00
+        )
+        after = MemoryItem(
+            id=uuid.uuid4(), raw_text="IST meeting", source="calendar",
+            occurred_at=datetime(2026, 10, 26, 13, 0, tzinfo=UTC),  # +02:00
+        )
+        core, repo = make_core(inbox=[before])
+
+        from brain.telegram_bot import Pending
+
+        idt_reply = core._card_reply(Pending(ids=(before.id,)))
+        core2, _ = make_core(inbox=[after])
+        ist_reply = core2._card_reply(Pending(ids=(after.id,)))
+
+        assert "When: Sat 24 Oct 16:00" in idt_reply.text  # IDT (+3)
+        assert "When: Mon 26 Oct 15:00" in ist_reply.text  # IST (+2)
+
+    def test_kind_label_shows_the_classified_type_for_notes(self, monkeypatch):
+        """A note classified as TASK shows '✔️ Task', not '📝 Note'."""
+        core, repo = make_core()
+        reply = core.route("Read the RAG paper and take notes", 111)
+
+        assert "✅ <b>Saved</b> · ✔️ Task" in reply.text
+
+    def test_kind_label_keeps_source_kind_for_email_whatsapp_calendar(self, monkeypatch):
+        core, _ = make_core()
+        email_reply = core.route(TestCardFormat.EMAIL, 111)
+        assert "· 📧 Email" in email_reply.text
+
+        wa_reply = core.route("[21/10/2026, 09:00:00] Dana: hi", 111)
+        assert "· 💬 WhatsApp" in wa_reply.text
+
+        cal_reply = core.route("TUESDAY, October 21, 2026\n9:00 – 12:30pm\nStandup", 111)
+        assert "· 📅 Event" in cal_reply.text
