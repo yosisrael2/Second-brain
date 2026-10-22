@@ -19,6 +19,18 @@ if _env_url is not None and not _env_url.rsplit("/", 1)[-1].split("?")[0].endswi
     )
 os.environ.setdefault("DATABASE_URL", _TEST_DB_URL)
 
+# Qdrant gets the same treatment as Postgres: the suite must never write to a
+# developer's real collection. The default collection name is the LIVE one
+# ('brain_items'), so ambient .env files would silently point e2e tests at it.
+# Pin a *_test collection; refuse non-test collections outright.
+_env_collection = os.environ.get("QDRANT_COLLECTION")
+if _env_collection is not None and not _env_collection.endswith("_test"):
+    raise RuntimeError(
+        "refusing to run tests against non-test qdrant collection "
+        f"{_env_collection!r}; point QDRANT_COLLECTION at a *_test collection"
+    )
+os.environ.setdefault("QDRANT_COLLECTION", "brain_items_test")
+
 from collections.abc import Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
 
