@@ -131,6 +131,9 @@ def test_jev_classifier_adapter_uses_injected_client():
 
 
 def test_item_type_enum_covers_the_contract():
+    # reminder + fact joined with PR A1 (extraction child kinds, spec section
+    # 2): a child item carries its kind in memory_items.type like any item.
     assert {member.value for member in ItemType} == {
-        "task", "decision", "note", "event", "reference", "idea",
+        "task", "decision", "note", "event", "reminder", "fact",
+        "reference", "idea",
     }

@@ -53,6 +53,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
     )
+    enrich = subparsers.add_parser(
+        "enrich", help="Drain the enrichment queue (extraction PR A1)"
+    )
+    enrich.add_argument(
+        "--since",
+        default=None,
+        help="Backfill mode: enqueue every qualifying capture created since "
+        "this ISO date (D6: its own budget, does not consume today's cap)",
+    )
+    enrich.add_argument(
+        "--limit", type=int, default=20, help="Max parents to process this run"
+    )
+    enrich.add_argument(
+        "--budget", type=int, default=None, help="Override the cap for this run"
+    )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     seed_kid = memory_sub.add_parser(
@@ -150,6 +165,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _telegram(whoami_hint=args.whoami_hint)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
+    if args.command == "enrich":
+        return _enrich(since=args.since, limit=args.limit, budget=args.budget)
     if args.command == "memory":
         if args.memory_command == "seed-kid":
             return _memory_seed_kid(
@@ -187,6 +204,60 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
   5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
      people) and restart. Only those ids are ever answered.
 """
+
+
+def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
+    """Drain the enrichment queue; --since switches to backfill mode (D6)."""
+    import os  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store, get_settings  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+
+    settings = get_settings()
+    # Same live-store guard as the API lifespan (PR #31), which covers the
+    # app only — the CLI must not silently write the live store either.
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    with SessionLocal() as session:
+        repo = ItemsRepository(session)
+        service = EnrichmentService(
+            repo,
+            session,
+            daily_cap=budget if budget is not None else settings.enrichment_daily_cap,
+        )
+        if since is not None:
+            day = datetime.fromisoformat(since).replace(tzinfo=UTC)
+            queued = 0
+            for item in repo.list(
+                item_type=None, project=None, status=None,
+                limit=10_000, offset=0, include_children=False,
+            ):
+                if item.created_at < day:
+                    continue
+                if service.enqueue(item, budget="backfill") is not None:
+                    queued += 1
+            print(f"backfill: queued {queued} parent(s) since {since}")
+        report = service.run_once(
+            datetime.now(tz=UTC), limit=limit, backfill=since is not None
+        )
+        summary = " ".join(
+            f"{name}={getattr(report, name)}"
+            for name in (
+                "processed",
+                "children_created",
+                "children_updated",
+                "dropped_ungrounded",
+                "deferred_over_cap",
+                "failed",
+            )
+        )
+        print(f"enrichment: {summary}")
+    return 0
 
 
 def _memory_seed_kid(

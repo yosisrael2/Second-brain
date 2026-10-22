@@ -16,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -75,6 +76,10 @@ class MemoryItem(Base):
             name="status",
         ),
         CheckConstraint(
+            "child_state IS NULL OR child_state IN ('proposed', 'kept', 'dropped')",
+            name="child_state",
+        ),
+        CheckConstraint(
             f"importance IS NULL OR importance BETWEEN {IMPORTANCE_MIN} AND {IMPORTANCE_MAX}",
             name="importance_range",
         ),
@@ -124,6 +129,22 @@ class MemoryItem(Base):
     # backfilled by the fingerprint migration. Nullable: rows created before
     # the column existed until the backfill runs (the migration backfills).
     fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # --- meaning extraction (PR A1; design delta items 6, 7, 19, 2b) -----
+    # child_state: NULL for ordinary top-level captures; otherwise the D2
+    # lifecycle of an EXTRACTED CHILD: 'proposed' (searchable, unlisted in
+    # /recent & /review until kept), 'kept' (user-approved), 'dropped'
+    # (user-rejected; re-runs never recreate it — item 30).
+    child_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # applies_to: resolved audience (item 17, rule R1-R5) as a JSON list of
+    # kid names / 'me' / 'nobody' / 'unknown'; NULL when never resolved.
+    applies_to: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    # date_conflict: a weekday named in the text disagrees with the resolved
+    # date (item 2b) — flagged, never silently fixed; conflicting children
+    # land in needs_review with both readings in extraction_meta.
+    date_conflict: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # extraction_meta: provenance for extracted children (item 7): model,
+    # prompt_version, run_id, extracted_at, date-resolution notes.
+    extraction_meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Format-specific extraction result (email headers, WhatsApp messages,
     # event fields). Always a JSON object; empty for plain notes.
     meta: Mapped[dict[str, Any]] = mapped_column(
@@ -304,3 +325,75 @@ class EmailMessage(Base):
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ItemSource(Base):
+    """A quote linking an extracted child item to its source item (item 7).
+
+    Many-to-many from day one ("white shirt 22.10" appears in BOTH teachers'
+    emails -> one child, two sources). The quote is verbatim source text and
+    is the grounding guard's evidence: a child without a grounded quote must
+    not exist. Both FKs cascade: deleting either endpoint deletes the link,
+    never the other item.
+    """
+
+    __tablename__ = "item_sources"
+    __table_args__ = (
+        # UNIQUE(child_id, source_id): one link per child-source pair; the
+        # quote (possibly very long) stays OUT of the btree index — a long
+        # TEXT in the UNIQUE index fails with 'index row size exceeds
+        # maximum'. Extra quotes live in extraction_meta.extra_quotes.
+        UniqueConstraint("child_id", "source_id"),
+        Index("ix_item_sources_source_id", "source_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    child_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    quote: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class EnrichmentJob(Base):
+    """One parent item's pending/finished enrichment pass (D5/D6, item 3).
+
+    Durable queue: survives restarts, drains oldest-first, carries the daily
+    cap accounting (``llm_used`` + ``finished_at``) and deferral (``not_before``
+    set to tomorrow when the cap is reached). ``budget`` separates the live
+    daily budget from the one-off backfill budget (D6). One job per parent
+    (unique item_id); re-runs re-open the existing job instead of duplicating.
+    """
+
+    __tablename__ = "enrichment_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'running', 'done', 'failed')", name="state"
+        ),
+        CheckConstraint("budget IN ('daily', 'backfill')", name="budget"),
+        UniqueConstraint("item_id"),
+        Index("ix_enrichment_jobs_state_not_before", "state", "not_before"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    budget: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="daily", server_default="daily"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    llm_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
