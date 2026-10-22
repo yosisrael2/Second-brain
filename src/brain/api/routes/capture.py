@@ -35,17 +35,9 @@ def capture_paste(
     """
     zone = ZoneInfo(get_settings().timezone)
     parsed = parse_paste(data.text, kind_hint=data.kind_hint, split=data.split, tz=zone)
-    items = [
-        schemas.ItemRead.model_validate(
-            service.create(
-                schemas.ItemCreate(
-                    raw_text=chunk.raw_text,
-                    source=parsed.kind,
-                    occurred_at=chunk.occurred_at,
-                    meta=chunk.meta,
-                )
-            )
-        )
-        for chunk in parsed.chunks
-    ]
-    return schemas.CaptureResponse(kind=parsed.kind, extracted=parsed.extracted, items=items)
+    items = service.capture_parsed(parsed)
+    return schemas.CaptureResponse(
+        kind=parsed.kind,
+        extracted=parsed.extracted,
+        items=[schemas.ItemRead.model_validate(item) for item in items],
+    )
