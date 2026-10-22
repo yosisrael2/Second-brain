@@ -323,6 +323,8 @@ def _live_services_factory() -> ServicesFactory:
                     search,
                     deps.get_llm_client(),
                     memory_block=memory.compact_block,
+                    memory=memory,
+                    items_repo=repo,
                 ),
                 memory=memory,
             )

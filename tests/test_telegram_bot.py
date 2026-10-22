@@ -79,7 +79,7 @@ class _StubSearch:
     def __init__(self, hits: list[SearchHit] | None = None) -> None:
         self.hits = hits or []
 
-    def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
+    def search(self, query: str, *, limit: int, offset: int = 0, extra_items=()) -> list[SearchHit]:
         return self.hits[:limit]
 
 
