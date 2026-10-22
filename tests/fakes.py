@@ -31,6 +31,13 @@ class FakeRepository:
     def get(self, item_id: uuid.UUID) -> MemoryItem | None:
         return self.items.get(item_id)
 
+    def get_by_fingerprint(self, fingerprint: str) -> MemoryItem | None:
+        matches = sorted(
+            (item for item in self.items.values() if item.fingerprint == fingerprint),
+            key=lambda item: (item.created_at, item.id),
+        )
+        return matches[0] if matches else None
+
     def get_many(self, item_ids: Sequence[uuid.UUID]) -> list[MemoryItem]:
         return [self.items[item_id] for item_id in item_ids if item_id in self.items]
 

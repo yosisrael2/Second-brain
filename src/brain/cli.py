@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from zoneinfo import ZoneInfo
 
 from brain.ai.embedder import Embedder, EmbedderError
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
@@ -12,9 +13,11 @@ from brain.config import get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
+from brain.services.dedupe import content_fingerprint
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsRepositoryProto
+from brain.services.paste import _calendar_one_liner
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -31,12 +34,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Print how to find your Telegram user id for TELEGRAM_ALLOWED_USER_IDS",
     )
+    subparsers.add_parser(
+        "normalize-calendar",
+        help="Rewrite legacy calendar items to the human one-liner raw_text",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
         return _reindex(batch_size=args.batch_size)
     if args.command == "telegram":
         return _telegram(whoami_hint=args.whoami_hint)
+    if args.command == "normalize-calendar":
+        return _normalize_calendar()
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
 
@@ -115,6 +124,60 @@ class _NoopClassifier:
 
     def classify(self, text: str) -> dict[str, object]:
         raise AssertionError("reindex must not classify")  # pragma: no cover
+
+
+_PAGE = 500
+
+
+def _normalize_calendar(
+    repo: ItemsRepositoryProto | None = None,
+) -> int:
+    """Rewrite pre-one-liner calendar items; returns a process exit code.
+
+    Old calendar items carry the whole ICS blob as raw_text. New captures
+    store a human one-liner ('<title> — <Day DD Mon HH:MM–HH:MM> [@ loc]')
+    and keep the ICS in meta['ics_raw']. This one-off rewrites existing rows
+    the same way (original text preserved in meta, fingerprint recomputed so
+    the dedupe guard keeps matching), and prints a count. Re-embedding is
+    deliberately NOT done here — run 'brain reindex' afterwards (the deploy
+    sequence does exactly that).
+    """
+    settings = get_settings()
+    zone = ZoneInfo(settings.timezone)
+    if repo is None:
+        repo = ItemsRepository(SessionLocal())
+    normalized = 0
+    offset = 0
+    while True:
+        batch = repo.list(
+            item_type=None, project=None, status=None, limit=_PAGE, offset=offset
+        )
+        if not batch:
+            break
+        for item in batch:
+            if item.source != "calendar":
+                continue
+            meta = dict(item.meta or {})
+            if not meta.get("title"):
+                continue  # nothing to build from; leave the item untouched
+            one_liner = _calendar_one_liner(meta, zone)
+            if item.raw_text == one_liner:
+                continue  # already normalized (idempotent rerun)
+            original = item.raw_text
+            if "begin:vevent" in original.lower() and "ics_raw" not in meta:
+                meta["ics_raw"] = original
+            elif "original_text" not in meta:
+                meta["original_text"] = original
+            item.raw_text = one_liner
+            item.meta = meta  # reassign so SQLAlchemy sees the JSONB change
+            item.fingerprint = content_fingerprint(
+                one_liner, item.occurred_at, item.source
+            )
+            normalized += 1
+        offset += len(batch)
+    repo.commit()
+    print(f"normalized {normalized} calendar item(s) (run 'brain reindex' to re-embed)")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

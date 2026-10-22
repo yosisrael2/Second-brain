@@ -86,7 +86,14 @@ class MemoryItem(Base):
             "search_vector",
             postgresql_using="gin",
         ),
+        Index("ix_memory_items_fingerprint", "fingerprint"),
     )
+
+    # Transient (not persisted): set on the RETURNED existing item when ingest
+    # detects an exact duplicate, so /capture and the bot can say "Already
+    # saved". Plain class attribute — SQLAlchemy does not map it.
+    deduplicated = False
+
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -111,6 +118,11 @@ class MemoryItem(Base):
     occurred_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Exact-duplicate guard: sha256 over (normalized text, occurred_at UTC
+    # minute, source kind); computed by brain.services.dedupe at ingest and
+    # backfilled by the fingerprint migration. Nullable: rows created before
+    # the column existed until the backfill runs (the migration backfills).
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Format-specific extraction result (email headers, WhatsApp messages,
     # event fields). Always a JSON object; empty for plain notes.
     meta: Mapped[dict[str, Any]] = mapped_column(

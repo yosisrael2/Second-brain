@@ -27,6 +27,8 @@ from brain.services.ask import AskResult, AskService
 from brain.services.ingest import IngestService
 from brain.services.search import SearchHit
 from brain.telegram_bot import (
+    CB_DELETE,
+    CB_UNDO,
     BotServices,
     TelegramBot,
     _ops_status_lines,
@@ -293,6 +295,39 @@ class TestCore:
 
         assert "✅ <b>Saved</b> · 💬 WhatsApp" in reply.text
         assert len(repo.items) == 1
+
+    def test_capture_exact_duplicate_replies_already_saved(self, monkeypatch):
+        _Events().install(monkeypatch)
+        core, repo = _core()
+
+        first = core.route("Read the RAG paper and take notes", 111)
+        second = core.route("Read the RAG paper and take notes", 111)
+
+        assert len(repo.items) == 1  # no second row
+        assert first.text.startswith("✅ <b>Saved</b>")
+        assert "Already saved" in second.text
+        assert "Read the RAG paper" in second.text  # the existing card
+
+    def test_deduped_capture_keyboard_has_no_undo(self, monkeypatch):
+        """Nothing was created by a deduped capture: Undo would delete the
+        ORIGINAL item, so the keyboard must not offer it (data-loss guard)."""
+        _Events().install(monkeypatch)
+        core, repo = _core()
+
+        first = core.route("Read the RAG paper and take notes", 111)
+        second = core.route("Read the RAG paper and take notes", 111)
+
+        first_cbs = [cb for row in first.keyboard for _l, cb in row]
+        second_cbs = [cb for row in second.keyboard for _l, cb in row]
+        assert any(cb.startswith(f"{CB_UNDO}:") for cb in first_cbs)  # normal capture
+        assert all(not cb.startswith(f"{CB_UNDO}:") for cb in second_cbs)
+        labels = [label for row in second.keyboard for label, _cb in row]
+        assert any("Delete original" in label for label in labels)
+        # the destructive button still targets the existing item explicitly
+        delete_cb = next(
+            cb for row in second.keyboard for label, cb in row if "Delete" in label
+        )
+        assert delete_cb.startswith(f"{CB_DELETE}:")
 
     def test_capture_timezone_makes_occurred_at_aware(self, monkeypatch):
         _Events().install(monkeypatch)

@@ -410,6 +410,7 @@ def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste
     clean = _strip_rtl(text).strip()
     meta: dict[str, Any] = {"attendees": []}
     occurred_at: datetime | None = None
+    date_only = False
     tzid = ""
     for raw_line in _unfold(clean.replace("\r\n", "\n").split("\n")):
         if ":" not in raw_line:
@@ -431,13 +432,22 @@ def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste
                 meta["start_raw" if name == "DTSTART" else "end_raw"] = value.strip()
                 if name == "DTSTART":
                     occurred_at = parsed_at
+                    date_only = len(value.strip()) == 8 and value.strip().isdigit()
         elif name == "ATTENDEE":
             if email := _EMAIL_ADDRESS_RE.search(value):
                 meta["attendees"].append(email.group(0))
     meta = {key: value for key, value in meta.items() if value not in (None, [], "")}
+    meta["ics_raw"] = clean  # the whole ICS: raw_text below becomes a one-liner
     return ParsedPaste(
         kind=KIND_CALENDAR,
-        chunks=[_chunk(clean, occurred_at, meta, KIND_CALENDAR)],
+        chunks=[
+            _chunk(
+                _calendar_one_liner(meta, zone, date_only=date_only),
+                occurred_at,
+                meta,
+                KIND_CALENDAR,
+            )
+        ],
         extracted=dict(meta),
     )
 
@@ -466,6 +476,47 @@ def _ics_datetime(value: str, tzid: str = "", zone: ZoneInfo | None = None) -> d
     except (ValueError, KeyError):
         return None
     return None
+
+
+def _calendar_one_liner(
+    meta: dict[str, Any], zone: ZoneInfo, *, date_only: bool = False
+) -> str:
+    """Human one-liner for a calendar event, in the app's timezone.
+
+    Format: ``<title> — <Day DD Mon HH:MM–HH:MM> [@ location]`` (en dash
+    between the times, em dash after the title). Date-only events (ICS
+    ``VALUE=DATE``) render the day without times. Unparseable instants
+    degrade gracefully: title only.
+    """
+    title = str(meta.get("title") or "").strip() or "Calendar event"
+    start = _meta_instant(meta.get("start"))
+    end = _meta_instant(meta.get("end"))
+    parts: list[str] = []
+    if start is not None:
+        local = start.astimezone(zone)
+        parts.append(f"{local:%a} {local.day} {local:%b}")
+        if not date_only:
+            parts.append(f"{local:%H:%M}")
+            if end is not None:
+                parts.append(f"–{end.astimezone(zone):%H:%M}")
+    line = title
+    if parts:
+        day = parts[0]
+        times = "".join(parts[1:])
+        line = f"{title} — {day} {times}".rstrip() if times else f"{title} — {day}"
+    if location := str(meta.get("location") or "").strip():
+        line += f" @ {location}"
+    return line
+
+
+def _meta_instant(value: Any) -> datetime | None:
+    """Parse an isoformat instant from extracted meta; None when absent/bad."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def _parse_calendar_text(
@@ -551,9 +602,12 @@ def _parse_calendar_text(
         meta["title"] = title
     meta["attendees"] = meta.get("attendees") or _EMAIL_ADDRESS_RE.findall(text)
     meta = {key: value for key, value in meta.items() if value not in (None, [], "")}
+    meta["original_text"] = text.strip()  # raw_text below becomes a one-liner
     return ParsedPaste(
         kind=KIND_CALENDAR,
-        chunks=[_chunk(text.strip(), occurred_at, meta, KIND_CALENDAR)],
+        chunks=[
+            _chunk(_calendar_one_liner(meta, zone), occurred_at, meta, KIND_CALENDAR)
+        ],
         extracted=dict(meta),
     )
 
