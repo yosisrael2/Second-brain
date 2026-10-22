@@ -229,6 +229,11 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
 .edge-sample.edge-red { border-color: var(--down); }
 .edge-sample.edge-grey { border-color: var(--edge-idle); border-top-style: dashed; }
 
+/* ---------- tab panels: exactly ONE visible at a time ---------- */
+
+.tab-panel { display: none; }
+.tab-panel.is-active { display: block; }
+
 /* ---------- flow panel ---------- */
 
 .flow-panel {
@@ -240,7 +245,10 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
 }
 #flow {
   display: block;
-  width: 100%; min-width: 880px; max-width: 1056px;
+  /* Natural size at every width: the panel scrolls horizontally when the
+   * viewport is narrower than the diagram; the SVG never rescales, so node
+   * text stays at its designed size (15px) on phones too. */
+  width: 1056px;
   margin: 0 auto; height: auto;
 }
 .flow-note { color: var(--text-muted); font-size: 13px; margin-top: 14px; }
@@ -303,7 +311,8 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
 .flow-edge.hl { stroke-width: 4; filter: drop-shadow(0 0 3px currentColor); }
 .flow-elabel {
   font-size: 12px; font-family: var(--font-mono); fill: var(--text-muted);
-  paint-order: stroke; stroke: var(--bg-surface); stroke-width: 3px;
+  paint-order: stroke; stroke: var(--bg-surface); stroke-width: 6px;
+  stroke-linejoin: round;
 }
 /* Idle labels hide by default (they stacked where several edges leave one
  * card); hovering or keyboard-focusing the edge reveals its own label.

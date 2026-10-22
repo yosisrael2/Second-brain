@@ -206,13 +206,12 @@ function renderFlow() {
   const flow = state.flow;
   if (!flow) return;
   const svg = $("flow");
-  const phone = window.innerWidth < 700;
-  const { width, height, pos } = layoutNodes(flow.nodes, phone);
+  const { width, height, pos } = layoutNodes(flow.nodes);
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.replaceChildren(
     svgEl("defs", {}, ...arrowMarkers()),
-    ...flowEdges(flow, pos, phone, width, height),
-    ...(phone ? [] : flowDecorations(flow, pos, width)),
+    ...flowEdges(flow, pos, width, height),
+    ...flowDecorations(flow, pos, width),
     ...flowNodes(flow, pos),
   );
 
@@ -236,26 +235,8 @@ function arrowMarkers() {
   });
 }
 
-function layoutNodes(nodes, phone) {
+function layoutNodes(nodes) {
   const pos = new Map();
-  if (phone) {
-    const ordered = [...nodes].sort((a, b) =>
-      (a.band === "infra") - (b.band === "infra") || a.column - b.column || a.row - b.row);
-    const W = Math.max(320, Math.min(window.innerWidth, 700)) - 16;
-    const boxW = W - 42; // right lane reserved for skip-edge routing
-    const rowH = 56;
-    let y = 12;
-    for (const node of ordered) {
-      if (node.band === "infra" && pos.get("__dividerY") === undefined) {
-        y += 24;
-        pos.set("__dividerY", { x: 0, y: y - 10, w: 0, h: 0 });
-      }
-      pos.set(node.id, { x: 8, y, w: boxW, h: 42 });
-      y += rowH;
-    }
-    pos.set("__laneX", { x: W - 8, y: 0, w: 0, h: 0 });
-    return { width: W, height: y + 2, pos };
-  }
   const width = 2 * COL_PITCH + NODE_W;
   pos.set("__labels", { x: 0, y: 16, w: 0, h: 0 });
   // Flow nodes first; the infrastructure band starts BELOW the tallest
@@ -325,32 +306,10 @@ function svgEl(tag, attrs, ...children) {
   return node;
 }
 
-function edgeGeometry(edge, pos, phone, anchors) {
+function edgeGeometry(edge, pos, anchors) {
   const from = pos.get(edge.from);
   const to = pos.get(edge.to);
   if (!from || !to) return null;
-  if (phone) {
-    const lane = pos.get("__laneX");
-    const a = nodeAnchor(from, "right");
-    const b = nodeAnchor(to, "right");
-    if (lane) {
-      // Skip edge: leave the source to the right, run through the lane beside
-      // the boxes, enter the target from the right.
-      const laneX = lane.x;
-      return {
-        d: `M ${a.x} ${a.y} C ${laneX} ${a.y}, ${laneX} ${b.y}, ${b.x} ${b.y}`,
-        label: { x: laneX - 8, y: (a.y + b.y) / 2, anchor: "end" },
-      };
-    }
-    const downward = to.y > from.y;
-    const a2 = nodeAnchor(from, downward ? "bottom" : "top");
-    const b2 = nodeAnchor(to, downward ? "top" : "bottom");
-    const midY = (a2.y + b2.y) / 2;
-    return {
-      d: `M ${a2.x} ${a2.y} C ${a2.x} ${midY}, ${b2.x} ${midY}, ${b2.x} ${b2.y}`,
-      label: { x: a2.x, y: midY, anchor: "middle" },
-    };
-  }
   const sameColumn = from.x === to.x;
   if (sameColumn) {
     // Straight vertical between the shared anchor points.
@@ -372,53 +331,47 @@ function edgeGeometry(edge, pos, phone, anchors) {
   };
   const b = { x: to.x, y: to.y + to.h * anchors.enterFrac };
   const bendX = a.x + 28 + anchors.bendIndex * 20;
+  // Label sits at the ENTER end: right-aligned before the target card. A
+  // straight edge takes the space above its line; a bent edge takes the
+  // space below, clear of its own bend vertical. Both stay off every lane.
+  const straight = Math.abs(a.y - b.y) < 0.5;
   return {
     d: `M ${a.x} ${a.y} L ${bendX} ${a.y} L ${bendX} ${b.y} L ${b.x} ${b.y}`,
-    // Beside the vertical bend lane — clear of both the source and target
-    // cards (labels on the first segment overlapped the source card edge).
-    label: { x: bendX + 8, y: a.y - 6, anchor: "middle" },
+    label: straight ? { x: b.x - 6, y: b.y - 8, anchor: "end" }
+                    : { x: b.x - 6, y: b.y + 16, anchor: "end" },
   };
 }
 
-function flowEdges(flow, pos, phone, width, height) {
+function flowEdges(flow, pos, width, height) {
   // Deterministic stagger: edges leaving/entering the same card get distinct
   // anchor rows; edges crossing the same column gap get distinct bend lanes.
-  const exitCount = new Map(), enterCount = new Map(), lanesPerGap = new Map();
+  const exitCount = new Map(), enterCount = new Map();
   for (const edge of flow.edges) {
     const from = pos.get(edge.from), to = pos.get(edge.to);
     if (!from || !to) continue;
     exitCount.set(edge.from, (exitCount.get(edge.from) || 0) + 1);
     enterCount.set(edge.to, (enterCount.get(edge.to) || 0) + 1);
-    if (!phone && from.x !== to.x) {
-      lanesPerGap.set(from.x, (lanesPerGap.get(from.x) || 0) + 1);
-    }
   }
   const seen = { exit: new Map(), enter: new Map(), lane: new Map() };
   const els = [];
   for (const edge of flow.edges) {
-    // Phone: readability over completeness — idle grey edges and infra
-    // hops are dropped; only traffic/problems stay.
-    if (phone && edge.count === 0 && edge.status === "grey") continue;
     const from = pos.get(edge.from), to = pos.get(edge.to);
     if (!from || !to) continue;
-    let anchors = null;
-    if (!phone) {
-      const exitIdx = seen.exit.get(edge.from) || 0;
-      seen.exit.set(edge.from, exitIdx + 1);
-      const enterIdx = seen.enter.get(edge.to) || 0;
-      seen.enter.set(edge.to, enterIdx + 1);
-      let bendIndex = 0;
-      if (from.x !== to.x) {
-        bendIndex = seen.lane.get(from.x) || 0;
-        seen.lane.set(from.x, bendIndex + 1);
-      }
-      anchors = {
-        exitFrac: (ANCHOR_FRACS[Math.min(exitCount.get(edge.from), 3)] || ANCHOR_FRACS[3])[exitIdx],
-        enterFrac: (ANCHOR_FRACS[Math.min(enterCount.get(edge.to), 3)] || ANCHOR_FRACS[3])[enterIdx],
-        bendIndex,
-      };
+    const exitIdx = seen.exit.get(edge.from) || 0;
+    seen.exit.set(edge.from, exitIdx + 1);
+    const enterIdx = seen.enter.get(edge.to) || 0;
+    seen.enter.set(edge.to, enterIdx + 1);
+    let bendIndex = 0;
+    if (from.x !== to.x) {
+      bendIndex = seen.lane.get(from.x) || 0;
+      seen.lane.set(from.x, bendIndex + 1);
     }
-    const geo = edgeGeometry(edge, pos, phone, anchors);
+    const anchors = {
+      exitFrac: (ANCHOR_FRACS[Math.min(exitCount.get(edge.from), 3)] || ANCHOR_FRACS[3])[exitIdx],
+      enterFrac: (ANCHOR_FRACS[Math.min(enterCount.get(edge.to), 3)] || ANCHOR_FRACS[3])[enterIdx],
+      bendIndex,
+    };
+    const geo = edgeGeometry(edge, pos, anchors);
     if (!geo) continue;
     const path = svgEl("path", {
       class: `flow-edge edge-${edge.status.replace(" ", "")}${edge.active ? " active" : ""}`,
@@ -431,10 +384,8 @@ function flowEdges(flow, pos, phone, width, height) {
       (edge.count ? ` · ${edge.count} calls/15m · p50 ${edge.p50 ?? "?"}ms` : " · no traffic/15m") +
       (edge.last_error ? ` · last error: ${jsonPreview(edge.last_error, 120)}` : "");
     path.append(title);
-    // Labels only where they earn their space: traffic on phone, on desktop
-    // edges with traffic or errors show theirs always, idle edges only on
-    // hover/focus — positioned off the arrow tip, clamped inside the canvas.
-    if (phone && edge.count === 0) continue;
+    // Labels: edges with traffic or errors show theirs always; idle edges
+    // only on hover/focus. Anchored in clear space (see edgeGeometry).
     const lx = Math.max(30, Math.min(geo.label.x, (width || 390) - 20));
     const ly = Math.max(16, Math.min(geo.label.y, (height || 800) - 8));
     const label = svgEl("text", {
