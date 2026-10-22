@@ -299,12 +299,18 @@ def _dims_ok(info: Any) -> bool:
     try:
         config = info.config.params.vectors
         dim = getattr(config, "size", None)
-        return dim is None or int(dim) == _embedder_dim()
+        if dim is None:
+            return True
+        expected = _embedder_dim()
+        return expected is None or int(dim) == expected
     except Exception:  # noqa: BLE001
         return True  # unknown shape: don't fake a degradation
 
 
 def _embedder_dim() -> int | None:
+    """Embed one probe sentence — ONLY for the free local provider (no tokens)."""
+    if get_settings().embedder_provider != "fastembed":
+        return None  # keyed providers: skip (health checks must never cost tokens)
     try:
         from brain.api import deps  # noqa: PLC0415
 
