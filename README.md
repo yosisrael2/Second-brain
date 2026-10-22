@@ -271,6 +271,14 @@ Qdrant + rerank), and grounded `/ask` are optional at runtime: with their API
 keys unset the app still captures and keyword-searches — degradations and
 failure modes are documented in [docs/ai-layer.md](docs/ai-layer.md).
 
+**Extraction evaluation**: `brain eval-extraction --gold <jsonl> --pred
+<jsonl> [--aggregate-only]` scores predicted child items against the frozen
+gold labels (per-type P/R/F1, date accuracy, applies_to accuracy, quote
+grounding, relation reproduction, date_conflict recall). `--aggregate-only`
+prints only the numbers (for the extraction developer); full mode writes a
+per-child report for the manager. Schema, matching and metrics:
+[docs/eval-extraction.md](docs/eval-extraction.md).
+
 **Default providers need no API keys**: the LLM runs on your local Claude Code
 login (`claude_agent_sdk`, check with `claude -p ok` — run `claude` and
 `/login` if needed) and embeddings run locally via `fastembed`
