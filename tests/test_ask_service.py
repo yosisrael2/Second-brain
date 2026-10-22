@@ -225,3 +225,52 @@ def test_temporal_hits_still_come_first_and_range_cap_holds():
     assert search.limits == [32, 30], "semantic pool 32 first, temporal cap 30 second"
     assert result.sources[0].item.raw_text == "basketball on tuesday"
     assert len(result.sources) == 9  # 1 temporal + top_k semantic (8)
+
+
+def test_memory_block_prepends_confirmed_facts_to_the_prompt():
+    """A non-empty memory block lands between the date line and Sources."""
+    repo = FakeRepository()
+    hits = make_hits(repo, "some fact")
+    captured: dict = {}
+
+    def capture(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return "I do not know."
+
+    service = AskService(
+        StubSearch(hits),
+        FakeLLMClient(reply=capture),
+        memory_block=lambda: "Confirmed memory:\n- Rona: gender girl, grade 5",
+    )  # type: ignore[arg-type]
+
+    service.ask("what?")
+
+    prompt = captured["prompt"]
+    date_at = prompt.index("Current date/time:")
+    memory_at = prompt.index("Confirmed memory:")
+    sources_at = prompt.index("Sources:")
+    assert date_at < memory_at < sources_at
+    assert "- Rona: gender girl, grade 5" in prompt
+
+
+def test_empty_memory_keeps_the_prompt_byte_identical():
+    """'' memory block -> the prompt is exactly the pre-memory format."""
+    repo = FakeRepository()
+    hits = make_hits(repo, "some fact")
+    prompts: list[str] = {}
+
+    def capture(prompt: str) -> str:
+        prompts["p"] = prompt
+        return "I do not know."
+
+    with_memory = AskService(
+        StubSearch(hits),
+        FakeLLMClient(reply=capture),
+        memory_block=lambda: "",
+    )  # type: ignore[arg-type]
+    without_memory = AskService(StubSearch(hits), FakeLLMClient(reply=capture))  # type: ignore[arg-type]
+
+    with_memory.ask("what?")
+    before = prompts["p"]
+    without_memory.ask("what?")
+    assert prompts["p"] == before

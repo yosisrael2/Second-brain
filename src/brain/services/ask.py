@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -68,12 +69,16 @@ class AskService:
         top_k: int = DEFAULT_TOP_K,
         recall_pool: int = DEFAULT_RECALL_POOL,
         tz: ZoneInfo | None = None,
+        memory_block: Callable[[], str] | None = None,
     ) -> None:
         self._search = search
         self._llm = llm
         self._top_k = top_k
         self._recall_pool = recall_pool
         self._tz = tz or ZoneInfo("UTC")
+        # Returns the confirmed-memory prompt block ('' when memory is empty);
+        # empty output keeps the prompt byte-identical to the pre-memory format.
+        self._memory_block = memory_block
 
     def ask(self, question: str, *, now: datetime | None = None) -> AskResult:
         """Answer ``question`` from the top-k most relevant memory items.
@@ -96,7 +101,14 @@ class AskService:
             for hit in context_hits
         ]
         with ops.span("ask", "llm", edge="ask->llm") as span:
-            result = answer(question, context, llm=self._llm, now=now, tz=self._tz)
+            result = answer(
+                question,
+                context,
+                llm=self._llm,
+                now=now,
+                tz=self._tz,
+                memory_block=self._memory_block() if self._memory_block else "",
+            )
             span.detail = {"model": result["model"], "cited": len(result["cited_ids"])}
         return AskResult(
             answer=result["answer"],

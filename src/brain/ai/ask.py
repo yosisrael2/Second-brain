@@ -183,12 +183,15 @@ def build_prompt(
     *,
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
+    memory_block: str = "",
 ) -> str:
     """Render the answer prompt: question, dated sources, citation rules.
 
     ``now`` (the caller's current instant) and ``tz`` are rendered into the
     prompt so relative expressions ("this week", "Friday") ground against
     the user's real clock — and the per-source When is already local.
+    ``memory_block`` (confirmed memory; '' when empty) is prepended so the
+    LLM knows the durable facts (who the kids are, standing routines).
     """
     instant = now or datetime.now(UTC)
     zone = tz or ZoneInfo("UTC")
@@ -198,9 +201,10 @@ def build_prompt(
         "",
         f"Current date/time: {local:%a} {local.day} {local:%b} {local.year} "
         f"{local:%H:%M} ({zone.key}). Source times below are in this timezone.",
-        "",
-        "Sources:",
     ]
+    if memory_block:
+        lines += ["", memory_block]
+    lines += ["", "Sources:"]
     lines += [
         f"- [{item['id']}] (When: {item['when']}) {item_text(item)}"
         if item.get("when")
@@ -219,6 +223,7 @@ def answer(
     *,
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
+    memory_block: str = "",
 ) -> dict[str, Any]:
     """Answer ``question`` from ``context_items``, citing item ids.
 
@@ -227,7 +232,9 @@ def answer(
     answered (None when the backend does not expose one). LLM failures raise
     :class:`LLMError`; callers own the fallback policy.
     """
-    completion = llm.complete(build_prompt(question, context_items, now=now, tz=tz))
+    completion = llm.complete(
+        build_prompt(question, context_items, now=now, tz=tz, memory_block=memory_block)
+    )
     return {
         "answer": completion.text,
         "cited_ids": extract_cited_ids(completion.text, context_items),
