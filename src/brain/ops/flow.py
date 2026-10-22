@@ -102,6 +102,7 @@ def _node_payload(node: dict[str, Any], health: dict[str, Any]) -> dict[str, Any
         "column": node["column"],
         "row": node["row"],
         "component": node["component"],
+        "band": node.get("band", "flow"),
         "status": _node_status(node, health),
         "summary": component_health.get("summary", ""),
         "latency_ms": round(min(hop_p50s), 1) if hop_p50s else None,

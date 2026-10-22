@@ -222,25 +222,33 @@ function layoutNodes(nodes, phone) {
     pos.set("__laneX", { x: W - 8, y: 0, w: 0, h: 0 });
     return { width: W, height: y + 2, pos };
   }
-  const colW = 212, rowH = 74, padX = 12, padY = 30, infraGap = 52;
-  let maxRow = 0;
-  for (const node of nodes) maxRow = Math.max(maxRow, node.row);
+  const colW = 212, rowH = 74, padX = 12, padY = 30, infraGap = 40;
   const width = padX * 2 + 3 * colW;
-  const height = padY + (maxRow + 1) * rowH + infraGap + 46;
   pos.set("__labels", { x: padX, y: padY - 14, w: 0, h: 0 });
-  let infraTop = null;
-  for (const node of nodes) {
-    const isInfra = node.band === "infra";
-    const y = padY + node.row * rowH + 10 + (isInfra ? infraGap : 0);
-    if (isInfra && (infraTop === null || y - 26 < infraTop)) infraTop = y - 26;
+  // Flow nodes first; the infra band starts BELOW the tallest column's last
+  // node (+gap) so it can never overlap a flow node.
+  let infraTop = 0;
+  for (const node of nodes.filter((n) => n.band !== "infra")) {
+    const y = padY + node.row * rowH + 10;
     pos.set(node.id, {
       x: padX + node.column * colW + 8,
       y,
       w: colW - 36,
       h: 50,
     });
+    infraTop = Math.max(infraTop, y + 50);
   }
-  if (infraTop !== null) pos.set("__dividerY", { x: padX, y: infraTop, w: width - 2 * padX, h: 0 });
+  infraTop += infraGap;
+  for (const node of nodes.filter((n) => n.band === "infra")) {
+    pos.set(node.id, {
+      x: padX + node.column * colW + 8,
+      y: infraTop,
+      w: colW - 36,
+      h: 50,
+    });
+  }
+  const height = infraTop + 50 + 12;
+  pos.set("__dividerY", { x: padX, y: infraTop - 20, w: width - 2 * padX, h: 0 });
   return { width, height, pos };
 }
 
@@ -289,24 +297,24 @@ function edgeGeometry(edge, pos, phone) {
   if (!from || !to) return null;
   if (phone) {
     const lane = pos.get("__laneX");
-    if (lane && Math.abs(to.y - from.y) > 70) {
-      // Skip edge (target not adjacent): leave the source to the right, run
-      // through the lane beside the boxes, enter the target from the right.
+    const a = nodeAnchor(from, "right");
+    const b = nodeAnchor(to, "right");
+    if (lane) {
+      // Skip edge: leave the source to the right, run through the lane beside
+      // the boxes, enter the target from the right.
       const laneX = lane.x;
-      const a = nodeAnchor(from, "right");
-      const b = nodeAnchor(to, "right");
       return {
         d: `M ${a.x} ${a.y} C ${laneX} ${a.y}, ${laneX} ${b.y}, ${b.x} ${b.y}`,
-        mid: bezierMid(a, { x: laneX, y: a.y }, { x: laneX, y: b.y }, b),
+        label: { x: laneX - 8, y: (a.y + b.y) / 2, anchor: "end" },
       };
     }
     const downward = to.y > from.y;
-    const a = nodeAnchor(from, downward ? "bottom" : "top");
-    const b = nodeAnchor(to, downward ? "top" : "bottom");
-    const midY = (a.y + b.y) / 2;
+    const a2 = nodeAnchor(from, downward ? "bottom" : "top");
+    const b2 = nodeAnchor(to, downward ? "top" : "bottom");
+    const midY = (a2.y + b2.y) / 2;
     return {
-      d: `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`,
-      mid: bezierMid(a, { x: a.x, y: midY }, { x: b.x, y: midY }, b),
+      d: `M ${a2.x} ${a2.y} C ${a2.x} ${midY}, ${b2.x} ${midY}, ${b2.x} ${b2.y}`,
+      label: { x: a2.x, y: midY, anchor: "middle" },
     };
   }
   const sameColumn = Math.abs(from.x - to.x) < 4;
@@ -315,31 +323,39 @@ function edgeGeometry(edge, pos, phone) {
     const a = nodeAnchor(from, downward ? "bottom" : "top");
     const b = nodeAnchor(to, downward ? "top" : "bottom");
     const midY = (a.y + b.y) / 2;
+    // Label BESIDE the line, pulled toward the source — away from the tip.
     return {
       d: `M ${a.x} ${a.y} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y}`,
-      mid: bezierMid(a, { x: a.x, y: midY }, { x: b.x, y: midY }, b),
+      label: { x: a.x + 16, y: a.y + (b.y - a.y) * 0.35, anchor: "start" },
     };
   }
   const a = nodeAnchor(from, "right");
   const b = nodeAnchor(to, "left");
   const midX = (a.x + b.x) / 2;
+  const c1 = { x: midX, y: a.y }, c2 = { x: midX, y: b.y };
+  // Label at t=0.4 — on the curve but well clear of the arrowhead.
+  const at = bezierPoint(a, c1, c2, b, 0.4);
   return {
     d: `M ${a.x} ${a.y} C ${midX} ${a.y}, ${midX} ${b.y}, ${b.x} ${b.y}`,
-    mid: bezierMid(a, { x: midX, y: a.y }, { x: midX, y: b.y }, b),
+    label: { x: at.x, y: at.y - 8, anchor: "middle" },
   };
 }
 
-// Point at t=0.5 of a cubic bezier: (A + 3·C1 + 3·C2 + B) / 8.
-function bezierMid(a, c1, c2, b) {
+// Point at parameter t of a cubic bezier.
+function bezierPoint(a, c1, c2, b, t) {
+  const u = 1 - t;
   return {
-    x: (a.x + 3 * c1.x + 3 * c2.x + b.x) / 8,
-    y: (a.y + 3 * c1.y + 3 * c2.y + b.y) / 8,
+    x: (u * u * u) * a.x + 3 * (u * u) * t * c1.x + 3 * u * (t * t) * c2.x + (t * t * t) * b.x,
+    y: (u * u * u) * a.y + 3 * (u * u) * t * c1.y + 3 * u * (t * t) * c2.y + (t * t * t) * b.y,
   };
 }
 
 function flowEdges(flow, pos, phone, width, height) {
   const els = [];
   for (const edge of flow.edges) {
+    // Phone: readability over completeness — idle grey edges and infra
+    // hops are dropped; only traffic/problems stay.
+    if (phone && edge.count === 0 && edge.status === "grey") continue;
     const geo = edgeGeometry(edge, pos, phone);
     if (!geo) continue;
     const path = svgEl("path", {
@@ -354,10 +370,15 @@ function flowEdges(flow, pos, phone, width, height) {
       (edge.last_error ? ` · last error: ${jsonPreview(edge.last_error, 120)}` : "");
     path.append(title);
     els.push(path);
-    // Clamp labels inside the canvas (centered) so nothing overflows the page.
-    const lx = Math.max(34, Math.min(geo.mid.x, (width || 390) - 34));
-    const ly = Math.max(16, Math.min(geo.mid.y - 4, (height || 800) - 8));
-    const label = svgEl("text", { class: "flow-elabel", x: lx, y: ly, "text-anchor": "middle" });
+    // Labels only where they earn their space: traffic on phone, always on
+    // desktop — positioned off the arrow tip and clamped inside the canvas.
+    if (phone && edge.count === 0) continue;
+    const lx = Math.max(30, Math.min(geo.label.x, (width || 390) - 20));
+    const ly = Math.max(16, Math.min(geo.label.y, (height || 800) - 8));
+    const label = svgEl("text", {
+      class: "flow-elabel", x: lx, y: ly,
+      "text-anchor": geo.label.anchor || "middle",
+    });
     label.textContent = edgeLabel(edge);
     els.push(label);
   }
@@ -658,6 +679,18 @@ function init() {
   if (params.get("measure")) {
     const report = () => {
       const doc = document.documentElement;
+      const rects = [...document.querySelectorAll("#flow .flow-node rect.body")]
+        .map((r) => r.getBoundingClientRect());
+      let overlaps = 0;
+      for (let i = 0; i < rects.length; i++) {
+        for (let j = i + 1; j < rects.length; j++) {
+          const a = rects[i], b = rects[j];
+          if (a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom) {
+            overlaps += 1;
+          }
+        }
+      }
+      window.__nodeOverlaps = overlaps;
       const offenders = [...document.querySelectorAll("body *")]
         .map((elm) => ({ elm, r: Math.round(elm.getBoundingClientRect().right), sw: elm.scrollWidth }))
         .filter((entry) => entry.r > doc.clientWidth + 1 || entry.sw > doc.clientWidth + 1)
@@ -668,7 +701,7 @@ function init() {
         .map((elm) => ({ tag: `${elm.tagName}.${String(elm.className.baseVal ?? elm.className).split(" ")[0]}`, r: Math.round(elm.getBoundingClientRect().right), sw: elm.scrollWidth }))
         .sort((a, b) => Math.max(b.r, b.sw) - Math.max(a.r, a.sw))
         .slice(0, 3);
-      document.title = `w=${doc.scrollWidth} iw=${window.innerWidth} cw=${doc.clientWidth} top:${widest.map((x) => `${x.tag} r=${x.r} sw=${x.sw}`).join(" | ")}`;
+      document.title = `w=${doc.scrollWidth} cw=${doc.clientWidth} overlaps=${window.__nodeOverlaps} top:${widest.map((x) => `${x.tag} r=${x.r} sw=${x.sw}`).join(" | ")}`;
       console.info(`scrollWidth=${doc.scrollWidth} offenders: ${offenders.join(", ")}`);
     };
     setTimeout(report, 300);

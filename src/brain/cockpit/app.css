@@ -115,7 +115,7 @@ h3 { font-size: 14px; margin: 0 0 8px; }
 .marker-fill.edge-grey { fill: var(--disabled); }
 .marker-fill.edge-notprobed { fill: var(--disabled); }
 .flow-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; }
-#flow { display: block; width: 100%; height: auto; }
+#flow { display: block; width: 100%; max-width: 900px; margin: 0 auto; height: auto; }
 .flow-note { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .flow-node { cursor: pointer; }
 .flow-node rect.body { stroke-width: 2; rx: 10; }
