@@ -536,3 +536,65 @@ class _ExitTG:
 
     async def get_updates(self, offset=None, timeout=0):
         raise self._exc
+
+
+# --- 9. hotfix: no reply may carry raw HTML (BadRequest parse-entities) --------
+
+
+class TestHtmlSafety:
+    """Every user/LLM-derived string in a reply is HTML-escaped (hotfix)."""
+
+    def test_ask_answer_escapes_lt_gt_amp_and_hebrew(self, monkeypatch):
+        answer = "Use <b>bold</b> & <fake tag> — עברית עובדת <>"
+        core, _ = make_core(ask=_CannedAsk(AskResult(answer=answer, cited_ids=[], model="m")))
+
+        reply = core.route("What?", 111)
+
+        assert "<b>" not in reply.text
+        assert "<fake tag>" not in reply.text
+        assert "&lt;b&gt;bold&lt;/b&gt;" in reply.text
+        assert "&amp;" in reply.text
+        assert "&lt;fake tag&gt;" in reply.text
+        assert "עברית עובדת" in reply.text
+
+    def test_send_resends_plain_when_telegram_rejects_entities(self, monkeypatch):
+        """BadRequest 'parse entities' -> resend stripped, parse_mode=None, ops event."""
+        from tests.test_telegram_bot import _fake_update
+
+        events = _Events()
+        events.install(monkeypatch)
+        core, repo = make_core()
+        tg = _AdapterTG()
+        calls = {"n": 0}
+
+        async def flaky_send(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                from telegram.error import BadRequest
+
+                raise BadRequest("Can't parse entities: unsupported start tag")
+            tg.sent.append(kwargs)
+            return None
+
+        tg.send_message = flaky_send  # type: ignore[method-assign]
+        message = SimpleNamespace(chat_id=555, message_id=7, text="hello note")
+        update = _fake_update(text="hello note")
+        update = SimpleNamespace(
+            update_id=update.update_id,
+            effective_user=update.effective_user,
+            callback_query=None,
+            effective_message=message,
+        )
+
+        async def _run():
+            from brain.telegram_bot import _handle_update
+
+            await _handle_update(tg, core, update)
+
+        asyncio.run(_run())
+
+        assert calls["n"] == 2  # one failure, one retry
+        plain = tg.sent[-1]
+        assert plain.get("parse_mode") is None  # retry without HTML parsing
+        assert "<b>" not in plain["text"]
+        assert any(e[0] == "error" and e[1] is False for e in events.events)  # ops record
