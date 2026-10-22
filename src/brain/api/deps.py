@@ -5,6 +5,7 @@ AI clients are app-lifetime singletons (cached factories) built from
 are request-scoped and assembled here via ``Depends``.
 """
 
+from collections.abc import Callable
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
@@ -162,7 +163,9 @@ def get_search_service(
 
 
 def build_ask_service(
-    search: SearchService, llm: LLMClient, memory_block: str = ""
+    search: SearchService,
+    llm: LLMClient,
+    memory_block: Callable[[], str] | None = None,
 ) -> AskService:
     """Build the AskService from settings — THE single builder.
 
@@ -170,6 +173,8 @@ def build_ask_service(
     their AskService here so they cannot drift: same timezone (settings),
     same retrieval sizes (ask_top_k / ask_recall_pool). A bare
     ``AskService(search, llm)`` silently runs on UTC with default sizes.
+    ``memory_block`` matches AskService: a callable returning the confirmed
+    memory block ('' when empty) or None — NOT a string (AskService calls it).
     """
     settings = get_settings()
     return AskService(

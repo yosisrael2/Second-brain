@@ -100,3 +100,38 @@ class TestBuilder:
             )()
         )
         assert result is sentinel
+
+    def test_memory_block_is_a_callable_that_reaches_the_prompt(self):
+        """memory.compact_block is a CALLABLE — AskService calls it; a real
+        string here would crash with 'str is not callable' (the review bug)."""
+        from datetime import UTC, datetime
+
+        from brain.ai.ask import FakeLLMClient
+        from brain.api.deps import build_ask_service
+        from brain.db.models import MemoryItem
+        from brain.services.search import SearchHit
+
+        item = MemoryItem(raw_text="להביא כובע מחר", status="filed")
+        item.occurred_at = datetime(2026, 10, 23, 9, 0, tzinfo=UTC)
+        search = type("S", (), {"search": lambda self, q, *, limit, offset=0: [
+            SearchHit(item=item, score=0.9)
+        ]})()
+        llm = FakeLLMClient(reply="42")
+        service = build_ask_service(search, llm, memory_block=lambda: "MEMBLOCK-SENTINEL")
+        service.ask("מה להביא?")
+        assert llm.prompts and "MEMBLOCK-SENTINEL" in llm.prompts[0]
+
+    def test_memory_block_none_yields_no_memory_in_the_prompt(self):
+        from brain.ai.ask import FakeLLMClient
+        from brain.api.deps import build_ask_service
+        from brain.db.models import MemoryItem
+        from brain.services.search import SearchHit
+
+        item = MemoryItem(raw_text="x", status="filed")
+        search = type("S", (), {"search": lambda self, q, *, limit, offset=0: [
+            SearchHit(item=item, score=0.9)
+        ]})()
+        llm = FakeLLMClient(reply="42")
+        service = build_ask_service(search, llm, memory_block=None)
+        service.ask("q")
+        assert llm.prompts and "MEMBLOCK-SENTINEL" not in llm.prompts[0]
