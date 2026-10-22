@@ -13,6 +13,12 @@ from brain.services.search import SearchHit, SearchService
 from brain.services.temporal import parse_question_ranges
 
 DEFAULT_TOP_K = 8
+# Candidates fetched from semantic search before truncating to top_k. The
+# reranker can only reorder what reaches it: measured on the live corpus, an
+# English question against Hebrew emails scores ~0.2 cosine (the TALAN email
+# sits at vector rank 23) — with a pool of 8 the reranker never sees it; at
+# 32 it lands in the top-8 after rerank. One rerank call, ~4x documents.
+DEFAULT_RECALL_POOL = 32
 # Each source is truncated in the LLM prompt only; the API response keeps the
 # full raw_text. Bounds prompt size (top_k x raw_text can otherwise reach
 # ~50k chars) and blunts cost/latency surprises.
@@ -60,11 +66,13 @@ class AskService:
         search: SearchService,
         llm: LLMClient,
         top_k: int = DEFAULT_TOP_K,
+        recall_pool: int = DEFAULT_RECALL_POOL,
         tz: ZoneInfo | None = None,
     ) -> None:
         self._search = search
         self._llm = llm
         self._top_k = top_k
+        self._recall_pool = recall_pool
         self._tz = tz or ZoneInfo("UTC")
 
     def ask(self, question: str, *, now: datetime | None = None) -> AskResult:
@@ -74,7 +82,9 @@ class AskService:
         production passes nothing (real clock), tests pin it.
         """
         with ops.span("ask", "search", edge="ask->search"):
-            hits = self._search.search(question, limit=self._top_k)
+            # rerank sees the whole pool; only the top_k best reach the prompt
+            pool = self._search.search(question, limit=self._recall_pool)
+            hits = pool[: self._top_k]
         context_hits = self._temporal_hits(question, now) + hits
         context_hits = _unique_by_text(self._unique_by_id(context_hits))
         context = [

@@ -1,11 +1,18 @@
 """AskService tests: grounded answers with citations."""
 
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
 from tests.fakes import FakeRepository
 
 from brain.ai.ask import FakeLLMClient, LLMError
 from brain.db.models import MemoryItem
 from brain.services.ask import AskService
 from brain.services.search import SearchHit
+
+JLM = ZoneInfo("Asia/Jerusalem")
+NOW_UTC = datetime(2026, 10, 22, 15, 30, tzinfo=UTC)  # Thu 18:30 Israel
+NOW_LOCAL = NOW_UTC.astimezone(JLM)
 
 
 class StubSearch:
@@ -145,3 +152,76 @@ def test_ask_cited_ids_dedupe_preserving_order():
     )
 
     assert cited == [str(hits[1].item.id), str(hits[0].item.id)]
+
+
+# --- recall pool: rerank sees 32, the prompt sees top_k (PR: ask-recall-pool) --
+
+
+class RecordingSearch(StubSearch):
+    """StubSearch that also records the limit each search call asked for."""
+
+    def __init__(self, hits: list[SearchHit]) -> None:
+        super().__init__(hits)
+        self.limits: list[int] = []
+
+    def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
+        self.limits.append(limit)
+        return super().search(query, limit=limit)
+
+
+def test_ask_fetches_the_full_recall_pool_then_truncates_to_top_k():
+    """Rerank can only reorder what reaches it: the pool must be deep (32)."""
+    repo = FakeRepository()
+    hits = make_hits(repo, *(f"fact {i}" for i in range(40)))
+    search = RecordingSearch(hits)
+
+    service = AskService(
+        search, FakeLLMClient(reply=cite_every_source), top_k=8
+    )  # type: ignore[arg-type]
+    result = service.ask("what?")
+
+    assert search.limits == [32], "search must request the whole recall pool"
+    assert len(result.sources) == 8, "but the prompt context is exactly top_k"
+
+
+def test_prompt_sources_follow_post_rerank_order():
+    """The first top_k hits of the (reranked) pool reach the LLM, in order."""
+    repo = FakeRepository()
+    hits = make_hits(repo, *(f"fact {i}" for i in range(40)))
+    captured: dict = {}
+
+    def capture(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return cite_every_source(prompt)
+
+    service = AskService(StubSearch(hits), FakeLLMClient(reply=capture), top_k=8)  # type: ignore[arg-type]
+
+    result = service.ask("what?")
+
+    expected = [str(hit.item.id) for hit in hits[:8]]
+    assert result.cited_ids == expected
+    for hit in hits[8:]:
+        assert f"[{hit.item.id}]" not in captured["prompt"]
+
+
+def test_temporal_hits_still_come_first_and_range_cap_holds():
+    """Temporal hits lead the context; the by_occurrence cap is unchanged."""
+    repo = FakeRepository()
+    event = repo.add(MemoryItem(raw_text="basketball on tuesday", occurred_at=NOW_LOCAL))
+    hits = make_hits(repo, *(f"filler {i}" for i in range(40)))
+
+    class TemporalStubSearch(RecordingSearch):
+        def by_occurrence(self, start, end, *, limit: int):
+            self.limits.append(limit)
+            return [SearchHit(item=event, score=None)][:limit]
+
+    search = TemporalStubSearch(hits)
+    service = AskService(
+        search, FakeLLMClient(reply=cite_every_source), top_k=8, tz=JLM
+    )  # type: ignore[arg-type]
+
+    result = service.ask("what is on tuesday?", now=NOW_UTC)
+
+    assert search.limits == [32, 30], "semantic pool 32 first, temporal cap 30 second"
+    assert result.sources[0].item.raw_text == "basketball on tuesday"
+    assert len(result.sources) == 9  # 1 temporal + top_k semantic (8)
