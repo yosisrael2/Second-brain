@@ -20,7 +20,7 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.add_column(
         "memory_items",
-        sa.Column("occurred_at", sa.DateTime(), nullable=True),
+        sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=True),
     )
     op.add_column(
         "memory_items",

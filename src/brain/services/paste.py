@@ -4,6 +4,13 @@ Pure, framework-free functions. :func:`parse` returns a :class:`ParsedPaste`
 with one :class:`ParsedChunk` per item to create; ``extracted`` is a
 JSON-serializable summary for the API response. Unknown formats fall back to
 ``note`` — detection never raises.
+
+Timezone rule: ``occurred_at`` is always an aware UTC datetime. Zone-less
+pasted times (Gmail, WhatsApp, copied Google/Outlook event text) are
+interpreted in the ``zone`` passed by the caller (the app's ``TIMEZONE``
+setting); explicit offsets (Outlook ``+0300``, ICS ``TZID`` / ``Z``) are
+honored as given. The original raw strings stay in ``meta`` for audit
+(``meta["date"]``, ``meta["at_raw"]``, ``meta["start_raw"]``).
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from brain.config import local_timezone_name
 
 KIND_EMAIL = "email"
 KIND_WHATSAPP = "whatsapp"
@@ -123,16 +132,25 @@ def detect_kind(text: str, kind_hint: str = "auto") -> str:
     return KIND_NOTE
 
 
-def parse(text: str, kind_hint: str = "auto", split: bool = False) -> ParsedPaste:
-    """Detect the paste kind and return its chunks (``split`` fans out)."""
+def parse(
+    text: str, kind_hint: str = "auto", split: bool = False, tz: ZoneInfo | None = None
+) -> ParsedPaste:
+    """Detect the paste kind and return its chunks (``split`` fans out).
+
+    ``tz`` is the IANA zone used to interpret zone-less times (defaults to
+    the machine's local zone; the /capture route passes the ``TIMEZONE``
+    setting). All ``occurred_at`` values are returned aware (UTC for
+    zone-less times, the explicit offset otherwise).
+    """
+    zone = tz if tz is not None else ZoneInfo(local_timezone_name())
     kind = detect_kind(text, kind_hint)
     if kind == KIND_WHATSAPP:
-        return _parse_whatsapp(text, split)
+        return _parse_whatsapp(text, split=split, zone=zone)
     parsed = {
         KIND_EMAIL: _parse_email,
         KIND_CALENDAR: _parse_calendar,
         KIND_NOTE: _parse_note,
-    }[kind](text)
+    }[kind](text, split=split, zone=zone)
     if not split and len(parsed.chunks) > 1:
         return _join_chunks(parsed)
     return parsed
@@ -196,7 +214,7 @@ def _join_chunks(parsed: ParsedPaste) -> ParsedPaste:
 # ---- email -------------------------------------------------------------------
 
 
-def _parse_email(text: str) -> ParsedPaste:
+def _parse_email(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     meta: dict[str, str] = {}
     lines = clean.splitlines()
@@ -216,8 +234,10 @@ def _parse_email(text: str) -> ParsedPaste:
             break
     occurred_at = _parse_any_date(meta.get("date", "")) if "date" in meta else None
     if occurred_at is not None:
-        meta["date_iso"] = occurred_at.isoformat()  # keeps any explicit offset
-        occurred_at = occurred_at.replace(tzinfo=None)  # wall clock for storage
+        if occurred_at.tzinfo is None:
+            # Zone-less (Gmail copy): interpret in TIMEZONE, store as aware UTC.
+            occurred_at = occurred_at.replace(tzinfo=zone).astimezone(UTC)
+        meta["date_iso"] = occurred_at.isoformat()  # the instant as parsed
     return ParsedPaste(
         kind=KIND_EMAIL,
         chunks=[_chunk(clean, occurred_at, meta, KIND_EMAIL)],
@@ -251,9 +271,12 @@ def _parse_any_date(value: str) -> datetime | None:
 # ---- whatsapp ------------------------------------------------------------------
 
 
-def _parse_whatsapp(text: str, split: bool = False) -> ParsedPaste:
+def _parse_whatsapp(
+    text: str, *, split: bool = False, zone: ZoneInfo
+) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     messages: list[dict[str, Any]] = []
+    occurred: list[datetime | None] = []
     message_lines: list[list[str]] = []
 
     for line in clean.splitlines():
@@ -263,20 +286,27 @@ def _parse_whatsapp(text: str, split: bool = False) -> ParsedPaste:
                 message_lines[-1].append(line)  # continuation of the previous message
             continue
         day, month, year, hour, minute, second, meridiem, sender, _body = match.groups()
+        at_utc = _wa_occurred(day, month, year, hour, minute, second, meridiem, zone)
+        if at_utc is None:  # unparseable stamp: skip the line defensively
+            continue
         messages.append(
             {
                 "sender": sender or "",
-                "at": _wa_iso(day, month, year, hour, minute, second, meridiem),
+                "at": at_utc.isoformat(),
+                "at_raw": _wa_raw_stamp(
+                    day, month, year, hour, minute, second, meridiem
+                ),
             }
         )
+        occurred.append(at_utc)
         message_lines.append([line.strip()])
 
     def chunk_for(index: int) -> ParsedChunk:
         message = messages[index]
         return ParsedChunk(
             raw_text="\n".join(message_lines[index]).strip(),
-            occurred_at=_wa_datetime(message["at"]),
-            meta={"messages": [{"sender": message["sender"], "at": message["at"]}]},
+            occurred_at=occurred[index],
+            meta={"messages": [dict(message)]},
             source=KIND_WHATSAPP,
         )
 
@@ -287,7 +317,7 @@ def _parse_whatsapp(text: str, split: bool = False) -> ParsedPaste:
         chunks = [
             _chunk(
                 clean,
-                _wa_datetime(messages[0]["at"]) if messages else None,
+                occurred[0] if occurred else None,
                 {"count": len(messages), "messages": messages},
                 KIND_WHATSAPP,
             )
@@ -298,6 +328,32 @@ def _parse_whatsapp(text: str, split: bool = False) -> ParsedPaste:
             "senders": list(dict.fromkeys(m["sender"] for m in messages if m["sender"])),
         }
     return ParsedPaste(kind=KIND_WHATSAPP, chunks=chunks, extracted=extracted)
+
+
+def _wa_raw_stamp(
+    day: str, month: str, year: str, hour: str, minute: str,
+    second: str | None, meridiem: str | None,
+) -> str:
+    """The timestamp exactly as written in the paste (for meta audit)."""
+    stamp = f"{day}/{month}/{year}, {hour}:{minute}"
+    if second:
+        stamp += f":{second}"
+    if meridiem:
+        stamp += f" {meridiem}"
+    return stamp
+
+
+def _wa_occurred(
+    day: str, month: str, year: str, hour: str, minute: str,
+    second: str | None, meridiem: str | None, zone: ZoneInfo,
+) -> datetime | None:
+    """WhatsApp timestamp (zone-less) -> aware UTC instant in ``zone``."""
+    naive = _wa_datetime(
+        _wa_iso(day, month, year, hour, minute, second, meridiem)
+    )
+    if naive is None:
+        return None
+    return naive.replace(tzinfo=zone).astimezone(UTC)
 
 
 def _wa_iso(day: str, month: str, year: str, hour: str, minute: str,
@@ -326,11 +382,17 @@ def _wa_datetime(iso: str) -> datetime | None:
 # ---- calendar ------------------------------------------------------------------
 
 
-def _parse_calendar(text: str) -> ParsedPaste:
+def _parse_calendar(
+    text: str, *, split: bool = False, zone: ZoneInfo
+) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
-    if "begin:vevent" in clean.lower():
-        return _parse_ics(clean)
-    return _parse_calendar_text(clean)
+    looks_like_ics = "begin:vevent" in clean.lower() or any(
+        line.strip().upper().startswith(("DTSTART", "DTEND", "SUMMARY"))
+        for line in clean.splitlines()
+    )
+    if looks_like_ics:
+        return _parse_ics(clean, zone=zone)
+    return _parse_calendar_text(clean, zone=zone)
 
 
 def _unfold(lines: list[str]) -> list[str]:
@@ -344,7 +406,7 @@ def _unfold(lines: list[str]) -> list[str]:
     return unfolded
 
 
-def _parse_ics(text: str) -> ParsedPaste:
+def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     meta: dict[str, Any] = {"attendees": []}
     occurred_at: datetime | None = None
@@ -361,13 +423,14 @@ def _parse_ics(text: str) -> ParsedPaste:
         elif name in ("LOCATION", "ORGANIZER"):
             meta[name.lower()] = value.strip()
         elif name in ("DTSTART", "DTEND"):
-            parsed_at = _ics_datetime(value, tzid)
+            parsed_at = _ics_datetime(value, tzid, zone)
             if parsed_at is not None:
+                # Z/TZID offsets are explicit and honored as given; meta also
+                # keeps the raw value for audit.
                 meta["start" if name == "DTSTART" else "end"] = parsed_at.isoformat()
+                meta["start_raw" if name == "DTSTART" else "end_raw"] = value.strip()
                 if name == "DTSTART":
-                    # occurred_at keeps the event's local wall clock (naive);
-                    # meta['start'] keeps the offset-aware ISO string.
-                    occurred_at = parsed_at.replace(tzinfo=None)
+                    occurred_at = parsed_at
         elif name == "ATTENDEE":
             if email := _EMAIL_ADDRESS_RE.search(value):
                 meta["attendees"].append(email.group(0))
@@ -379,9 +442,14 @@ def _parse_ics(text: str) -> ParsedPaste:
     )
 
 
-def _ics_datetime(value: str, tzid: str = "") -> datetime | None:
-    """Parse an iCalendar date/date-time: with Z, with TZID, or date-only."""
+def _ics_datetime(value: str, tzid: str = "", zone: ZoneInfo | None = None) -> datetime | None:
+    """Parse an iCalendar date/date-time: with Z, with TZID, or date-only.
+
+    Z and TZID values are honored as given (aware, original offset); the
+    date-only form is zone-less and is interpreted in ``zone`` (aware UTC).
+    """
     value = value.strip()
+    fallback = zone if zone is not None else ZoneInfo(local_timezone_name())
     try:
         if value.endswith("Z"):
             return datetime.fromisoformat(value[:-1]).replace(tzinfo=UTC)
@@ -389,15 +457,20 @@ def _ics_datetime(value: str, tzid: str = "") -> datetime | None:
             naive = datetime.fromisoformat(value)
             if tzid:
                 return naive.replace(tzinfo=ZoneInfo(tzid))
+            if fallback is not None:
+                return naive.replace(tzinfo=fallback).astimezone(UTC)
             return naive
         if len(value) == 8 and value.isdigit():
-            return datetime.strptime(value, "%Y%m%d")
+            naive = datetime.strptime(value, "%Y%m%d")
+            return naive.replace(tzinfo=fallback).astimezone(UTC)
     except (ValueError, KeyError):
         return None
     return None
 
 
-def _parse_calendar_text(text: str) -> ParsedPaste:
+def _parse_calendar_text(
+    text: str, *, split: bool = False, zone: ZoneInfo
+) -> ParsedPaste:
     """Parse Google/Outlook copied event text (title, date · time range, …)."""
     lines = [line.strip() for line in _strip_rtl(text).strip().splitlines() if line.strip()]
     meta: dict[str, Any] = {}
@@ -427,11 +500,13 @@ def _parse_calendar_text(text: str) -> ParsedPaste:
                     and int(start_time.split(":")[0]) + 12 < end_at.hour
                 ):
                     start_meridiem = end_meridiem
-            occurred_at = _date_with_time(event_date, start_time, start_meridiem)
+            start_naive = _date_with_time(event_date, start_time, start_meridiem)
+            occurred_at = _aware(start_naive, zone) if start_naive else None
             if occurred_at is not None:
                 meta["start"] = occurred_at.isoformat()
+                meta["start_raw"] = line
                 if end_at is not None:
-                    meta["end"] = end_at.isoformat()
+                    meta["end"] = _aware(end_at, zone).isoformat()
             if index > 0:
                 title = lines[0]
             time_range_end = index
@@ -441,21 +516,23 @@ def _parse_calendar_text(text: str) -> ParsedPaste:
             time_range_end = index
             continue
         if (time_match := _CAL_TIME_RE.match(line)) and date_text:
-            occurred_at = _date_with_time(
+            start_naive = _date_with_time(
                 date_text,
                 f"{time_match.group(1)}:{time_match.group(2)}",
                 time_match.group(3),
             )
+            occurred_at = _aware(start_naive, zone) if start_naive else None
             if occurred_at is not None:
                 meta["start"] = occurred_at.isoformat()
+                meta["start_raw"] = line
             if time_match.group(4):
-                end_at = _date_with_time(
+                end_naive = _date_with_time(
                     date_text,
                     f"{time_match.group(4)}:{time_match.group(5)}",
                     time_match.group(6) or time_match.group(3),
                 )
-                if end_at is not None:
-                    meta["end"] = end_at.isoformat()
+                if end_naive is not None:
+                    meta["end"] = _aware(end_naive, zone).isoformat()
             time_range_end = index
             continue
         if line.lower().startswith(("location:", "מקום:")):
@@ -479,6 +556,11 @@ def _parse_calendar_text(text: str) -> ParsedPaste:
         chunks=[_chunk(text.strip(), occurred_at, meta, KIND_CALENDAR)],
         extracted=dict(meta),
     )
+
+
+def _aware(naive: datetime, zone: ZoneInfo) -> datetime:
+    """Interpret a zone-less local time in ``zone`` and return it as aware UTC."""
+    return naive.replace(tzinfo=zone).astimezone(UTC)
 
 
 def _parse_month_day(text: str) -> datetime | None:
@@ -517,7 +599,7 @@ def _date_with_time(
         return None
 
 
-def _parse_note(text: str) -> ParsedPaste:
+def _parse_note(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     return ParsedPaste(
         kind=KIND_NOTE,

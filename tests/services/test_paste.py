@@ -2,13 +2,23 @@
 
 Fixtures are realistic pastes (Gmail, Outlook, Apple Mail Hebrew, iOS +
 Android WhatsApp incl. RTL marks, .ics, Google + Outlook copied events).
+
+Timezone contract: zone-less times are interpreted in the ``tz`` passed to
+:func:`parse` (the TIMEZONE setting in production) and returned as aware UTC;
+explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
+original raw strings stay in ``meta`` for audit.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from brain.config import local_timezone_name
 from brain.services.paste import ParsedChunk, detect_kind, parse
+
+JERUSALEM = ZoneInfo("Asia/Jerusalem")
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 class TestDetectKind:
@@ -50,17 +60,20 @@ class TestEmail:
             "Please review the draft before Thursday.\n"
             "— Ada"
         )
-        parsed = parse(text)
+        parsed = parse(text, tz=JERUSALEM)
 
         assert parsed.kind == "email"
         assert parsed.chunks[0].source == "email"
         assert parsed.chunks[0].meta["from"] == "Ada Levi <ada@example.com>"
         assert parsed.chunks[0].meta["subject"] == "Quarterly OKR draft"
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 10, 14)
+        # zone-less Gmail date: interpreted in TIMEZONE, stored as aware UTC
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 7, 14, tzinfo=UTC)
+        assert parsed.chunks[0].meta["date"] == "Tue, Oct 21, 2026 at 10:14 AM"  # audit
+        assert parsed.chunks[0].meta["date_iso"] == "2026-10-21T07:14:00+00:00"
         # nothing is lost: the item text is the full paste
         assert parsed.chunks[0].raw_text == text
 
-    def test_outlook_rfc2822_date_is_timezone_aware(self):
+    def test_outlook_rfc2822_date_offset_honored_as_given(self):
         text = (
             "From: Vendor <vendor@corp.com>\n"
             "To: me@example.com\n"
@@ -71,7 +84,10 @@ class TestEmail:
         )
         parsed = parse(text)
 
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 22, 9, 30)  # wall clock
+        assert parsed.chunks[0].occurred_at == datetime.fromisoformat(
+            "2026-10-22T09:30:00+03:00"
+        )
+        assert parsed.chunks[0].meta["date"] == "Wed, 22 Oct 2026 09:30:00 +0300"
         assert parsed.chunks[0].meta["date_iso"] == "2026-10-22T09:30:00+03:00"
         assert parsed.chunks[0].meta["subject"] == "DPA signature"
 
@@ -106,32 +122,55 @@ class TestEmail:
 
 class TestWhatsApp:
     def test_ios_bracket_format_with_seconds(self):
-        parsed = parse("[21/10/2026, 10:00:33] Dana: Renew the TLS certificate")
+        parsed = parse("[21/10/2026, 10:00:33] Dana: Renew the TLS certificate", tz=JERUSALEM)
 
         assert parsed.kind == "whatsapp"
         assert parsed.chunks[0].meta["messages"][0] == {
             "sender": "Dana",
-            "at": "2026-10-21T10:00:33",
+            "at": "2026-10-21T07:00:33+00:00",  # 10:00:33 IDT (+03:00) as UTC
+            "at_raw": "21/10/2026, 10:00:33",
         }
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 10, 0, 33)
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 7, 0, 33, tzinfo=UTC)
 
     def test_android_plain_format_24h(self):
-        parsed = parse("21/10/2026, 14:30 - Dana: moved the call to 15:00")
+        parsed = parse("21/10/2026, 14:30 - Dana: moved the call to 15:00", tz=JERUSALEM)
 
         assert parsed.chunks[0].meta["messages"][0]["sender"] == "Dana"
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 14, 30)
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 11, 30, tzinfo=UTC)
 
     def test_12h_am_pm(self):
-        parsed = parse("[25/10/2026, 9:05:00 PM] Rami: see you tomorrow")
+        parsed = parse("[10/2/2026, 9:05:00 PM] Rami: see you tomorrow", tz=JERUSALEM)
 
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 25, 21, 5, 0)
+        # Feb 2026 = IST (+02:00) in Israel
+        assert parsed.chunks[0].occurred_at == datetime(2026, 2, 10, 19, 5, 0, tzinfo=UTC)
+
+    def test_israel_dst_switch_week(self):
+        # 2026-10-25: clocks fall back 02:00 IDT -> 01:00 IST; 03:00 is IST
+        parsed = parse("[25/10/2026, 03:00:00] Dana: after the switch", tz=JERUSALEM)
+
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 25, 1, 0, tzinfo=UTC)
+
+    def test_timezone_override_changes_interpretation(self):
+        text = "[21/10/2026, 10:00:00] Dana: same paste"
+
+        in_jerusalem = parse(text, tz=JERUSALEM).chunks[0].occurred_at
+        in_new_york = parse(text, tz=NEW_YORK).chunks[0].occurred_at
+
+        assert in_jerusalem == datetime(2026, 10, 21, 7, 0, tzinfo=UTC)
+        assert in_new_york == datetime(2026, 10, 21, 14, 0, tzinfo=UTC)  # 10:00 EDT (-04:00)
+
+    def test_default_tz_is_the_machine_local_zone(self):
+        parsed = parse("[21/10/2026, 10:00:00] Dana: hi")
+
+        local = ZoneInfo(local_timezone_name())
+        assert parsed.chunks[0].occurred_at == expected_local(local)
 
     def test_rtl_marks_stripped_hebrew_text_kept(self):
         text = (
             "‏[21/10/2026, 21:05:10] ‏דנה: הפגישה עם הספק עברה ליום רביעי\n"
             "\u200e[21/10/2026, 21:06:00] \u200fיוסי: אישור, עדכנתי ביומן"
         )
-        parsed = parse(text)
+        parsed = parse(text, tz=JERUSALEM)
 
         assert "\u200e" not in parsed.chunks[0].raw_text
         assert "\u200f" not in parsed.chunks[0].raw_text
@@ -140,7 +179,7 @@ class TestWhatsApp:
 
     def test_multiline_message_appends_continuation_lines(self):
         text = "[21/10/2026, 09:00:00] Dana: agenda:\n- budget\n- hiring"
-        parsed = parse(text)
+        parsed = parse(text, tz=JERUSALEM)
 
         assert len(parsed.chunks) == 1
         assert "- budget" in parsed.chunks[0].raw_text
@@ -148,15 +187,15 @@ class TestWhatsApp:
 
     def test_split_true_yields_one_chunk_per_message(self):
         text = "[21/10/2026, 09:00:00] Dana: one\n[21/10/2026, 09:01:00] Rami: two"
-        parsed = parse(text, split=True)
+        parsed = parse(text, split=True, tz=JERUSALEM)
 
         assert [chunk.meta["messages"][0]["sender"] for chunk in parsed.chunks] == ["Dana", "Rami"]
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 9, 0)
-        assert parsed.chunks[1].occurred_at == datetime(2026, 10, 21, 9, 1)
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 6, 0, tzinfo=UTC)
+        assert parsed.chunks[1].occurred_at == datetime(2026, 10, 21, 6, 1, tzinfo=UTC)
 
     def test_default_joins_thread_into_one_chunk(self):
         text = "[21/10/2026, 09:00:00] Dana: one\n[21/10/2026, 09:01:00] Rami: two"
-        parsed = parse(text)
+        parsed = parse(text, tz=JERUSALEM)
 
         assert len(parsed.chunks) == 1
         assert "one" in parsed.chunks[0].raw_text
@@ -165,7 +204,7 @@ class TestWhatsApp:
 
     def test_line_without_sender_continues_previous_message(self):
         text = "[21/10/2026, 09:00:00] Dana: agenda:\n- budget\n- hiring"
-        parsed = parse(text, split=True)
+        parsed = parse(text, split=True, tz=JERUSALEM)
 
         assert len(parsed.chunks) == 1
         assert "agenda:" in parsed.chunks[0].raw_text
@@ -190,19 +229,33 @@ class TestCalendar:
         meta = parsed.chunks[0].meta
         assert meta["title"] == "Vendor review"
         assert meta["location"] == "Board room"
+        # TZID is explicit: honored as given, not re-interpreted
         assert meta["start"] == "2026-10-21T10:00:00+03:00"
         assert meta["end"] == "2026-10-21T11:00:00+03:00"
+        assert meta["start_raw"] == "20261021T100000"
         assert "bob@example.com" in meta["attendees"]
         assert "ada@example.com" in meta["organizer"]
-        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 10, 0)
+        assert parsed.chunks[0].occurred_at == datetime.fromisoformat(
+            "2026-10-21T10:00:00+03:00"
+        )
+
+    def test_ics_utc_zulu_honored(self):
+        parsed = parse("SUMMARY:x\nDTSTART:20261021T100000Z")
+
+        assert parsed.chunks[0].occurred_at == datetime(2026, 10, 21, 10, 0, tzinfo=UTC)
 
     def test_google_copied_event(self):
         year = datetime.now().year
-        parsed = parse("Team sync\nTuesday, October 21 · 10:00 – 11:00am\nMeeting room 2")
+        parsed = parse(
+            "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nMeeting room 2",
+            tz=JERUSALEM,
+        )
 
         assert parsed.chunks[0].meta["title"] == "Team sync"
-        assert parsed.chunks[0].occurred_at == datetime(year, 10, 21, 10, 0)
-        assert parsed.chunks[0].meta["end"] == f"{year}-10-21T11:00:00"
+        assert parsed.chunks[0].occurred_at == datetime(year, 10, 21, 7, 0, tzinfo=UTC)
+        assert parsed.chunks[0].meta["start"] == f"{year}-10-21T07:00:00+00:00"
+        assert parsed.chunks[0].meta["end"] == f"{year}-10-21T08:00:00+00:00"
+        assert parsed.chunks[0].meta["start_raw"] == "Tuesday, October 21 · 10:00 – 11:00am"
         assert parsed.chunks[0].meta["location"] == "Meeting room 2"
 
     def test_outlook_copied_event(self):
@@ -213,21 +266,22 @@ class TestCalendar:
             "Location: Teams call\n"
             "Attendees: ada@example.com, bob@example.com"
         )
-        parsed = parse(text)
+        parsed = parse(text, tz=JERUSALEM)
 
         meta = parsed.chunks[0].meta
         assert meta["title"] == "DPA signature call"
-        assert meta["start"].startswith("2026-10-22T09:30")
-        assert meta["end"].startswith("2026-10-22T10:00")
+        assert meta["start"] == "2026-10-22T06:30:00+00:00"  # 09:30 IDT
+        assert meta["end"] == "2026-10-22T07:00:00+00:00"
+        assert meta["start_raw"] == "9:30 AM - 10:00 AM"
         assert meta["location"] == "Teams call"
         assert "bob@example.com" in meta["attendees"]
 
     def test_12h_pm_end_derivation(self):
         year = datetime.now().year
-        parsed = parse("Offsite planning\nFriday, October 23 · 9:00 – 12:30pm")
+        parsed = parse("Offsite planning\nFriday, October 23 · 9:00 – 12:30pm", tz=JERUSALEM)
 
-        assert parsed.chunks[0].occurred_at == datetime(year, 10, 23, 9, 0)
-        assert parsed.chunks[0].meta["end"] == f"{year}-10-23T12:30:00"
+        assert parsed.chunks[0].occurred_at == datetime(year, 10, 23, 6, 0, tzinfo=UTC)
+        assert parsed.chunks[0].meta["end"] == f"{year}-10-23T09:30:00+00:00"
 
 
 class TestNote:
@@ -268,3 +322,9 @@ class TestShape:
     def test_detect_kind_prefers_calendar_over_email_for_ics(self):
         text = "From: x@y.z\nSubject: invite\n\nBEGIN:VEVENT\nSUMMARY:s\nEND:VEVENT"
         assert detect_kind(text) == "calendar"
+
+
+def expected_local(zone: ZoneInfo) -> datetime:
+    """Aware-UTC instant of 2026-10-21 10:00 in the given zone."""
+    local = datetime(2026, 10, 21, 10, 0).replace(tzinfo=zone)
+    return local.astimezone(UTC)

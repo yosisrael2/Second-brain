@@ -6,9 +6,11 @@ their defaults from here), keeping the dependency DAG one-way.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -31,6 +33,21 @@ DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
 def unwrap_secret(value: SecretStr | None) -> str | None:
     """Unwrap an optional SecretStr for client constructors (single shared helper)."""
     return value.get_secret_value() if value else None
+
+
+def local_timezone_name() -> str:
+    """Best-effort IANA name of the machine's local zone (fallback: ``UTC``).
+
+    Reads the ``/etc/localtime`` symlink target (POSIX); used as the default
+    for the ``TIMEZONE`` setting, which interprets zone-less pasted times.
+    """
+    try:
+        parts = Path("/etc/localtime").resolve().parts
+        if "zoneinfo" in parts:
+            return "/".join(parts[parts.index("zoneinfo") + 1 :])
+    except OSError:  # pragma: no cover - resolve rarely fails; fallback below
+        pass
+    return "UTC"
 
 
 class Settings(BaseSettings):
@@ -77,6 +94,20 @@ class Settings(BaseSettings):
     # Claude Code login LLM (used when llm_provider="claude_sdk", the default)
     claude_sdk_model: str | None = None
     claude_sdk_timeout_s: float = DEFAULT_SDK_TIMEOUT_S
+
+    # IANA zone used to interpret zone-less pasted times (Gmail, WhatsApp,
+    # copied calendar text) before storing them as aware UTC.
+    timezone: str = Field(default_factory=local_timezone_name)
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """Refuse to boot with an unresolvable IANA zone name."""
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError, KeyError, OSError) as exc:
+            raise ValueError(f"TIMEZONE must be a valid IANA zone name, got {value!r}") from exc
+        return value
 
 
 @lru_cache

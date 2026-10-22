@@ -125,6 +125,7 @@ Revisit only if real production traffic shows a need.
 | `ANTHROPIC_MAX_TOKENS` | `1024` | `ClaudeLLMClient` |
 | `ANTHROPIC_TIMEOUT_S` | `60` | `ClaudeLLMClient` |
 | `QDRANT_URL` | `http://localhost:6333` | `QdrantVectorStore` |
+| `TIMEZONE` | machine's local IANA zone (e.g. `Asia/Jerusalem`) | capture: interprets zone-less pasted times (Gmail/WhatsApp/calendar text) before storing `occurred_at` as aware UTC |
 | `QDRANT_API_KEY` | — | `QdrantVectorStore` |
 | `QDRANT_COLLECTION` | `brain_items` | `QdrantVectorStore` |
 | `QDRANT_TIMEOUT_S` | `10` | `QdrantVectorStore` |

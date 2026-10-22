@@ -103,10 +103,13 @@ class MemoryItem(Base):
         _enum_column(ItemStatus), nullable=False, default=ItemStatus.INBOX
     )
     # When the captured thing happened (email date, WhatsApp timestamp, event
-    # start), as opposed to created_at (when we captured it). Stored as a naive
-    # local wall clock — the time as written in the source; any explicit UTC
-    # offset lives on in meta (e.g. meta["date_iso"], meta["start"]).
-    occurred_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # start), as opposed to created_at (when we captured it). Zone-less pasted
+    # times are interpreted in the TIMEZONE setting and stored as aware UTC;
+    # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
+    # original raw strings stay in meta for audit.
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Format-specific extraction result (email headers, WhatsApp messages,
     # event fields). Always a JSON object; empty for plain notes.
     meta: Mapped[dict[str, Any]] = mapped_column(

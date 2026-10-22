@@ -34,8 +34,9 @@ class ItemCreate(BaseModel):
     actionability: Actionability | None = None
     confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
     status: ItemStatus = ItemStatus.INBOX
-    # When the captured thing happened (None = unknown); format-specific
-    # extraction result (email headers, WhatsApp messages, event fields).
+    # When the captured thing happened (None = unknown) as an aware UTC
+    # instant; format-specific extraction result (email headers, WhatsApp
+    # messages, event fields; raw source strings kept for audit).
     occurred_at: datetime | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
 

@@ -4,13 +4,17 @@ POST /capture runs :func:`brain.services.paste.parse` on the payload, creates
 one memory item per parsed chunk (whole thread by default, one per message
 with ``split=true``), and returns the detected kind, the extraction summary,
 and the created items. Detection never fails: unknown formats fall back to
-plain notes.
+plain notes. Zone-less times are interpreted in the ``TIMEZONE`` setting and
+stored as aware UTC; explicit offsets are honored as given.
 """
+
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, status
 
 from brain import schemas
 from brain.api.deps import get_ingest_service
+from brain.config import get_settings
 from brain.services.ingest import IngestService
 from brain.services.paste import parse as parse_paste
 
@@ -25,10 +29,12 @@ def capture_paste(
     """Parse a pasted email/WhatsApp thread/calendar event/note and capture it.
 
     Items are created with ``source`` set to the detected kind and their
-    ``occurred_at``/``meta`` filled from the extraction. Classification and
-    indexing failures never block creation (same contract as POST /items).
+    ``occurred_at``/``meta`` filled from the extraction (aware UTC instants;
+    raw source strings kept in ``meta``). Classification and indexing
+    failures never block creation (same contract as POST /items).
     """
-    parsed = parse_paste(data.text, kind_hint=data.kind_hint, split=data.split)
+    zone = ZoneInfo(get_settings().timezone)
+    parsed = parse_paste(data.text, kind_hint=data.kind_hint, split=data.split, tz=zone)
     items = [
         schemas.ItemRead.model_validate(
             service.create(
