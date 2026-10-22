@@ -10,6 +10,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
 <link rel="stylesheet" href="/cockpit/app.css">
+<link rel="stylesheet" href="/cockpit/memory.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%234F46E5'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='7' cy='12' r='2'/%3E%3Ccircle cx='17' cy='7' r='2'/%3E%3Ccircle cx='17' cy='17' r='2'/%3E%3Cpath d='M9 11l6-3M9 13l6 3'/%3E%3C/g%3E%3C/svg%3E">
 <script>
   // Apply stored theme before first paint (no flash).
@@ -32,8 +33,9 @@
       <a class="tab nav-item" data-tab="events" href="#events">Events</a>
       <a class="tab nav-item" data-tab="stats" href="#stats">Stats</a>
       <a class="tab nav-item" data-tab="debug" href="#debug">Debug</a>
-      <!-- Sixth slot: worker_5's Memory tab plugs in here as another
-           .nav-item; the sidebar flex column absorbs it with no changes. -->
+      <a class="tab nav-item" data-tab="memory" href="#memory">Memory</a>
+      <!-- Sixth slot kept free: the sidebar flex column absorbs more items
+           with no layout change. -->
     </nav>
     <div class="build-card" title="deployed git sha + overall status">
       <span id="build-dot" class="dot ok" aria-hidden="true"></span>
@@ -144,6 +146,48 @@
           </div>
         </div>
       </section>
+
+      <!-- MEMORY -->
+      <section id="tab-memory" class="tab-panel">
+        <div class="memory-controls">
+          <label>show
+            <select id="memory-status">
+              <option value="confirmed">confirmed</option>
+              <option value="proposed">proposed inbox</option>
+            </select>
+          </label>
+          <input id="memory-q" type="text" placeholder="search name or alias…">
+          <button id="memory-add-entity-btn" class="btn btn-sm">＋ Entity</button>
+          <span id="memory-count" class="pageinfo"></span>
+        </div>
+        <div id="memory-add-entity" class="memory-add-entity" hidden>
+          <label>kind
+            <select id="memory-entity-kind">
+              <option value="person">person</option>
+              <option value="group">group</option>
+              <option value="place">place</option>
+              <option value="org">org</option>
+              <option value="channel">channel</option>
+            </select>
+          </label>
+          <label>name
+            <input id="memory-entity-name" type="text" dir="auto" placeholder="e.g. Rona / ה' ספיר">
+          </label>
+          <label>aliases (comma-separated)
+            <input id="memory-entity-aliases" type="text" dir="auto" placeholder="רונה, Rona C.">
+          </label>
+          <button id="memory-entity-save" class="btn btn-sm">Save</button>
+          <button id="memory-entity-cancel" class="btn btn-sm">Cancel</button>
+        </div>
+        <div id="memory-list"></div>
+        <aside id="memory-drawer" class="memory-drawer" hidden aria-label="fact history">
+          <div class="drawer-head">
+            <h3>Fact history</h3>
+            <button id="memory-drawer-close" class="btn btn-sm">✕ Close</button>
+          </div>
+          <div id="memory-drawer-body" class="drawer-body"></div>
+        </aside>
+      </section>
     </main>
   </div>
 </div>
@@ -151,5 +195,6 @@
 <div id="toast" class="toast" hidden></div>
 
 <script src="/cockpit/app.js"></script>
+<script src="/cockpit/memory.js"></script>
 </body>
 </html>

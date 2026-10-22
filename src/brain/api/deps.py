@@ -21,10 +21,12 @@ from brain.config import get_settings, unwrap_secret
 from brain.db.session import get_db
 from brain.factories import build_embedder, build_llm_client
 from brain.repositories.items import ItemsRepository
+from brain.repositories.memory import MemoryRepository
 from brain.services.ask import AskService
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsService
+from brain.services.memory import MemoryService
 from brain.services.search import SearchService
 
 
@@ -137,6 +139,18 @@ def get_ingest_service(
     return IngestService(repo, classifier, indexer)
 
 
+def get_memory_repository(db: Session = Depends(get_db)) -> MemoryRepository:
+    """Provide a request-scoped MemoryRepository."""
+    return MemoryRepository(db)
+
+
+def get_memory_service(
+    repo: MemoryRepository = Depends(get_memory_repository),
+) -> MemoryService:
+    """Provide a MemoryService bound to the request-scoped DB session."""
+    return MemoryService(repo)
+
+
 def get_search_service(
     repo: ItemsRepository = Depends(get_items_repository),
     embedder: Embedder = Depends(get_embedder),
@@ -150,8 +164,9 @@ def get_search_service(
 def get_ask_service(
     search: SearchService = Depends(get_search_service),
     llm: LLMClient = Depends(get_llm_client),
+    memory: MemoryService = Depends(get_memory_service),
 ) -> AskService:
-    """Provide an AskService wired to search and the shared LLM client."""
+    """Provide an AskService wired to search, the shared LLM client and memory."""
     settings = get_settings()
     return AskService(
         search,
@@ -159,4 +174,5 @@ def get_ask_service(
         top_k=settings.ask_top_k,
         recall_pool=settings.ask_recall_pool,
         tz=ZoneInfo(settings.timezone),
+        memory_block=memory.compact_block,
     )

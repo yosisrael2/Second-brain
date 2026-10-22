@@ -362,7 +362,9 @@ class TestRecentAndCommands:
         _run_poll(tg, core)
 
         names = [c.command for c in (tg.commands or [])]
-        assert names == ["ask", "search", "review", "recent", "status", "help"]
+        assert names == [
+            "ask", "search", "review", "recent", "profile", "remember", "status", "help",
+        ]
 
 
 class _FakeTGForPoll:

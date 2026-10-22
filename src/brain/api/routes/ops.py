@@ -233,3 +233,14 @@ def get_cockpit_js() -> FileResponse:
 @router.get("/cockpit/app.css")
 def get_cockpit_css() -> FileResponse:
     return FileResponse(_COCKPIT_DIR / "app.css", media_type="text/css")
+
+
+@router.get("/cockpit/memory.js")
+def get_cockpit_memory_js() -> FileResponse:
+    """The Memory tab (PR 0b) lives in its own file so restyles can adopt it."""
+    return FileResponse(_COCKPIT_DIR / "memory.js", media_type="application/javascript")
+
+
+@router.get("/cockpit/memory.css")
+def get_cockpit_memory_css() -> FileResponse:
+    return FileResponse(_COCKPIT_DIR / "memory.css", media_type="text/css")

@@ -168,6 +168,10 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
 }
 .btn:hover { background: var(--bg-page); }
 .btn:disabled { opacity: 0.5; cursor: default; }
+/* Ghost variant: borderless quiet buttons (used by the Memory tab's inline
+ * row actions: rename / delete / add fact). */
+.btn-ghost { border-color: transparent; background: none; color: var(--text-muted); }
+.btn-ghost:hover { background: none; color: var(--text); border-color: var(--border); }
 .btn-sm { height: 36px; padding: 0 12px; font-size: 13px; }
 .btn-icon { width: 44px; padding: 0; }
 .btn svg { flex: none; }
