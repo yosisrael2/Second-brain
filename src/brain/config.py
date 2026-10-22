@@ -57,10 +57,10 @@ class Settings(BaseSettings):
 
     app_name: str = "second-brain"
     environment: str = "dev"
-    database_url: str = "postgresql+psycopg://brain:brain@localhost:5432/brain"
+    database_url: str = "postgresql+psycopg://brain:brain@localhost:27432/brain"
 
     # Vector store
-    qdrant_url: str = "http://localhost:6333"
+    qdrant_url: str = "http://localhost:27333"
     qdrant_api_key: SecretStr | None = None
     qdrant_collection: str = DEFAULT_QDRANT_COLLECTION
     qdrant_timeout_s: int = DEFAULT_QDRANT_TIMEOUT_S

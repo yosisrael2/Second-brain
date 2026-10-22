@@ -620,7 +620,7 @@ produced only plain text — no tool call, no side effects.
   <li><code>pip install -e ".[dev]"</code>; copy <code>.env.example</code> → <code>.env</code>.</li>
   <li><code>alembic upgrade head</code> — create the schema.</li>
   <li><code>uvicorn brain.main:app --reload</code>; check <code>GET /health</code>.</li>
-  <li>Capture: <code>curl -X POST :8000/items -H 'Content-Type: application/json' -d '{"raw_text": "…"}'</code></li>
+  <li>Capture: <code>curl -X POST :27800/items -H 'Content-Type: application/json' -d '{"raw_text": "…"}'</code></li>
   <li>After bulk imports or outages: <code>brain reindex</code>.</li>
 </ol>
 

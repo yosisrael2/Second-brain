@@ -20,15 +20,15 @@ from conftest import assert_test_database
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEV_DB_URL = "postgresql://brain:brain@localhost:5432/brain"
+DEV_DB_URL = "postgresql://brain:brain@localhost:27432/brain"
 MARKER_RAW_TEXT = "__db_isolation_marker__"
 
 
 def test_guard_refuses_non_test_urls_and_accepts_test_ones() -> None:
     with pytest.raises(RuntimeError, match="not a \\*_test database"):
-        assert_test_database("postgresql://brain:brain@localhost:5432/brain")
-    assert_test_database("postgresql://brain:brain@localhost:5432/brain_test")
-    assert_test_database("postgresql+psycopg://brain:brain@localhost:5432/brain_test?x=1")
+        assert_test_database("postgresql://brain:brain@localhost:27432/brain")
+    assert_test_database("postgresql://brain:brain@localhost:27432/brain_test")
+    assert_test_database("postgresql+psycopg://brain:brain@localhost:27432/brain_test?x=1")
 
 
 def _ensure_dev_like_schema() -> None:

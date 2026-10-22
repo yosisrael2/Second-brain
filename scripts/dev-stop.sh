@@ -8,7 +8,7 @@ cd "$ROOT"
 # shellcheck disable=SC1091  # dynamic path: lib.sh sits next to this script
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-27800}"
 PID_FILE=".dev/uvicorn.pid"
 DOWN=0
 PURGE=0
@@ -28,7 +28,6 @@ default second-brain-dev) and is printed before any docker call.
 EOF
 }
 
-say() { printf '%s\n' "$*"; }
 die() { printf 'dev-stop: %s\n' "$*" >&2; exit 1; }
 
 stop_server() {
