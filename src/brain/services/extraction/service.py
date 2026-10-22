@@ -33,7 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from brain import ops
-from brain.db.enums import ItemStatus, ItemType
+from brain.db.enums import Actionability, ItemStatus, ItemType
 from brain.db.models import EnrichmentJob, ItemSource, MemoryItem
 from brain.services.extraction import dates as xdates
 from brain.services.extraction.base import Extractor, StubExtractor
@@ -303,10 +303,30 @@ class EnrichmentService:
     def _validate(
         self, candidate: ChildCandidate, source: MemoryItem, now: datetime
     ) -> _ResolvedChild | None:
-        """Grounding guard first (item 8); then dates (2b/41); then applies_to (42)."""
-        if not quote_in_source(candidate.quote, source.raw_text):
+        """Grounding guard first (item 8); then dates (2b/41); then applies_to (42).
+
+        Derived children (item 22) cite the fact they derive from, not the
+        source: an EMPTY quote is allowed only for them and skips the
+        grounding guard; a NON-derived empty quote is still dropped, and a
+        derived child WITH a quote is verified normally (eval doc).
+        """
+        if candidate.quote:
+            if not quote_in_source(candidate.quote, source.raw_text):
+                logger.info(
+                    "enrichment: dropped ungrounded candidate %r from %s",
+                    candidate.title[:60],
+                    source.id,
+                )
+                ops.record_event(
+                    "enrichment",
+                    "ungrounded_dropped",
+                    ok=True,
+                    detail={"item_id": str(source.id)},
+                )
+                return None
+        elif candidate.derived_from is None:
             logger.info(
-                "enrichment: dropped ungrounded candidate %r from %s",
+                "enrichment: dropped empty-quote non-derived candidate %r from %s",
                 candidate.title[:60],
                 source.id,
             )
@@ -341,8 +361,16 @@ class EnrichmentService:
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,
             "model": getattr(self._extractor, "name", "stub"),
+            "prompt_version": getattr(
+                self._extractor, "prompt_version", None
+            ),
             "run_id": None,  # set at storage time
         }
+        if candidate.derived_from is not None:
+            # item 22: the link lands in extraction_meta until PR B's
+            # item_relations table; the target is the candidate INDEX the
+            # extractor used (stable within one extraction pass)
+            meta["derived_from"] = candidate.derived_from
         if conflict_note:
             meta["date_conflict_note"] = conflict_note  # both readings survive (item 2b)
         return _ResolvedChild(
@@ -456,6 +484,12 @@ class EnrichmentService:
             source=source.source,
             type=kind,  # the candidate's kind survives (review round 1, defect 1)
             occurred_at=moment,
+            importance=candidate.importance,
+            actionability=(
+                Actionability(candidate.actionability)
+                if candidate.actionability is not None
+                else None
+            ),
             status=ItemStatus.NEEDS_REVIEW if resolved.date_conflict else ItemStatus.INBOX,
             child_state="proposed",
             applies_to=resolved.applies_to,
@@ -491,6 +525,12 @@ class EnrichmentService:
         candidate = resolved.candidate
         child.raw_text = candidate.title
         child.occurred_at = resolved.start or resolved.due
+        child.importance = resolved.candidate.importance
+        child.actionability = (
+            Actionability(resolved.candidate.actionability)
+            if resolved.candidate.actionability is not None
+            else None
+        )
         child.applies_to = resolved.applies_to
         child.date_conflict = resolved.date_conflict
         child.status = ItemStatus.NEEDS_REVIEW if resolved.date_conflict else child.status

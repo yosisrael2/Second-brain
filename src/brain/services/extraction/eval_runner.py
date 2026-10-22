@@ -1,0 +1,175 @@
+"""Offline extraction-eval runner (PR A2): emails file -> pred.jsonl.
+
+Runs the REAL extractor + the FULL A1 pipeline (grounding, deterministic
+dates, applies_to) over a file of emails split by '=====' separators — never
+against the live store (the same guard as `brain enrich`) — and writes pred
+rows in the eval schema (docs/eval-extraction.md). The gold files are NEVER
+read here; the extraction developer consumes aggregate numbers only.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import text
+
+from brain.db.models import MemoryItem
+from brain.services.extraction.service import EnrichmentService
+from brain.services.memory import MemoryRepository, MemoryService
+
+logger = logging.getLogger(__name__)
+
+_SEPARATOR = "====="
+
+
+def split_emails(raw: str) -> list[dict[str, str]]:
+    """Split the dogfood file into {'email_id', 'sent', 'text'} dicts.
+
+    email_id is 'E' + 2-digit position IN FILE ORDER (E01..); sent is the
+    email's Date header (raw string, parsed by the caller's pipeline).
+    """
+    emails: list[dict[str, str]] = []
+    for chunk in raw.split(_SEPARATOR):
+        body = chunk.strip()
+        if not body:
+            continue
+        sent_line = ""
+        text_lines: list[str] = []
+        for line in body.splitlines():
+            if line.startswith("Date:"):
+                sent_line = line[len("Date:") :].strip()
+                continue
+            text_lines.append(line)
+        emails.append(
+            {
+                "email_id": f"E{len(emails) + 1:02d}",
+                "sent": sent_line,
+                "text": "\n".join(text_lines).strip(),
+            }
+        )
+    return emails
+
+
+def _parse_sent(raw: str) -> datetime:
+    """Email Date header -> aware UTC datetime ('Thu, 22 Oct 2026 13:43')."""
+    parsed = parsedate_to_datetime(raw)
+    if parsed.tzinfo is None:  # zone-less header: interpret as local via UTC
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _iso_local(moment: datetime | None, tz: Any) -> str | None:
+    """Aware UTC -> local wall-clock ISO WITHOUT offset (eval schema)."""
+    if moment is None:
+        return None
+    return moment.astimezone(tz).replace(tzinfo=None).isoformat()
+
+
+def _child_rows(
+    session: Any,  # noqa: ANN001 — Session
+    source: MemoryItem,
+    email_id: str,
+    tz: Any,
+) -> list[dict[str, Any]]:
+    """One email's stored children -> eval pred rows (full pipeline output)."""
+    links = session.execute(
+        text(
+            "SELECT child_id, quote FROM item_sources WHERE source_id = :sid "
+            "ORDER BY created_at ASC"
+        ),
+        {"source_id": str(source.id)},
+    ).all()
+    rows: list[dict[str, Any]] = []
+    for number, (child_id, quote) in enumerate(links):
+        child = session.get(MemoryItem, child_id)
+        assert child is not None
+        meta = child.extraction_meta or {}
+        row: dict[str, Any] = {
+            "email_id": email_id,
+            "child_id": f"{email_id}-C{number + 1:02d}",
+            "type": child.type.value if child.type else "event",
+            "title": child.raw_text,
+        }
+        when = _iso_local(child.occurred_at, tz)
+        if child.type is not None and child.type.value == "task":
+            row["due"] = when
+        else:
+            row["start"] = when
+        row["all_day"] = bool(child.occurred_at) and _is_midnight(child.occurred_at, tz)
+        row["applies_to"] = list(child.applies_to or ["unknown"])
+        row["importance"] = child.importance
+        row["actionability"] = meta.get("actionability")
+        row["source_quote"] = quote
+        if meta.get("derived_from") is not None:
+            # relation to the derived-from child, by pred child_id (item 22);
+            # the extractor's index refers to candidate order == link order
+            target_number = int(meta["derived_from"]) + 1
+            row["relation"] = {
+                "kind": "derived_from",
+                "target": f"{email_id}-C{target_number:02d}",
+            }
+        row["date_conflict"] = bool(child.date_conflict)
+        rows.append(row)
+    return rows
+
+
+def _is_midnight(moment: datetime, tz: Any) -> bool:
+    return moment.astimezone(tz).time().isoformat() == "00:00:00"
+
+
+def run_extraction_eval(
+    input_path: Path,
+    out_path: Path,
+    session: Any,  # noqa: ANN001 — Session
+    extractor: Any,  # noqa: ANN001 — Extractor
+    *,
+    tz: Any,
+) -> list[dict[str, Any]]:
+    """Extract children for every email and write the pred file.
+
+    Returns the rows (also written as JSONL). Runs against the session's DB
+    (a TEST database — the CLI guard refuses the live store); cleans its own
+    rows before and after.
+    """
+    emails = split_emails(input_path.read_text(encoding="utf-8"))
+    memory = MemoryService(MemoryRepository(session))
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+
+    service = EnrichmentService(
+        ItemsRepository(session), session, extractor=extractor, memory=memory
+    )
+    _wipe(session)
+    rows: list[dict[str, Any]] = []
+    now = datetime.now(tz=UTC)
+    for email in emails:
+        source = MemoryItem(
+            raw_text=email["text"],
+            source="email",
+            occurred_at=_parse_sent(email["sent"]) if email["sent"] else None,
+            meta={"email_id": email["email_id"], "subject_kind": "school"},
+        )
+        session.add(source)
+        session.commit()
+        if service.enqueue(source) is None:
+            logger.warning("extract-eval: %s did not qualify (D1b)", email["email_id"])
+            continue
+        service.run_once(now, limit=1)
+        rows.extend(_child_rows(session, source, email["email_id"], tz))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return rows
+
+
+def _wipe(session: Any) -> None:  # noqa: ANN001
+    session.execute(text("DELETE FROM enrichment_jobs"))
+    session.execute(text("DELETE FROM item_sources"))
+    session.execute(text("DELETE FROM memory_items"))
+    session.commit()

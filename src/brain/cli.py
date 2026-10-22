@@ -65,6 +65,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     enrich.add_argument(
         "--budget", type=int, default=None, help="Override the cap for this run"
     )
+    extract_eval = subparsers.add_parser(
+        "extract-eval",
+        help="Run the LLM extractor over an emails file -> pred.jsonl (offline)",
+    )
+    extract_eval.add_argument("--input", required=True, help="Emails file (split on =====)")
+    extract_eval.add_argument("--out", required=True, help="Output pred.jsonl path")
+    extract_eval.add_argument(
+        "--limit", type=int, default=None, help="Only the first N emails (smoke runs)"
+    )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     seed_kid = memory_sub.add_parser(
@@ -138,6 +147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _normalize_calendar()
     if args.command == "enrich":
         return _enrich(since=args.since, limit=args.limit, budget=args.budget)
+    if args.command == "extract-eval":
+        return _extract_eval(input_path=args.input, out_path=args.out, limit=args.limit)
     if args.command == "memory":
         if args.memory_command == "seed-kid":
             return _memory_seed_kid(
@@ -171,6 +182,53 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
   5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
      people) and restart. Only those ids are ever answered.
 """
+
+
+def _extract_eval(*, input_path: str, out_path: str, limit: int | None) -> int:
+    """Offline extraction-eval runner: emails file -> pred.jsonl (never live)."""
+    import os  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    from brain.api.deps import get_llm_client  # noqa: PLC0415
+    from brain.config import assert_not_live_store, get_settings  # noqa: PLC0415
+    from brain.services.extraction.eval_runner import run_extraction_eval  # noqa: PLC0415
+    from brain.services.extraction.llm_extractor import (  # noqa: PLC0415
+        LLMExtractor,
+    )
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    emails_text = Path(input_path).read_text(encoding="utf-8")
+    if limit is not None:
+        chunks = [c for c in emails_text.split("=====") if c.strip()][:limit]
+        emails_text = "=====".join(chunks)
+        temp = Path(out_path).parent / f".eval-input-{Path(out_path).stem}.txt"
+        temp.write_text(emails_text, encoding="utf-8")
+        input_path = str(temp)
+
+    llm = get_llm_client()
+    try:
+        extractor = LLMExtractor(llm)
+        with SessionLocal() as session:
+            rows = run_extraction_eval(
+                Path(input_path),
+                Path(out_path),
+                session,
+                extractor,
+                tz=ZoneInfo(settings.timezone),
+            )
+    finally:
+        close = getattr(llm, "close", None)
+        if close is not None:
+            close()
+    print(f"extract-eval: {len(rows)} children -> {out_path}")
+    return 0
 
 
 def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
