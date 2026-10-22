@@ -268,3 +268,101 @@ def test_add_fact_requires_object_or_value(memory: MemoryService):
     me = memory._ensure_entity(kind="person", name="me")
     with pytest.raises(ValueError):
         memory.add_fact(me.id, "note")
+
+
+# -- channels (WhatsApp baseline: link a channel to its audience) -----------------
+
+
+def _seed_channel(
+    memory: MemoryService,
+    name: str,
+    kind: str,
+    applies_to: str | None,
+    *,
+    confirmed: bool = True,
+) -> dict:
+    """Create a channel entity + its facts the way seed-channel will."""
+    channel = memory._ensure_entity(kind="channel", name=name)
+    memory.add_fact(channel.id, "channel_kind", value=kind)
+    fact = None
+    if applies_to is not None:
+        fact = memory.add_fact(
+            channel.id,
+            "applies_to",
+            value=applies_to,
+            status="confirmed" if confirmed else "proposed",
+        )
+    return {"id": channel.id, "fact": fact}
+
+
+def test_channel_maps_to_its_kid(memory: MemoryService):
+    _seed_world(memory)
+    _seed_channel(memory, "הורים כיתה ב' ברקת", "parents", "Itamar")
+    assert memory.resolve_applies_to({"channel": "הורים כיתה ב' ברקת"}) == ["Itamar"]
+
+
+def test_unknown_channel_is_unknown(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.resolve_applies_to({"channel": "לא קיים"}) == ["unknown"]
+
+
+def test_family_channel_resolves_all_confirmed_kids_plus_me_at_query_time(
+    memory: MemoryService,
+):
+    _seed_world(memory)
+    _seed_channel(memory, "הודעות בית ספר", "parents", "family")
+    # kids sorted by name (deterministic), then 'me' — resolved at query time
+    assert memory.resolve_applies_to({"channel": "הודעות בית ספר"}) == [
+        "Itamar",
+        "Rona",
+        "me",
+    ]
+    # a kid added later is included without touching the channel
+    memory.set_kid("Noa", gender="girl", school="בראשית", grade="4", class_="ג' ע", teacher="T")
+    assert memory.resolve_applies_to({"channel": "הודעות בית ספר"}) == [
+        "Itamar",
+        "Noa",
+        "Rona",
+        "me",
+    ]
+
+
+def test_channel_without_applies_to_fact_is_unknown(memory: MemoryService):
+    _seed_world(memory)
+    _seed_channel(memory, "ערוץ ספורט", "club", None)
+    assert memory.resolve_applies_to({"channel": "ערוץ ספורט"}) == ["unknown"]
+
+
+def test_unconfirmed_applies_to_fact_is_unknown(memory: MemoryService):
+    """Only CONFIRMED memory drives resolution (delta item 31d)."""
+    _seed_world(memory)
+    _seed_channel(memory, "הורים שכבה ה", "parents", "Rona", confirmed=False)
+    assert memory.resolve_applies_to({"channel": "הורים שכבה ה"}) == ["unknown"]
+
+
+# -- seed-channel CLI (values handed over at seed time, nothing hard-coded) -------
+
+
+def test_seed_channel_cli_roundtrip(memory: MemoryService, capsys):
+    """The CLI path produces a channel the resolver can answer from."""
+    _seed_world(memory)
+    from brain.cli import main
+
+    code = main(
+        [
+            "memory",
+            "seed-channel",
+            "--name",
+            "וואטסאפ הורי שכבת ה",
+            "--kind",
+            "parents",
+            "--applies-to",
+            "Rona",
+        ]
+    )
+    assert code == 0
+    assert (
+        memory.resolve_applies_to({"channel": "וואטסאפ הורי שכבת ה"}) == ["Rona"]
+    )
+    out = capsys.readouterr().out
+    assert "seeded channel" in out

@@ -194,7 +194,7 @@ class Entity(Base):
     __tablename__ = "entities"
     __table_args__ = (
         CheckConstraint(
-            _in_domain("kind", ("person", "group", "place", "org")),
+            _in_domain("kind", ("person", "group", "place", "org", "channel")),
             name="kind",
         ),
     )

@@ -49,6 +49,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_kid.add_argument("--grade", required=True)
     seed_kid.add_argument("--class", dest="class_", required=True)
     seed_kid.add_argument("--teacher", required=True)
+    seed_channel = memory_sub.add_parser(
+        "seed-channel",
+        help="Register a channel (WhatsApp group etc.) and who it is for",
+    )
+    seed_channel.add_argument("--name", required=True, help="Exact channel name")
+    seed_channel.add_argument(
+        "--kind",
+        required=True,
+        choices=["teacher", "parents", "kids", "club", "committee"],
+    )
+    seed_channel.add_argument(
+        "--applies-to",
+        required=True,
+        help="Rona | Itamar | me | family (values handed over at seed time)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
@@ -66,6 +81,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 grade=args.grade,
                 class_=args.class_,
                 teacher=args.teacher,
+            )
+        if args.memory_command == "seed-channel":
+            return _memory_seed_channel(
+                name=args.name, kind=args.kind, applies_to=args.applies_to
             )
         parser.error(f"unknown memory command {args.memory_command!r}")
         return 2
@@ -106,6 +125,24 @@ def _memory_seed_kid(
         )
         attrs = ", ".join(f"{key} {value}" for key, value in kid.items() if key != "name")
         print(f"seeded {name}: {attrs}")
+        return 0
+    finally:
+        session.close()
+
+
+def _memory_seed_channel(*, name: str, kind: str, applies_to: str) -> int:
+    """Register a channel and its audience (values handed over at seed time)."""
+    from brain.db.session import SessionLocal  # noqa: PLC0415  (deferred: CLI startup)
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    session = SessionLocal()
+    try:
+        service = MemoryService(MemoryRepository(session))
+        channel = service.add_entity("channel", name)
+        service.add_fact(channel["id"], "channel_kind", value=kind)
+        service.add_fact(channel["id"], "applies_to", value=applies_to)
+        print(f"seeded channel {name}: kind {kind}, applies_to {applies_to}")
         return 0
     finally:
         session.close()

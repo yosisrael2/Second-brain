@@ -213,6 +213,10 @@ class MemoryService:
         if not kids:
             return ["unknown"]
 
+        channel = audience.get("channel")
+        if channel is not None:
+            return self._resolve_channel(str(channel))
+
         named = audience.get("named_kids") or []
         if named:
             known = [kid["name"] for kid in kids if kid["name"] in named]
@@ -250,6 +254,29 @@ class MemoryService:
         if unconfirmed:
             return ["unknown"]
         return ["nobody"]
+
+    def _resolve_channel(self, name: str) -> list[str]:
+        """Audience of a named channel (exact match) from its confirmed fact.
+
+        'family' resolves at QUERY time to all confirmed kids + 'me', so a
+        kid seeded later is included without touching the channel.
+        """
+        entity = self._repo.find_entity(kind="channel", name=name)
+        if entity is None:
+            return ["unknown"]
+        for fact in self._repo.current_facts(
+            subject_ids=[entity.id], status="confirmed"
+        ):
+            if fact.predicate != "applies_to" or fact.value is None:
+                continue
+            if fact.value == "me":
+                return ["me"]
+            if fact.value == "family":
+                return sorted(kid["name"] for kid in self.kids()) + ["me"]
+            if fact.value in {kid["name"] for kid in self.kids()}:
+                return [fact.value]
+            return ["unknown"]  # names a kid with no confirmed memory
+        return ["unknown"]
 
     def _match_kid(self, kid: dict[str, Any], audience: dict[str, Any]) -> str:
         """'match' | 'incompatible' | 'unconfirmed' for one kid vs an audience."""
