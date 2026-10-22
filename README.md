@@ -656,6 +656,17 @@ refuses to run at all against a non-`*_test` URL, and the destructive
 `tests/test_db_isolation.py` proves the point: it seeds a marker row in the
 dev database, runs the DB-backed suite, and asserts the marker survives.
 
+**Per-worker Qdrant collections.** The suite also refuses non-`*_test`
+Qdrant collections — and when you leave `QDRANT_COLLECTION` unset, it DERIVES
+the collection from the test database name (`brain_w5_test` ->
+`brain_items_w5_test`, `brain_test` -> `brain_items_test`), so two workers
+testing against different test databases never share one vector collection.
+Previously every suite silently pinned the same `brain_items_test`, and
+concurrent runs polluted each other's vectors (a real incident). Run two
+suites side by side by pointing each at its own `DATABASE_URL` and letting
+the collection follow, e.g. `DATABASE_URL=.../brain_w5_test pytest`;
+CI's `brain_test` keeps the classic `brain_items_test`.
+
 CI runs the same commands on every PR and push to main (GitHub Actions,
 `.github/workflows/ci.yml`): ruff, mypy, shellcheck, and pytest against
 Postgres 16 + Qdrant service containers — no API keys or Claude login

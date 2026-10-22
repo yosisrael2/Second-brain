@@ -134,6 +134,10 @@ class ItemsRepository:
         body'), so the exact channel name as stored in memory matches the
         items captured from that channel. Needles are user/entity data, so
         LIKE wildcards in them are escaped, never interpreted.
+
+        Extracted children with ``child_state = 'dropped'`` (user-rejected by
+        the meaning-extraction lifecycle, item 19) are never recalled;
+        ordinary captures, 'proposed' and 'kept' children are.
         """
         if not needles:
             return []
@@ -143,7 +147,11 @@ class ItemsRepository:
         ]
         stmt = (
             select(MemoryItem)
-            .where(or_(*clauses))
+            .where(
+                or_(*clauses),
+                # 'dropped' children are excluded (NULL-safe: NULL != 'dropped')
+                or_(MemoryItem.child_state.is_(None), MemoryItem.child_state != "dropped"),
+            )
             .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)
         )

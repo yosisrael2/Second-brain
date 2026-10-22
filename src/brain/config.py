@@ -204,6 +204,22 @@ LIVE_DATABASE_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain"
 LIVE_QDRANT_COLLECTION = DEFAULT_QDRANT_COLLECTION  # 'brain_items'
 
 
+def test_collection_for(database_name: str) -> str:
+    """The Qdrant collection name for a test database (per-worker isolation).
+
+    Derives the test collection from the test database name so two workers
+    running suites against different test databases (brain_w5_test,
+    brain_test, ...) never share one Qdrant collection — concurrent suites
+    polluting each other's vectors was a real incident. 'brain_w5_test' ->
+    'brain_items_w5_test', 'brain_test' -> 'brain_items_test'. Callers keep
+    the ``*_test``-suffix guard: this function is only ever fed names that
+    already end in ``_test`` (conftest enforces that before calling).
+    """
+    if database_name.startswith("brain_"):
+        database_name = database_name[len("brain_"):]
+    return f"brain_items_{database_name}"
+
+
 def _is_live_database_url(url: str) -> bool:
     """True when `url` points at the live database.
 

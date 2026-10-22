@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -177,10 +178,15 @@ class AskService:
         if self._memory is None or self._items_repo is None:
             return []
         entities = self._memory.overview(status="confirmed", q=None)
-        lowered = question.lower()
 
         def mentions(name: str) -> bool:
-            return bool(name) and name.lower() in lowered
+            if not name:
+                return False
+            # Whole-word match only: 'May' must not fire inside 'mayor',
+            # 'שחר' not inside 'שחרור'. \w is Unicode-aware, so Hebrew
+            # letters count as word characters on both sides.
+            pattern = rf"(?<!\w){re.escape(name)}(?!\w)"
+            return re.search(pattern, question, re.IGNORECASE) is not None
 
         kids: list[dict[str, Any]] = []
         channels: list[dict[str, Any]] = []
