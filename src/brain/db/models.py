@@ -11,6 +11,7 @@ from sqlalchemy import (
     Computed,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -179,4 +180,100 @@ class OpsHeartbeat(Base):
     version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     detail: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+
+
+class Entity(Base):
+    """A durable thing in the user's world: person, group, place, or org.
+
+    Memory layer (design: meaning-extraction §"MEMORY LAYER"): separate from
+    the capture stream — notes are WHAT HAPPENED, entities+facts are WHAT IS
+    TRUE. ``kind`` is a closed set so applies_to resolution can trust it.
+    """
+
+    __tablename__ = "entities"
+    __table_args__ = (
+        CheckConstraint(
+            _in_domain("kind", ("person", "group", "place", "org")),
+            name="kind",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class EntityAlias(Base):
+    """An alternate name for an entity (Hebrew/English/nickname).
+
+    PK (entity_id, alias): the same alias may belong to several entities
+    (disambiguation happens in the service, not the schema).
+    """
+
+    __tablename__ = "entity_aliases"
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("entities.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    alias: Mapped[str] = mapped_column(Text, primary_key=True)
+    lang: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+
+class MemoryFact(Base):
+    """A time-versioned fact about an entity.
+
+    Never updated in place: changing a fact closes the old row (valid_to=now)
+    and opens a new one linked via ``supersedes_id``; history stays queryable.
+    ``status`` gates usage — ONLY confirmed, current facts drive applies_to
+    and the ask prompt block. Provenance records where the fact came from
+    (user command or source items + quote), so extraction (PR A) can insert
+    proposals without a schema change.
+    """
+
+    __tablename__ = "memory_facts"
+    __table_args__ = (
+        CheckConstraint(
+            _in_domain("status", ("proposed", "confirmed", "rejected")),
+            name="status",
+        ),
+        CheckConstraint(
+            "object_id IS NOT NULL OR value IS NOT NULL",
+            name="has_object_or_value",
+        ),
+        Index("ix_memory_facts_subject", "subject_id"),
+        Index("ix_memory_facts_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    subject_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
+    )
+    predicate: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entities.id", ondelete="SET NULL"), nullable=True
+    )
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_facts.id", ondelete="SET NULL"), nullable=True
+    )
+    provenance: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )

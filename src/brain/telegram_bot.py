@@ -311,12 +311,20 @@ def _live_services_factory() -> ServicesFactory:
                 deps.get_vector_store(),
                 deps.get_reranker(),
             )
+            from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+            from brain.services.memory import MemoryService  # noqa: PLC0415
+
+            memory = MemoryService(MemoryRepository(session))
             yield BotServices(
                 ingest=IngestService(repo, deps.get_classifier(), deps.get_item_indexer()),
                 items=ItemsService(repo, deps.get_item_indexer()),
                 search=search,
-                ask=AskService(search, deps.get_llm_client()),
-                memory=MemoryService(MemoryRepository(session)),
+                ask=AskService(
+                    search,
+                    deps.get_llm_client(),
+                    memory_block=memory.compact_block,
+                ),
+                memory=memory,
             )
         finally:
             session.close()
