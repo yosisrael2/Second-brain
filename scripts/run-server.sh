@@ -27,7 +27,9 @@ UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 
 [ -x "$UVICORN" ] || {
   say "run-server: $UVICORN missing — provision the venv first (scripts/dev-start.sh does)" >&2
-  exit 78  # EX_CONFIG: launchd must not restart-loop on a missing venv
+  # Exit 0, not 78: KeepAlive SuccessfulExit=false restarts ANY non-zero exit,
+  # and a missing venv is permanent — restart-looping would be wrong.
+  exit 0
 }
 
 load_env_file  # fills unset vars from .env (DATABASE_URL, QDRANT_URL, ...); real env wins

@@ -478,6 +478,21 @@ class TestCardFormat:
 
 
 class TestExitCodes:
+    @staticmethod
+    def _short_conflict_window(monkeypatch) -> None:
+        """run() uses the production conflict window (10 min); the exit-code
+        tests only need the MAPPING, so shrink the window via poll_loop."""
+        from brain import telegram_bot
+
+        real_poll_loop = telegram_bot.poll_loop
+
+        def _fast(tg, core):
+            return real_poll_loop(
+                tg, core, conflict_window_s=0.05, conflict_backoff_s=0.01
+            )
+
+        monkeypatch.setattr(telegram_bot, "poll_loop", _fast)
+
     def test_no_token_logs_disabled_and_exits_zero(self, monkeypatch, caplog):
         from brain import telegram_bot
 
@@ -486,9 +501,10 @@ class TestExitCodes:
             assert telegram_bot.run(settings) == 0
         assert "telegram bot disabled (no token)" in caplog.text
 
-    def test_conflict_exits_78(self, monkeypatch):
+    def test_conflict_exits_78_after_the_window(self, monkeypatch):
         from brain import telegram_bot
 
+        self._short_conflict_window(monkeypatch)
         conflict = telegram.error.Conflict("terminated by other getUpdates request")
         monkeypatch.setattr(telegram_bot, "build_bot", lambda s: (object(), _ExitTG(conflict)))
         settings = telegram_bot.Settings(

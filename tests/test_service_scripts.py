@@ -145,12 +145,14 @@ class TestRunBotExitContract:
 
 
 class TestRunServer:
-    def test_missing_venv_exits_78_no_restart_loop(self, tmp_path):
+    def test_missing_venv_exits_0_no_restart_loop(self, tmp_path):
+        """A missing venv is permanent: exit 0 so KeepAlive SuccessfulExit=false
+        does NOT restart-loop (any non-zero exit would be restarted)."""
         result = _run(
             [str(SCRIPTS / "run-server.sh")],
             env={"UVICORN_BIN": str(tmp_path / "no-such-uvicorn")},
         )
-        assert result.returncode == 78
+        assert result.returncode == 0
         assert "missing" in result.stderr
 
     def test_runs_uvicorn_foreground_on_port(self, tmp_path):

@@ -228,12 +228,12 @@ class _FakeTG:
         self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
 
 
-def _run_poll(tg, core, *, expect_runtime_error: bool = True):
+def _run_poll(tg, core, *, expect_runtime_error: bool = True, **kwargs):
     """Run poll_loop to completion; swallow the tests' RuntimeError("stop")."""
     from brain.telegram_bot import poll_loop
 
     try:
-        asyncio.run(poll_loop(tg, core, poll_timeout_s=1))
+        asyncio.run(poll_loop(tg, core, poll_timeout_s=1, **kwargs))
     except RuntimeError as exc:
         if not (expect_runtime_error and str(exc) == "stop"):
             raise
@@ -418,17 +418,26 @@ class TestPollLoop:
         assert events.heartbeats and events.heartbeats[0][1]["pending"] == 1
         assert events.events[0][0] == "capture"
 
-    def test_conflict_records_and_stops(self, monkeypatch):
+    def test_conflict_records_and_stops_after_the_window(self, monkeypatch):
+        """A conflict that persists past the retry window stops the bot (78
+        upstream); each retry records an ops conflict event."""
         telegram = pytest.importorskip("telegram")
         events = _Events()
         events.install(monkeypatch)
         core, _ = _core()
-        tg = _FakeTG([[telegram.error.Conflict("terminated by other getUpdates request")]])
+        tg = _FakeTG(
+            [[telegram.error.Conflict("terminated by other getUpdates request")]] * 12
+        )  # persistent conflict: enough batches to outlast the 0.05s window
 
         with pytest.raises(telegram.error.Conflict):
-            _run_poll(tg, core, expect_runtime_error=False)
+            _run_poll(
+                tg, core, expect_runtime_error=False,
+                conflict_window_s=0.05, conflict_backoff_s=0.01,
+            )
 
-        assert events.events[0][0] == "conflict" and events.events[0][1] is False
+        conflicts = [e for e in events.events if e[0] == "conflict"]
+        assert len(conflicts) >= 2  # retried within the window, not a first-poll exit
+        assert conflicts[0][1] is False
         assert tg.shutdowns == 1
 
     def test_rejected_user_gets_no_reply_and_is_logged(
@@ -556,31 +565,133 @@ class TestCli:
             root.setLevel(saved_level)
 
 
-class TestSingleInstanceLock:
-    """One getUpdates poller per repo, enforced in-process: exclusive flock on
-    .dev/telegram.lock; the second instance exits 78 (no 409 restart loop)."""
+class _ScriptedPollTG:
+    """get_updates yields scripted items: an exception is raised, a list is
+    returned; an empty script raises RuntimeError("stop") like the other
+    poll-loop fakes."""
 
-    def test_second_acquire_reports_the_first_pid(self):
+    def __init__(self, script):
+        self._script = list(script)
+        self.polls = 0
+        self.initialized = False
+        self.shutdown_called = False
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def shutdown(self):
+        self.shutdown_called = True
+
+    async def set_my_commands(self, commands):
+        return None
+
+    async def get_updates(self, offset=None, timeout=0):
+        self.polls += 1
+        item = self._script.pop(0) if self._script else RuntimeError("stop")
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _AlwaysConflictTG(_ScriptedPollTG):
+    """Every get_updates conflicts forever (the give-up path)."""
+
+    async def get_updates(self, offset=None, timeout=0):
+        from telegram.error import Conflict
+
+        self.polls += 1
+        raise Conflict("forever")
+
+
+class TestConflictBackoff:
+    """409 is usually transient (a restart's old long-poll lingers for a few
+    seconds): retry with backoff inside the window, exit 78 only when the
+    conflict persists past it."""
+
+    @staticmethod
+    def _core():
+        return SimpleNamespace(allowed_count=0)
+
+    def test_transient_conflict_keeps_polling(self, monkeypatch):
+        from telegram.error import Conflict
+
+        from brain import telegram_bot
+
+        events: list[tuple] = []
+        monkeypatch.setattr(
+            telegram_bot, "record_event", lambda *a, **k: events.append((a, k))
+        )
+        tg = _ScriptedPollTG([Conflict("c1"), Conflict("c2"), []])
+
+        _run_poll(tg, self._core(), conflict_window_s=5.0, conflict_backoff_s=0.01)
+
+        assert tg.polls >= 4  # 2 conflicts retried + 1 success + 1 stop
+        assert tg.shutdown_called  # clean finally, still polling
+        conflicts = [(a, k) for a, k in events if len(a) > 1 and a[1] == "conflict"]
+        assert len(conflicts) == 2
+        assert all(k.get("ok") is False for _, k in conflicts)
+
+    def test_permanent_conflict_exits_78_after_the_window(self):
+        from telegram.error import Conflict
+
+        from brain.telegram_bot import poll_loop
+
+        tg = _AlwaysConflictTG([])
+        with pytest.raises(Conflict):
+            asyncio.run(
+                poll_loop(
+                    tg,
+                    SimpleNamespace(allowed_count=0),
+                    poll_timeout_s=0.01,
+                    conflict_window_s=0.06,
+                    conflict_backoff_s=0.01,
+                )
+            )
+        assert tg.polls >= 2  # it retried before giving up (not a first-poll exit)
+
+    def test_success_resets_the_conflict_window(self, monkeypatch):
+        from telegram.error import Conflict
+
+        from brain import telegram_bot
+
+        monkeypatch.setattr(telegram_bot, "record_event", lambda *a, **k: None)
+        # conflict, success, conflict, success ...: each success must reset the
+        # window, so alternating conflicts NEVER exhaust it.
+        tg = _ScriptedPollTG([Conflict("c"), [], Conflict("c"), [], Conflict("c"), []])
+
+        _run_poll(tg, self._core(), conflict_window_s=0.1, conflict_backoff_s=0.01)
+
+        assert tg.polls == 7  # 3 conflicts + 3 successes + stop
+
+
+class TestSingleInstanceLock:
+    """One getUpdates poller per bot, enforced in-process: exclusive flock on
+    a machine-wide per-bot lock file; the second instance exits 78 (no 409
+    restart loop)."""
+
+    def test_second_acquire_reports_the_first_pid(self, monkeypatch, tmp_path):
         import os
 
         from brain import telegram_bot
 
-        first, other = telegram_bot._acquire_instance_lock()
+        monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(tmp_path / "cache"))
+        first, other = telegram_bot._acquire_instance_lock("123:secret")
         assert first is not None and other is None
         try:
-            second, holder = telegram_bot._acquire_instance_lock()
+            second, holder = telegram_bot._acquire_instance_lock("123:secret")
             assert second is None, "second flock must lose"
             assert holder == os.getpid()
         finally:
             first.close()  # releases the lock (and lets other tests acquire)
 
-    def test_run_exits_78_when_another_instance_holds_the_lock(self, caplog, monkeypatch):
+    def test_run_exits_78_when_another_instance_holds_the_lock(self, caplog, monkeypatch, tmp_path):
         import logging
         import os
 
         from brain import telegram_bot
 
-        lock, _ = telegram_bot._acquire_instance_lock()
+        monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(tmp_path / "cache"))
+        lock, _ = telegram_bot._acquire_instance_lock("123:placeholder")
         try:
             def _fail_build(_settings):
                 raise AssertionError("build_bot must not run in a second instance")
@@ -597,3 +708,56 @@ class TestSingleInstanceLock:
             assert f"pid {os.getpid()}" in caplog.text
         finally:
             lock.close()
+
+
+class TestLockScope:
+    """The single-instance lock must be MACHINE-WIDE and per bot id — a bot
+    started from any other clone/worktree with the same token must be blocked
+    too (that is exactly the unexplained-second-poller class)."""
+
+    def test_same_bot_id_from_another_repo_is_blocked(self, monkeypatch, tmp_path):
+        import os
+
+        from brain import telegram_bot
+
+        monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setattr(telegram_bot, "_repo_lock_dir", lambda: tmp_path / "repoA")
+        first, other = telegram_bot._acquire_instance_lock("123:SECRET")
+        assert first is not None and other is None
+        try:
+            # A different checkout, same bot id: must hit the SAME lock file.
+            monkeypatch.setattr(telegram_bot, "_repo_lock_dir", lambda: tmp_path / "repoB")
+            second, holder = telegram_bot._acquire_instance_lock("123:SECRET")
+            assert second is None, "lock must be machine-wide, not per checkout"
+            assert holder == os.getpid()
+            # The secret half of the token never appears in the lock name.
+            assert (tmp_path / "cache" / "telegram-123.lock").exists()
+            assert not list((tmp_path / "cache").glob("*SECRET*"))
+        finally:
+            first.close()
+
+    def test_different_bot_ids_do_not_block_each_other(self, monkeypatch, tmp_path):
+        from brain import telegram_bot
+
+        monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setattr(telegram_bot, "_repo_lock_dir", lambda: tmp_path / "repoA")
+        first, _ = telegram_bot._acquire_instance_lock("123:SECRET")
+        try:
+            second, _ = telegram_bot._acquire_instance_lock("456:OTHER")
+            assert second is not None, "a different bot id has its own lock"
+        finally:
+            first.close()
+
+    def test_falls_back_to_repo_dev_when_cache_dir_unwritable(self, monkeypatch, tmp_path):
+        from brain import telegram_bot
+
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a dir")  # cache mkdir under this must fail
+        monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(blocker / "cache"))
+        monkeypatch.setattr(telegram_bot, "_repo_lock_dir", lambda: tmp_path / "repoA" / ".dev")
+        handle, other = telegram_bot._acquire_instance_lock("123:SECRET")
+        try:
+            assert handle is not None and other is None
+            assert (tmp_path / "repoA" / ".dev" / "telegram.lock").exists()
+        finally:
+            handle.close()
