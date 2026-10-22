@@ -301,6 +301,13 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
   font-size: 12px; font-family: var(--font-mono); fill: var(--text-muted);
   paint-order: stroke; stroke: var(--bg-surface); stroke-width: 3px;
 }
+/* Idle labels hide by default (they stacked where several edges leave one
+ * card); hovering or keyboard-focusing the edge reveals its own label.
+ * Labels for edges with traffic or errors are never hidden. */
+.flow-elabel.idle { opacity: 0; }
+.flow-edgegroup:hover .flow-elabel.idle,
+.flow-edgegroup:focus-within .flow-elabel.idle { opacity: 1; }
+.flow-edgegroup { outline: none; }
 @keyframes dashmove { to { stroke-dashoffset: -12; } }
 @media (prefers-reduced-motion: reduce) {
   .flow-edge.active { animation: none; }

@@ -371,7 +371,9 @@ function edgeGeometry(edge, pos, phone, anchors) {
   const bendX = a.x + 28 + anchors.bendIndex * 20;
   return {
     d: `M ${a.x} ${a.y} L ${bendX} ${a.y} L ${bendX} ${b.y} L ${b.x} ${b.y}`,
-    label: { x: (a.x + bendX) / 2, y: a.y - 6, anchor: "middle" },
+    // Beside the vertical bend lane — clear of both the source and target
+    // cards (labels on the first segment overlapped the source card edge).
+    label: { x: bendX + 8, y: a.y - 6, anchor: "middle" },
   };
 }
 
@@ -426,9 +428,9 @@ function flowEdges(flow, pos, phone, width, height) {
       (edge.count ? ` · ${edge.count} calls/15m · p50 ${edge.p50 ?? "?"}ms` : " · no traffic/15m") +
       (edge.last_error ? ` · last error: ${jsonPreview(edge.last_error, 120)}` : "");
     path.append(title);
-    els.push(path);
-    // Labels only where they earn their space: traffic on phone, always on
-    // desktop — positioned off the arrow tip and clamped inside the canvas.
+    // Labels only where they earn their space: traffic on phone, on desktop
+    // edges with traffic or errors show theirs always, idle edges only on
+    // hover/focus — positioned off the arrow tip, clamped inside the canvas.
     if (phone && edge.count === 0) continue;
     const lx = Math.max(30, Math.min(geo.label.x, (width || 390) - 20));
     const ly = Math.max(16, Math.min(geo.label.y, (height || 800) - 8));
@@ -437,7 +439,14 @@ function flowEdges(flow, pos, phone, width, height) {
       "text-anchor": geo.label.anchor || "middle",
     });
     label.textContent = edgeLabel(edge);
-    els.push(label);
+    const hasTraffic = edge.count > 0 || edge.status === "amber" || edge.status === "red";
+    if (!hasTraffic) label.classList.add("idle");
+    // Edge + label share a group so hovering/focusing the edge reveals its
+    // idle label; groups without traffic are keyboard-focusable.
+    const edgeGroup = svgEl("g", { class: "flow-edgegroup" });
+    if (!hasTraffic) edgeGroup.setAttribute("tabindex", "0");
+    edgeGroup.append(path, label);
+    els.push(edgeGroup);
   }
   return els;
 }
@@ -718,11 +727,16 @@ async function openInspector(itemId) {
 
 // ---------- tabs + refresh loop ----------
 
-const TAB_NAMES = ["flow", "health", "events", "stats", "debug"];
+// Valid tabs come from the nav DOM (data-tab attrs), so a sixth tab (e.g.
+// Memory) works on reload without touching this file.
+function tabNames() {
+  const names = [...document.querySelectorAll(".tab")].map((tab) => tab.dataset.tab);
+  return names.length ? names : ["flow"];
+}
 
 function tabFromHash() {
   const name = decodeURIComponent(location.hash.replace("#", ""));
-  return TAB_NAMES.includes(name) ? name : "flow";
+  return tabNames().includes(name) ? name : "flow";
 }
 
 function switchTab(name) {
