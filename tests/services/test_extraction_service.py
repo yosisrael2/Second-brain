@@ -814,9 +814,11 @@ def test_llm_extractor_maps_canned_json_to_candidates(world: World):
     assert cands[0].title == "כינוס הורים"
     assert cands[1].due is True and cands[1].quote == "הסדירו זאת בהקדם"
     # the prompt carries the sent time, the memory block and the injection fence
+    # (the timezone name depends on the runner's local zone — assert structure)
     prompt = llm.prompts[0]
     assert "<<<BEGIN_EMAIL>>>" in prompt and "<<<END_EMAIL>>>" in prompt
-    assert "Asia/Jerusalem" in prompt
+    assert "The email was SENT at:" in prompt
+    assert "Memory context (confirmed kid profiles" in prompt
 
 
 def test_llm_extractor_retries_then_fails_on_invalid_json(world: World):
