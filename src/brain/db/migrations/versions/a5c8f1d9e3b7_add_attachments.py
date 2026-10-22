@@ -43,7 +43,7 @@ def upgrade() -> None:
         sa.Column("sha256", sa.String(64), nullable=False),
         sa.Column("mime", sa.String(128), nullable=True),
         sa.Column("filename", sa.Text(), nullable=False),
-        sa.Column("size_bytes", sa.BigInteger(), nullable=False),
+        sa.Column("size_bytes", sa.Integer(), nullable=False),
         sa.Column("source", sa.String(16), nullable=False),
         sa.Column("source_ref", sa.Text(), nullable=True),
         sa.Column("text", sa.Text(), nullable=True),

@@ -7,6 +7,7 @@ permission gate. The real claude_agent_sdk behaviour was probed separately.
 
 import asyncio
 import hashlib
+import os
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -410,3 +411,75 @@ class TestOpsEndpoint:
         assert body["daily_budget"] == 7
         assert body["read_today"] == 0
         assert body["queue_depth"] == 0  # capture does not enqueue by itself
+
+
+class TestGateRelativePaths:
+    """The prompt names the file; Claude may call Read with a RELATIVE path.
+
+    The gate must resolve a relative file_path against the SANDBOX dir (not
+    the python process cwd) before the realpath comparison.
+    """
+
+    def _sandbox(self, tmp_path: Path):
+        sandbox = tmp_path / "sb"
+        sandbox.mkdir()
+        target = sandbox / "abc.png"
+        target.write_bytes(b"x")
+        return sandbox, target
+
+    def test_relative_name_is_allowed(self, tmp_path):
+        from brain.services.attachments import make_read_gate
+
+        sandbox, target = self._sandbox(tmp_path)
+        gate = make_read_gate(target)
+        old = os.getcwd()
+        os.chdir(tmp_path)  # cwd deliberately != sandbox (proves it is not used)
+        try:
+            ok = _run(gate("Read", {"file_path": "abc.png"}, None))
+            assert ok.behavior == "allow"
+        finally:
+            os.chdir(old)
+
+    def test_relative_dotdot_is_denied(self, tmp_path):
+        from brain.services.attachments import make_read_gate
+
+        sandbox, target = self._sandbox(tmp_path)
+        gate = make_read_gate(target)
+        denied = _run(gate("Read", {"file_path": "../x.png"}, None))
+        assert denied.behavior == "deny"
+
+    def test_absolute_other_file_is_denied(self, tmp_path):
+        from brain.services.attachments import make_read_gate
+
+        sandbox, target = self._sandbox(tmp_path)
+        other = tmp_path / "other.png"
+        other.write_bytes(b"y")
+        gate = make_read_gate(target)
+        denied = _run(gate("Read", {"file_path": str(other)}, None))
+        assert denied.behavior == "deny"
+
+    def test_prompt_names_the_absolute_path(self, tmp_path, svc_env):
+        parent = _parent()
+        fake = FakeQuery(reply="txt")
+        svc = _make_service(svc_env, fake)
+        att = svc.capture(parent, b"\x89PNG", "x.png", "image/png", "telegram", "m")
+        _run(svc.process(att.id))
+        prompt = fake.calls[0]["prompt"]
+        assert "/brain-attach-" in prompt  # the sandbox cwd appears in full
+        assert prompt.strip().endswith(".png and transcribe it.")  # named by sha256, absolute
+
+
+class TestReaderTimeout:
+    def test_hung_reader_times_out(self, tmp_path):
+        """A query_fn that never yields must not block the queue forever."""
+        import pytest
+
+        from brain.services.attachments import AttachmentError, ClaudeFileReader
+
+        async def hung(*, prompt, options):
+            await asyncio.sleep(3600)
+            yield None  # pragma: no cover
+
+        reader = ClaudeFileReader(query_fn=hung, timeout_s=0.2, scratch_root=tmp_path / "s")
+        with pytest.raises(AttachmentError, match="timed out"):
+            _run(reader.read(b"\x89PNG", ".png"))
