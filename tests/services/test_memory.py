@@ -20,11 +20,13 @@ ITAMAR = {
 
 
 @pytest.fixture(name="memory")
-def memory_fixture() -> MemoryService:
+def memory_fixture(database: None) -> MemoryService:
     """A clean memory world per test; the session closes with the test.
 
-    Owning the session here (and closing it) is what keeps the pool from
-    exhausting across ~20 tests.
+    Depends on the session-scoped ``database`` fixture so a FRESH test DB
+    gets migrated before the first memory test touches it (otherwise the
+    whole file errors with UndefinedTable). The session is owned here and
+    closed with the test, which keeps the pool from exhausting.
     """
     session = SessionLocal()
     try:
@@ -502,3 +504,32 @@ def test_delete_entity_refused_while_current_facts_exist(memory: MemoryService):
         memory.delete_fact(fact.id)
     memory.delete_entity(rona.id)  # now allowed (history rows cascade)
     assert memory._repo.find_entity(kind="person", name="Rona") is None
+
+
+# --- follow-up cleanup PR (review of PR #28 round) ---------------------------------
+
+
+def test_grade_range_with_quotes_on_both_ends(memory: MemoryService):
+    """'ה'-ו'' and 'ה׳–ו׳' — quotes on both ends of the range still parse."""
+    _seed_world(memory)
+    for spelling in ("ה'-ו'", "ה׳–ו׳"):
+        assert memory.resolve_applies_to(
+            {"school": "בראשית", "grades": spelling}
+        ) == ["Rona"], spelling
+
+
+def test_bare_yod_is_grade_ten(memory: MemoryService):
+    """Bare 'י' (grade 10) and 'י'' (with geresh) parse again."""
+    _seed_world(memory)
+    memory.set_kid("Noa", gender="girl", school="בראשית", grade="10", class_="י א", teacher="T")
+    assert memory.resolve_applies_to({"school": "בראשית", "grades": "י"}) == ["Noa"]
+    assert memory.resolve_applies_to({"school": "בראשית", "grades": "י'"}) == ["Noa"]
+
+
+def test_set_channel_rejects_invalid_kind(memory: MemoryService):
+    with pytest.raises(ValueError):
+        memory.set_channel("ערוץ", kind="Teachers", applies_to="me")
+    with pytest.raises(ValueError):
+        memory.set_channel("ערוץ", kind="family", applies_to="me")
+    # the valid set still works
+    memory.set_channel("ערוץ", kind="teacher", applies_to="me")

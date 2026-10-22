@@ -222,7 +222,6 @@ class TestConflictRule:
         # both disagreeing sources are present for the model to quote
         assert "[cal-1]" in prompt and "[wa-2]" in prompt
         assert CONFLICT_RULES in prompt
-        assert CONFLICT_RULES in prompt
 
 
 def test_build_prompt_shapes_sources_as_bracketed_lines():

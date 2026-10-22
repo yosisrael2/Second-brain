@@ -26,6 +26,7 @@ HEBREW_TENS = {"י": 10}
 # Compound forms after the tens letter: יא = 11, יב = 12.
 
 VALID_GENDERS = frozenset({"girl", "boy"})
+CHANNEL_KINDS = frozenset({"teacher", "parents", "kids", "club", "committee"})
 
 BLOCK_MAX_CHARS = 6000  # ~1500 tokens; hard cap, truncated with a marker
 
@@ -156,6 +157,10 @@ class MemoryService:
         Re-seeding the SAME value is a no-op; a different value closes the old
         fact and opens a new one (supersedes_id), so history stays complete.
         """
+        if kind not in CHANNEL_KINDS:
+            raise ValueError(
+                f"kind must be one of {sorted(CHANNEL_KINDS)} (got {kind!r})"
+            )
         if applies_to != "me" and applies_to != "family":
             kid_names = {kid["name"] for kid in self.kids()}
             if applies_to not in kid_names:
@@ -586,8 +591,11 @@ def _parse_grades(raw: Any) -> set[str] | None:
     if not text:
         return None
     if "-" in text:
+        # quote marks can appear on BOTH ends of the range (ה'-ו', ה׳–ו׳):
+        # strip them per part after splitting, not just around the whole span
         low, _, high = text.partition("-")
-        low_d, high_d = _hebrew_grade(low), _hebrew_grade(high)
+        low_d = _hebrew_grade(low.strip().strip(_QUOTE_CHARS))
+        high_d = _hebrew_grade(high.strip().strip(_QUOTE_CHARS))
         if low_d is None or high_d is None:
             return None
         return {str(g) for g in range(min(low_d, high_d), max(low_d, high_d) + 1)}
@@ -601,8 +609,11 @@ def _hebrew_grade(text: str) -> int | None:
     cleaned = str(text).strip()
     if cleaned.isdigit():
         return int(cleaned)
-    if len(cleaned) == 1 and cleaned in HEBREW_DIGITS:
-        return HEBREW_DIGITS[cleaned]
+    if len(cleaned) == 1:
+        if cleaned in HEBREW_DIGITS:
+            return HEBREW_DIGITS[cleaned]
+        if cleaned in HEBREW_TENS:
+            return HEBREW_TENS[cleaned]  # bare י = grade 10
     if len(cleaned) == 2 and cleaned[0] in HEBREW_TENS and cleaned[1] in HEBREW_DIGITS:
         return HEBREW_TENS[cleaned[0]] + HEBREW_DIGITS[cleaned[1]]
     return None
