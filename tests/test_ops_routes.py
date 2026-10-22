@@ -1,5 +1,8 @@
 """Cockpit routes: /cockpit serves the page; events/stats/item endpoints."""
 
+import json
+import shutil
+import subprocess
 import uuid
 
 import pytest
@@ -35,6 +38,41 @@ class TestCockpitPage:
     def test_serves_static_assets(self, client: TestClient):
         assert client.get("/cockpit/app.js").status_code == 200
         assert client.get("/cockpit/app.css").status_code == 200
+
+
+class TestCockpitKpis:
+    """The Flow tab's KPI row is computed from the live /ops/flow payload.
+
+    The counting logic is exercised by executing the real statusCounts()
+    from the SERVED app.js with node (skipped when node is absent), so the
+    test covers exactly the code the browser runs.
+    """
+
+    def test_kpi_row_served(self, client: TestClient):
+        html = client.get("/cockpit/").text
+        assert 'id="kpi-row"' in html
+        for kpi in ("kpi-ok", "kpi-notprobed", "kpi-degraded", "kpi-down"):
+            assert f'id="{kpi}"' in html
+
+    def test_kpi_counts_derived_from_flow_payload(self, client: TestClient):
+        js = client.get("/cockpit/app.js").text
+        assert "function statusCounts" in js
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not available")
+        start = js.index("function statusCounts")
+        end = js.index("\n}", start) + 2
+        statuses = ["ok", "ok", "not probed", "degraded", "down", "disabled", "bogus"]
+        script = (
+            js[start:end]
+            + "\nconsole.log(JSON.stringify(statusCounts(["
+            + ",".join(json.dumps({"status": status}) for status in statuses)
+            + "])))"
+        )
+        result = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+        counts = json.loads(result.stdout.strip())
+        # disabled/unknown statuses are legend-only, never KPI cards.
+        assert counts == {"ok": 2, "not probed": 1, "degraded": 1, "down": 1}
 
 
 class TestEventsEndpoint:

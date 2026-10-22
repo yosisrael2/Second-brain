@@ -169,3 +169,57 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the cached Settings instance."""
     return Settings()
+
+
+# --- live-store startup guard -------------------------------------------------
+# The Settings defaults ARE the live service (they match docker-compose.yml and
+# the launchd path via .env). A bare `uvicorn brain.main:app` from a worktree
+# without .env therefore points at production — that incident is why the app
+# refuses to start against the live store unless explicitly allowed.
+LIVE_DATABASE_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain"
+LIVE_QDRANT_COLLECTION = DEFAULT_QDRANT_COLLECTION  # 'brain_items'
+
+
+def _is_live_database_url(url: str) -> bool:
+    """True when `url` points at the live database.
+
+    Either the exact default URL, or any driver scheme pointing at database
+    name 'brain' on localhost:27432 (the live service's port).
+    """
+    if url == LIVE_DATABASE_URL:
+        return True
+    try:
+        from sqlalchemy.engine import make_url  # noqa: PLC0415 — models already ship it
+
+        parsed = make_url(url)
+    except Exception:  # noqa: BLE001 — a non-URL string is simply not the live URL
+        return False
+    host = (parsed.host or "").lower()
+    name = (parsed.database or "").lstrip("/")
+    return name == "brain" and parsed.port == 27432 and host in {"localhost", "127.0.0.1", "::1"}
+
+
+def assert_not_live_store(
+    database_url: str, qdrant_collection: str, allow_live: str | None = None
+) -> None:
+    """Refuse to start the app against the LIVE store unless explicitly allowed.
+
+    Wired into the app lifespan (src/brain/main.py). ``scripts/run-server.sh``
+    — the launchd path — exports ``BRAIN_ALLOW_LIVE=1`` to opt in; anything
+    else (a worktree without .env, a stray local instance) must point at an
+    explicit test DATABASE_URL / QDRANT_COLLECTION or fail fast here.
+    """
+    if allow_live == "1":
+        return
+    reasons: list[str] = []
+    if _is_live_database_url(url=database_url):
+        reasons.append(f"DATABASE_URL points at the live database ({database_url!r})")
+    if qdrant_collection == LIVE_QDRANT_COLLECTION:
+        reasons.append(f"QDRANT_COLLECTION is the live collection ({qdrant_collection!r})")
+    if reasons:
+        raise RuntimeError(
+            "refusing to start against the LIVE store; set DATABASE_URL/QDRANT_COLLECTION "
+            "for a test instance, or BRAIN_ALLOW_LIVE=1 for the real service ("
+            + "; ".join(reasons)
+            + ")"
+        )
