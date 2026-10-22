@@ -102,7 +102,9 @@ class ItemsRepository:
         )
         return list(self._db.scalars(stmt))
 
-    def by_occurrence(self, *, start: datetime, end: datetime, limit: int) -> Sequence[MemoryItem]:
+    def by_occurrence(
+        self, *, start: datetime, end: datetime, limit: int
+    ) -> Sequence[MemoryItem]:
         """Every item with occurred_at inside [start, end), soonest first.
 
         Drives temporal retrieval: day/date questions fetch ALL events in the

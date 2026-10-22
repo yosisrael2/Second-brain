@@ -100,6 +100,7 @@ class MemoryItem(Base):
     # saved". Plain class attribute — SQLAlchemy does not map it.
     deduplicated = False
 
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(
@@ -120,7 +121,9 @@ class MemoryItem(Base):
     # times are interpreted in the TIMEZONE setting and stored as aware UTC;
     # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
     # original raw strings stay in meta for audit.
-    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Exact-duplicate guard: sha256 over (normalized text, occurred_at UTC
     # minute, source kind); computed by brain.services.dedupe at ingest and
     # backfilled by the fingerprint migration. Nullable: rows created before
@@ -247,7 +250,9 @@ class Entity(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -298,7 +303,9 @@ class MemoryFact(Base):
         Index("ix_memory_facts_status", "status"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     subject_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
     )

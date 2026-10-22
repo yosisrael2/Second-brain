@@ -1,7 +1,7 @@
 """WhatsApp poll-state table: per-chat ingestion cursor (PR D1).
 
 Revision ID: a9c4e7d2f1b6
-Revises: b7c2d5e8f1a4
+Revises: a1e5f7b9c3d2
 Create Date: 2026-10-22 22:30:00.000000
 
 One row per allowlisted bridge chat: cursor (UTC), last poll time and
@@ -16,7 +16,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a9c4e7d2f1b6"
-down_revision: str | None = "b7c2d5e8f1a4"
+down_revision: str | None = "a1e5f7b9c3d2"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

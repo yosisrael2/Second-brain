@@ -140,7 +140,8 @@ class Settings(BaseSettings):
             part = part.strip()
             if part and not part.lstrip("+").isdigit():
                 raise ValueError(
-                    f"TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, got {value!r}"
+                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
+                    f"got {value!r}"
                 )
         return value
 

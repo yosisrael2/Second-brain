@@ -170,7 +170,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 teacher=args.teacher,
             )
         if args.memory_command == "seed-channel":
-            return _memory_seed_channel(name=args.name, kind=args.kind, applies_to=args.applies_to)
+            return _memory_seed_channel(
+                name=args.name, kind=args.kind, applies_to=args.applies_to
+            )
         parser.error(f"unknown memory command {args.memory_command!r}")
         return 2
     if args.command == "eval-extraction":
@@ -505,7 +507,9 @@ def _normalize_calendar(
     normalized = 0
     offset = 0
     while True:
-        batch = repo.list(item_type=None, project=None, status=None, limit=_PAGE, offset=offset)
+        batch = repo.list(
+            item_type=None, project=None, status=None, limit=_PAGE, offset=offset
+        )
         if not batch:
             break
         for item in batch:
@@ -524,7 +528,9 @@ def _normalize_calendar(
                 meta["original_text"] = original
             item.raw_text = one_liner
             item.meta = meta  # reassign so SQLAlchemy sees the JSONB change
-            item.fingerprint = content_fingerprint(one_liner, item.occurred_at, item.source)
+            item.fingerprint = content_fingerprint(
+                one_liner, item.occurred_at, item.source
+            )
             normalized += 1
         offset += len(batch)
     repo.commit()

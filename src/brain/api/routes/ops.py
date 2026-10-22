@@ -132,9 +132,7 @@ def get_ops_events(
         rows = conn.execute(
             text(
                 "SELECT id, ts, component, kind, ok, latency_ms, edge, detail "
-                + base
-                + where
-                + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
+                + base + where + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).mappings()
