@@ -748,6 +748,28 @@ class TestLockScope:
         finally:
             first.close()
 
+    def test_default_cache_dir_under_home_when_env_unset(self, monkeypatch, tmp_path):
+        """With SECOND_BRAIN_CACHE_DIR UNSET the lock dir must be
+        $HOME/Library/Caches/second-brain — NOT Path('') == '.' (the CWD).
+        Regression guard: Path(os.environ.get(X) or '') is truthy, which made
+        the production default silently the current directory."""
+        import os
+
+        from brain import telegram_bot
+
+        monkeypatch.delenv("SECOND_BRAIN_CACHE_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setattr(telegram_bot, "_repo_lock_dir", lambda: tmp_path / "repoA" / ".dev")
+        handle, other = telegram_bot._acquire_instance_lock("123:SECRET")
+        try:
+            assert handle is not None and other is None
+            expected = tmp_path / "home" / "Library" / "Caches" / "second-brain" / "telegram-123.lock"
+            assert expected.exists(), (
+                f"lock must default to HOME/Library/Caches/second-brain, not the CWD"
+            )
+        finally:
+            handle.close()
+
     def test_falls_back_to_repo_dev_when_cache_dir_unwritable(self, monkeypatch, tmp_path):
         from brain import telegram_bot
 

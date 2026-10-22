@@ -1014,10 +1014,14 @@ def _repo_lock_dir() -> Path:
 
 def _cache_lock_dir() -> Path:
     """Machine-wide lock dir: ~/Library/Caches/second-brain (override via
-    SECOND_BRAIN_CACHE_DIR for tests)."""
-    return Path(os.environ.get("SECOND_BRAIN_CACHE_DIR") or "") or (
-        Path.home() / "Library" / "Caches" / "second-brain"
-    )
+    SECOND_BRAIN_CACHE_DIR for tests).
+
+    NOTE: the env var must be checked for emptiness BEFORE wrapping in Path —
+    Path('') is PosixPath('.') (truthy!), which would silently make the CWD
+    the lock dir and downgrade the lock to per-checkout again.
+    """
+    env = os.environ.get("SECOND_BRAIN_CACHE_DIR")
+    return Path(env) if env else Path.home() / "Library" / "Caches" / "second-brain"
 
 
 def _lock_paths(token: str | None) -> list[Path]:
