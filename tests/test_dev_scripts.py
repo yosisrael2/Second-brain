@@ -177,13 +177,30 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
         'exec /usr/bin/curl "$@"\n'
     )
     shim_curl.chmod(0o755)
+    # Stub docker too: this test owns the SERVER lifecycle (health-fail ->
+    # kill), not container management. A real compose up would fight whatever
+    # already serves 5432/6333 (CI service containers, a dev stack) — the stub
+    # makes the run hermetic on any machine with or without docker.
+    shim_docker = shim / "docker"
+    shim_docker.write_text(
+        '#!/usr/bin/env bash\n'
+        '# compose stub: report success, start nothing (see test docstring)\n'
+        'exit 0\n'
+    )
+    shim_docker.chmod(0o755)
 
     env = dict(os.environ)
     env["PATH"] = f"{shim}:{env['PATH']}"
-    env.pop("DATABASE_URL", None)  # let dev-start read .env, not the pytest test-db URL
+    # Point dev-start at the suite's own brain_test (already migrated to head
+    # by the conftest): dev-start's migrate step is then a no-op and the run
+    # never touches the real dev database. Everything else (.env reuse checks,
+    # pid/log state, ports) stays on the script's real code path.
+    env["DATABASE_URL"] = "postgresql+psycopg://brain:brain@localhost:5432/brain_test"
     env["PORT"] = "18765"
     env["HEALTH_TIMEOUT_S"] = "2"
-    # Isolate .dev state: a test run must never see (or stop) the real pid file.
+    # Throwaway compose project + isolated .dev state: a test run must never
+    # see (or stop) the real project or pid file.
+    env["COMPOSE_PROJECT_NAME"] = f"second-brain-ci-{os.getpid()}"
     env["DEV_PID_FILE"] = str(tmp_path / "uvicorn.pid")
     env["DEV_LOG_FILE"] = str(tmp_path / "uvicorn.log")
     result = subprocess.run(
