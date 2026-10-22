@@ -17,6 +17,7 @@ from brain.repositories.memory import MemoryRepository
 from brain.services.extraction.candidates import ChildCandidate
 from brain.services.extraction.service import EnrichmentService, qualifies
 from brain.services.memory import MemoryService
+from conftest import assert_test_database
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
 
@@ -65,7 +66,7 @@ def _wipe(session: Session) -> None:
 @pytest.fixture(name="world")
 def world_fixture(database: None) -> World:
     """Fresh DB world for one extraction test; wipes both layers around it."""
-    assert str(engine.url).endswith("brain_w2_test")
+    assert_test_database(str(engine.url))  # any *_test database, same guard as conftest
     session = SessionLocal()
     _wipe(session)
     repo = ItemsRepository(session)
