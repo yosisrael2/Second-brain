@@ -6,14 +6,13 @@
 # directly — whatever DATABASE_URL the app uses is what gets seeded.
 set -u
 
-say() { printf '%s\n' "$*"; }
 die() { printf 'seed-demo: %s\n' "$*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-27800}"
 BASE="http://127.0.0.1:${PORT}"
 
 say "app: checking $BASE/health"

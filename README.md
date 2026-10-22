@@ -123,17 +123,17 @@ the AI/integrations track).
 Example:
 
 ```bash
-curl -X POST localhost:8000/items -H 'Content-Type: application/json' \
+curl -X POST localhost:27800/items -H 'Content-Type: application/json' \
   -d '{"raw_text": "Renew the ssl cert", "type": "task", "importance": 5}'
-curl 'localhost:8000/items?type=task&status=inbox'
-curl 'localhost:8000/items/search?q=renew+cert'
-curl -X PATCH localhost:8000/items/<id> -H 'Content-Type: application/json' -d '{"status": "filed"}'
-curl -X DELETE localhost:8000/items/<id>
+curl 'localhost:27800/items?type=task&status=inbox'
+curl 'localhost:27800/items/search?q=renew+cert'
+curl -X PATCH localhost:27800/items/<id> -H 'Content-Type: application/json' -d '{"status": "filed"}'
+curl -X DELETE localhost:27800/items/<id>
 # AI endpoints (see docs/ai-layer.md for behavior + env vars)
-curl -X POST 'localhost:8000/items?classify=false' -H 'Content-Type: application/json' \
+curl -X POST 'localhost:27800/items?classify=false' -H 'Content-Type: application/json' \
   -d '{"raw_text": "raw capture, no classification"}'
-curl 'localhost:8000/search?q=how+do+I+roll+out+kubernetes'
-curl -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+curl 'localhost:27800/search?q=how+do+I+roll+out+kubernetes'
+curl -X POST localhost:27800/ask -H 'Content-Type: application/json' \
   -d '{"question": "what port does the server run on?"}'
 ```
 
@@ -226,8 +226,8 @@ Code login. `scripts/dev-start.sh` collapses steps 1-3 (see
 scripts/dev-start.sh
 
 #    ...or by hand:
-# docker compose up -d && curl -s localhost:6333/healthz && alembic upgrade head
-# uvicorn brain.main:app --port 8000
+# docker compose up -d && curl -s localhost:27333/healthz && alembic upgrade head
+# uvicorn brain.main:app --port 27800
 
 # 2. Keys: JEV_API_KEY in .env (gitignored) — optional but needed for
 #    classification/rerank. LLM + embeddings come from your Claude Code
@@ -237,22 +237,22 @@ claude -p ok            # verifies the Claude Code login; run `claude` + /login 
 
 # 3. Run the API (first /search or /items call downloads the fastembed model,
 #    ~130MB, cached in ~/.cache/fastembed — afterwards fully offline)
-uvicorn brain.main:app --port 8000
+uvicorn brain.main:app --port 27800
 
 # 4. Capture with auto-classification (Jev fills type/importance/actionability,
 #    confidence, and routes by confidence; fields you sent explicitly in the
 #    payload are never overwritten — classification only fills what's missing)
-curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
+curl -s -X POST localhost:27800/items -H 'Content-Type: application/json' \
   -d '{"raw_text": "Renew the TLS certificate before Friday"}'
 # expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
 #             "confidence": 0.0-1.0, "status": "filed" (>=0.9) or "needs_review" (0.5-0.9)
 
 # 5. Semantic search (fastembed -> Qdrant -> Jev rerank)
-curl -s 'localhost:8000/search?q=renew+certificate&limit=5'
+curl -s 'localhost:27800/search?q=renew+certificate&limit=5'
 # expect 200: array of items with float "score" (null only in keyword-fallback mode)
 
 # 6. Grounded answer with citations (via your Claude Code login)
-curl -s -X POST localhost:8000/ask -H 'Content-Type: application/json' \
+curl -s -X POST localhost:27800/ask -H 'Content-Type: application/json' \
   -d '{"question": "what do I need to renew?"}'
 # expect 200: {"answer": "...[<item-id>]...", "cited_ids": ["<item-id>"], "sources": [...]}
 
@@ -274,7 +274,7 @@ reordering, `/ask` still answers from your login.
 
 ```bash
 scripts/dev-start.sh             # preflight (docker, venv, .env, jev/claude status),
-                                 # compose up + health wait, alembic, uvicorn on :8000
+                                 # compose up + health wait, alembic, uvicorn on :27800
 scripts/dev-start.sh --reindex   # also rebuild the vector collection first
 scripts/dev-start.sh --no-reload # production-ish uvicorn (no file watching)
 scripts/dev-start.sh --force-port# kill a FOREIGN port holder without asking
@@ -293,13 +293,13 @@ Behavior worth knowing:
   script shows pid + command and asks `kill it? [y/N]` (refusing by default
   when non-interactive); `--force-port` kills without asking. Protected
   processes are NEVER killed: docker/rancher/colima/vpnkit proxies,
-  anything on 5432/6333 (those are the reuse path below), pid 1, or the
+  anything on the infra ports (those are the reuse path below), pid 1, or the
   script's own shell.
 - **Stable compose project** — both scripts resolve `COMPOSE_PROJECT_NAME`
   identically (`scripts/lib.sh`: real environment > `.env` > default
   `second-brain-dev`) and print it before any docker call, so a stop can never
   target another project's volumes. Container names never drift.
-- **Port collisions with other compose projects** — if 5432/6333 are already
+- **Port collisions with other compose projects** — if the dedicated ports (27432/27333) are already
   published by a foreign compose project, the script says who holds it and
   REUSES the healthy service (verified against `DATABASE_URL` / `QDRANT_URL`)
   instead of touching another project's containers; if what's on the port is
@@ -312,7 +312,7 @@ Behavior worth knowing:
   the default works.
 - **State** — pid + log live under `.dev/` (gitignored). A busy port is
   never silently taken over (see self-healing above). `PORT` overrides the
-  default 8000. Stopping kills the whole uvicorn tree (no orphans under
+  default 27800. Stopping kills the whole uvicorn tree (no orphans under
   `--reload`).
 - **Data purge** — `scripts/dev-stop.sh --purge-data` deletes the resolved
   project's docker volumes (all items + vectors), naming the project and each
@@ -344,7 +344,7 @@ alembic upgrade head
 
 # 5. Run
 uvicorn brain.main:app --reload
-# Health check: http://127.0.0.1:8000/health
+# Health check: http://127.0.0.1:27800/health
 ```
 
 ## Config / env vars
@@ -354,8 +354,8 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | Variable       | Default                                                | Purpose            |
 | -------------- | ------------------------------------------------------ | ------------------ |
 | `APP_ENV`      | `dev`                                                  | runtime environment |
-| `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:5432/brain` | Postgres (SQLAlchemy URL) |
-| `QDRANT_URL`   | `http://localhost:6333`                                | Qdrant API endpoint |
+| `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:27432/brain` | Postgres (SQLAlchemy URL) |
+| `QDRANT_URL`   | `http://localhost:27333`                                | Qdrant API endpoint |
 | `LLM_PROVIDER` | `claude_sdk`                                           | `claude_sdk` (local login) or `anthropic` |
 | `CLAUDE_SDK_MODEL` | unset (login default)                              | model for `/ask` on `claude_sdk`, e.g. `claude-haiku-5-5` (faster) / `claude-sonnet-5-5` (quality) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5`                                 | model for `/ask` on `anthropic` |
@@ -453,7 +453,7 @@ submitted to main in one PR:
 | No retries/backoff | external calls fail fast by design; revisit when an adapter needs resilience | `src/brain/ai/_http.py` |
 | fastembed first-run download | ~130MB model download on first capture/search, then offline | `src/brain/ai/embedder.py` |
 | Qdrant image pinned to client | image tag and qdrant-client version move together | `docker-compose.yml` |
-| Compose port collisions | two projects on 5432/6333: dev-start reuses healthy services or fails loudly | `scripts/dev-start.sh` |
+| Compose port collisions | two projects on the dedicated ports (27432/27333): dev-start reuses healthy services or fails loudly | `scripts/dev-start.sh` |
 
 ### 3. Roadmap — phases 4-6 (from the project plan)
 

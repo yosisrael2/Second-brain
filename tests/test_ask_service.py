@@ -36,7 +36,7 @@ def cite_every_source(prompt: str) -> str:
 
 def test_ask_cites_item_ids_and_returns_sources():
     repo = FakeRepository()
-    hits = make_hits(repo, "The server runs on port 8000.", "Deployments use Jenkins.")
+    hits = make_hits(repo, "The server runs on port 27800.", "Deployments use Jenkins.")
     service = AskService(StubSearch(hits), FakeLLMClient(reply=cite_every_source))  # type: ignore[arg-type]
 
     result = service.ask("what port does the server use?")

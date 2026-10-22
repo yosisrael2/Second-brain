@@ -142,20 +142,41 @@ kill_tree() {
 
 pg_url() {
   # DATABASE_URL is a SQLAlchemy URL (postgresql+psycopg://...); psycopg wants plain postgresql://
-  local url="${DATABASE_URL:-postgresql+psycopg://brain:brain@localhost:5432/brain}"
+  local url="${DATABASE_URL:-postgresql+psycopg://brain:brain@localhost:27432/brain}"
   echo "${url//+psycopg/}"
 }
 
 pg_port() {
-  local url="${DATABASE_URL:-postgresql+psycopg://brain:brain@localhost:5432/brain}"
+  local url="${DATABASE_URL:-postgresql+psycopg://brain:brain@localhost:27432/brain}"
   local port="${url##*:}"
   port="${port%%/*}"
-  [[ "$port" =~ ^[0-9]+$ ]] && echo "$port" || echo 5432
+  [[ "$port" =~ ^[0-9]+$ ]] && echo "$port" || echo 27432
 }
 
 qdrant_port() {
-  local url="${QDRANT_URL:-http://localhost:6333}"
+  local url="${QDRANT_URL:-http://localhost:27333}"
   local port="${url##*:}"
   port="${port%%/*}"
-  [[ "$port" =~ ^[0-9]+$ ]] && echo "$port" || echo 6333
+  [[ "$port" =~ ^[0-9]+$ ]] && echo "$port" || echo 27333
+}
+
+# One warning block when DATABASE_URL/QDRANT_URL still pin the OLD default
+# ports (5432/6333): the compose stack now publishes dedicated ports nobody
+# else uses (27432/27333), so old-pinned URLs stop matching the stack. Old
+# containers (if still running) keep serving the old ports; the user must
+# update their env. Prints the exact lines to change; never edits user files.
+warn_if_legacy_ports() {
+  local legacy=0
+  case "${DATABASE_URL:-}" in
+    *":5432/"*|*":5432?"*) legacy=1 ;;
+  esac
+  case "${QDRANT_URL:-}" in
+    *":6333"|*":6333/"*|*":6333?") legacy=1 ;;
+  esac
+  [ "$legacy" -eq 1 ] || return 0
+  say "WARNING: DATABASE_URL/QDRANT_URL use the old default ports (5432/6333);" >&2
+  say "         the compose stack now publishes 27432 (postgres) and 27333 (qdrant)." >&2
+  say "Update your .env (or environment) to the new dedicated ports:" >&2
+  [ -n "${DATABASE_URL:-}" ] && printf '  DATABASE_URL=%s\n' "${DATABASE_URL/:5432/:27432}" >&2
+  [ -n "${QDRANT_URL:-}" ] && printf '  QDRANT_URL=%s\n' "${QDRANT_URL/:6333/:27333}" >&2
 }

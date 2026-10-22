@@ -7,7 +7,7 @@ fast, and the destructive fixtures double-check the engine URL before deleting.
 
 import os
 
-_TEST_DB_URL = "postgresql+psycopg://brain:brain@localhost:5432/brain_test"
+_TEST_DB_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain_test"
 
 # The env var wins over .env in pydantic-settings, so this pins the suite to
 # the test database unless the caller already chose a *_test one.
