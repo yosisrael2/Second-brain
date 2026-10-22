@@ -1,5 +1,7 @@
 """rerank() behavior: ordering, truncation, and Jev-failure fallback."""
 
+import pytest
+
 from brain.ai.jev import JevError, JevScore
 from brain.ai.rerank import rerank
 
@@ -50,6 +52,12 @@ def test_rerank_ties_keep_original_order():
     ranked = rerank("q", CANDIDATES, top_n=3, jev=jev)
 
     assert [item["id"] for item in ranked] == ["a", "b", "c"]
+
+
+def test_rerank_jev_parameter_is_required():
+    """Omitting jev is a signature error (required param), not a guarded fallback."""
+    with pytest.raises(TypeError):
+        rerank("q", CANDIDATES)  # type: ignore[call-arg]
 
 
 def test_rerank_jev_failure_returns_original_order():

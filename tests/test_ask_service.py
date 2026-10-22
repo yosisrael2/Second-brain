@@ -85,3 +85,25 @@ def test_ask_with_no_sources_still_answers():
 
     assert result.cited_ids == []
     assert result.sources == []
+
+
+def test_prompt_sources_are_truncated_but_api_sources_are_not():
+    """The LLM prompt carries truncated text; the API response keeps raw_text whole."""
+    long_text = "needle " + "filler " * 800  # ~5600 chars > SOURCE_PROMPT_MAX_CHARS
+    repo = FakeRepository()
+    item = repo.add(MemoryItem(raw_text=long_text))
+    hits = [SearchHit(item=item, score=0.9)]
+    captured: dict[str, str] = {}
+
+    def capture(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return f"see [{item.id}]"
+
+    service = AskService(StubSearch(hits), FakeLLMClient(reply=capture))  # type: ignore[arg-type]
+
+    result = service.ask("where is the needle")
+
+    assert len(captured["prompt"]) < len(long_text)  # prompt truncated, not the whole text
+    assert "filler " * 400 not in captured["prompt"]  # a run beyond 2000 chars is gone
+    assert result.sources[0].item.raw_text == long_text  # API response keeps it whole
+    assert result.cited_ids == [str(item.id)]

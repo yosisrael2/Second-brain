@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import Protocol
 
 from brain.ai.embedder import Embedder
@@ -11,6 +12,10 @@ from brain.ai.vectorstore import VectorStore
 from brain.db.models import MemoryItem
 
 logger = logging.getLogger(__name__)
+
+# Probe text embedded once before a destructive reindex purge, so an
+# unreachable embedder fails before the collection is dropped.
+_PROBE_TEXT = "reindex readiness probe"
 
 
 class ItemIndexerProto(Protocol):
@@ -23,6 +28,21 @@ class ItemIndexerProto(Protocol):
 
     def index(self, item: MemoryItem) -> None:
         """Embed and upsert the item's vector + payload."""
+        ...
+
+    def index_batch(self, items: Sequence[MemoryItem]) -> int:
+        """Embed and upsert many items with one embed call and one upsert.
+
+        Returns the number of items indexed. Vectors are identical to the
+        per-item path; only the round-trips are batched.
+        """
+        ...
+
+    def probe(self) -> None:
+        """Verify the embedder is reachable; raises EmbedderError otherwise.
+
+        Callers run destructive steps (collection purge) only after this.
+        """
         ...
 
     def remove(self, item_id: uuid.UUID) -> None:
@@ -48,12 +68,46 @@ class QdrantItemIndexer:
         self._ensured = False
 
     def index(self, item: MemoryItem) -> None:
-        """Embed and upsert the item's vector + payload."""
+        """Embed and upsert the item's vector + payload.
+
+        The once-per-process collection check is deliberately racy: two
+        concurrent first indexes may both call ``ensure_collection`` — the
+        store call is idempotent, so the worst case is one redundant call.
+        """
         vector = self._embedder.embed(item.raw_text)
         if not self._ensured:
             self._store.ensure_collection(len(vector))
             self._ensured = True
         self._store.upsert(str(item.id), vector, self._payload_for(item))
+
+    def index_batch(self, items: Sequence[MemoryItem]) -> int:
+        """Embed and upsert a whole DB batch in one embed + one upsert call.
+
+        Produces the exact vectors and payloads the per-item ``index`` would
+        (batch embedding preserves order), so the final Qdrant state is
+        identical — just ~2 fewer round-trips per item.
+        """
+        if not items:
+            return 0
+        vectors = self._embedder.embed_batch([item.raw_text for item in items])
+        if not self._ensured:
+            self._store.ensure_collection(len(vectors[0]))
+            self._ensured = True
+        self._store.upsert_many(
+            [
+                (str(item.id), vector, self._payload_for(item))
+                for item, vector in zip(items, vectors, strict=True)
+            ]
+        )
+        return len(items)
+
+    def probe(self) -> None:
+        """One throwaway embed call; raises EmbedderError if the embedder is down.
+
+        ``IngestService.reindex`` probes before purging so a failed rebuild
+        never starts by dropping the collection.
+        """
+        self._embedder.embed(_PROBE_TEXT)
 
     def remove(self, item_id: uuid.UUID) -> None:
         """Delete the item's vector (missing ids are tolerated)."""

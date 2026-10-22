@@ -200,7 +200,8 @@ claude -p ok            # verifies the Claude Code login; run `claude` + /login 
 uvicorn brain.main:app --port 8000
 
 # 4. Capture with auto-classification (Jev fills type/importance/actionability,
-#    confidence, and routes by confidence)
+#    confidence, and routes by confidence; fields you sent explicitly in the
+#    payload are never overwritten — classification only fills what's missing)
 curl -s -X POST localhost:8000/items -H 'Content-Type: application/json' \
   -d '{"raw_text": "Renew the TLS certificate before Friday"}'
 # expect 201: "type": "task", "importance": 1-5, "actionability": "none|later|now",
@@ -236,6 +237,7 @@ scripts/dev-start.sh             # preflight (docker, venv, .env, jev/claude sta
                                  # compose up + health wait, alembic, uvicorn on :8000
 scripts/dev-start.sh --reindex   # also rebuild the vector collection first
 scripts/dev-start.sh --no-reload # production-ish uvicorn (no file watching)
+scripts/dev-start.sh --force-port# kill a FOREIGN port holder without asking
 scripts/dev-stop.sh              # stop uvicorn (pid file)
 scripts/dev-stop.sh --down       # also stop postgres + qdrant containers
 scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
@@ -243,6 +245,16 @@ scripts/dev-stop.sh --purge-data # ALSO delete volumes — asks for confirmation
 
 Behavior worth knowing:
 
+- **Self-healing restart** — running `dev-start.sh` when our uvicorn is
+  already running (pid file or orphan on the port) stops it first (TERM,
+  wait, KILL escalation — the same shared logic `dev-stop.sh` uses) and
+  starts fresh. Running it twice in a row is safe and just restarts.
+- **Port holders** — if the app port is held by a FOREIGN process, the
+  script shows pid + command and asks `kill it? [y/N]` (refusing by default
+  when non-interactive); `--force-port` kills without asking. Protected
+  processes are NEVER killed: docker/rancher/colima/vpnkit proxies,
+  anything on 5432/6333 (those are the reuse path below), pid 1, or the
+  script's own shell.
 - **Stable compose project** — both scripts resolve `COMPOSE_PROJECT_NAME`
   identically (`scripts/lib.sh`: real environment > `.env` > default
   `second-brain-dev`) and print it before any docker call, so a stop can never
@@ -258,10 +270,10 @@ Behavior worth knowing:
   and checks the `claude` CLI is installed (no LLM round-trip — if `/ask`
   returns 502, run `claude` once and `/login`). `JEV_BASE_URL` is optional —
   the default works.
-- **State** — pid + log live under `.dev/` (gitignored). Starting twice is
-  safe: it refuses with the running pid. A busy port is refused with the
-  holder named. `PORT` overrides the default 8000. Stopping kills the whole
-  uvicorn tree (no orphans under `--reload`).
+- **State** — pid + log live under `.dev/` (gitignored). A busy port is
+  never silently taken over (see self-healing above). `PORT` overrides the
+  default 8000. Stopping kills the whole uvicorn tree (no orphans under
+  `--reload`).
 - **Data purge** — `scripts/dev-stop.sh --purge-data` deletes the resolved
   project's docker volumes (all items + vectors), naming the project and each
   volume in the confirmation prompt (`PURGE` to proceed).
@@ -326,8 +338,15 @@ mypy src/brain/ai      # type check (strict-ish; config in pyproject [tool.mypy]
 
 `tests/test_health.py` needs no infrastructure. DB-backed tests
 (`tests/test_items.py`) need the docker-compose Postgres running (they apply
-Alembic migrations to the configured `DATABASE_URL` and clean the table after
-each test; they skip with a hint if Postgres is unreachable).
+Alembic migrations and clean the table after each test; they skip with a hint
+if Postgres is unreachable).
+
+The suite NEVER touches a developer's database: `tests/conftest.py` pins
+`DATABASE_URL` to a separate `brain_test` database (created on demand),
+refuses to run at all against a non-`*_test` URL, and the destructive
+`clean_items` teardown double-checks the engine URL in use before deleting.
+`tests/test_db_isolation.py` proves the point: it seeds a marker row in the
+dev database, runs the DB-backed suite, and asserts the marker survives.
 
 CI runs the same commands on every PR and push to main (GitHub Actions,
 `.github/workflows/ci.yml`): ruff, mypy, shellcheck, and pytest against
@@ -359,26 +378,25 @@ needed (the suite uses fakes and mock transports, never live providers).
 
 ## Next steps
 
-For the next worker. Items in section 1 are **in progress on `feature/mvp-hardening` and NOT on main yet**.
-Anything marked **PROPOSAL** is an idea, not a decided behavior.
+For the next worker. Anything marked **PROPOSAL** is an idea, not a decided
+behavior.
 
-### 1. In progress — `feature/mvp-hardening` (not on main yet)
+### 1. Landed — hardening (PR #3 + follow-ups)
 
-| Item | Why | Where | Acceptance hint |
-| --- | --- | --- | --- |
-| Reindex batching | reindex embeds+upserts one item per call (~2N round-trips) | `src/brain/services/ingest.py`, `src/brain/services/indexing.py` | one embed + one upsert per DB batch; identical final state; 1k items reindex in seconds |
-| Embedder probe before purge | purge-then-fail leaves the collection empty | `src/brain/services/ingest.py` (`reindex`) | EmbedderError before purge leaves the collection untouched |
-| Search N+1 → get_many | per-candidate SELECT in `_load_items` | `src/brain/services/search.py` | one `WHERE id IN` query per search |
-| Delete dead `ItemsService.create` | divergent duplicate of `IngestService.create`; skips classify+index | `src/brain/services/items.py` | no second creation path left |
-| UUID guard in `_load_items` | malformed vector payload id → 500 | `src/brain/services/search.py` | malformed id skipped like a deleted item |
-| Deterministic list ordering (secondary sort on id) | ties in `created_at` can reorder offset pages | `src/brain/services/ingest.py`, `src/brain/repositories/items.py` | ties in created_at no longer reorder pages |
-| Qdrant healthcheck in compose | `--wait` has nothing to wait on | `docker-compose.yml` | fresh `up -d --wait` passes on an empty machine |
-| dev-start self-healing restart | stale pidfile after a crash blocks start | `scripts/dev-start.sh` | restart kills only our own cwd-scoped process (command + port verified) |
-| Test DB isolation | suite deletes rows of whatever DB `.env` points at | `tests/conftest.py` | tests run against `brain_test` and refuse the dev DB |
-| Seed-demo script | fresh clone has an empty DB | `scripts/` | `scripts/seed-demo.sh` fills a few example items |
-| `/ask` source truncation | a 10k-char item can blow the prompt | `src/brain/services/ask.py`, `src/brain/ai/ask.py` | per-source prompt budget enforced |
-| Config shim removal | ai modules re-export config defaults nobody imports | `src/brain/ai/jev.py` (same pattern in ask/embedder) | grep shows no shim imports |
-| `rerank(jev=...)` required | optional param + ValueError guard for a required dep | `src/brain/ai/rerank.py` | signature requires `jev`; guard deleted |
+All of the hardening items below are merged into the hardening branch and
+submitted to main in one PR:
+
+- Landed in PR #3: search N+1 → `get_many`; dead `ItemsService.create` deleted;
+  UUID guard in `_load_items`; deterministic list ordering; Qdrant healthcheck
+  in compose; dev-start self-healing restart; test DB isolation; seed-demo
+  script; `/ask` source truncation.
+- Landed on top of PR #3: **reindex batching** (one `embed_batch` + one
+  `upsert_many` per DB batch, identical final Qdrant state), **embedder probe
+  before purge** (an EmbedderError in `reindex` now hits before the collection
+  is dropped), removal of the config-default re-export shims in `ai/`
+  (`brain.config` is the single source), and `rerank(jev=...)` made a required
+  dependency (the ValueError guard is gone).
+
 
 ### 2. Known limitations / tech debt (on main)
 
@@ -438,8 +456,8 @@ from that distribution.
 
 ### 5. Where to start tomorrow
 
-1. Review + merge PR #1 (this branch), then PR #2 (`feature/mvp-docs-html`).
-2. Finish `feature/mvp-hardening` — biggest bang: reindex batching (section 1, rows 1-2).
-3. Add the CI workflow (section 2) so everything above gets enforced automatically.
-4. Start the dogfood week (section 4) with real notes.
-5. Slice the first Phase-4 ticket (section 3) once the hardening branch lands.
+1. Review + merge the open hardening PR (section 1 — PR #3's work plus
+   reindex batching, the embedder probe, and the ai-layer cleanups).
+2. Add the CI workflow (section 2) so everything above gets enforced automatically.
+3. Start the dogfood week (section 4) with real notes.
+4. Slice the first Phase-4 ticket (section 3) once hardening has landed.

@@ -15,11 +15,6 @@ from ._http import post_json
 
 logger = logging.getLogger(__name__)
 
-# Canonical defaults live in brain.config; re-exported for convenience.
-DEFAULT_BASE_URL = DEFAULT_JEV_BASE_URL
-DEFAULT_MODEL = DEFAULT_JEV_MODEL
-DEFAULT_TIMEOUT_S = DEFAULT_JEV_TIMEOUT_S
-
 
 class JevError(RuntimeError):
     """The Jev API could not be reached or returned an unusable payload.
@@ -135,9 +130,9 @@ class JevClient:
     def __init__(
         self,
         api_key: str | None = None,
-        base_url: str = DEFAULT_BASE_URL,
-        model: str = DEFAULT_MODEL,
-        timeout_s: float = DEFAULT_TIMEOUT_S,
+        base_url: str = DEFAULT_JEV_BASE_URL,
+        model: str = DEFAULT_JEV_MODEL,
+        timeout_s: float = DEFAULT_JEV_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._api_key = api_key

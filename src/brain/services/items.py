@@ -36,6 +36,8 @@ class ItemsRepositoryProto(Protocol):
 
     def get(self, item_id: uuid.UUID) -> MemoryItem | None: ...
 
+    def get_many(self, item_ids: Sequence[uuid.UUID]) -> Sequence[MemoryItem]: ...
+
     def list(
         self,
         *,
@@ -62,27 +64,14 @@ class ItemsService:
     remove the item's vector and PATCHes touching indexed fields re-index it.
     Index failures never fail the request: they are logged and the item is
     picked up by the next ``brain reindex``.
+
+    Creation lives in :class:`~brain.services.ingest.IngestService` (capture +
+    classify + index in one use case); this service covers the rest.
     """
 
     def __init__(self, repo: ItemsRepositoryProto, indexer: ItemIndexerProto | None = None) -> None:
         self._repo = repo
         self._indexer = indexer
-
-    def create(self, data: schemas.ItemCreate) -> MemoryItem:
-        """Create a new memory item from the given payload."""
-        item = MemoryItem(
-            raw_text=data.raw_text,
-            source=data.source,
-            type=data.type,
-            project=data.project,
-            importance=data.importance,
-            actionability=data.actionability,
-            confidence=data.confidence,
-            status=data.status,
-        )
-        self._repo.add(item)
-        self._repo.commit()
-        return item
 
     def get(self, item_id: uuid.UUID) -> MemoryItem:
         """Return the item with the given id."""

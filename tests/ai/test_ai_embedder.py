@@ -47,6 +47,15 @@ class TestFakeEmbedder:
 
         assert cosine(base, similar) > cosine(base, unrelated)
 
+    def test_embed_batch_matches_per_item_embeds(self):
+        """embed_batch returns exactly the per-item vectors, in order."""
+        embedder = FakeEmbedder(dim=32)
+        texts = ["first note", "second note", "third note"]
+
+        batched = embedder.embed_batch(texts)
+
+        assert batched == [embedder.embed(text) for text in texts]
+
 
 class TestOpenAIEmbedder:
     def test_sends_model_and_input_with_bearer_key(self):
@@ -65,6 +74,31 @@ class TestOpenAIEmbedder:
         assert seen["auth"] == "Bearer k"
         assert seen["body"] == {"model": "text-embedding-3-small", "input": "hello"}
         assert vector == [0.5, -0.5, 1.0]
+
+    def test_embed_batch_sends_one_request_and_returns_vectors_in_order(self):
+        """Batched embedding: one POST with the input list, vectors in order."""
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["requests"] = seen.get("requests", 0) + 1
+            seen["body"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"index": 0, "embedding": [1.0, 0.0]},
+                        {"index": 1, "embedding": [0.0, 1.0]},
+                        {"index": 2, "embedding": [0.5, 0.5]},
+                    ]
+                },
+            )
+
+        embedder = OpenAIEmbedder(api_key="k", transport=httpx.MockTransport(handler))
+        vectors = embedder.embed_batch(["a", "b", "c"])
+
+        assert seen["requests"] == 1
+        assert seen["body"] == {"model": "text-embedding-3-small", "input": ["a", "b", "c"]}
+        assert vectors == [[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
 
     def test_base_url_override(self):
         seen = {}

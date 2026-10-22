@@ -63,8 +63,8 @@ def _reindex(
         indexed = service.reindex(batch_size=batch_size)
     except (EmbedderError, VectorStoreError) as exc:
         print(
-            f"reindex failed: {exc}. The collection is now PARTIAL; "
-            "rerun 'brain reindex' to finish rebuilding.",
+            f"reindex failed: {exc}. If the failure came after the purge, the "
+            "collection is PARTIAL; rerun 'brain reindex' to finish rebuilding.",
             file=sys.stderr,
         )
         return 1
