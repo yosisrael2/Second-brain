@@ -33,19 +33,25 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from brain import ops
-from brain.db.enums import ItemStatus
+from brain.db.enums import ItemStatus, ItemType
 from brain.db.models import EnrichmentJob, ItemSource, MemoryItem
+from brain.services.eval_extraction import DEFAULT_TITLE_THRESHOLD
 from brain.services.extraction import dates as xdates
 from brain.services.extraction.base import Extractor, StubExtractor
 from brain.services.extraction.candidates import ChildCandidate
 from brain.services.items import ItemsRepositoryProto
 from brain.services.memory import MemoryService
-from brain.services.textnorm import quote_in_source
+from brain.services.textnorm import quote_in_source, title_similarity
 
 logger = logging.getLogger(__name__)
 
 _JOB_STATES = ("queued", "running", "done", "failed")
 _BUDGETS = ("daily", "backfill")
+# Re-run identity (items 18+30): same title wording within this ratio — the
+# SAME threshold constant the eval harness uses, never a second number.
+_TITLE_THRESHOLD = DEFAULT_TITLE_THRESHOLD
+# timed children match within one hour of resolved start (delta item 18)
+_TIMED_MATCH_WINDOW = timedelta(hours=1)
 
 # D1(b): emails and long/multi-date text get the extraction pass; short
 # plain notes keep Jev-only labels (nothing to extract worth a model call).
@@ -365,11 +371,42 @@ class EnrichmentService:
         return {row.id: row for row in rows}
 
     @staticmethod
-    def _identity_key(candidate: ChildCandidate) -> tuple[str, str]:
-        """(kind, normalized title) — the diff key within one source (item 18)."""
-        from brain.services.textnorm import normalize  # noqa: PLC0415
+    def _same_child(
+        candidate: ChildCandidate,
+        moment: datetime | None,
+        applies_to: list[str],
+        child: MemoryItem,
+    ) -> bool:
+        """The spec's re-run identity (items 18 + 30), not an exact title.
 
-        return (candidate.kind, normalize(candidate.title))
+        A candidate matches an existing child of the same source when:
+        - the KIND is the same (child.type stores candidate.kind);
+        - the resolved date is the same — timed children within ±1h;
+          dateless children only match dateless ones;
+        - the resolved applies_to SET is the same;
+        - the title similarity >= the eval harness's threshold (an LLM
+          rewording 'דיאלוג בנות 13:35' vs 'דיאלוג בנות, איסוף 13:35' still
+          matches — one shared similarity function with the eval, never a
+          second one).
+        """
+        if child.type is None or child.type.value != candidate.kind:
+            return False
+        if (child.occurred_at is None) != (moment is None):
+            return False
+        if moment is not None and child.occurred_at is not None:
+            delta = abs((child.occurred_at - moment).total_seconds())
+            if delta > _TIMED_MATCH_WINDOW.total_seconds():
+                return False
+        stored = set(child.applies_to or [])
+        candidate_set = set(applies_to)
+        if stored != candidate_set:
+            # the ONE allowed mismatch: the stored child was unresolved
+            # (['unknown']) and memory has since improved — the candidate is
+            # still the same child and updates it in place (item 18). Two
+            # different KNOWN audiences (Rona vs Noa) never match.
+            if stored != {"unknown"}:
+                return False
+        return title_similarity(child.raw_text, candidate.title) >= _TITLE_THRESHOLD
 
     def _store_child(
         self,
@@ -387,13 +424,10 @@ class EnrichmentService:
         Returns 'created' | 'updated' | 'skipped'.
         """
         candidate = resolved.candidate
-        key = self._identity_key(candidate)
+        moment = resolved.start or resolved.due
+        kind = ItemType(candidate.kind)  # validated child kind (spec section 2)
         for child in existing_children.values():
-            child_key = (
-                (child.type.value if child.type else "event"),
-                _normalized(child.raw_text),
-            )
-            if child_key != key:
+            if not self._same_child(candidate, moment, resolved.applies_to, child):
                 continue
             if child.child_state == "dropped":
                 return "skipped"  # remembered rejection: never reappears (item 30)
@@ -406,8 +440,8 @@ class EnrichmentService:
         child = MemoryItem(
             raw_text=candidate.title,
             source=source.source,
-            type="event",  # refined by A2's typed candidates; search-visible now
-            occurred_at=resolved.start or resolved.due,
+            type=kind,  # the candidate's kind survives (review round 1, defect 1)
+            occurred_at=moment,
             status=ItemStatus.NEEDS_REVIEW if resolved.date_conflict else ItemStatus.INBOX,
             child_state="proposed",
             applies_to=resolved.applies_to,
@@ -419,6 +453,7 @@ class EnrichmentService:
         self._session.add(
             ItemSource(child_id=child.id, source_id=source.id, quote=candidate.quote)
         )
+        existing_children[child.id] = child  # visible to later candidates this run
         self._repo.commit()
         self._index_child(child)
         return "created"
@@ -446,6 +481,20 @@ class EnrichmentService:
         child.date_conflict = resolved.date_conflict
         child.status = ItemStatus.NEEDS_REVIEW if resolved.date_conflict else child.status
         child.extraction_meta = {**resolved.meta, "run_id": str(run_id)}
+        # one link per (child, source): a DIFFERENT quote of the same pair is
+        # an extra quote, not a second link row (UNIQUE(child_id, source_id))
+        link = (
+            self._session.query(ItemSource)
+            .filter(
+                ItemSource.child_id == child.id, ItemSource.source_id == source.id
+            )
+            .one_or_none()
+        )
+        if link is not None and link.quote != resolved.candidate.quote:
+            extras = list(child.extraction_meta.get("extra_quotes", []))
+            if resolved.candidate.quote not in extras:
+                extras.append(resolved.candidate.quote)
+            child.extraction_meta["extra_quotes"] = extras
 
 
 @dataclass(frozen=True)
@@ -459,8 +508,3 @@ class _ResolvedChild:
     date_conflict: bool
     meta: dict[str, Any]
 
-
-def _normalized(text: str) -> str:
-    from brain.services.textnorm import normalize  # noqa: PLC0415
-
-    return normalize(text)

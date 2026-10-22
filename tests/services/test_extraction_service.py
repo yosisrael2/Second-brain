@@ -77,8 +77,12 @@ def world_fixture(database: None) -> World:
     _wipe(session)
 
 
-def _capture(repo: ItemsRepository, body: str, *, source: str = "manual") -> MemoryItem:
-    item = MemoryItem(raw_text=body, source=source)
+def _capture(
+    repo: ItemsRepository, body: str, *, source: str = "manual"
+) -> MemoryItem:
+    """Capture with a PINNED occurred_at (= NOW) so relative dates ('מחר')
+    resolve deterministically regardless of the wall clock."""
+    item = MemoryItem(raw_text=body, source=source, occurred_at=NOW)
     repo.add(item)
     repo.commit()
     return item
@@ -120,7 +124,7 @@ def test_stub_end_to_end_creates_linked_children(world: World):
     body = (
         "שלום,\n"
         "מחר כינוס הורים באמפי 22.10\n"
-        "ביום חמישי 22.10 חולצה לבנה\n"
+        "חולצה לבנה ליום חמישי 23.10\n"
         "שבוע הציפורים 1.11\n"
     )
     source = _capture(world.repo, body, source="email")
@@ -287,8 +291,12 @@ def test_kept_child_is_immutable_and_dropped_child_never_reappears(world: World)
     world.session.commit()
     extractor = CountingExtractor(
         [
-            ChildCandidate(kind="event", title=kept.raw_text, quote=kept.raw_text),
-            ChildCandidate(kind="event", title=dropped.raw_text, quote=dropped.raw_text),
+            ChildCandidate(
+                kind="event", title=kept.raw_text, quote=kept.raw_text, when_raw="22.10"
+            ),
+            ChildCandidate(
+                kind="event", title=dropped.raw_text, quote=dropped.raw_text, when_raw="23.10"
+            ),
         ]
     )
     report = world.with_extractor(extractor).run_once(NOW)
@@ -412,3 +420,236 @@ def test_extraction_meta_carries_model_and_run_id(world: World):
     assert meta["model"] == "stub-v0"
     assert uuid.UUID(meta["run_id"])  # a valid run id
     assert meta["when_raw"]
+
+
+# --- review round 1 (PR #33): kind is preserved, identity per items 18/30 -----
+
+
+def test_child_kind_round_trips_and_rerun_does_not_duplicate(world: World):
+    """RED (defect 1): task/reminder/fact children keep their kind; re-run safe."""
+    body = "הודעה על אספה 22.10\nלהביא כיבוד 22.10\nלזכור שהצ'ופר ב-22.10\nחולצה לבנה 22.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="event", title="אספת הורים", quote="אספה 22.10", when_raw="22.10"
+        ),
+        ChildCandidate(
+            kind="task", title="להביא כיבוד", quote="להביא כיבוד 22.10", when_raw="22.10"
+        ),
+        ChildCandidate(
+            kind="fact", title="הצ'ופר ב-22.10", quote="הצ'ופר ב-22.10", when_raw="22.10"
+        ),
+        ChildCandidate(
+            kind="reminder", title="חולצה לבנה", quote="חולצה לבנה 22.10", when_raw="22.10"
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 4
+
+    kinds = sorted(
+        (row.type.value, row.raw_text)
+        for row in world.session.query(MemoryItem).all()
+        if row.child_state
+    )
+    assert kinds == [
+        ("event", "אספת הורים"),
+        ("fact", "הצ'ופר ב-22.10"),
+        ("reminder", "חולצה לבנה"),
+        ("task", "להביא כיבוד"),
+    ]
+
+    # re-run with the SAME candidates: every kind matches its stored child
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    report2 = world.with_extractor(CountingExtractor(candidates)).run_once(NOW)
+    assert report2.children_created == 0  # no duplicates for ANY kind (item 18)
+    assert len([row for row in world.session.query(MemoryItem).all() if row.child_state]) == 4
+
+
+def test_dropped_task_child_stays_suppressed_after_kind_fix(world: World):
+    """RED (defect 1b): a DROPPED task child must never be recreated (item 30)."""
+    body = "להגיש טופס 22.10 בהקדם"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(kind="task", title="להגיש טופס", quote="להגיש טופס 22.10", when_raw="22.10")
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    child.child_state = "dropped"  # user pressed Drop
+    world.session.commit()
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+
+    report = world.with_extractor(CountingExtractor(candidates)).run_once(NOW)
+    assert report.children_created == 0  # was recreated before the fix
+    assert len(_children(world.session)) == 1
+
+
+def test_reworded_title_still_matches_on_rerun(world: World):
+    """RED (defect 2): an LLM rewording must match the same child (items 18/30)."""
+    body = "דיאלוג בנות ביום שני 19.10 איסוף 13:35"
+    source = _capture(world.repo, body, source="email")
+    v1 = ChildCandidate(
+        kind="event", title="דיאלוג בנות 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    service = world.with_extractor(CountingExtractor([v1]))
+    service.enqueue(source)
+    service.run_once(NOW)
+    assert len(_children(world.session)) == 1
+
+    # the next run rewords the title — same child, not a second one
+    v2 = ChildCandidate(
+        kind="event", title="דיאלוג בנות, איסוף 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    report = world.with_extractor(CountingExtractor([v2])).run_once(NOW)
+    assert report.children_created == 0
+    assert len(_children(world.session)) == 1
+
+
+def test_same_title_on_a_different_date_is_a_new_child(world: World):
+    """RED (defect 2): date is part of identity — 22.10 vs 23.10 do not match."""
+    body = "אספה 22.10 בבוקר\nאספה 23.10 בבוקר"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(kind="event", title="אספה בבוקר", quote="אספה 22.10", when_raw="22.10"),
+        ChildCandidate(kind="event", title="אספה בבוקר", quote="אספה 23.10", when_raw="23.10"),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2  # NOT deduped: different dates
+    dates = sorted(str(row.occurred_at) for row in _children(world.session))
+    assert len(set(dates)) == 2
+
+
+def test_same_title_different_applies_to_is_not_the_same_child(world: World):
+    """RED (defect 2): applies_to is part of identity."""
+    body = "אספת הורים 22.10 בכיתה ב2 ואספת הורים 22.10 בכיתה ג3"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="event", title="אספת הורים לכיתה ב2",
+            quote="אספת הורים 22.10 בכיתה ב2",
+            when_raw="22.10", audience={"school": "ברקת", "grades": "2"},
+        ),
+        ChildCandidate(
+            kind="event", title="אספת הורים לכיתה ה",
+            quote="אספת הורים 22.10 בכיתה ג3",
+            when_raw="22.10", audience={"school": "ברקת", "grades": "5"},
+        ),
+    ]
+    world.memory.set_kid(
+        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+    )
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2  # different audiences: two children
+    audiences = sorted(tuple(row.applies_to) for row in _children(world.session))
+    assert audiences == [("Rona",), ("nobody",)]
+
+
+def test_same_title_with_different_applies_to_stays_two_children(world: World):
+    """Red (defect 2): identity includes applies_to even with IDENTICAL titles."""
+    body = "מסיבת יום הולדת 22.10 בכיתה ב2 ומסיבת יום הולדת 22.10 בכיתה ה"
+    source = _capture(world.repo, body, source="email")
+    world.memory.set_kid(
+        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+    )
+    candidates = [
+        ChildCandidate(
+            kind="event", title="מסיבת יום הולדת", quote="מסיבת יום הולדת 22.10",
+            when_raw="22.10", audience={"school": "ברקת", "grades": "2"},
+        ),
+        ChildCandidate(
+            kind="event", title="מסיבת יום הולדת", quote="מסיבת יום הולדת 22.10",
+            when_raw="22.10", audience={"school": "ברקת", "grades": "5"},
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2  # same title, different audiences
+    audiences = sorted(tuple(row.applies_to) for row in _children(world.session))
+    assert audiences == [("Rona",), ("nobody",)]
+
+
+def test_dropped_child_suppressed_even_after_rewording(world: World):
+    """RED (defect 2): item 30 suppression follows the RELAXED matcher."""
+    body = "דיאלוג בנות ביום שני 19.10 איסוף 13:35"
+    source = _capture(world.repo, body, source="email")
+    v1 = ChildCandidate(
+        kind="event", title="דיאלוג בנות איסוף 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    service = world.with_extractor(CountingExtractor([v1]))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    child.child_state = "dropped"  # user pressed Drop
+    world.session.commit()
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+
+    v2 = ChildCandidate(
+        kind="event", title="דיאלוג בנות, איסוף 13:35", quote="דיאלוג בנות", when_raw="19.10"
+    )
+    report = world.with_extractor(CountingExtractor([v2])).run_once(NOW)
+    assert report.children_created == 0  # reworded, but still the SAME child
+    assert len(_children(world.session)) == 1
+
+
+def test_very_long_quote_does_not_break_the_link_table(world: World):
+    """RED (defect 3): a 5,000-char INCOMPRESSIBLE quote must not hit the btree.
+
+    Repetitive Hebrew compresses below the btree row limit and hides the bug
+    (verified: it passes against the broken schema); random hex words do not.
+    """
+    import uuid as _uuid
+
+    body = " ".join(_uuid.uuid4().hex for _ in range(420))[:5100] + " 22.10"
+    source = _capture(world.repo, body, source="email")
+    long_quote = body[:5000]  # 5,000 incompressible chars (random hex words)
+    candidate = ChildCandidate(
+        kind="event", title="יום הספורט", quote=long_quote, when_raw="22.10"
+    )
+    service = world.with_extractor(CountingExtractor([candidate]))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 1
+    link = world.session.query(ItemSource).one()
+    assert link.quote == long_quote
+
+
+# --- review round 1 small items ---------------------------------------------
+
+
+def test_enrich_cli_refuses_the_live_store(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`brain enrich` carries the PR #31 live-store guard (small 5).
+
+    The API lifespan guard covers the app only; the CLI must fail fast the
+    same way when pointed at the live store, unless BRAIN_ALLOW_LIVE=1.
+    """
+    from brain import cli
+    from brain.config import LIVE_DATABASE_URL, LIVE_QDRANT_COLLECTION, get_settings
+
+    monkeypatch.setenv("DATABASE_URL", LIVE_DATABASE_URL)
+    monkeypatch.setenv("QDRANT_COLLECTION", LIVE_QDRANT_COLLECTION)
+    monkeypatch.delenv("BRAIN_ALLOW_LIVE", raising=False)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="LIVE store"):
+            cli.main(["enrich", "--limit", "1"])
+    finally:
+        get_settings.cache_clear()

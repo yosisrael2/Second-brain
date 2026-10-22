@@ -175,13 +175,21 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
 
 def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
     """Drain the enrichment queue; --since switches to backfill mode (D6)."""
+    import os  # noqa: PLC0415
     from datetime import UTC, datetime  # noqa: PLC0415
 
-    from brain.config import get_settings  # noqa: PLC0415
+    from brain.config import assert_not_live_store, get_settings  # noqa: PLC0415
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415
     from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
 
     settings = get_settings()
+    # Same live-store guard as the API lifespan (PR #31), which covers the
+    # app only — the CLI must not silently write the live store either.
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
     with SessionLocal() as session:
         repo = ItemsRepository(session)
         service = EnrichmentService(

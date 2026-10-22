@@ -26,6 +26,17 @@ _CHILD_STATES = ("proposed", "kept", "dropped")
 
 
 def upgrade() -> None:
+    # --- widen the item-type domain with the extraction child kinds -------
+    # The spec's child cards are event|task|reminder|fact (section 2); the
+    # pre-extraction enum had no reminder/fact. Same CHECK name (op.f), so
+    # models + DB keep agreeing.
+    op.drop_constraint(op.f("ck_memory_items_type"), "memory_items", type_="check")
+    op.create_check_constraint(
+        op.f("ck_memory_items_type"),
+        "memory_items",
+        _TYPE_DOMAIN_WIDE,
+    )
+
     # --- child markers on memory_items -----------------------------------
     # child_state: NULL = ordinary top-level item; else the D2/item-19
     # lifecycle. 'kept' children are user-approved; 'dropped' are user-
@@ -82,7 +93,12 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         # convention uq_%(table_name)s_%(column_0_name)s -> uq_item_sources_child_id
-        sa.UniqueConstraint("child_id", "source_id", "quote"),
+        # UNIQUE(child_id, source_id): one link per child-source pair. The
+        # quote column is the PRIMARY quote; a long TEXT inside the UNIQUE
+        # btree fails with 'index row size exceeds maximum' (reproduced with
+        # a 5,000-char incompressible quote). Extra quotes of the same pair
+        # live in the child's extraction_meta.extra_quotes.
+        sa.UniqueConstraint("child_id", "source_id"),
     )
     op.create_index(
         op.f("ix_item_sources_source_id"), "item_sources", ["source_id"]
@@ -136,6 +152,31 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Narrowing the type domain REFUSES to run while children still use the
+    # new values (documented decision: silently rewriting user rows to a
+    # wrong type would be worse than a loud stop). Re-classify or delete
+    # reminder/fact rows first.
+    import sqlalchemy as sa  # noqa: PLC0415
+
+    conn = op.get_bind()
+    in_use = conn.execute(
+        sa.text(
+            "SELECT count(*) FROM memory_items "
+            "WHERE type IN ('reminder', 'fact')"
+        )
+    ).scalar_one()
+    if in_use:
+        raise RuntimeError(
+            f"cannot downgrade {revision!r}: {in_use} memory_items row(s) use "
+            "type 'reminder'/'fact' (introduced by this migration). Re-classify "
+            "or delete them first."
+        )
+    op.drop_constraint(op.f("ck_memory_items_type"), "memory_items", type_="check")
+    op.create_check_constraint(
+        op.f("ck_memory_items_type"),
+        "memory_items",
+        _TYPE_DOMAIN_ORIGINAL,
+    )
     op.drop_index(
         op.f("ix_enrichment_jobs_state_not_before"), table_name="enrichment_jobs"
     )
@@ -149,3 +190,14 @@ def downgrade() -> None:
         op.f("ck_memory_items_child_state"), "memory_items", type_="check"
     )
     op.drop_column("memory_items", "child_state")
+
+
+# Self-contained domains (migrations must not depend on current enums.py):
+# the original pre-extraction domain and the widened one (spec child kinds).
+_TYPE_DOMAIN_ORIGINAL = (
+    "type IN ('task', 'decision', 'note', 'event', 'reference', 'idea')"
+)
+_TYPE_DOMAIN_WIDE = (
+    "type IN ('task', 'decision', 'note', 'event', 'reminder', 'fact', "
+    "'reference', 'idea')"
+)

@@ -24,6 +24,8 @@ class ItemType(enum.StrEnum):
     DECISION = "decision"
     NOTE = "note"
     EVENT = "event"
+    REMINDER = "reminder"
+    FACT = "fact"
     REFERENCE = "reference"
     IDEA = "idea"
 
