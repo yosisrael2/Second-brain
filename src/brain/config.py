@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
     # ~4x documents.
     ask_recall_pool: int = 32
+    # Kid-recall leg of /ask (PR 0d): when a question names a confirmed kid,
+    # items from that kid's channels/class join the recall pool before the
+    # rerank. This caps how many extra candidates that leg may fetch —
+    # a ceiling, never a floor (fewer matches -> fewer candidates).
+    ask_kid_recall_limit: int = 16
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
