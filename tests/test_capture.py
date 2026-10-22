@@ -5,6 +5,7 @@ interpreted in the ``TIMEZONE`` setting (pinned to Asia/Jerusalem here so the
 tests are machine-independent); explicit offsets are honored as given.
 """
 
+import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -127,9 +128,7 @@ def test_capture_timezone_setting_changes_interpretation(clean_items: None) -> N
 
 
 def _capture_with_timezone(zone: str, payload: dict | None = None) -> dict:
-    """POST /capture with TIMEZONE temporarily set (own client, own settings)."""
-    import os
-
+    """POST /capture with TIMEZONE temporarily set (fresh app + settings)."""
     previous = os.environ.get("TIMEZONE")
     os.environ["TIMEZONE"] = zone
     get_settings.cache_clear()
@@ -221,8 +220,3 @@ class TestTimezoneSetting:
     def test_invalid_zone_is_rejected(self):
         with pytest.raises(ValidationError, match="IANA"):
             Settings(timezone="Mars/Olympus_Mons")
-
-
-def expected_local(zone: ZoneInfo) -> datetime:  # pragma: no cover - helper
-    """Aware-UTC instant of 2026-10-21 10:00 wall time in the given zone."""
-    return datetime(2026, 10, 21, 10, 0).replace(tzinfo=zone).astimezone(UTC)
