@@ -82,7 +82,7 @@ def _child_rows(
             "SELECT child_id, quote FROM item_sources WHERE source_id = :sid "
             "ORDER BY created_at ASC"
         ),
-        {"source_id": str(source.id)},
+        {"sid": str(source.id)},
     ).all()
     rows: list[dict[str, Any]] = []
     for number, (child_id, quote) in enumerate(links):

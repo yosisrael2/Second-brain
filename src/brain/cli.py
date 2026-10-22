@@ -204,12 +204,17 @@ def _extract_eval(*, input_path: str, out_path: str, limit: int | None) -> int:
     )
     from brain.db.session import SessionLocal  # noqa: PLC0415
 
-    emails_text = Path(input_path).read_text(encoding="utf-8")
     if limit is not None:
-        chunks = [c for c in emails_text.split("=====") if c.strip()][:limit]
-        emails_text = "=====".join(chunks)
-        temp = Path(out_path).parent / f".eval-input-{Path(out_path).stem}.txt"
-        temp.write_text(emails_text, encoding="utf-8")
+        # --limit: build a truncated copy of the emails file first
+        out_dir = Path(out_path).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        chunks = [
+            c
+            for c in Path(input_path).read_text(encoding="utf-8").split("=====")
+            if c.strip()
+        ]
+        temp = out_dir / f".eval-input-{Path(out_path).stem}.txt"
+        temp.write_text("=====".join(chunks[:limit]), encoding="utf-8")
         input_path = str(temp)
 
     llm = get_llm_client()
