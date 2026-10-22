@@ -320,6 +320,7 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `CLAUDE_SDK_MODEL` | unset (login default)                              | model for `/ask` on `claude_sdk`, e.g. `claude-haiku-5-5` (faster) / `claude-sonnet-5-5` (quality) |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5`                                 | model for `/ask` on `anthropic` |
 | `EMBEDDER_PROVIDER` | `fastembed`                                       | `fastembed` (local) or `openai` |
+| `TIMEZONE` | machine's local IANA zone (e.g. `Asia/Jerusalem`)   | interprets zone-less pasted times (Gmail/WhatsApp/calendar) before storing them as aware UTC |
 
 All settings live in `Settings` (`src/brain/config.py`); AI-layer variables
 (keys as `SecretStr`, base URLs, models, timeouts) are listed in

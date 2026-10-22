@@ -184,8 +184,12 @@ class TestClaudeSdkModel:
             first = future_a.result(timeout=10)
             second = future_b.result(timeout=10)
 
-        assert first.model == "model-A"
-        assert second.model == "model-B"
+        # Which thread is scheduled first is not deterministic — the fake tags
+        # each completion by its TEXT ("a" first-called, "b" second), so map
+        # model expectations to the text each Completion carries.
+        by_text = {first.text: first.model, second.text: second.model}
+        assert by_text["a"] == "model-A"
+        assert by_text["b"] == "model-B"
 
 
 class TestAnthropicModel:

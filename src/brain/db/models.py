@@ -3,6 +3,7 @@
 import uuid
 from collections.abc import Iterable
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -14,9 +15,10 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy import Enum as SAEnum
-from sqlalchemy.dialects.postgresql import TSVECTOR, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from brain.db.base import Base
@@ -99,6 +101,19 @@ class MemoryItem(Base):
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[ItemStatus] = mapped_column(
         _enum_column(ItemStatus), nullable=False, default=ItemStatus.INBOX
+    )
+    # When the captured thing happened (email date, WhatsApp timestamp, event
+    # start), as opposed to created_at (when we captured it). Zone-less pasted
+    # times are interpreted in the TIMEZONE setting and stored as aware UTC;
+    # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
+    # original raw strings stay in meta for audit.
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Format-specific extraction result (email headers, WhatsApp messages,
+    # event fields). Always a JSON object; empty for plain notes.
+    meta: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     search_vector: Mapped[TSVECTOR] = mapped_column(
         TSVECTOR,
