@@ -22,7 +22,7 @@ class StubSearch:
         self._hits = hits
         self.last_query: str | None = None
 
-    def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
+    def search(self, query: str, *, limit: int, offset: int = 0, extra_items=()) -> list[SearchHit]:
         self.last_query = query
         return self._hits[:limit]
 
@@ -164,7 +164,7 @@ class RecordingSearch(StubSearch):
         super().__init__(hits)
         self.limits: list[int] = []
 
-    def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
+    def search(self, query: str, *, limit: int, offset: int = 0, extra_items=()) -> list[SearchHit]:
         self.limits.append(limit)
         return super().search(query, limit=limit)
 

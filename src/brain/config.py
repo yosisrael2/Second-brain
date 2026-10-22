@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
     # ~4x documents.
     ask_recall_pool: int = 32
+    # Kid-recall leg of /ask (PR 0d): when a question names a confirmed kid,
+    # items from that kid's channels/class join the recall pool before the
+    # rerank. This caps how many extra candidates that leg may fetch —
+    # a ceiling, never a floor (fewer matches -> fewer candidates).
+    ask_kid_recall_limit: int = 16
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None

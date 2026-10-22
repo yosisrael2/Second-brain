@@ -165,6 +165,7 @@ def get_ask_service(
     search: SearchService = Depends(get_search_service),
     llm: LLMClient = Depends(get_llm_client),
     memory: MemoryService = Depends(get_memory_service),
+    repo: ItemsRepository = Depends(get_items_repository),
 ) -> AskService:
     """Provide an AskService wired to search, the shared LLM client and memory."""
     settings = get_settings()
@@ -175,4 +176,7 @@ def get_ask_service(
         recall_pool=settings.ask_recall_pool,
         tz=ZoneInfo(settings.timezone),
         memory_block=memory.compact_block,
+        memory=memory,
+        items_repo=repo,
+        kid_recall_limit=settings.ask_kid_recall_limit,
     )

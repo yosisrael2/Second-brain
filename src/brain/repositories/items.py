@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
 from brain.db.models import MemoryItem
+
+
+def _escape_like(needle: str) -> str:
+    """Neutralise LIKE wildcards in user/entity-derived needles."""
+    return re.sub(r"([\\%_])", r"\\\1", needle)
 
 
 class ItemsRepository:
@@ -104,6 +110,29 @@ class ItemsRepository:
             .where(MemoryItem.occurred_at >= start)
             .where(MemoryItem.occurred_at < end)
             .order_by(MemoryItem.occurred_at.asc(), MemoryItem.id.desc())
+            .limit(limit)
+        )
+        return list(self._db.scalars(stmt))
+
+    def by_text_any(self, needles: Sequence[str], *, limit: int) -> Sequence[MemoryItem]:
+        """Items whose raw_text contains ANY needle (case-insensitive), newest first.
+
+        Drives the kid-recall leg of /ask: a captured WhatsApp message keeps
+        its chat name in the raw_text header ('[date, time] <chat> / <sender>:
+        body'), so the exact channel name as stored in memory matches the
+        items captured from that channel. Needles are user/entity data, so
+        LIKE wildcards in them are escaped, never interpreted.
+        """
+        if not needles:
+            return []
+        clauses = [
+            MemoryItem.raw_text.ilike(f"%{_escape_like(needle)}%", escape="\\")
+            for needle in needles
+        ]
+        stmt = (
+            select(MemoryItem)
+            .where(or_(*clauses))
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)
         )
         return list(self._db.scalars(stmt))
