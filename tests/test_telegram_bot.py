@@ -562,6 +562,7 @@ class TestCli:
 
         root = logging.getLogger()
         saved_handlers, saved_level = root.handlers[:], root.level
+        saved_httpx = logging.getLogger("httpx").level
         root.handlers = []  # simulate a bare launchd process
         try:
             settings = telegram_bot.Settings(TELEGRAM_BOT_TOKEN=None, _env_file=None)
@@ -572,9 +573,15 @@ class TestCli:
                 if isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
             ]
             assert stderr_handlers, "run() left the root logger without a stderr handler"
+            # httpx INFO request lines carry the FULL bot token in the URL;
+            # they must never reach the service log (module security contract).
+            assert logging.getLogger("httpx").level >= logging.WARNING
+            assert logging.getLogger("httpcore").level >= logging.WARNING
         finally:
             root.handlers[:] = saved_handlers
             root.setLevel(saved_level)
+            logging.getLogger("httpx").setLevel(saved_httpx)
+            logging.getLogger("httpcore").setLevel(saved_httpx)
 
 
 class _ScriptedPollTG:

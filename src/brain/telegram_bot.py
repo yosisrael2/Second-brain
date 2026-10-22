@@ -1304,6 +1304,10 @@ def run(settings: Settings) -> int:
             stream=sys.stderr,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
+        # httpx INFO request lines contain the FULL bot token in the URL —
+        # they must never reach the service log (module security contract).
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
     if settings.telegram_bot_token is None:
         logger.error("telegram bot disabled (no token)")
         return EXIT_DISABLED

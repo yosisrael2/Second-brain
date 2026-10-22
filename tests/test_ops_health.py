@@ -288,8 +288,8 @@ class TestBackgroundComponent:
         (stub / "launchctl").write_text(
             "#!/usr/bin/env bash\n"
             'case "$2" in\n'
-            "  *com.secondbrain.api) printf '  state = running\\n  pid = 4242\\n"
-            "  last exit code = 0\\n';;\n"
+            "  *com.secondbrain.api) printf '\tstate = running\\n\tpid = 4242\\n"
+            "\tlast exit code = 0\\n';;\n"
             '  *) echo "Could not find service" >&2; exit 3;;\n'
             "esac\n"
         )
@@ -302,3 +302,47 @@ class TestBackgroundComponent:
         assert raw["summary"] == "1/1 agents running"
         assert raw["details"]["agents"]["com.secondbrain.api"]["pid"] == 4242
         assert raw["details"]["agents"]["com.secondbrain.telegram"] == {}
+
+    def test_adapter_uses_top_level_state_not_nested_entries(self, monkeypatch, tmp_path):
+        """Real `launchctl print` output contains NESTED 'state = active' lines
+        (events/sockets sub-dicts) after the top-level 'state = running'. The
+        parser must read the top-level (one-tab) keys only — the last nested
+        line previously overwrote the state and a healthy agent read as
+        'active' (=> background 'down 0/2' while both agents run)."""
+        import os
+
+        stub = tmp_path / "stubbin2"
+        stub.mkdir()
+        real_like = (
+            "gui/501/com.secondbrain.api = {\n"
+            "\tactive count = 1\n"
+            "\tpath = /Users/x/Library/LaunchAgents/com.secondbrain.api.plist\n"
+            "\ttype = LaunchAgent\n"
+            "\tstate = running\n"
+            "\tprogram = /Users/x/git/Second-brain/scripts/run-server.sh\n"
+            "\tevents = {\n"
+            "\t\tstate = active\n"
+            "\t}\n"
+            "\tsockets = {\n"
+            "\t\tstate = active\n"
+            "\t}\n"
+            "\tpid = 93202\n"
+            "\tlast exit code = (never exited)\n"
+            "}\n"
+        )
+        (stub / "launchctl").write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$2" in\n'
+            f"  *com.secondbrain.api) printf '{real_like}';;\n"
+            "  *) exit 3;;\n"
+            "esac\n"
+        )
+        (stub / "launchctl").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
+        ops_health.reset_cache()
+        body = ops_health.run_health_checks(ops_health.HealthContext())
+        raw = body["components"]["background"]
+        assert raw["status"] == "ok"
+        agent = raw["details"]["agents"]["com.secondbrain.api"]
+        assert agent["state"] == "running"
+        assert agent["pid"] == 93202

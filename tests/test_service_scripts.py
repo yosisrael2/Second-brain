@@ -249,6 +249,20 @@ class TestServiceInstall:
         assert any("bootstrap" in c and "com.secondbrain.telegram" in c for c in calls)
 
     @need_venv
+    @need_venv
+    def test_install_precreates_log_files_0600(self, tmp_path):
+        """The four log files are pre-created mode 600 BEFORE bootstrap: launchd
+        writes into the existing inode (preserving the mode), so service logs
+        are never world-readable."""
+        env = _service_env(tmp_path)
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        log_dir = tmp_path / "Logs"
+        for name in ("api.log", "api.err.log", "telegram.log", "telegram.err.log"):
+            log = log_dir / name
+            assert log.exists(), f"{name} not pre-created"
+            assert log.stat().st_mode & 0o777 == 0o600, f"{name} not 0600"
+
     def test_install_takes_over_manual_bot_without_duplicates(self, tmp_path):
         """A running nohup bot (pid file + our cwd) is DEAD after install —
         launchd's bot must be the only getUpdates poller (else: 409)."""
