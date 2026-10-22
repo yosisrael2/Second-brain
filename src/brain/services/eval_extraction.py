@@ -15,7 +15,7 @@ INPUT FORMAT (one JSON object per line; unknown extra fields are ignored):
      "start": "2026-10-19T13:35:00",       # ISO local wall-clock; optional
      "end": null, "all_day": true,         # all_day rows carry a date-only start
      "due": "2026-11-01",                  # tasks: due when no start
-     "applies_to": "rona",                 # "rona, itamar" | "me" | "nobody" | "unknown" | ""
+     "applies_to": "rona",                 # "rona, itamar" | ["Rona", "me"] | "me" | "nobody"
      "importance": 3, "actionability": "now",
      "source_quote": "verbatim text from the email",
      "relation": {"kind": "supersedes", "target": "<child_id>"},   # or "supersedes:<child_id>"
@@ -36,10 +36,15 @@ MATCHING (deterministic, documented):
   effective date (`start` if present else `due`), times within ±1 hour when
   both sides are timed (all_day rows gate on the day only; a timed row may
   match an all_day row of the same day, and then counts as date-inexact),
-  and compatible `applies_to` (normalized token sets equal; "unknown"/empty
-  is a wildcard that matches anything — but see applies_to accuracy below;
-  two different KNOWN values never match, e.g. grade 2 vs grade 5 stay
-  separate).
+  and compatible `applies_to` (JSON string or JSON list of strings, both
+  normalized to the same token set; normalized token sets equal;
+  "unknown"/empty is a wildcard that matches anything — but see applies_to
+  accuracy below; two different KNOWN values never match). Any field whose
+  JSON value has an unexpected type (applies_to that is neither string nor
+  list, non-boolean all_day/date_conflict, non-integer importance, non-string
+  relation/notes/email_text/source_quote/actionability) raises EvalError —
+  nothing is silently coerced to a default, because a silent fallback (e.g.
+  applies_to -> unknown) would let every row match every prediction.
 - Children with no date at all (standing facts) match only other dateless
   children of the same email. A date-only ISO start/due (e.g. "2026-11-01",
   no time part) implies an all-day child unless an explicit all_day field
@@ -235,41 +240,69 @@ def _opt_datetime(row: dict[str, Any], key: str, side: str, idx: int) -> datetim
         raise EvalError(f"{side} row {idx}: bad datetime {value!r}: {exc}") from exc
 
 
-def _opt_int(value: Any) -> int | None:
+def _opt_int(row: dict[str, Any], key: str, side: str, idx: int) -> int | None:
+    """Optional integer field: absent/null -> None; any other type raises."""
+    value = row.get(key)
     if value is None or value == "":
         return None
-    if isinstance(value, bool):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise EvalError(f"{side} row {idx}: {key} must be an integer")
+    return value
+
+
+def _opt_bool(row: dict[str, Any], key: str, side: str, idx: int) -> bool | None:
+    """Optional boolean field: absent/null -> None; any other type raises."""
+    value = row.get(key)
+    if value is None:
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
-    return None
+    if not isinstance(value, bool):
+        raise EvalError(f"{side} row {idx}: {key} must be a boolean")
+    return value
 
 
-def _flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
+def _opt_str(row: dict[str, Any], key: str, side: str, idx: int) -> str:
+    """Optional string field: absent/null -> ''; any other type raises."""
+    value = row.get(key)
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise EvalError(f"{side} row {idx}: {key} must be a string")
+    return value.strip()
+
+
+def _parse_relation(value: Any, side: str, idx: int) -> tuple[str, str] | None:
+    """Accept {"kind", "target"} or "kind", "kind:target", "kind target".
+
+    A bare kind string (no target) is kept as (kind, "") — the eval then
+    reports the relation as unresolvable (target not labeled). Any other
+    JSON type is a schema error, never silently ignored.
+    """
+    if value is None or value == "":
+        return None
     if isinstance(value, str):
-        return value.strip().casefold() in ("true", "1", "yes")
-    return bool(value)
-
-
-def _parse_relation(value: Any) -> tuple[str, str] | None:
-    """Accept {"kind", "target"} or "kind", "kind:target", "kind target"."""
-    if value is None or value == "":
-        return None
+        text = value.strip()
+        for sep in (":", " "):
+            if sep in text:
+                kind, target = (part.strip() for part in text.split(sep, 1))
+                if kind and target:
+                    return (kind.casefold(), target)
+        return (text.casefold(), "") if text else None
     if isinstance(value, dict):
-        kind = str(value.get("kind", "")).strip().casefold()
-        target = str(value.get("target", "")).strip()
-        return (kind, target) if kind and target else None
-    text = str(value).strip()
-    for sep in (":", " "):
-        if sep in text:
-            kind, target = (part.strip() for part in text.split(sep, 1))
-            if kind and target:
-                return (kind.casefold(), target)
-    return (text.casefold(), "") if text else None
+        dict_kind = value.get("kind")
+        dict_target = value.get("target")
+        if (
+            not isinstance(dict_kind, str)
+            or not isinstance(dict_target, str)
+            or not dict_kind.strip()
+            or not dict_target.strip()
+        ):
+            raise EvalError(
+                f"{side} row {idx}: relation object needs non-empty string 'kind' and 'target'"
+            )
+        return (dict_kind.strip().casefold(), dict_target.strip())
+    raise EvalError(
+        f"{side} row {idx}: relation must be a string or an object with string 'kind' and 'target'"
+    )
 
 
 def _is_date_only(value: Any) -> bool:
@@ -283,30 +316,48 @@ def _is_date_only(value: Any) -> bool:
     )
 
 
-def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
-    applies_raw = row.get("applies_to")
-    applies_raw = applies_raw.strip() if isinstance(applies_raw, str) else ""
-    tokens = frozenset(
-        token.strip().casefold() for token in re.split(r"[,;/]", applies_raw) if token.strip()
-    )
+def _parse_applies_to(row: dict[str, Any], side: str, idx: int) -> tuple[frozenset[str], str]:
+    """Normalize applies_to to a token set; str and list[str] both work.
+
+    worker_3's gold schema uses a JSON LIST (e.g. ["Rona"], ["Itamar",
+    "me"]); a string ("rona, me") normalizes to the same token set. An
+    empty value or ["unknown"] becomes the empty set == unknown wildcard.
+    Any other JSON type is a schema error — a silent fallback to unknown
+    would let every row match every prediction.
+    """
+    value = row.get("applies_to")
+    if value is None or value == "":
+        return frozenset(), ""
+    if isinstance(value, str):
+        applies_raw = value.strip()
+        raw_tokens = re.split(r"[,;/]", applies_raw)
+    elif isinstance(value, list):
+        if not all(isinstance(item, str) for item in value):
+            raise EvalError(f"{side} row {idx}: applies_to list must contain strings")
+        applies_raw = ", ".join(item.strip() for item in value)
+        raw_tokens = value
+    else:
+        raise EvalError(f"{side} row {idx}: applies_to must be a string or list of strings")
+    tokens = frozenset(token.strip().casefold() for token in raw_tokens if token.strip())
     if tokens == {"unknown"}:
         tokens = frozenset()
-    notes = row.get("notes")
-    notes = notes.strip() if isinstance(notes, str) else ""
-    email_text = row.get("email_text")
-    email_text = email_text if isinstance(email_text, str) else ""
-    relation = _parse_relation(row.get("relation"))
-    if "all_day" in row:
-        all_day = _flag(row.get("all_day"))
+    return tokens, applies_raw
+
+
+def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
+    tokens, applies_raw = _parse_applies_to(row, side, idx)
+    notes = _opt_str(row, "notes", side, idx)
+    email_text = _opt_str(row, "email_text", side, idx)
+    relation = _parse_relation(row.get("relation"), side, idx)
+    explicit_all_day = _opt_bool(row, "all_day", side, idx)
+    if explicit_all_day is not None:
+        all_day = explicit_all_day
     else:
         # A date-only ISO start/due (no time part) implies an all-day child.
         all_day = _is_date_only(row.get("start")) or _is_date_only(row.get("due"))
-    actionability_value = row.get("actionability")
-    actionability = (
-        actionability_value.strip().casefold() if isinstance(actionability_value, str) else None
-    )
-    quote_value = row.get("source_quote")
-    source_quote = quote_value if isinstance(quote_value, str) else ""
+    actionability = _opt_str(row, "actionability", side, idx) or None
+    source_quote = _opt_str(row, "source_quote", side, idx)
+    explicit_conflict = _opt_bool(row, "date_conflict", side, idx)
     return Child(
         email_id=_req_str(row, "email_id", side, idx),
         child_id=_req_str(row, "child_id", side, idx),
@@ -317,14 +368,14 @@ def _parse_child(row: dict[str, Any], side: str, idx: int) -> Child:
         all_day=all_day,
         applies_to=tokens,
         applies_raw=applies_raw,
-        importance=_opt_int(row.get("importance")),
+        importance=_opt_int(row, "importance", side, idx),
         actionability=actionability,
         source_quote=source_quote,
         relation=relation,
         # Gold rows only: the notes text may flag a date_conflict. Preds must
         # use the explicit boolean field (a pred note mentioning the word is
         # not a claim the pipeline verified).
-        date_conflict=_flag(row.get("date_conflict", False))
+        date_conflict=explicit_conflict is True
         or (side == "gold" and "date_conflict" in notes.casefold()),
         notes=notes,
         email_text=email_text,

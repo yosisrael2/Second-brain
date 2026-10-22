@@ -31,7 +31,7 @@ ignored, so the labeling schema can grow without breaking the harness.
 | `end`           | no       | carried, not scored                                                    |
 | `all_day`       | no       | explicit flag; a date-only `start`/`due` implies true                  |
 | `due`           | no       | tasks: used as the matching date when `start` is absent                |
-| `applies_to`    | no       | `"rona"`, `"rona, itamar"`, `"me"`, `"nobody"`, `"unknown"` or empty   |
+| `applies_to`    | no       | JSON string (`"rona"`, `"rona, itamar"`, `"me"`, `"nobody"`, `"unknown"`, empty) or JSON list of strings (`["Rona", "me"]`) — both normalize to the same token set; any other type is an error |
 | `importance`    | no       | carried, not scored                                                    |
 | `actionability` | no       | carried, not scored                                                    |
 | `source_quote`  | no       | verbatim text from the source email (verified for preds)               |
@@ -59,7 +59,8 @@ Email text for the grounding check: the first non-empty `email_text` per
   first, ties broken by gold then pred `child_id` — no randomness anywhere.
   Title similarity is `max(SequenceMatcher ratio, token Jaccard)` over
   normalized titles (shared normalizer: NFKC, bidi marks, nikud, geresh/
-  gershayim, whitespace, case), so it behaves identically for Hebrew and
+  gershayim, maqaf and en/em dashes unified to '-', whitespace, case), so it
+  behaves identically for Hebrew and
   English. Pairs below `--title-threshold` (default 0.3) never match. Greedy
   is used instead of Hungarian because per-email candidate sets are tiny and
   it avoids a scipy dependency.
@@ -72,6 +73,11 @@ Printed as `key: value` lines (fractions rounded to 4 decimals, `n/a` when a
 rate has no denominator):
 
 - `precision` / `recall` / `f1` overall (micro) and `type_<t>_*` per type.
+- Field types are validated: an `applies_to` that is neither a string nor a
+  list of strings, a non-boolean `all_day`/`date_conflict`, a non-integer
+  `importance`, or a non-string `relation`/`notes`/`email_text`/
+  `source_quote`/`actionability` raises an error instead of being silently
+  coerced (a silent fallback to `unknown` would make every row match).
 - `date_exact_match_rate`: matched pairs whose compared date is exactly equal
   (same day, same all_day-ness, same minute for timed rows) — matching
   tolerates ±1h, this metric reports how often the prediction was exact.
@@ -81,7 +87,8 @@ rate has no denominator):
   that always says `unknown` cannot score perfectly.
 - `grounding_rate`: pred children whose `source_quote` verifies as a substring
   of the email text after normalization (NFKC, bidi/invisible marks stripped,
-  nikud stripped, geresh/gershayim unified, whitespace collapsed, casefolded
+  nikud stripped, geresh/gershayim unified, maqaf and en/em dashes unified
+  to '-', whitespace collapsed, casefolded
   — one shared implementation in `src/brain/services/textnorm.py`). Preds
   whose email text is unknown are counted in `grounding_unverifiable` and
   excluded from the denominator (surfaced, never silently dropped). An empty

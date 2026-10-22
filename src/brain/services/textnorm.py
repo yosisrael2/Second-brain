@@ -11,11 +11,14 @@ them, in order:
    HTML and copy/paste sprinkle into RTL text (LRM/RLM, embeddings/overrides/
    isolates, ZWSP/ZWNJ/ZWJ, soft hyphen, BOM).
 3. Strip nikud — Hebrew points and cantillation (U+0591–U+05BD, U+05BF,
-   U+05C1, U+05C2, U+05C4, U+05C5, U+05C7). Maqaf/paseq/sof pasuq stay: they
-   are punctuation, not vocalization.
-4. Unify geresh/gershayim so quote style differences never matter:
-   ׳ (U+05F3), ’ (U+2019) -> ' ; ״ (U+05F4), “ (U+201C), ” (U+201D) -> ".
-5. Collapse all whitespace runs (email HTML line wrapping) to single spaces,
+   U+05C1, U+05C2, U+05C4, U+05C5, U+05C7). Paseq/sof pasuq stay: they are
+   punctuation, not vocalization.
+4. Unify quote characters so style differences never matter: ׳ (U+05F3),
+   ‘ (U+2018), ’ (U+2019) -> ' ; ״ (U+05F4), “ (U+201C), ” (U+201D) -> ".
+5. Unify dash-like separators: Hebrew maqaf ־ (U+05BE), en dash – (U+2013),
+   em dash — (U+2014) -> '-', so 'ה-ו' (hyphen) matches 'ה־ו' (maqaf) across
+   email vs WhatsApp wording.
+6. Collapse all whitespace runs (email HTML line wrapping) to single spaces,
    strip, and casefold.
 
 ``quote_in_source`` is the canonical grounding check used by both callers:
@@ -55,23 +58,17 @@ _MARKS = (
 # Nikud: Hebrew points + cantillation. NOT maqaf/paseq/sof pasuq (punctuation).
 _NIKUD_RE = re.compile(r"[\u0591-\u05bd\u05bf\u05c1\u05c2\u05c4\u05c5\u05c7]")
 
-# Geresh/gershayim look-alikes -> ASCII quote characters.
-_QUOTE_MAP = {
-    "\u05f3": "'",  # hebrew punctuation geresh
-    "\u2019": "'",  # right single quotation mark
-    "\u05f4": '"',  # hebrew punctuation gershayim
-    "\u201c": '"',  # left double quotation mark
-    "\u201d": '"',  # right double quotation mark
-}
-
-
-# Geresh/gershayim look-alikes -> ASCII quote characters.
-_QUOTE_MAP = {
-    "\u05f3": "'",  # ׳ -> '
-    "\u2019": "'",  # ’ -> '
-    "\u05f4": '"',  # ״ -> "
-    "\u201c": '"',  # “ -> "
-    "\u201d": '"',  # ” -> "
+# Quote/dash look-alikes -> ASCII characters.
+_PUNCT_MAP = {
+    "\u05f3": "'",  # ׳ hebrew geresh -> '
+    "\u2018": "'",  # ‘ left single quotation mark -> '
+    "\u2019": "'",  # ’ right single quotation mark -> '
+    "\u05f4": '"',  # ״ hebrew gershayim -> "
+    "\u201c": '"',  # “ left double quotation mark -> "
+    "\u201d": '"',  # ” right double quotation mark -> "
+    "\u05be": "-",  # ־ hebrew maqaf -> -
+    "\u2013": "-",  # – en dash -> -
+    "\u2014": "-",  # — em dash -> -
 }
 
 
@@ -81,7 +78,7 @@ def normalize(text: str) -> str:
     for mark in _MARKS:
         text = text.replace(mark, "")
     text = _NIKUD_RE.sub("", text)
-    for src, dst in _QUOTE_MAP.items():
+    for src, dst in _PUNCT_MAP.items():
         text = text.replace(src, dst)
     return " ".join(text.split()).casefold()
 

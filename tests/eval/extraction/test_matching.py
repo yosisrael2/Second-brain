@@ -68,6 +68,39 @@ def test_unknown_applies_to_is_a_wildcard_but_scored_wrong():
     assert "applies_to_pred_unknown: 0" in out
 
 
+def test_applies_to_json_list_from_gold_schema():
+    # worker_3's schema uses a JSON LIST for applies_to, e.g. ["Rona"]
+    out = agg([row(applies_to=["Rona"])], [row(child_id="p1", applies_to="Itamar")])
+    assert "matched: 0" in out
+    out = agg(
+        [row(applies_to=["Rona", "me"])],
+        [row(child_id="p1", applies_to="me, rona")],
+    )
+    assert "matched: 1" in out
+    assert "applies_to_accuracy: 1.0" in out
+
+
+def test_unexpected_field_types_raise_not_coerced():
+    with pytest.raises(EvalError, match="applies_to"):
+        evaluate([row(applies_to=5)], [])
+    with pytest.raises(EvalError, match="relation"):
+        evaluate([row(relation=5)], [])
+    with pytest.raises(EvalError, match="importance"):
+        evaluate([row(importance=3.5)], [])
+    with pytest.raises(EvalError, match="all_day"):
+        evaluate([row(all_day=1)], [])
+    with pytest.raises(EvalError, match="notes"):
+        evaluate([row(notes=["x"])], [])
+    with pytest.raises(EvalError, match="email_text"):
+        evaluate([row(email_text=7)], [])
+    with pytest.raises(EvalError, match="source_quote"):
+        evaluate([], [row(child_id="p1", source_quote=9)])
+    with pytest.raises(EvalError, match="actionability"):
+        evaluate([row(actionability=3)], [])
+    with pytest.raises(EvalError, match="date_conflict"):
+        evaluate([row(date_conflict=1)], [])
+
+
 def test_pred_unknown_against_known_gold_counts_wrong_and_reported():
     out = agg([row()], [row(child_id="p1", applies_to="unknown")])
     assert "matched: 1" in out

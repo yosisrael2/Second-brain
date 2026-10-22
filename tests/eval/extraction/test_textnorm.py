@@ -13,6 +13,17 @@ def test_gershayim_variants_fold_together():
     assert normalize("סת”ם") == normalize('סת"ם')
 
 
+def test_left_single_quote_folds_to_apostrophe():
+    assert normalize("‘ה’") == normalize("'ה'")
+
+
+def test_maqaf_and_dashes_fold_to_hyphen():
+    assert normalize("ה־ו") == normalize("ה-ו")  # maqaf U+05BE vs hyphen
+    assert normalize("a–b") == "a-b"  # en dash
+    assert normalize("a—b") == "a-b"  # em dash
+    assert quote_in_source("ה-ו", "בנות ה־ו")  # email vs WhatsApp separator
+
+
 def test_nikud_stripped():
     assert normalize("שַׁבָּת") == normalize("שבת")
     assert normalize("בְּקִצוּר") == "בקצור"
