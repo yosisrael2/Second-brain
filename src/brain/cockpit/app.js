@@ -177,7 +177,7 @@ function renderFlow() {
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
   svg.replaceChildren(
     svgEl("defs", {}, ...arrowMarkers()),
-    ...flowEdges(flow, pos, phone),
+    ...flowEdges(flow, pos, phone, width, height),
     ...(phone ? [] : flowDecorations(flow, pos, width)),
     ...flowNodes(flow, pos),
   );
@@ -337,7 +337,7 @@ function bezierMid(a, c1, c2, b) {
   };
 }
 
-function flowEdges(flow, pos, phone) {
+function flowEdges(flow, pos, phone, width, height) {
   const els = [];
   for (const edge of flow.edges) {
     const geo = edgeGeometry(edge, pos, phone);
@@ -354,7 +354,10 @@ function flowEdges(flow, pos, phone) {
       (edge.last_error ? ` · last error: ${jsonPreview(edge.last_error, 120)}` : "");
     path.append(title);
     els.push(path);
-    const label = svgEl("text", { class: "flow-elabel", x: geo.mid.x, y: geo.mid.y - 4 });
+    // Clamp labels inside the canvas (centered) so nothing overflows the page.
+    const lx = Math.max(34, Math.min(geo.mid.x, (width || 390) - 34));
+    const ly = Math.max(16, Math.min(geo.mid.y - 4, (height || 800) - 8));
+    const label = svgEl("text", { class: "flow-elabel", x: lx, y: ly, "text-anchor": "middle" });
     label.textContent = edgeLabel(edge);
     els.push(label);
   }
@@ -654,9 +657,19 @@ function init() {
   if (params.get("hl")) setTraceHighlight(params.get("hl"));
   if (params.get("measure")) {
     const report = () => {
-      const w = document.documentElement.scrollWidth;
-      document.title = `w=${w}`;
-      console.info(`scrollWidth=${w}`);
+      const doc = document.documentElement;
+      const offenders = [...document.querySelectorAll("body *")]
+        .map((elm) => ({ elm, r: Math.round(elm.getBoundingClientRect().right), sw: elm.scrollWidth }))
+        .filter((entry) => entry.r > doc.clientWidth + 1 || entry.sw > doc.clientWidth + 1)
+        .sort((a, b) => Math.max(b.r, b.sw) - Math.max(a.r, a.sw))
+        .slice(0, 6)
+        .map(({ elm, r, sw }) => `${elm.tagName}.${String(elm.className.baseVal ?? elm.className).split(" ")[0]} r=${r} sw=${sw}`);
+      const widest = [...document.querySelectorAll("body *")]
+        .map((elm) => ({ tag: `${elm.tagName}.${String(elm.className.baseVal ?? elm.className).split(" ")[0]}`, r: Math.round(elm.getBoundingClientRect().right), sw: elm.scrollWidth }))
+        .sort((a, b) => Math.max(b.r, b.sw) - Math.max(a.r, a.sw))
+        .slice(0, 3);
+      document.title = `w=${doc.scrollWidth} iw=${window.innerWidth} cw=${doc.clientWidth} top:${widest.map((x) => `${x.tag} r=${x.r} sw=${x.sw}`).join(" | ")}`;
+      console.info(`scrollWidth=${doc.scrollWidth} offenders: ${offenders.join(", ")}`);
     };
     setTimeout(report, 300);
     setTimeout(report, 3000);
