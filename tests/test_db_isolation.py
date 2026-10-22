@@ -83,6 +83,7 @@ def test_full_suite_leaves_dev_db_rows_untouched() -> None:
             timeout=300,
             cwd=str(REPO_ROOT),
             env={
+                **os.environ,  # forward DATABASE_URL: each worker owns a *_test DB
                 "PATH": "/usr/bin:/bin:/usr/sbin:/usr/local/bin",
                 "HOME": str(Path.home()),
             },
@@ -105,7 +106,7 @@ def test_full_suite_leaves_dev_db_rows_untouched() -> None:
 
 def test_suite_settings_point_at_a_test_database() -> None:
     """Whatever the ambient environment says, the suite resolves to *_test."""
-    assert get_settings().database_url.endswith("/brain_test")
+    assert get_settings().database_url.rsplit("/", 1)[-1].endswith("_test")
 
 
 def test_suite_never_targets_the_default_qdrant_collection() -> None:
