@@ -305,6 +305,8 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `DATABASE_URL` | `postgresql+psycopg://brain:brain@localhost:5432/brain` | Postgres (SQLAlchemy URL) |
 | `QDRANT_URL`   | `http://localhost:6333`                                | Qdrant API endpoint |
 | `LLM_PROVIDER` | `claude_sdk`                                           | `claude_sdk` (local login) or `anthropic` |
+| `CLAUDE_SDK_MODEL` | unset (login default)                              | model for `/ask` on `claude_sdk`, e.g. `claude-haiku-5-5` (faster) / `claude-sonnet-5-5` (quality) |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5`                                 | model for `/ask` on `anthropic` |
 | `EMBEDDER_PROVIDER` | `fastembed`                                       | `fastembed` (local) or `openai` |
 
 All settings live in `Settings` (`src/brain/config.py`); AI-layer variables

@@ -9,6 +9,7 @@ and we never read, copy, or log credentials.
 from __future__ import annotations
 
 import asyncio
+import logging
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
@@ -17,10 +18,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from brain.config import DEFAULT_SDK_TIMEOUT_S
 
-from .ask import LLMError
+from .ask import Completion, LLMError
 
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions
+
+logger = logging.getLogger(__name__)
 
 # The full ask prompt (question, sources, citation rules) rides in the system
 # prompt; the user turn only nudges the model to answer it.
@@ -77,13 +80,14 @@ class ClaudeSdkLLMClient:
         """Remove the scratch dir (idempotent; missing dirs are ignored)."""
         shutil.rmtree(self._scratch_dir, ignore_errors=True)
 
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the model's completion for ``prompt``.
 
         Uses ``asyncio.run`` internally: do NOT call from inside a running
         event loop (call from a worker thread instead — FastAPI sync routes
         already run in one).
         """
+        logger.info("llm: provider=claude_sdk model=%s", self._model or "cli-default")
         try:
             return asyncio.run(
                 asyncio.wait_for(self._collect_text(prompt), timeout=self._timeout_s)
@@ -95,7 +99,7 @@ class ClaudeSdkLLMClient:
         except _sdk_error_types() as exc:
             raise LLMError(f"claude sdk failed: {type(exc).__name__}: {exc}") from exc
 
-    async def _collect_text(self, prompt: str) -> str:
+    async def _collect_text(self, prompt: str) -> Completion:
         from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock
 
         options = ClaudeAgentOptions(
@@ -109,15 +113,20 @@ class ClaudeSdkLLMClient:
             cwd=str(self._scratch_dir),
         )
         texts: list[str] = []
+        answered_model: str | None = None
         async for message in self._query_fn(prompt=_USER_TURN, options=options):
             if isinstance(message, AssistantMessage):
                 texts.extend(
                     block.text for block in message.content if isinstance(block, TextBlock)
                 )
+                if message.model:
+                    answered_model = message.model
         text = "".join(texts).strip()
         if not text:
             raise LLMError("claude sdk returned no text")
-        return text
+        # Per-call data, never stored on the client: the shared app-lifetime
+        # singleton must not let concurrent requests observe each other's model.
+        return Completion(text, model=answered_model or self._model)
 
 
 def _sdk_query(*, prompt: str, options: ClaudeAgentOptions | None) -> AsyncIterator[Any]:
