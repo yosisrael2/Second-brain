@@ -122,6 +122,20 @@ def clean_items_fixture(database: None) -> Iterator[None]:
         conn.execute(text("DELETE FROM memory_items"))
 
 
+@pytest.fixture(name="clean_memory")
+def clean_memory_fixture(database: None) -> Iterator[None]:
+    """Delete all memory-layer rows after the test (facts first: FK order).
+
+    Same guard as clean_items: only ever runs against a ``*_test`` database.
+    """
+    yield
+    assert_test_database(str(engine.url))
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM memory_facts"))
+        conn.execute(text("DELETE FROM entity_aliases"))
+        conn.execute(text("DELETE FROM entities"))
+
+
 def _run_migrations() -> None:
     """Apply Alembic migrations up to head against the configured database.
 

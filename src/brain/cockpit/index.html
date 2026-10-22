@@ -33,6 +33,7 @@
   <button class="tab" data-tab="events" role="tab">Events</button>
   <button class="tab" data-tab="stats" role="tab">Stats</button>
   <button class="tab" data-tab="debug" role="tab">Debug</button>
+  <button class="tab" data-tab="memory" role="tab">Memory</button>
 </nav>
 
 <main>
@@ -116,6 +117,47 @@
     </div>
   </section>
 </main>
+
+<!-- MEMORY (own panel, outside the debug grid) -->
+<section id="tab-memory" class="tab-panel">
+  <div class="memory-controls">
+    <label>show
+      <select id="memory-status">
+        <option value="confirmed">confirmed</option>
+        <option value="proposed">proposed inbox</option>
+      </select>
+    </label>
+    <input id="memory-q" type="text" placeholder="search name or alias…">
+    <button id="memory-add-entity-btn" class="btn">＋ Entity</button>
+    <span id="memory-count" class="pageinfo"></span>
+  </div>
+  <div id="memory-add-entity" class="memory-add-entity" hidden>
+    <label>kind
+      <select id="memory-entity-kind">
+        <option value="person">person</option>
+        <option value="group">group</option>
+        <option value="place">place</option>
+        <option value="org">org</option>
+      </select>
+    </label>
+    <label>name
+      <input id="memory-entity-name" type="text" dir="auto" placeholder="e.g. Rona / ה' ספיר">
+    </label>
+    <label>aliases (comma-separated)
+      <input id="memory-entity-aliases" type="text" dir="auto" placeholder="רונה, Rona C.">
+    </label>
+    <button id="memory-entity-save" class="btn">Save</button>
+    <button id="memory-entity-cancel" class="btn btn-ghost">Cancel</button>
+  </div>
+  <div id="memory-list"></div>
+  <aside id="memory-drawer" class="memory-drawer" hidden aria-label="fact history">
+    <div class="drawer-head">
+      <h3>Fact history</h3>
+      <button id="memory-drawer-close" class="btn btn-ghost">✕ Close</button>
+    </div>
+    <div id="memory-drawer-body" class="drawer-body"></div>
+  </aside>
+</section>
 
 <div id="toast" class="toast" hidden></div>
 

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from brain.db.enums import (
     CONFIDENCE_MAX,
@@ -121,3 +121,97 @@ class CaptureResponse(BaseModel):
     kind: str
     extracted: dict[str, Any]
     items: list[ItemRead]
+
+
+# --- Memory layer (entities + versioned facts) --------------------------------
+
+ENTITY_NAME_MAX_LENGTH = 200
+ENTITY_ALIAS_MAX_LENGTH = 200
+FACT_PREDICATE_MAX_LENGTH = 64
+FACT_VALUE_MAX_LENGTH = 2_000
+
+
+class FactRead(BaseModel):
+    """One version of a memory fact (versions chain via ``supersedes_id``)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    subject_id: uuid.UUID
+    predicate: str
+    object_id: uuid.UUID | None = None
+    value: str | None = None
+    valid_from: datetime
+    valid_to: datetime | None = None
+    status: str
+    supersedes_id: uuid.UUID | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class EntityRead(BaseModel):
+    """An entity with its aliases and (current-version) facts."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: str
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    facts: list[FactRead] = Field(default_factory=list)
+    created_at: datetime
+
+
+class MemoryOverview(BaseModel):
+    """Response for GET /memory: entities with their facts, grouped."""
+
+    entities: list[EntityRead]
+
+
+class EntityCreate(BaseModel):
+    """Payload for POST /memory/entities."""
+
+    kind: Literal["person", "group", "place", "org"]
+    name: str = Field(min_length=1, max_length=ENTITY_NAME_MAX_LENGTH)
+    aliases: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+
+    @field_validator("aliases")
+    @classmethod
+    def _aliases_not_blank(cls, value: list[str]) -> list[str]:
+        for alias in value:
+            if not alias.strip():
+                raise ValueError("aliases must not be blank")
+        return value
+
+
+class EntityPatch(BaseModel):
+    """Partial payload for PATCH /memory/entities/{id}."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=ENTITY_NAME_MAX_LENGTH)
+
+
+class FactCreate(BaseModel):
+    """Payload for POST /memory/facts."""
+
+    subject_id: uuid.UUID
+    predicate: str = Field(min_length=1, max_length=FACT_PREDICATE_MAX_LENGTH)
+    object_id: uuid.UUID | None = None
+    value: str | None = Field(default=None, max_length=FACT_VALUE_MAX_LENGTH)
+    valid_from: datetime | None = None
+
+    @model_validator(mode="after")
+    def _object_or_value_required(self) -> "FactCreate":
+        if self.object_id is None and (self.value is None or not self.value.strip()):
+            raise ValueError("fact needs an object_id or a non-empty value")
+        return self
+
+
+class FactPatch(BaseModel):
+    """Partial payload for PATCH /memory/facts/{id} (= new version)."""
+
+    predicate: str | None = Field(default=None, min_length=1, max_length=FACT_PREDICATE_MAX_LENGTH)
+    object_id: uuid.UUID | None = None
+    value: str | None = Field(default=None, max_length=FACT_VALUE_MAX_LENGTH)
