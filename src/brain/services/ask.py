@@ -116,13 +116,18 @@ class AskService:
         production passes nothing (real clock), tests pin it.
         """
         with ops.span("ask", "search", edge="ask->search") as span:
-            # rerank sees the whole pool; only the top_k best reach the prompt
+            # rerank sees the whole pool; only the top_k best reach the prompt.
+            # No kid named -> the call is EXACTLY the pre-0d one (byte-identical
+            # pool; also keeps third-party search fakes without the kwarg working).
             kid_items = self._kid_recall_items(question)
-            pool = self._search.search(
-                question,
-                limit=self._recall_pool,
-                extra_items=kid_items,
-            )
+            if kid_items:
+                pool = self._search.search(
+                    question,
+                    limit=self._recall_pool,
+                    extra_items=kid_items,
+                )
+            else:
+                pool = self._search.search(question, limit=self._recall_pool)
             hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
             span.detail = {
