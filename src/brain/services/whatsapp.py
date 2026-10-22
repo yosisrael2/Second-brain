@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from brain import ops
@@ -429,7 +430,7 @@ class WhatsAppPoller:
         created = 0
         updated = 0
         cursor = state.cursor_utc
-        open_id: Any = state.open_item_id
+        open_id: UUID | None = state.open_item_id
         set_open = False
         if fresh:
             cursor = fresh[-1].timestamp_utc
