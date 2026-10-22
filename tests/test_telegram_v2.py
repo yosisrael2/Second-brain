@@ -817,11 +817,13 @@ class TestHtmlSafety:
 
         reply = core.route("What?", 111)
 
-        assert "<b>" not in reply.text
+        # the card's own header uses <b>, but the ANSWER body must be escaped
+        assert "<b>bold</b>" not in reply.text
         assert "<fake tag>" not in reply.text
         assert "&lt;b&gt;bold&lt;/b&gt;" in reply.text
         assert "&amp;" in reply.text
         assert "&lt;fake tag&gt;" in reply.text
+        assert "&lt;&gt;" in reply.text
         assert "עברית עובדת" in reply.text
 
     def test_send_resends_plain_when_telegram_rejects_entities(self, monkeypatch):
