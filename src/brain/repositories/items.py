@@ -129,6 +129,10 @@ class ItemsRepository:
         """Commit the current transaction."""
         self._db.commit()
 
+    def rollback(self) -> None:
+        """Discard the current transaction (used by batch pollers on failure)."""
+        self._db.rollback()
+
     def refresh(self, item: MemoryItem) -> None:
         """Reload server-generated fields (e.g. updated_at) from the DB."""
         self._db.refresh(item)
