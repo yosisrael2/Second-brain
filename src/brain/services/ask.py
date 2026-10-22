@@ -219,9 +219,8 @@ class AskService:
         ops.record_event(
             "ask", "kid_recall", ok=True,
             detail={
-                "needles": needles,
+                "needles": len(needles),
                 "fetched": len(items),
-                "ids": [str(item.id) for item in items],
             },
         )
         return items

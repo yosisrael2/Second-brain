@@ -5,6 +5,7 @@ AI clients are app-lifetime singletons (cached factories) built from
 are request-scoped and assembled here via ``Depends``.
 """
 
+from collections.abc import Callable
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
@@ -161,13 +162,25 @@ def get_search_service(
     return SearchService(repo, embedder, store, reranker)
 
 
-def get_ask_service(
-    search: SearchService = Depends(get_search_service),
-    llm: LLMClient = Depends(get_llm_client),
-    memory: MemoryService = Depends(get_memory_service),
-    repo: ItemsRepository = Depends(get_items_repository),
+def build_ask_service(
+    search: SearchService,
+    llm: LLMClient,
+    memory: MemoryService | None = None,
+    items_repo: ItemsRepository | None = None,
+    memory_block: Callable[[], str] | None = None,
 ) -> AskService:
-    """Provide an AskService wired to search, the shared LLM client and memory."""
+    """Build the AskService from settings — THE single builder.
+
+    Both the API (``get_ask_service``) and the Telegram bot must construct
+    their AskService here so they cannot drift: same timezone (settings),
+    same retrieval sizes (ask_top_k / ask_recall_pool). A bare
+    ``AskService(search, llm)`` silently runs on UTC with default sizes.
+    ``memory_block`` matches AskService: a callable returning the confirmed
+    memory block ('' when empty) or None — NOT a string (AskService calls it).
+    Passing ``memory`` + ``items_repo`` enables the PR 0d kid-recall leg
+    (capped by ``ask_kid_recall_limit``); omitting either keeps /ask
+    byte-identical to the pre-0d pipeline.
+    """
     settings = get_settings()
     return AskService(
         search,
@@ -175,8 +188,24 @@ def get_ask_service(
         top_k=settings.ask_top_k,
         recall_pool=settings.ask_recall_pool,
         tz=ZoneInfo(settings.timezone),
-        memory_block=memory.compact_block,
+        memory_block=memory_block,
+        memory=memory,
+        items_repo=items_repo,
+        kid_recall_limit=settings.ask_kid_recall_limit,
+    )
+
+
+def get_ask_service(
+    search: SearchService = Depends(get_search_service),
+    llm: LLMClient = Depends(get_llm_client),
+    memory: MemoryService = Depends(get_memory_service),
+    repo: ItemsRepository = Depends(get_items_repository),
+) -> AskService:
+    """Provide an AskService wired to search, the shared LLM client and memory."""
+    return build_ask_service(
+        search,
+        llm,
         memory=memory,
         items_repo=repo,
-        kid_recall_limit=settings.ask_kid_recall_limit,
+        memory_block=memory.compact_block,
     )
