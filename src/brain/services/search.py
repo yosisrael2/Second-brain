@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -117,8 +118,13 @@ class SearchService:
                         {"id": key, "text": item.raw_text, "vector_score": None}
                     )
         with ops.span("search", "rerank", edge="search->rerank") as span:
+            pre_ids = [c["id"] for c in candidates]
+            span.detail = {
+                "extras_in": len(extra_items),
+                "pre_rerank_size": len(pre_ids),
+                "pre_rerank_hash": hashlib.sha1(",".join(pre_ids).encode()).hexdigest()[:12],
+            }
             ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
-            span.detail = {"pre_rerank_ids": [c["id"] for c in candidates]}
         fused = self._fuse_with_keywords(query, ranked, limit=limit + offset)
         return self._load_items(fused[offset : offset + limit])
 

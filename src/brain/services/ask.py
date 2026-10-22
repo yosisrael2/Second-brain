@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -123,10 +124,12 @@ class AskService:
                 extra_items=kid_items,
             )
             hits = pool[: self._top_k]
+            pool_ids = [str(hit.item.id) for hit in pool]
             span.detail = {
                 "kid_leg_fired": bool(kid_items),
-                "kid_leg_ids": [str(item.id) for item in kid_items],
-                "pool_ids": [str(hit.item.id) for hit in pool],
+                "kid_leg_count": len(kid_items),
+                "pool_size": len(pool_ids),
+                "pool_hash": hashlib.sha1(",".join(pool_ids).encode()).hexdigest()[:12],
             }
         context_hits = self._temporal_hits(question, now) + hits
         context_hits = _unique_by_text(self._unique_by_id(context_hits))
