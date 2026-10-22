@@ -240,9 +240,10 @@ class DupPointStore:
         pass
 
     def search(self, vector: list[float], k: int) -> list[dict]:
+        point = {"id": self._item_id, "payload": {"id": self._item_id, "text": self._text}}
         return [
-            {"id": self._item_id, "score": 0.9, "payload": {"id": self._item_id, "text": self._text}},
-            {"id": self._item_id, "score": 0.8, "payload": {"id": self._item_id, "text": self._text}},
+            {**point, "score": 0.9},
+            {**point, "score": 0.8},
         ][:k]
 
     def close(self) -> None:

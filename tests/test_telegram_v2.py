@@ -20,6 +20,7 @@ passes once the feature lands):
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -44,43 +45,64 @@ class TestCaptureKeyboards:
         reply = core.route("Read the RAG paper and take notes", 111)
 
         labels = [label for row in reply.keyboard for label, _ in row]
-        assert labels == ["File", "Type", "Delete", "Undo"]
-        assert reply.keyboard[1] == [("Type", f"t:{reply.keyboard[1][0][1].split(':')[1]}")]
+        # one row; the stub classifier files at 0.95 confidence so File is hidden
+        assert labels == ["🏷 Type", "🗑 Delete", "↩️ Undo"]
+        assert len(reply.keyboard) == 1
+
+    def test_capture_buttons_show_file_only_for_unfiled_items(self):
+        core, _ = make_core()
+
+        class Inbox:
+            id = uuid.uuid4()
+            status = "inbox"
+
+        class Filed:
+            id = uuid.uuid4()
+            status = "filed"
+
+        inbox_row = core._capture_buttons([Inbox()])[0]
+        filed_row = core._capture_buttons([Filed()])[0]
+        assert [label for label, _ in inbox_row] == ["✅ File", "🏷 Type", "🗑 Delete", "↩️ Undo"]
+        assert [label for label, _ in filed_row] == ["🏷 Type", "🗑 Delete", "↩️ Undo"]
 
     def test_undo_callback_deletes_the_items_created_by_that_message(self, monkeypatch):
         core, repo = make_core()
         reply = core.route("hello note one", 111)
         assert len(repo.items) == 1
-        token = reply.keyboard[3][0][1].split(":", 1)[1]  # "u:<token>"
+        token = reply.keyboard[0][1][1].split(":", 1)[1]  # second button '🗑 Delete'
 
         undo = core.handle_callback(f"u:{token}")
 
         assert repo.items == {}
-        assert "Undo" in undo.text or "deleted" in undo.text.lower()
+        assert undo.text.startswith("↩️ Undone")
 
     def test_delete_and_file_callbacks(self, monkeypatch):
         core, repo = make_core()
         reply_one = core.route("hello note two", 111)
-        reply_other = core.route("hello note three", 111)
+        core.route("hello note three", 111)
 
-        d_token = reply_one.keyboard[2][0][1].split(":", 1)[1]
+        d_token = reply_one.keyboard[0][0][1].split(":", 1)[1]  # '🗑 Delete'
         core.handle_callback(f"d:{d_token}")
         assert len(repo.items) == 1  # note two deleted, note three remains
 
-        f_token = reply_other.keyboard[0][0][1].split(":", 1)[1]
-        core.handle_callback(f"f:{f_token}")
+        from brain.telegram_bot import Pending
+
+        token = core.registry.put(Pending(ids=(next(iter(repo.items)),)))
+        core.handle_callback(f"f:{token}")
         assert all(i.status == ItemStatus.FILED for i in repo.items.values())
 
     def test_type_submenu_then_apply(self, monkeypatch):
         core, repo = make_core()
         reply = core.route("hello note four", 111)
-        t_label, t_data = reply.keyboard[1][0]
+        _t_label, t_data = reply.keyboard[0][0]
         t_token = t_data.split(":", 1)[1]
 
         submenu = core.handle_callback(f"t:{t_token}")
         assert submenu.keyboard is not None
         type_labels = [label for row in submenu.keyboard for label, _ in row]
-        assert set(type_labels) == {"task", "decision", "note", "event", "reference", "idea"}
+        assert set(type_labels) == {
+            "✔️ Task", "⚖️ Decision", "📝 Note", "📅 Event", "🔗 Reference", "💡 Idea", "« Back",
+        }
 
         item_id = next(iter(repo.items))
         apply_data = f"ty:{t_token}:{ItemType.TASK.value}"
@@ -125,7 +147,7 @@ class TestWhatsAppChoice:
 
         joined = core.handle_callback(f"w1:{token}")
         assert len(repo.items) == 1
-        assert "1 item(s)" in joined.text
+        assert "✅ <b>Saved</b> · 💬 WhatsApp" in joined.text
 
     def test_save_separately_makes_one_item_per_message(self, monkeypatch):
         core, repo = make_core()
@@ -134,7 +156,7 @@ class TestWhatsAppChoice:
 
         split = core.handle_callback(f"wm:{token}")
         assert len(repo.items) == 2
-        assert "2 item(s)" in split.text
+        assert "· 2 items" in split.text
 
 
 def _choice_token(reply, label: str) -> str:
@@ -243,12 +265,16 @@ class _AdapterTG:
 
     def __init__(self, file_bytes: bytes = b""):
         self.sent: list[dict] = []
+        self.edits: list[dict] = []
         self.chat_actions: list[tuple] = []
         self.commands: list | None = None
         self._file_bytes = file_bytes
 
     async def send_message(self, chat_id=None, text=None, **kwargs):
         self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
+
+    async def edit_message_text(self, chat_id=None, message_id=None, text=None, **kwargs):
+        self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kwargs})
 
     async def send_chat_action(self, chat_id=None, action=None):
         self.chat_actions.append((chat_id, action))
@@ -290,6 +316,7 @@ class TestQuestionRouting:
         reply = core.route("What?", 111)
         open_buttons = [d for row in reply.keyboard for _l, d in row if d.startswith("o:")]
         assert len(open_buttons) == 1
+        assert reply.keyboard[0][0][0] == "📎 1"  # one row, numbered
 
         opened = core.handle_callback(open_buttons[0])
         assert "cited source" in opened.text
@@ -320,11 +347,11 @@ class TestRecentAndCommands:
         reply = core.route("/recent", 111)
         lines = reply.text.splitlines()
         assert lines[0] == "🕘 Last 10 item(s):"  # header says 10, not 12
-        bullets = [line for line in lines[1:] if line.startswith("•")]
-        assert len(bullets) == 10
-        # exactly the 10 newest (items 2..11), oldest two dropped; order comes
-        # from created_at DESC, which is deterministic across the 12 inserts
-        shown = sorted(line.split(" — ", 1)[1] for line in bullets)
+        rows = [line for line in lines[1:] if line[0].isdigit()]
+        assert len(rows) == 10
+        assert rows[0].startswith("1. 📝") and " · " in rows[0]  # numbered, emoji, date
+        # exactly the 10 newest (items 2..11); order comes from created_at DESC
+        shown = sorted(line.split(". 📝 ", 1)[1].split(" · ")[0] for line in rows)
         assert shown == sorted(f"item {i}" for i in range(2, 12))
 
     def test_bot_commands_registered_at_startup(self, monkeypatch):
@@ -446,19 +473,20 @@ class TestCardFormat:
         core, _ = make_core()
         reply = core.route(self.EMAIL, 111)
 
-        assert reply.text.startswith("📧")  # email emoji
-        assert "dana@example.com" in reply.text  # from
-        assert "Kickoff meeting" in reply.text  # subject
-        assert "2026" in reply.text  # when
-        assert "type:" in reply.text and "importance:" in reply.text
-        assert "actionability:" in reply.text and "status:" in reply.text
+        assert reply.text.startswith("✅ <b>Saved</b> · 📧 Email")
+        assert "From: Dana Cohen" in reply.text
+        assert "Subject: Kickoff meeting" in reply.text
+        assert "When:" in reply.text
+        assert "⭐" in reply.text  # importance as stars
+        assert "type:" not in reply.text and "importance:" not in reply.text
+        assert "status:" not in reply.text  # no debug labels
 
         cal = core.route(
             "TUESDAY, October 21, 2026\n9:00 – 12:30pm\nStandup\n"
             "Location: Haifa office",
             111,
         )
-        assert "Haifa office" in cal.text  # location (calendar kind)
+        assert "Where: Haifa office" in cal.text  # location (calendar kind)
 
     def test_html_is_escaped(self, monkeypatch):
         core, _ = make_core()
@@ -469,9 +497,9 @@ class TestCardFormat:
 
     def test_kind_emoji_per_kind(self, monkeypatch):
         core, _ = make_core()
-        assert core.route("[21/10/2026, 09:00:00] Dana: hi", 111).text.startswith("💬")
+        assert "💬 WhatsApp" in core.route("[21/10/2026, 09:00:00] Dana: hi", 111).text
         cal_reply = core.route("TUESDAY, October 21, 2026\n9:00 – 12:30pm\nStandup", 111)
-        assert cal_reply.text.startswith("📅")
+        assert "📅 Event" in cal_reply.text
 
 
 # --- 8. exit codes -------------------------------------------------------------
@@ -536,3 +564,244 @@ class _ExitTG:
 
     async def get_updates(self, offset=None, timeout=0):
         raise self._exc
+
+
+# --- 9. golden text: the exact rendered cards (A5 regression guard) -----------
+
+
+class TestGoldenFormat:
+    """Freeze the exact rendered text per message type (manager spec A2-A4)."""
+
+    EMAIL = (
+        "From: Dana Cohen <dana@example.com>\nSubject: Kickoff meeting\n"
+        "Date: 21/10/2026 09:00\n\nLet's meet <b>tomorrow</b>.\n"
+        "Location: Haifa office, floor 3"
+    )
+    PASTE = "[21/10/2026, 09:00:00] Dana: one\n[21/10/2026, 09:01:00] Rami: two"
+
+    def _sources(self, repo):
+        i1 = MemoryItem(
+            id=uuid.UUID(int=1),
+            raw_text="Renew the TLS certificate before Friday",
+            source="email",
+            occurred_at=datetime(2026, 10, 22, 9, 0, tzinfo=UTC),
+        )
+        i2 = MemoryItem(
+            id=uuid.UUID(int=2),
+            raw_text="WhatsApp pool party on Saturday, bring towels and snacks for everyone",
+            source="whatsapp",
+            created_at=datetime(2026, 10, 21, 9, 0, tzinfo=UTC),
+        )
+        repo.add(i1)
+        repo.add(i2)
+        return i1, i2
+
+    def test_ask_answer_with_sources_golden(self, monkeypatch):
+        core, repo = make_core()
+        i1, i2 = self._sources(repo)
+        from brain.services.search import SearchHit
+
+        result = AskResult(
+            answer=f"Renew it <b>before</b> Friday & audit keys. See [{i1.id}] and [{i2.id}].",
+            cited_ids=[str(i1.id), str(i2.id)],
+            sources=[SearchHit(item=i1, score=0.9), SearchHit(item=i2, score=0.8)],
+            model="claude-sonnet-5-5",
+        )
+        core = make_core(ask=_CannedAsk(result))[0]
+
+        reply = core.route("When is the TLS cert due?", 111)
+
+        assert reply.text == (
+            "🧠 <b>Answer</b>\n"
+            "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
+            "\n"
+            "📚 <b>Sources</b>\n"
+            "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
+            "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
+            "\n"
+            "<i>claude-sonnet-5-5 · "
+        ) or True  # seconds vary: assert prefix exactly, footer tail loosely
+        assert reply.text.startswith(
+            "🧠 <b>Answer</b>\n"
+            "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
+            "\n"
+            "📚 <b>Sources</b>\n"
+            "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
+            "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
+            "\n"
+            "<i>claude-sonnet-5-5 · "
+        )
+        labels = [label for row in reply.keyboard for label, _ in row]
+        assert labels == ["📎 1", "📎 2"]  # one row, matches source numbers
+
+    def test_ask_without_citations_is_plain(self, monkeypatch):
+        core, _ = make_core(
+            ask=_CannedAsk(AskResult(answer="I do not know.", cited_ids=[], model="m"))
+        )
+        reply = core.route("What?", 111)
+
+        assert reply.text.startswith("🧠 <b>Answer</b>\nI do not know.\n\n<i>m · ")
+        assert reply.text.endswith("</i>")
+        assert "📚" not in reply.text  # no sources block
+        assert reply.keyboard == []  # no buttons
+
+    def test_ask_escapes_html_and_fake_tags(self, monkeypatch):
+        answer = "Got it <script>alert(1)</script> & done."
+        core, _ = make_core(ask=_CannedAsk(AskResult(answer=answer, cited_ids=[], model=None)))
+        reply = core.route("What?", 111)
+
+        assert "<script>" not in reply.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in reply.text
+        assert "&amp;" in reply.text
+
+    def test_capture_email_card_golden(self, monkeypatch):
+        core, _ = make_core()
+        reply = core.route(TestCardFormat.EMAIL, 111)
+
+        lines = reply.text.splitlines()
+        assert lines[0] == "✅ <b>Saved</b> · 📧 Email"
+        assert lines[2] == "From: Dana Cohen &lt;dana@example.com&gt;"
+        assert lines[3] == "Subject: Kickoff meeting"
+        assert lines[4] == "When: 21/10/2026 09:00"
+        assert lines[5] == "⭐⭐⭐⭐ · ⏰ Now"
+        assert len(lines) == 6  # no status line: born filed, not needs_review
+        # one action row, File hidden (born filed at 0.95 confidence)
+        assert [label for row in reply.keyboard for label, _ in row] == [
+            "🏷 Type", "🗑 Delete", "↩️ Undo",
+        ]
+
+    def test_capture_whatsapp_card_golden(self, monkeypatch):
+        core, _ = make_core()
+        reply = core.route("[21/10/2026, 09:00:00] Dana: hi", 111)
+
+        assert reply.text.startswith(
+            "✅ <b>Saved</b> · 💬 WhatsApp\n[21/10/2026, 09:00:00] Dana: hi\n"
+        )
+
+    def test_needs_review_line_with_confidence(self, monkeypatch):
+        core, repo = make_core()
+        item = MemoryItem(
+            id=uuid.uuid4(),
+            raw_text="unsure thing",
+            source="note",
+            status=ItemStatus.NEEDS_REVIEW,
+            confidence=0.63,
+        )
+        repo.add(item)
+        from brain.telegram_bot import Pending
+
+        reply = core._card_reply(Pending(ids=(item.id,)))
+
+        assert "🔎 Needs review (63%)" in reply.text
+
+    def test_search_golden(self, monkeypatch):
+        from tests.test_telegram_bot import make_core_with_repo
+
+        from brain.services.search import SearchHit
+
+        core, repo = make_core_with_repo()
+        i1 = MemoryItem(
+            id=uuid.uuid4(), raw_text="Found the meeting notes", source="note",
+            created_at=datetime(2026, 10, 22, 9, 0, tzinfo=UTC),
+        )
+        i2 = MemoryItem(
+            id=uuid.uuid4(), raw_text="Meeting agenda draft", source="whatsapp",
+            occurred_at=datetime(2026, 10, 21, 9, 0, tzinfo=UTC),
+        )
+        repo.add(i2)
+        repo.add(i1)
+        from tests.test_telegram_bot import _core as _make_core
+
+        core = _make_core(repo=repo, search_hits=[
+            SearchHit(item=i1, score=0.9), SearchHit(item=i2, score=0.8),
+        ])[0]
+
+        reply = core.route("/search meeting", 111)
+
+        assert reply.text == (
+            "🔍 2 result(s) for 'meeting':\n"
+            "1. 📝 Found the meeting notes · 22 Oct\n"
+            "2. 💬 Meeting agenda draft · 21 Oct"
+        )
+        labels = [label for row in reply.keyboard for label, _ in row]
+        assert labels == ["📎 1", "📎 2"]
+
+    def test_review_card_golden(self, monkeypatch):
+        core, repo = make_core()
+        item = MemoryItem(
+            id=uuid.uuid4(),
+            raw_text="inbox candidate",
+            source="note",
+            status=ItemStatus.INBOX,
+            importance=2,
+        )
+        core, _ = make_core(inbox=[item])
+        reply = core.route("/review", 111)
+
+        assert reply.text == (
+            "📥 Inbox (1/1)\n"
+            "inbox candidate\n"
+            "⭐⭐ · —"
+        )
+        labels = [label for row in reply.keyboard for label, _ in row]
+        assert labels == ["✅ File", "🏷 Type", "🗑 Delete"]
+
+    def test_status_golden(self, monkeypatch):
+        from brain.ops import health as ops_health
+
+        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
+            "components": {
+                "api": {"status": "ok", "summary": "pid 7"},
+                "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
+                "telegram": {"status": "disabled", "summary": "no token"},
+            }
+        })
+        core, _ = make_core()
+        reply = core.route("/status", 111)
+
+        assert reply.text == (
+            "🟠 brain: degraded\n"
+            "🟢 api: pid 7\n"
+            "🟡 qdrant: vectors 6/6\n"
+            "⚪ telegram: no token"
+        )
+
+
+class TestEditInPlace:
+    """Callback actions EDIT the card message instead of sending a new one."""
+
+    @staticmethod
+    def _callback_update(core, data: str, message_id: int = 42):
+        from tests.test_telegram_bot import _fake_update
+
+        message = SimpleNamespace(chat_id=555, message_id=message_id, text=None)
+        return _fake_update(callback=SimpleNamespace(data=data, message=message))
+
+    def test_delete_edits_the_card_in_place(self, monkeypatch):
+        core, repo = make_core()
+        reply = core.route("hello edit one", 111)
+        token = reply.keyboard[0][0][1].split(":", 1)[1]  # first button: Delete
+        tg = _AdapterTG()
+
+        _handle(self._callback_update(core, f"d:{token}"), core, tg)
+
+        assert repo.items == {}
+        assert len(tg.edits) == 1 and not tg.sent
+        assert tg.edits[0]["message_id"] == 42
+        assert tg.edits[0]["text"].startswith("🗑 Deleted")
+
+    def test_open_sends_a_new_message(self, monkeypatch):
+        from tests.test_telegram_bot import make_core_with_repo
+
+        core, repo = make_core_with_repo()
+        cited = MemoryItem(id=uuid.uuid4(), raw_text="cited source", source="note")
+        repo.add(cited)
+        ask = _CannedAsk(AskResult(answer="42", cited_ids=[str(cited.id)], model="m"))
+        core = make_core_with_repo(repo=repo, ask=ask)[0]
+        reply = core.route("What?", 111)
+        data = reply.keyboard[0][0][1]
+        tg = _AdapterTG()
+
+        _handle(self._callback_update(core, data), core, tg)
+
+        assert not tg.edits and len(tg.sent) == 1  # Open is a new card, not an edit

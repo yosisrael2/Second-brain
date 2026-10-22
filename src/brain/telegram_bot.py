@@ -56,6 +56,7 @@ from zoneinfo import ZoneInfo
 
 from brain.config import Settings, unwrap_secret
 from brain.schemas import ItemUpdate
+from brain.services.ask import AskResult
 from brain.services.ingest import IngestService
 from brain.services.paste import parse as parse_paste
 
@@ -65,13 +66,43 @@ TELEGRAM_REPLY_MAX_CHARS = 4000  # Telegram messages cap at 4096
 PENDING_TTL_S = 600  # inline buttons / WhatsApp choice stay valid 10 minutes
 TYPING_REFRESH_S = 4
 
-KIND_EMOJI = {"email": "📧", "whatsapp": "💬", "calendar": "📅", "note": "📝"}
+KIND_EMOJI = {
+    "email": "📧",
+    "whatsapp": "💬",
+    "calendar": "📅",
+    "note": "📝",
+    "task": "✔️",
+    "idea": "💡",
+    "decision": "⚖️",
+    "reference": "🔗",
+}
+KIND_NAME = {
+    "email": "Email",
+    "whatsapp": "WhatsApp",
+    "calendar": "Event",
+    "event": "Event",
+    "note": "Note",
+    "task": "Task",
+    "idea": "Idea",
+    "decision": "Decision",
+    "reference": "Reference",
+}
+ACTIONABILITY_LABEL = {"now": "⏰ Now", "later": "🕐 Later"}
+TYPE_EMOJI = {
+    "task": "✔️",
+    "decision": "⚖️",
+    "note": "📝",
+    "event": "📅",
+    "reference": "🔗",
+    "idea": "💡",
+}
 
 # Compact callback-data prefixes (kept < 64 bytes; ids live in the registry).
 CB_UNDO = "u"  # u:<token>              -> delete the items created by that message
 CB_FILE = "f"  # f:<token>              -> status inbox -> filed
 CB_DELETE = "d"  # d:<token>            -> delete items
 CB_TYPE = "t"  # t:<token>              -> type submenu
+CB_BACK = "b"  # b:<token>              -> back from the type menu
 CB_TYPE_APPLY = "ty"  # ty:<token>:<type>
 CB_NEXT = "n"  # n:<offset>            -> next inbox card
 CB_OPEN = "o"  # o:<token>:<index>     -> show a cited item card
@@ -139,23 +170,38 @@ def record_event(
 def _ops_status_lines() -> list[str] | None:
     """Per-component status lines from the cockpit health service, or None.
 
-    Assumes ``brain.ops`` exposes ``component_status()`` returning either a
-    list of strings or ``(name, ok, summary)`` tuples — the cockpit contract
-    behind GET /ops/health. Anything else counts as "not installed".
+    Prefers ``run_health_checks`` (full ok/degraded/down/disabled ->
+    🟢🟡🔴⚪); falls back to the ``component_status()`` tuple contract, then
+    plain strings. Anything unusable counts as "not installed".
     """
     try:
         ops = importlib.import_module("brain.ops")
     except ImportError:
         return None
-    fn = getattr(ops, "component_status", None)
-    if fn is None:
-        return None
+    icon = {"ok": "🟢", "degraded": "🟡", "down": "🔴", "disabled": "⚪", "not probed": "⚪"}
     try:
+        try:
+            health_mod = importlib.import_module("brain.ops.health")
+        except ImportError:
+            health_mod = None
+        run = getattr(health_mod, "run_health_checks", None)
+        if run is not None:
+            health = run()
+            lines = [
+                f"{icon.get(entry.get('status'), '⚪')} {name}: "
+                f"{entry.get('summary') or entry.get('status') or '?'}"
+                for name, entry in health.get("components", {}).items()
+            ]
+            if lines:
+                return lines
+        fn = getattr(ops, "component_status", None)
+        if fn is None:
+            return None
         raw = fn()
     except Exception:  # noqa: BLE001  (a broken cockpit must not crash /status)
-        logger.debug("telegram: ops.component_status raised", exc_info=True)
+        logger.debug("telegram: cockpit status failed", exc_info=True)
         return None
-    lines: list[str] = []
+    lines = []
     for entry in raw or []:
         if isinstance(entry, str):
             lines.append(entry)
@@ -174,10 +220,13 @@ class Reply:
 
     ``keyboard`` rows are tuples of ``(label, callback_data)``; the adapter
     turns them into a PTB InlineKeyboardMarkup. Empty keyboard = plain text.
+    ``edit=True`` asks the adapter to EDIT the message a callback came from
+    (in-place card updates) instead of sending a new one.
     """
 
     text: str
     keyboard: list[list[tuple[str, str]]] | None = None
+    edit: bool = False
 
 
 @dataclass(frozen=True)
@@ -267,8 +316,28 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
-def _preview(text: str, limit: int = 80) -> str:
-    return _esc(" ".join(text.split())[:limit])
+def _one_line(text: str, limit: int) -> str:
+    """Collapse to one line, cut at ``limit`` with an ellipsis when cut."""
+    flat = " ".join(str(text).split())
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return _esc(flat)
+
+_SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _ref(n: int) -> str:
+    """Numbered citation ref: 1 -> ¹ (fallback [n] beyond the superscript set)."""
+    return str(n).translate(_SUPERSCRIPT) if 0 <= n <= 20 else f"[{n}]"
+
+
+def _stars(importance: Any) -> str:
+    """Importance as stars ('⭐⭐⭐'); empty string when unset."""
+    try:
+        n = int(importance) if importance is not None else 0
+    except (TypeError, ValueError):
+        return ""
+    return "⭐" * max(0, min(n, 5))
 
 
 class TelegramBot:
@@ -381,6 +450,7 @@ class TelegramBot:
                 parsed, extra_meta=extra_meta, occurred_at=occurred_at
             )
         token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
+        _ = token  # buttons are built by _capture_buttons; keep the registry warm
         record_event(
             "telegram",
             EVENT_CAPTURE,
@@ -392,13 +462,25 @@ class TelegramBot:
         )
         return Reply(
             text=self._capture_card(parsed, items),
-            keyboard=[
-                [("File", f"{CB_FILE}:{token}")],
-                [("Type", f"{CB_TYPE}:{token}")],
-                [("Delete", f"{CB_DELETE}:{token}")],
-                [("Undo", f"{CB_UNDO}:{token}")],
-            ],
+            keyboard=self._capture_buttons(items),
         )
+
+    def _capture_buttons(self, items: list[Any]) -> list[list[tuple[str, str]]]:
+        """One action row: [✅ File] [🏷 Type] [🗑 Delete] [↩️ Undo].
+
+        File is hidden when every captured item is already filed.
+        """
+        token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
+        filed = bool(items) and all(item.status == "filed" for item in items)
+        row: list[tuple[str, str]] = []
+        if not filed:
+            row.append(("✅ File", f"{CB_FILE}:{token}"))
+        row += [
+            ("🏷 Type", f"{CB_TYPE}:{token}"),
+            ("🗑 Delete", f"{CB_DELETE}:{token}"),
+            ("↩️ Undo", f"{CB_UNDO}:{token}"),
+        ]
+        return [row]
 
     def _message_count(self, parsed: Any) -> int:
         """Number of WhatsApp messages across the parsed chunks."""
@@ -409,43 +491,58 @@ class TelegramBot:
 
     # -- cards -------------------------------------------------------------------
 
+    def _card_header(self, items: list[Any], notice: str | None = None) -> str:
+        """'✅ Saved · 💬 WhatsApp [· 2 items]' (+ optional notice line)."""
+        header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
+        if len(items) > 1:
+            header += f" · {len(items)} items"
+        return f"{notice}\n{header}" if notice else header
+
     def _capture_card(self, parsed: Any, items: list[Any]) -> str:
-        emoji = KIND_EMOJI.get(parsed.kind, "📝")
-        lines = [f"{emoji} Captured {len(items)} item(s) ({parsed.kind})"]
-        for item in items:
-            lines.append(self._item_card(item, indent="• "))
-        return "\n".join(lines)
+        return self._card_header(items) + "\n" + "\n".join(self._item_card(item) for item in items)
+
+    def _kind_label(self, items: list[Any]) -> str:
+        source = getattr(items[0], "source", "note") if items else "note"
+        emoji = KIND_EMOJI.get(source, "📝")
+        return f"{emoji} {KIND_NAME.get(source, _esc(source))}"
 
     def _item_card(self, item: Any, indent: str = "") -> str:
-        """HTML card: kind emoji, extracted fields, classification, status."""
-        emoji = KIND_EMOJI.get(item.source, "📝")
-        lines = [
-            f"{indent}{emoji} <b>{_esc(item.source)}</b> {str(item.id)[:8]}",
-            f"{indent}    {_preview(item.raw_text, 200)}",
-        ]
+        """Compact HTML card: text preview, existing fields, rating, status."""
+        lines = [f"{indent}{_one_line(item.raw_text, 200)}"]
         meta = item.meta or {}
-        for label, key in (("From", "from"), ("Subject", "subject"), ("Location", "location")):
-            if meta.get(key):
-                lines.append(f"{indent}    {label}: {_esc(meta[key])}")
-        if meta.get("senders"):
-            lines.append(f"{indent}    From: {_esc(', '.join(meta['senders']))}")
-        if meta.get("sender"):
-            lines.append(f"{indent}    From: {_esc(meta['sender'])}")
+        fields: list[str] = []
+        who = meta.get("from") or meta.get("sender")
+        if not who and meta.get("senders"):
+            who = ", ".join(meta["senders"])
+        if who:
+            fields.append(f"From: {_one_line(who, 60)}")
+        if meta.get("subject"):
+            fields.append(f"Subject: {_one_line(meta['subject'], 60)}")
         when = self._when_of(item)
         if when:
-            lines.append(f"{indent}    When: {_esc(when)}")
-        lines.append(
-            f"{indent}    type: {_esc(item.type or '—')} · "
-            f"importance: {item.importance if item.importance is not None else '—'} · "
-            f"actionability: {_esc(item.actionability or '—')} · "
-            f"status: {_esc(item.status)}"
+            fields.append(f"When: {_esc(when)}")
+        if meta.get("location"):
+            fields.append(f"Where: {_one_line(meta['location'], 60)}")
+        lines += [f"{indent}{field}" for field in fields[:3]]
+        rating = " · ".join(
+            part
+            for part in (
+                _stars(item.importance),
+                ACTIONABILITY_LABEL.get(str(item.actionability or ""), "—"),
+            )
+            if part
         )
+        if rating:
+            lines.append(f"{indent}{rating}")
+        if item.status == "needs_review":
+            percent = int(round((item.confidence or 0) * 100))
+            lines.append(f"{indent}🔎 Needs review ({percent}%)")
         return "\n".join(lines)
 
     @staticmethod
     def _when_of(item: Any) -> str | None:
         if item.occurred_at is not None:
-            return item.occurred_at.strftime("%Y-%m-%d %H:%M %Z").strip()
+            return item.occurred_at.strftime("%a %d %b %H:%M").replace(" 0", " ")
         meta = item.meta or {}
         for key in ("start", "date"):
             if meta.get(key):
@@ -465,18 +562,21 @@ class TelegramBot:
             record_event("telegram", EVENT_SEARCH, ok=True, detail=detail)
             return Reply(f"🔍 No results for '{_esc(query)}'.")
         lines = [f"🔍 {len(hits)} result(s) for '{_esc(query)}':"]
-        for hit in hits:
-            score = f" ({hit.score:.2f})" if hit.score is not None else ""
-            lines.append(
-                f"• {str(hit.item.id)[:8]}{_esc(score)} — {_preview(hit.item.raw_text, 80)}"
-            )
+        for position, hit in enumerate(hits, start=1):
+            emoji = KIND_EMOJI.get(hit.item.source, "📝")
+            when = self._short_date(hit.item)
+            suffix = f" · {when}" if when else ""
+            lines.append(f"{position}. {emoji} {_one_line(hit.item.raw_text, 60)}{suffix}")
         record_event(
             "telegram",
             EVENT_SEARCH,
             ok=True,
             detail={"item_ids": [str(hit.item.id) for hit in hits], "chars": len(query)},
         )
-        return Reply(text="\n".join(lines))
+        return Reply(
+            text="\n".join(lines),
+            keyboard=self._open_buttons([str(hit.item.id) for hit in hits]),
+        )
 
     def ask(self, question: str) -> Reply:
         if not question:
@@ -484,6 +584,7 @@ class TelegramBot:
             return Reply("Usage: /ask <question>")
         from brain.ai.ask import LLMError  # noqa: PLC0415
 
+        started = time.monotonic()
         try:
             with self._services_factory() as services:
                 result = services.ask.ask(question)
@@ -495,18 +596,49 @@ class TelegramBot:
                 detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
             )
             return Reply("⚠️ LLM unavailable; try again later.")
+        elapsed = time.monotonic() - started
         record_event(
             "telegram",
             EVENT_ASK,
             ok=True,
             detail={"item_ids": list(result.cited_ids), "chars": len(result.answer)},
         )
-        text = result.answer
+        return self._ask_card(result, elapsed)
+
+    def _ask_card(self, result: AskResult, elapsed_s: float) -> Reply:
+        """Format an answer: 🧠 header, refs instead of raw uuids, 📚 sources."""
+        order = {item_id: n for n, item_id in enumerate(result.cited_ids, start=1)}
+        body = _esc(result.answer)
+        for item_id, n in order.items():
+            body = body.replace(f"[{item_id}]", _ref(n))
+        lines = ["🧠 <b>Answer</b>", body]
+        if order:  # nothing cited -> plain answer, no sources block
+            by_id = {str(hit.item.id): hit for hit in result.sources}
+            source_lines: list[str] = []
+            for item_id, n in order.items():
+                hit = by_id.get(item_id)
+                if hit is None:
+                    continue
+                emoji = KIND_EMOJI.get(hit.item.source, "📝")
+                when = self._short_date(hit.item)
+                suffix = f" · {when}" if when else ""
+                source_lines.append(f"{n}. {emoji} {_one_line(hit.item.raw_text, 60)}{suffix}")
+            if source_lines:
+                lines += ["", "📚 <b>Sources</b>", *source_lines]
         if result.model:
-            text += f"\n\n— {_esc(result.model)}"
-        return Reply(text=text, keyboard=self._open_buttons(result.cited_ids))
+            lines += ["", f"<i>{_esc(result.model)} · {elapsed_s:.1f}s</i>"]
+        return Reply(text="\n".join(lines), keyboard=self._open_buttons(result.cited_ids))
+
+    def _short_date(self, item: Any) -> str | None:
+        """Day + short month in the bot's timezone (source-line suffix)."""
+        instant = item.occurred_at or item.created_at
+        if instant is None:
+            return None
+        local = instant.astimezone(self._timezone)
+        return f"{local.day} {local.strftime('%b')}"
 
     def _open_buttons(self, cited_ids: list[str]) -> list[list[tuple[str, str]]]:
+        """One row of 📎 buttons (max 5), numbered like the source list."""
         valid: list[uuid_mod.UUID] = []
         for raw in cited_ids or []:
             try:
@@ -515,11 +647,9 @@ class TelegramBot:
                 continue
         if not valid:
             return []
+        valid = valid[:5]
         token = self.registry.put(Pending(ids=tuple(valid)))
-        return [
-            [(f"Open {str(item_id)[:8]}", f"{CB_OPEN}:{token}:{index}")]
-            for index, item_id in enumerate(valid)
-        ]
+        return [[(f"📎 {n}", f"{CB_OPEN}:{token}:{n - 1}") for n in range(1, len(valid) + 1)]]
 
     def review(self, offset: int = 0) -> Reply:
         """Walk the inbox one card at a time (File / Type / Delete / Next)."""
@@ -536,23 +666,25 @@ class TelegramBot:
             return Reply("📥 End of inbox.")
         item = items[offset]
         token = self.registry.put(Pending(ids=(item.id,)))
-        rows = [
-            [("File", f"{CB_FILE}:{token}")],
-            [("Type", f"{CB_TYPE}:{token}")],
-            [("Delete", f"{CB_DELETE}:{token}")],
+        row = [
+            ("✅ File", f"{CB_FILE}:{token}"),
+            ("🏷 Type", f"{CB_TYPE}:{token}"),
+            ("🗑 Delete", f"{CB_DELETE}:{token}"),
         ]
+        rows = [row]
         if offset + 1 < len(items):
-            rows.append([("Next", f"{CB_NEXT}:{offset + 1}")])
+            rows.append([("Next ▶️", f"{CB_NEXT}:{offset + 1}")])
         record_event(
             "telegram", EVENT_REVIEW, ok=True, detail={"item_ids": [str(item.id)], "chars": 0}
         )
         return Reply(
             text=f"📥 Inbox ({offset + 1}/{len(items)})\n{self._item_card(item)}",
             keyboard=rows,
+            edit=offset > 0,
         )
 
     def recent(self) -> Reply:
-        """List the last 10 items as compact cards."""
+        """List the last 10 items as compact rows with an Open button each."""
         with self._services_factory() as services:
             items = list(
                 services.items.list(item_type=None, project=None, status=None, limit=10, offset=0)
@@ -560,18 +692,33 @@ class TelegramBot:
         if not items:
             return Reply("No items yet — paste something!")
         lines = [f"🕘 Last {len(items)} item(s):"]
-        for item in items:
-            lines.append(f"• {str(item.id)[:8]} — {_preview(item.raw_text, 60)}")
-        return Reply(text="\n".join(lines))
+        for position, item in enumerate(items, start=1):
+            emoji = KIND_EMOJI.get(item.source, "📝")
+            when = self._short_date(item)
+            suffix = f" · {when}" if when else ""
+            lines.append(f"{position}. {emoji} {_one_line(item.raw_text, 60)}{suffix}")
+        return Reply(
+            text="\n".join(lines),
+            keyboard=self._open_buttons([str(item.id) for item in items]),
+        )
 
     def status(self) -> Reply:
         """Component health from the cockpit (no event: /status is not data ops)."""
         lines = _ops_status_lines()
         if lines is None:
             return Reply("cockpit not installed yet")
-        all_ok = all(line.startswith("🟢") or ":" not in line for line in lines)
-        header = "🟢 brain: healthy" if all_ok else "🟠 brain: degraded"
-        return Reply(header + "\n" + "\n".join(_esc(line) for line in lines))
+        emoji_lines = [line for line in lines if line.startswith(("🟢", "🟡", "🔴", "⚪"))]
+        if emoji_lines and len(emoji_lines) == len(lines):
+            if any(line.startswith("🔴") for line in lines):
+                header = "🔴 brain: down"
+            elif any(not line.startswith(("🟢", "⚪")) for line in lines):
+                header = "🟠 brain: degraded"
+            else:
+                header = "🟢 brain: healthy"
+        else:  # legacy plain-string component_status: only ok/not-ok known
+            all_ok = all(line.startswith("🟢") or ":" not in line for line in lines)
+            header = "🟢 brain: healthy" if all_ok else "🟠 brain: degraded"
+        return Reply(header + "\n" + "\n".join(lines))
 
     def start(self) -> Reply:
         return Reply(
@@ -624,16 +771,36 @@ class TelegramBot:
             return self._save_whatsapp_choice(pending, split=True)
         if prefix == CB_TYPE:
             return self._type_menu(token)
+        if prefix == CB_BACK:
+            return self._card_reply(pending)
         if prefix == CB_TYPE_APPLY:
             return self._apply_type(pending, arg)
         if prefix == CB_FILE:
             changed = self._update_items(pending, {"status": "filed"})
-            return Reply(f"📁 Filed {changed} item(s).")
+            return self._card_reply(pending, notice=f"📁 Filed {changed} item(s).")
         if prefix == CB_OPEN:
             return self._open_card(pending, index)
         if prefix == CB_UNDO:
             return self._delete_items(pending, undo=True)
         return self._delete_items(pending, undo=False)  # CB_DELETE
+
+    def _card_reply(self, pending: Pending, notice: str | None = None) -> Reply:
+        """Re-render the capture card for the pending items (edit-in-place)."""
+        from brain.services.items import ItemNotFound  # noqa: PLC0415
+
+        items = []
+        with self._services_factory() as services:
+            for item_id in pending.ids:
+                try:
+                    items.append(services.items.get(item_id))
+                except ItemNotFound:
+                    continue
+        if not items:
+            return Reply("🗑 Deleted", edit=True)
+        text = self._card_header(items, notice=notice) + "\n" + "\n".join(
+            self._item_card(item) for item in items
+        )
+        return Reply(text=text, keyboard=self._capture_buttons(items), edit=True)
 
     def _open_card(self, pending: Pending, index: int) -> Reply:
         """Show one cited item's card (the Open button under /ask answers)."""
@@ -653,13 +820,18 @@ class TelegramBot:
         return self._save_parsed(parsed)
 
     def _type_menu(self, token: str) -> Reply:
+        """Type picker: emoji labels in rows of up to 3 + a back row."""
         from brain.db.enums import ItemType  # noqa: PLC0415
 
-        rows = [
-            [(item_type.value, f"{CB_TYPE_APPLY}:{token}:{item_type.value}")]
-            for item_type in ItemType
+        buttons = [
+            (
+                f"{TYPE_EMOJI.get(t.value, '🏷')} {KIND_NAME.get(t.value, t.value)}",
+                f"{CB_TYPE_APPLY}:{token}:{t.value}",
+            )
+            for t in ItemType
         ]
-        return Reply("Pick a type:", keyboard=rows)
+        grid = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
+        return Reply("Pick a type:", keyboard=grid + [[("« Back", f"{CB_BACK}:{token}")]])
 
     def _apply_type(self, pending: Pending, type_value: str) -> Reply:
         from brain.db.enums import ItemType  # noqa: PLC0415
@@ -668,8 +840,9 @@ class TelegramBot:
             item_type = ItemType(type_value)
         except ValueError:
             return Reply("Unknown type — the button is stale or invalid.")
-        changed = self._update_items(pending, {"type": item_type})
-        return Reply(f"✏️ Set type to {item_type.value} on {changed} item(s).")
+        self._update_items(pending, {"type": item_type})
+        label = KIND_NAME.get(item_type.value, item_type.value)
+        return self._card_reply(pending, notice=f"✏️ Type: {label}")
 
     def _update_items(self, pending: Pending, changes: dict[str, Any]) -> int:
         """Apply an ItemUpdate to the pending ids; returns how many changed."""
@@ -696,8 +869,8 @@ class TelegramBot:
                     deleted += 1
                 except ItemNotFound:
                     continue  # already gone: Undo pressed twice, etc.
-        verb = "Undone — deleted" if undo else "Deleted"
-        return Reply(f"{verb} {deleted} item(s).")
+        verb = "↩️ Undone" if undo else "🗑 Deleted"
+        return Reply(f"{verb} {deleted} item(s).", edit=True)
 
 
 # --- polling adapter (needs python-telegram-bot) -----------------------------
@@ -791,7 +964,23 @@ def _inline_keyboard(rows: list[list[tuple[str, str]]] | None) -> Any:
     )
 
 
-async def _send(tg: Any, chat_id: int, reply: Reply) -> None:
+async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None = None) -> None:
+    """Send a reply; edit ``message_id`` in place when the reply asks for it."""
+    edit = getattr(reply, "edit", False)
+    if edit and message_id is not None:
+        edit_message = getattr(tg, "edit_message_text", None)
+        if edit_message is not None:
+            try:
+                await edit_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
+                    parse_mode="HTML",
+                    reply_markup=_inline_keyboard(reply.keyboard),
+                )
+                return
+            except Exception as exc:  # noqa: BLE001  (edit can fail: message too old)
+                logger.debug("telegram: edit_message_text failed, sending new (%s)", exc)
     await tg.send_message(
         chat_id=chat_id,
         text=reply.text[:TELEGRAM_REPLY_MAX_CHARS],
@@ -888,9 +1077,10 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
             await answer()
         reply = core.handle_callback(query.data or "")
         record_event("telegram", EVENT_CALLBACK, ok=True, detail={})
-        chat_id = getattr(getattr(query, "message", None), "chat_id", None)
+        message = getattr(query, "message", None)
+        chat_id = getattr(message, "chat_id", None)
         if chat_id is not None:
-            await _send(tg, chat_id, reply)
+            await _send(tg, chat_id, reply, message_id=getattr(message, "message_id", None))
         return
     message = update.effective_message
     if message is None:

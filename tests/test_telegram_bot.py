@@ -276,7 +276,7 @@ class TestCore:
 
         reply = core.route("Read the RAG paper and take notes", 111)
 
-        assert reply.text.startswith("📝 Captured 1 item(s) (note)")  # card header: kind emoji
+        assert reply.text.startswith("✅ <b>Saved</b> · 📝 Note")  # compact card header
         assert len(repo.items) == 1
         item = next(iter(repo.items.values()))
         assert item.meta["channel"] == "telegram"
@@ -289,7 +289,7 @@ class TestCore:
 
         reply = core.route("[21/10/2026, 09:00:00] Dana: one", 111)
 
-        assert "1 item(s) (whatsapp)" in reply.text
+        assert "✅ <b>Saved</b> · 💬 WhatsApp" in reply.text
         assert len(repo.items) == 1
 
     def test_capture_timezone_makes_occurred_at_aware(self, monkeypatch):
@@ -382,15 +382,25 @@ class TestCore:
         monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
             "components": {
                 "postgres": {"status": "ok", "summary": "3 items"},
-                "qdrant": {"status": "down", "summary": "unreachable"},
+                "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
+                "telegram": {"status": "disabled", "summary": "no token"},
             }
         })
         core, _ = _core()
         reply = core.route("/status", 111)
-        assert "brain: degraded" in reply.text
-        assert "postgres" in reply.text and "qdrant" in reply.text
-        # the shim contract: component_status returns (name, ok, summary) tuples
-        assert ops_health.run_health_checks  # sanity: attribute exists
+        assert "🟠 brain: degraded" in reply.text
+        assert "🟢 postgres: 3 items" in reply.text
+        assert "🟡 qdrant" in reply.text and "⚪ telegram" in reply.text
+
+    def test_status_down_when_a_component_is_down(self, monkeypatch):
+        _Events().install(monkeypatch)
+        from brain.ops import health as ops_health
+
+        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
+            "components": {"qdrant": {"status": "down", "summary": "unreachable"}}
+        })
+        core, _ = _core()
+        assert "🔴 brain: down" in core.route("/status", 111).text
 
     def test_start_and_help(self, monkeypatch):
         _Events().install(monkeypatch)
