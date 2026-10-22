@@ -178,8 +178,12 @@ The layer is wired into the app on this branch (see also README):
   long-polling getUpdates (no webhook); messages are parsed by the same paste
   parser as `POST /capture` and ingested through the same services, built
   per update over the API's shared singletons (`brain.api.deps`). Allowlist
-  is enforced before any reply; a getUpdates 409 conflict (a second poller)
-  is recorded and stops the bot.
+  is enforced before any reply. Captures render HTML cards with inline
+  File/Type/Delete/Undo buttons (short-token registry, 10-minute TTL);
+  multi-message WhatsApp pastes ask join-vs-split before saving; questions
+  ending in `?` route to /ask with a TYPING indicator. Exit codes for the
+  launchd service: 0 = no token (disabled), 1 = transient, 78 (EX_CONFIG) =
+  409 conflict or invalid token.
 - **Collections**: `QdrantVectorStore.ensure_collection` is called with the
   active embedder's `dim` (384 for fastembed's `BAAI/bge-small-en-v1.5`, 1536
   for `text-embedding-3-small`); an existing collection with a different dim

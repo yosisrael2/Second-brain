@@ -171,11 +171,41 @@ for MVP top-k use.
 
 `brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
 `pip install -e '.[telegram]'`). Plain messages are captured through the same
-paste parser as `POST /capture`; `/search`, `/ask`, `/review` and `/status`
-reuse the same services as the API in-process. Access is allowlist-only: with
-`TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS` (comma-separated ids) is
-required — anyone else gets no reply (their id is logged once at INFO).
-`brain telegram --whoami-hint` explains how to find your id.
+paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent` and
+`/status` reuse the same services as the API in-process. Access is
+allowlist-only: with `TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS`
+(comma-separated ids) is required — anyone else gets no reply (their id is
+logged once at INFO). `brain telegram --whoami-hint` explains how to find
+your id.
+
+Interaction details:
+
+- every capture answers with a card (kind emoji, extracted fields such as
+  from/subject/when/location, type · importance · actionability · status;
+  HTML-escaped) carrying inline buttons **File / Type / Delete / Undo** —
+  valid for 10 minutes, callback data stays under 64 bytes, stale or unknown
+  buttons are answered gracefully (no crash, no state change).
+- a multi-message WhatsApp thread is **not saved immediately**: the bot asks
+  "Save as 1 item / Save separately" first (the paste is held in memory,
+  expiring after 10 minutes).
+- forwarded messages record `meta.sender` + `meta.forwarded = true` and use
+  the forward date as `occurred_at` (source stays the parsed kind).
+- any text ending in `?` (without a slash) is an ask; the bot shows the
+  TYPING indicator while waiting and answers with the model name plus one
+  "Open" button per cited item.
+- `/review` walks the inbox one card at a time (File / Type / Delete / Next);
+  `/recent` lists the last 10 items; bot commands are registered via
+  `set_my_commands` at startup.
+- documents: `.ics` files are captured as calendar items; other files,
+  photos and voice get a "not supported yet" reply.
+
+Exit codes (launchd service contract):
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | `TELEGRAM_BOT_TOKEN` unset — logs "telegram bot disabled (no token)"; the service stays idle, no restart loop |
+| `1`  | transient failure (network, etc.) — the service restarts |
+| `78` | `EX_CONFIG`: getUpdates 409 conflict (a second poller on the same token) or an invalid/unauthorized token — fix the configuration, do not restart-loop |
 
 The shared AI clients are app-lifetime singletons built in
 `src/brain/api/deps.py` (implementations picked by `LLM_PROVIDER` /

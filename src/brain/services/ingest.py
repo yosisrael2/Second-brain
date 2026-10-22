@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Protocol
 
 from brain import schemas
@@ -79,13 +80,15 @@ class IngestService:
         *,
         source: str | None = None,
         extra_meta: dict[str, Any] | None = None,
+        occurred_at: datetime | None = None,
     ) -> list[MemoryItem]:
         """Create one item per parsed chunk (shared capture path).
 
         Used by POST /capture and the Telegram bot: ``source`` defaults to
         the detected paste kind, ``extra_meta`` is merged over each chunk's
-        meta. Classification/indexing failures never block creation (same
-        contract as :meth:`create`).
+        meta, and ``occurred_at`` (e.g. a Telegram forward date) overrides
+        each chunk's parsed instant when given. Classification/indexing
+        failures never block creation (same contract as :meth:`create`).
         """
         items: list[MemoryItem] = []
         for chunk in parsed.chunks:
@@ -94,7 +97,7 @@ class IngestService:
                     schemas.ItemCreate(
                         raw_text=chunk.raw_text,
                         source=source or parsed.kind,
-                        occurred_at=chunk.occurred_at,
+                        occurred_at=occurred_at or chunk.occurred_at,
                         meta={**chunk.meta, **(extra_meta or {})},
                     )
                 )
