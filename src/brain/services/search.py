@@ -89,17 +89,22 @@ class SearchService:
         """Resolve ranked candidate ids to stored items, skipping unusable ones.
 
         Candidates whose payload id is not a UUID (corrupt/legacy payload) and
-        ids no longer in Postgres are skipped; rank order is preserved.
+        ids no longer in Postgres are skipped; rank order is preserved. A
+        candidate id already resolved is skipped too — stores must hold one
+        point per item, but stale collections can violate that and the user
+        must never see the same source twice.
         """
         by_id = {
             item.id: item
             for item in self._repo.get_many(_parse_uuids(ranked))
         }
         hits: list[SearchHit] = []
+        seen: set[uuid.UUID] = set()
         for candidate in ranked:
             parsed = candidate_id(candidate)
             item = by_id.get(parsed) if parsed is not None else None
-            if item is not None:
+            if item is not None and parsed not in seen:
+                seen.add(parsed)  # type: ignore[arg-type]
                 hits.append(SearchHit(item=item, score=_as_score(candidate.get("vector_score"))))
         return hits
 

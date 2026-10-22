@@ -213,3 +213,50 @@ def test_load_items_skips_unparseable_payload_ids():
     hits = service.search("kubernetes", limit=5)
 
     assert [hit.item.id for hit in hits] == [item.id]
+
+
+class DupPointStore:
+    """Store violating the one-point-per-item invariant (stale/legacy state).
+
+    Mirrors the pollution found on the live instance: two points can carry
+    the same item id; search must collapse them, not list the item twice.
+    """
+
+    def __init__(self, item_id: str, text: str, dim: int = 8) -> None:
+        self._item_id = item_id
+        self._text = text
+        self._dim = dim
+
+    def ensure_collection(self, dim: int) -> None:
+        pass
+
+    def upsert(self, item_id: str, vector: list[float], payload: dict) -> None:
+        pass
+
+    def delete(self, item_id: str) -> None:
+        pass
+
+    def delete_collection(self) -> None:
+        pass
+
+    def search(self, vector: list[float], k: int) -> list[dict]:
+        point = {"id": self._item_id, "payload": {"id": self._item_id, "text": self._text}}
+        return [
+            {**point, "score": 0.9},
+            {**point, "score": 0.8},
+        ][:k]
+
+    def close(self) -> None:
+        pass
+
+
+def test_search_dedupes_candidates_by_item_id():
+    """Two points with one item id collapse to a single hit (order kept)."""
+    repo = FakeRepository()
+    (item,) = seed(repo, "kubernetes rollout runbook")
+    store = DupPointStore(str(item.id), "kubernetes rollout runbook")
+    service = make_service(repo, store=store)
+
+    hits = service.search("kubernetes", limit=5)
+
+    assert [hit.item.id for hit in hits] == [item.id]

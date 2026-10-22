@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -203,9 +204,15 @@ def answer(
 
 
 def extract_cited_ids(answer_text: str, context_items: Sequence[Mapping[str, Any]]) -> list[str]:
-    """Return the context item ids cited (as ``[id]``) in ``answer_text``."""
-    return [
-        item["id"]
-        for item in context_items
-        if item.get("id") and f"[{item['id']}]" in answer_text
-    ]
+    """Return the context item ids cited (as ``[id]``) in ``answer_text``.
+
+    Order-preserving dedupe: ids come back in first-citation order, each once.
+    """
+    context_ids = {item["id"] for item in context_items if item.get("id")}
+    cited: list[str] = []
+    seen: set[str] = set()
+    for match in re.findall(r"\[([^\[\]]+)\]", answer_text):
+        if match in context_ids and match not in seen:
+            seen.add(match)
+            cited.append(match)
+    return cited
