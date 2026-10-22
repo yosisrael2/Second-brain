@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from brain import ops
 from brain.ai.ask import LLMClient, answer
+from brain.db.models import MemoryItem
 from brain.services.search import SearchHit, SearchService
 from brain.services.temporal import parse_question_ranges
 
@@ -114,7 +115,7 @@ class AskService:
                 unique.append(hit)
         return unique
 
-    def _when_of(self, item) -> str | None:
+    def _when_of(self, item: MemoryItem) -> str | None:
         """Local When-line for the prompt ('Fri 23 Oct 19:00-22:00'), or None."""
         start = item.occurred_at
         if start is None:

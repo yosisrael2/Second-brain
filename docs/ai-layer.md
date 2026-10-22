@@ -13,7 +13,7 @@ Implementations are selected by two `Settings` fields and built in
 | Concern | `Settings` field | Default | Alternatives |
 | ------- | ---------------- | ------- | ------------ |
 | LLM | `llm_provider` | `claude_sdk` — `ClaudeSdkLLMClient` via your local Claude Code login, no API key | `anthropic` — `ClaudeLLMClient` (needs `ANTHROPIC_API_KEY`) |
-| Embeddings | `embedder_provider` | `fastembed` — `FastEmbedEmbedder`, local, 384 dims | `openai` — `OpenAIEmbedder` (needs `OPENAI_API_KEY`) |
+| Embeddings | `embedder_provider` | `fastembed` — `FastEmbedEmbedder`, local, 256 dims, multilingual (Hebrew+English) | `openai` — `OpenAIEmbedder` (needs `OPENAI_API_KEY`) |
 
 Both `ClaudeSdkLLMClient` and `FastEmbedEmbedder` run fully offline (after
 fastembed's one-time model download) and neither reads credentials — the SDK
