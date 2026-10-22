@@ -25,6 +25,9 @@ def _healthy_ctx() -> ops_health.HealthContext:
         telegram=lambda: {"token_set": True, "allowlist_set": True, "heartbeat_age_s": 4.0},
         docker=lambda: {"available": True, "services": {"qdrant": "healthy"}},
         disk=lambda: {"free_gb": 42.0, "fastembed_free_gb": 0.2},
+        whatsapp=lambda: {"configured": True, "interval_s": 30.0,
+                          "heartbeat_age_s": 5.0, "last_poll_age_s": 5.0,
+                          "channels": 2},
     )
 
 
@@ -49,7 +52,7 @@ class TestHealthEndpoint:
         ops_health._default_context = lambda: monkeypatch_ctx  # type: ignore[assignment]
         body = client.get("/ops/health").json()
         expected = {"api", "postgres", "qdrant", "embedder", "jev",
-                    "llm", "telegram", "docker", "background", "disk"}
+                    "llm", "telegram", "docker", "background", "disk", "whatsapp"}
         assert expected <= set(body["components"].keys())
         for component in expected:
             entry = body["components"][component]
