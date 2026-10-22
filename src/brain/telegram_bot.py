@@ -1298,16 +1298,17 @@ def run(settings: Settings) -> int:
     logging config): without it, the startup line and errors below WARNING
     would vanish from StandardErrorPath.
     """
+    # httpx INFO request lines contain the FULL bot token in the URL — they
+    # must never reach any log (module security contract), whatever configured
+    # logging, so the pin applies even when run() skipped basicConfig.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
             stream=sys.stderr,
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
-        # httpx INFO request lines contain the FULL bot token in the URL —
-        # they must never reach the service log (module security contract).
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
     if settings.telegram_bot_token is None:
         logger.error("telegram bot disabled (no token)")
         return EXIT_DISABLED
