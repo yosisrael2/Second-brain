@@ -11,12 +11,6 @@ from brain.api import deps
 from brain.api.routes import ask, capture, health, items, memory, ops, search
 from brain.config import get_settings
 from brain.services.items import ItemNotFound
-from brain.services.memory import (
-    EntityNotFound,
-    FactClosed,
-    FactNotFound,
-    FactNotProposed,
-)
 
 
 @asynccontextmanager
@@ -68,10 +62,6 @@ def create_app() -> FastAPI:
     app.include_router(memory.router)
     app.middleware("http")(_instrument_requests)
     app.add_exception_handler(ItemNotFound, _handle_item_not_found)  # type: ignore[arg-type]
-    app.add_exception_handler(EntityNotFound, _handle_entity_not_found)  # type: ignore[arg-type]
-    app.add_exception_handler(FactNotFound, _handle_fact_not_found)  # type: ignore[arg-type]
-    app.add_exception_handler(FactClosed, _handle_fact_closed)  # type: ignore[arg-type]
-    app.add_exception_handler(FactNotProposed, _handle_fact_not_proposed)  # type: ignore[arg-type]
     app.add_exception_handler(LLMError, _handle_llm_unavailable)  # type: ignore[arg-type]
     return app
 
@@ -79,22 +69,6 @@ def create_app() -> FastAPI:
 def _handle_item_not_found(request: Request, exc: ItemNotFound) -> JSONResponse:
     detail = f"memory item '{exc.item_id}' not found"
     return JSONResponse(status_code=404, content={"detail": detail})
-
-
-def _handle_entity_not_found(request: Request, exc: EntityNotFound) -> JSONResponse:
-    return JSONResponse(status_code=404, content={"detail": f"entity '{exc.entity_id}' not found"})
-
-
-def _handle_fact_not_found(request: Request, exc: FactNotFound) -> JSONResponse:
-    return JSONResponse(status_code=404, content={"detail": f"fact '{exc.fact_id}' not found"})
-
-
-def _handle_fact_closed(request: Request, exc: FactClosed) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": "fact already closed (deleted or superseded)"})
-
-
-def _handle_fact_not_proposed(request: Request, exc: FactNotProposed) -> JSONResponse:
-    return JSONResponse(status_code=409, content={"detail": "fact is not proposed; confirm only applies to proposed facts"})
 
 
 def _handle_llm_unavailable(request: Request, exc: LLMError) -> JSONResponse:

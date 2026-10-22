@@ -780,7 +780,8 @@ class TelegramBot:
                     lines.append("🧠 <b>Remembered</b>")
                 for fact in facts:
                     fact_ids.append(str(fact["id"]))
-                    lines.append(f"• {_esc(fact.get('predicate', 'note'))}: {_one_line(fact.get('value'), 80)}")
+                    predicate = _esc(fact.get("predicate", "note"))
+                    lines.append(f"• {predicate}: {_one_line(fact.get('value'), 80)}")
                 continue
             lines.append("")
             lines.append(f"🧒 <b>{_esc(entity.get('name', '?'))}</b>")
@@ -821,8 +822,6 @@ class TelegramBot:
 
     def _remove_profile_fact(self, pending: Pending, index: int) -> Reply:
         """Soft-delete one profile fact, then re-render the card in place."""
-        from brain.services.memory import FactNotFound  # noqa: PLC0415
-
         if not 0 <= index < len(pending.ids):
             return Reply("Unknown action — the button is stale or invalid.")
         with self._services_factory() as services:
@@ -831,7 +830,7 @@ class TelegramBot:
                 return Reply("Memory layer is not installed yet.")
             try:
                 memory.delete_fact(pending.ids[index])
-            except FactNotFound:
+            except KeyError:
                 return Reply("⌛ That fact was already removed.")
         return self.profile_reply(notice="🗑 Removed (history kept).")
 

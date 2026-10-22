@@ -164,11 +164,10 @@ def get_search_service(
 def get_ask_service(
     search: SearchService = Depends(get_search_service),
     llm: LLMClient = Depends(get_llm_client),
-    db: Session = Depends(get_db),
+    memory: MemoryService = Depends(get_memory_service),
 ) -> AskService:
-    """Provide an AskService wired to search and the shared LLM client."""
+    """Provide an AskService wired to search, the shared LLM client and memory."""
     settings = get_settings()
-    memory = MemoryService(MemoryRepository(db))
     return AskService(
         search,
         llm,

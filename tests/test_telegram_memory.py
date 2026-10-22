@@ -13,6 +13,8 @@ from tests.fakes import FakeRepository, StubClassifier
 from brain.services.ingest import IngestService
 from brain.telegram_bot import BotServices, TelegramBot
 
+_ALLOWED = frozenset({111})
+
 KID_FACTS = [
     {"id": str(uuid.uuid4()), "predicate": "gender", "value": "girl"},
     {"id": str(uuid.uuid4()), "predicate": "class", "value": "ה' ספיר"},
@@ -56,9 +58,6 @@ class FakeMemory:
 class _ExplodingMemory:
     """A memory service whose delete_fact loses rows (already removed)."""
 
-    class FactNotFound(Exception):
-        pass
-
     def __init__(self, entities: list[dict] | None = None) -> None:
         self.entities = entities or []
 
@@ -69,7 +68,7 @@ class _ExplodingMemory:
         return {"id": str(uuid.uuid4()), "predicate": "note", "value": text}
 
     def delete_fact(self, fact_id: uuid.UUID) -> None:
-        raise _ExplodingMemory.FactNotFound(str(fact_id))
+        raise KeyError(fact_id)  # the real service's not-found signal
 
 
 def _core(memory: Any) -> TelegramBot:
@@ -86,7 +85,7 @@ def _core(memory: Any) -> TelegramBot:
             memory=memory,
         )
 
-    return TelegramBot(services_factory=factory, allowed_ids=ALLOWED, timezone=None)
+    return TelegramBot(services_factory=factory, allowed_ids=_ALLOWED, timezone=None)
 
 
 def test_remember_stores_confirmed_fact() -> None:

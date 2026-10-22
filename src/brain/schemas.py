@@ -201,6 +201,8 @@ class FactCreate(BaseModel):
     object_id: uuid.UUID | None = None
     value: str | None = Field(default=None, max_length=FACT_VALUE_MAX_LENGTH)
     valid_from: datetime | None = None
+    # confirmed (default) or proposed (the inbox); rejected is reached via DELETE only
+    status: Literal["confirmed", "proposed"] = "confirmed"
 
     @model_validator(mode="after")
     def _object_or_value_required(self) -> "FactCreate":

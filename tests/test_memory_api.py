@@ -7,7 +7,6 @@ soft (status=rejected, valid_to set), confirm only moves proposed->confirmed.
 
 import uuid
 
-import pytest
 from fastapi.testclient import TestClient
 
 _ENDPOINT = "/memory"
@@ -70,8 +69,11 @@ def test_get_memory_status_filter_proposed_excludes_confirmed(
     proposed = client.get(_ENDPOINT, params={"status": "proposed"}).json()
     confirmed = client.get(_ENDPOINT).json()
 
-    assert [e["name"] for e in proposed["entities"]] == ["Itamar"]
-    assert {e["name"] for e in confirmed["entities"]} == {"Rona"}
+    assert [e["name"] for e in proposed["entities"]] == ["Itamar"]  # no empty groups
+    # the default view still lists every entity; Itamar carries no confirmed facts
+    assert {e["name"] for e in confirmed["entities"]} == {"Rona", "Itamar"}
+    itamar_view = next(e for e in confirmed["entities"] if e["name"] == "Itamar")
+    assert itamar_view["facts"] == []
 
 
 def test_get_memory_search_q_filters(client: TestClient, clean_memory: None) -> None:
@@ -193,7 +195,7 @@ def test_create_fact_unknown_subject_404(client: TestClient, clean_memory: None)
 # --- PATCH /memory/facts/{id}: versioning semantics ------------------------------
 
 
-def test_patch_fact_closes_old_version_and_opens_new(client: TestClient, clean_memory: None) -> None:
+def test_patch_fact_closes_old_and_opens_new(client: TestClient, clean_memory: None) -> None:
     rona = _add_entity(client, name="Rona")
     fact = _add_fact(client, rona["id"], value="5")
 
@@ -205,11 +207,14 @@ def test_patch_fact_closes_old_version_and_opens_new(client: TestClient, clean_m
     assert new_version["value"] == "6"
     assert new_version["supersedes_id"] == fact["id"]
     assert new_version["valid_to"] is None  # the current version
-    # the old fact is closed, not gone
+    # the overview shows the NEW version only; the old one lives in history
     overview = client.get(_ENDPOINT).json()
     facts = {f["id"]: f for e in overview["entities"] for f in e["facts"]}
-    assert facts[fact["id"]]["valid_to"] is not None
-    assert facts[fact["id"]]["status"] == fact["status"]
+    assert fact["id"] not in facts  # closed fact hidden from the overview
+    assert new_version["id"] in facts
+    chain = client.get(f"{_ENDPOINT}/facts/{fact['id']}/history").json()
+    assert [f["id"] for f in chain] == [fact["id"], new_version["id"]]
+    assert chain[0]["valid_to"] is not None  # old version closed
 
 
 def test_patch_fact_absent_fields_inherited(client: TestClient, clean_memory: None) -> None:
@@ -237,11 +242,12 @@ def test_delete_fact_is_soft_history_kept(client: TestClient, clean_memory: None
     response = client.delete(f"{_ENDPOINT}/facts/{fact['id']}")
 
     assert response.status_code == 204
-    overview = client.get(_ENDPOINT).json()
-    facts = {f["id"]: f for e in overview["entities"] for f in e["facts"]}
-    assert facts[fact["id"]]["status"] == "rejected"
-    assert facts[fact["id"]]["valid_to"] is not None
-    # rejected facts are excluded from the confirmed view
+    # the row is NOT hard-deleted: the history chain keeps it, marked rejected
+    chain = client.get(f"{_ENDPOINT}/facts/{fact['id']}/history").json()
+    assert [f["id"] for f in chain] == [fact["id"]]
+    assert chain[0]["status"] == "rejected"
+    assert chain[0]["valid_to"] is not None
+    # and it disappears from the confirmed overview (only history keeps it)
     confirmed = client.get(_ENDPOINT).json()
     assert all(f["id"] != fact["id"] for e in confirmed["entities"] for f in e["facts"])
 
