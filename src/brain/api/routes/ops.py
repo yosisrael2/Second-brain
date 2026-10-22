@@ -234,6 +234,38 @@ def _item_events(item_id: str) -> list[dict[str, Any]]:
     return events
 
 
+@router.get("/ops/whatsapp")
+def get_ops_whatsapp() -> dict[str, Any]:
+    """WhatsApp poller ops: last poll time + per-channel cursor and counts (PR D1)."""
+    with engine.connect() as conn:
+        rows = (
+            conn.execute(
+                text(
+                    "SELECT chat_jid, channel_name, cursor_utc, last_poll_at, last_message_at, "
+                    "messages_seen, conversations_created, conversations_updated "
+                    "FROM whatsapp_poll_state ORDER BY channel_name, chat_jid"
+                )
+            )
+            .mappings()
+            .all()
+        )
+    channels = [
+        {
+            "channel": row["channel_name"],
+            "chat_jid": row["chat_jid"],
+            "cursor_at": _iso(row["cursor_utc"]) if row["cursor_utc"] else None,
+            "last_poll_at": _iso(row["last_poll_at"]) if row["last_poll_at"] else None,
+            "last_message_at": _iso(row["last_message_at"]) if row["last_message_at"] else None,
+            "messages_seen": int(row["messages_seen"]),
+            "conversations_created": int(row["conversations_created"]),
+            "conversations_updated": int(row["conversations_updated"]),
+        }
+        for row in rows
+    ]
+    polls = [row["last_poll_at"] for row in rows if row["last_poll_at"] is not None]
+    return {"last_poll_at": _iso(max(polls)) if polls else None, "channels": channels}
+
+
 @router.get("/ops/stats")
 def get_ops_stats() -> dict[str, Any]:
     """24h/7d per-component stats + confidence histogram + status shares."""

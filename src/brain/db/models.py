@@ -204,6 +204,36 @@ class OpsHeartbeat(Base):
     )
 
 
+class WhatsAppPollState(Base):
+    """Per-chat ingestion cursor for the WhatsApp poller (PR D1).
+
+    One row per allowlisted bridge chat. ``cursor_utc`` is the UTC instant of
+    the last message processed (never a fixed-offset wall clock — item 41);
+    polls re-read a small overlap window and dedupe on message ids, so a
+    restart never duplicates conversations. ``open_item_id`` points at the
+    source item of the conversation that may still receive messages (updated
+    in place until the time gap closes it).
+    """
+
+    __tablename__ = "whatsapp_poll_state"
+
+    chat_jid: Mapped[str] = mapped_column(String(255), primary_key=True)
+    channel_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Messages at/below this instant were deliberately SKIPPED as history when
+    # the channel was first seen (live-edge start, no backfill); the overlap
+    # window must not re-fetch them on the next poll.
+    history_until_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    messages_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversations_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversations_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    open_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
 class Entity(Base):
     """A durable thing in the user's world: person, group, place, or org.
 
@@ -296,6 +326,33 @@ class MemoryFact(Base):
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class EmailMessage(Base):
+    """A processed Gmail message (the poller's seen-ledger, F2).
+
+    ``dedupe_id`` is unique: the RFC 5322 Message-ID, or ``fp:`` + sha256
+    over (sender, subject, internal minute) when the message has none —
+    the at-most-once guarantee for the email source.
+    """
+
+    __tablename__ = "email_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    dedupe_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    gmail_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="SET NULL"), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -11,12 +12,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from brain.ai.embedder import Embedder, EmbedderError
+from brain.ai.gmail import GMAIL_SCOPE, RestGmailClient
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
-from brain.config import get_settings, unwrap_secret
+from brain.config import Settings, get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
+from brain.services.email_poller import EmailPoller, heartbeat_email
 from brain.services.eval_extraction import (
     DEFAULT_TITLE_THRESHOLD,
     EvalError,
@@ -29,7 +32,10 @@ from brain.services.eval_extraction import (
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsRepositoryProto
+from brain.services.keychain import GMAIL_ACCOUNT, Keychain
 from brain.services.paste import _calendar_one_liner
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -45,6 +51,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--whoami-hint",
         action="store_true",
         help="Print how to find your Telegram user id for TELEGRAM_ALLOWED_USER_IDS",
+    )
+    whatsapp = subparsers.add_parser(
+        "whatsapp", help="Run the WhatsApp poller (bridge store -> conversations)"
+    )
+    whatsapp.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="Seconds between polls (default: WHATSAPP_POLL_INTERVAL_S, 30)",
+    )
+    whatsapp.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help="ISO instant to backfill from on first sight of a channel "
+        "(default: the live edge — history is NOT backfilled)",
     )
     subparsers.add_parser(
         "normalize-calendar",
@@ -89,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_channel.add_argument(
         "--applies-to",
         required=True,
-        help="Rona | Itamar | me | family (values handed over at seed time)",
+        help="<kid name> | me | family (values handed over at seed time)",
     )
     eval_extraction = subparsers.add_parser(
         "eval-extraction",
@@ -128,12 +150,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Zone for converting offset-bearing start/due values "
         "(default: Settings.timezone from TIMEZONE)",
     )
+    gmail_auth = subparsers.add_parser(
+        "gmail-auth",
+        help="One-time Google OAuth consent; stores ONLY the refresh token "
+        "in the macOS login keychain (never in the repo or .env)",
+    )
+    gmail_auth.add_argument(
+        "--client-secret",
+        default=None,
+        help="Path to the Desktop-client secret JSON "
+        "(default: GMAIL_CREDENTIALS_PATH; keep it OUTSIDE the repo)",
+    )
+    gmail_auth.add_argument(
+        "--account",
+        default=GMAIL_ACCOUNT,
+        help=f"Keychain account name (default: {GMAIL_ACCOUNT})",
+    )
+    gmail_poll = subparsers.add_parser(
+        "gmail-poll",
+        help="Poll the configured Gmail label (GMAIL_LABEL_ID) and capture "
+        "new messages through the standard paste path",
+    )
+    gmail_poll.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one poll cycle and exit (also used by tests)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
         return _reindex(batch_size=args.batch_size)
     if args.command == "telegram":
         return _telegram(whoami_hint=args.whoami_hint)
+    if args.command == "whatsapp":
+        return _whatsapp(interval_s=args.interval, since=args.since)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
     if args.command == "enrich":
@@ -156,6 +206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.command == "eval-extraction":
         return _eval_extraction(args)
+    if args.command == "gmail-auth":
+        return _gmail_auth(args)
+    if args.command == "gmail-poll":
+        return _gmail_poll(args)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
 
@@ -285,6 +339,94 @@ def _telegram(whoami_hint: bool) -> int:
     return run_bot(get_settings())
 
 
+def _whatsapp(interval_s: float | None, since: str | None) -> int:
+    """Run the WhatsApp poller: bridge store -> per-conversation source items.
+
+    Read-only against the bridge; cursor state lives in our DB (see
+    brain.services.whatsapp). Per-poll failures are logged and retried on the
+    next tick; Ctrl-C exits cleanly.
+    """
+    import time  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.ops import heartbeat, record_event  # noqa: PLC0415
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.repositories.whatsapp import WhatsAppStateRepository  # noqa: PLC0415
+    from brain.services.whatsapp import (  # noqa: PLC0415
+        BridgeStore,
+        PollerError,
+        WhatsAppPoller,
+    )
+
+    settings = get_settings()
+    if not settings.whatsapp_bridge_db.strip():
+        print("whatsapp: WHATSAPP_BRIDGE_DB is not configured; poller disabled", file=sys.stderr)
+        return 1
+    try:
+        bridge = BridgeStore(settings.whatsapp_bridge_db, naive_zone=settings.timezone)
+    except Exception as exc:
+        print(f"whatsapp: cannot open bridge store: {exc}", file=sys.stderr)
+        return 1
+
+    backfill: datetime | None = None
+    if since:
+        try:
+            backfill = datetime.fromisoformat(since)
+        except ValueError as exc:
+            print(f"whatsapp: --since must be an ISO instant: {exc}", file=sys.stderr)
+            return 1
+        if backfill.tzinfo is None:
+            backfill = backfill.replace(tzinfo=UTC)
+
+    interval = float(interval_s) if interval_s else settings.whatsapp_poll_interval_s
+    session = SessionLocal()
+    try:
+        poller = WhatsAppPoller(
+            bridge=bridge,
+            state=WhatsAppStateRepository(session),
+            items=ItemsRepository(session),
+            memory=MemoryRepository(session),
+            indexer=None,  # vectors come from 'brain reindex' when run as a side process
+            zone_name=settings.timezone,
+            gap_minutes=settings.whatsapp_gap_minutes,
+            overlap_minutes=settings.whatsapp_overlap_minutes,
+            backfill_since=backfill,
+            commit=True,
+        )
+    except PollerError as exc:
+        print(f"whatsapp: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"whatsapp: polling {bridge.path} every {interval:.0f}s (Ctrl-C to stop)")
+    try:
+        while True:
+            started = time.monotonic()
+            try:
+                results = poller.poll(now=datetime.now(UTC))
+                for result in results:
+                    if result.seen or result.created or result.updated:
+                        print(
+                            f"whatsapp: {result.channel}: +{result.seen} msgs, "
+                            f"{result.created} new / {result.updated} updated conversations"
+                        )
+                heartbeat("whatsapp", detail={"channels": len(results)})
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 — the loop outlives poll failures
+                logger.warning("whatsapp: poll cycle failed: %s", exc)
+                record_event(
+                    "whatsapp",
+                    "poll_cycle_error",
+                    ok=False,
+                    detail={"error": type(exc).__name__},
+                )
+            elapsed = time.monotonic() - started
+            time.sleep(max(0.5, interval - elapsed))
+    except KeyboardInterrupt:
+        print("whatsapp: stopped")
+    return 0
+
+
 def _eval_extraction(args: argparse.Namespace) -> int:
     """Score predicted children against gold labels; returns a process exit code.
 
@@ -367,6 +509,7 @@ def _reindex(
     print(f"indexed {indexed} item(s) into collection '{settings.qdrant_collection}'")
     return 0
 
+
 class _NoopClassifier:
     """Classifier stand-in: reindex never classifies, only embeds."""
 
@@ -426,6 +569,103 @@ def _normalize_calendar(
     repo.commit()
     print(f"normalized {normalized} calendar item(s) (run 'brain reindex' to re-embed)")
     return 0
+
+
+# --- gmail (email source, F2) -------------------------------------------------
+
+
+def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs google libs
+    """Build the installed-app OAuth flow (the ONLY google import in the CLI)."""
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise SystemExit(
+            "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
+        ) from exc
+    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=[GMAIL_SCOPE])
+
+
+def _gmail_auth(args: argparse.Namespace) -> int:
+    """One-time consent; stores ONLY the refresh token in the login keychain."""
+    settings: Settings = get_settings()
+    path = args.client_secret or settings.gmail_credentials_path
+    if not path:
+        print(
+            "gmail-auth: no client secret — pass --client-secret /path/to/secret.json "
+            "(or set GMAIL_CREDENTIALS_PATH). Keep the file OUTSIDE the repo.",
+            file=sys.stderr,
+        )
+        return 78
+    if not Path(path).exists():
+        print(f"gmail-auth: client secret file not found: {path}", file=sys.stderr)
+        return 78
+    flow = _build_oauth_flow(path)
+    print("gmail-auth: opening the browser for Google consent (read-only Gmail scope)…")
+    try:
+        creds = flow.run_local_server(port=0)
+    except KeyboardInterrupt:
+        print("gmail-auth: cancelled", file=sys.stderr)
+        return 130
+    token = creds.refresh_token
+    if not token:
+        print(
+            "gmail-auth: Google did not return a refresh token — revoke the app at "
+            "https://myaccount.google.com/permissions and re-run (prompt=consent).",
+            file=sys.stderr,
+        )
+        return 78
+    Keychain().store(args.account, token)
+    print(
+        f"gmail-auth: refresh token stored in the login keychain "
+        f"(service second-brain-gmail, account {args.account}). The token is never "
+        f"printed or written to disk.\n"
+        f"Next: set GMAIL_LABEL_ID to the immutable Gmail label id to poll "
+        f"(see docs/email-setup.md), then run `brain gmail-poll`."
+    )
+    return 0
+
+
+def _build_email_poller(settings: Settings) -> EmailPoller:
+    """Assemble the poller from the shared AI singletons (same path as the bot)."""
+    from brain.api import deps  # noqa: PLC0415  (deferred: shared client singletons)
+    from brain.repositories.email import EmailMessageRepository  # noqa: PLC0415
+
+    session = SessionLocal()
+    ingest = IngestService(
+        ItemsRepository(session),
+        deps.get_classifier(),
+        deps.get_item_indexer(),
+    )
+    return EmailPoller(
+        client=RestGmailClient(token_loader=lambda: Keychain().read(GMAIL_ACCOUNT) or ""),
+        ingest=ingest,
+        seen_repo=EmailMessageRepository(session),
+        settings=settings,
+    )
+
+
+def _gmail_poll(args: argparse.Namespace) -> int:
+    settings: Settings = get_settings()
+    if not settings.gmail_label_id:
+        print("gmail-poll: GMAIL_LABEL_ID unset — nothing to poll", file=sys.stderr)
+        return 78
+    token = Keychain().read(GMAIL_ACCOUNT)
+    if not token:
+        print(
+            "gmail-poll: no refresh token in the keychain — run `brain gmail-auth` first",
+            file=sys.stderr,
+        )
+        return 78
+    poller = _build_email_poller(settings)
+    if args.once:
+        summary = poller.poll_once()
+        heartbeat_email(summary)
+        print(
+            f"gmail-poll: state={summary.state} listed={summary.listed} new={summary.new} "
+            f"skipped={summary.skipped} errors={summary.errors}"
+        )
+        return 0
+    return poller.run_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

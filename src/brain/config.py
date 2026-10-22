@@ -118,10 +118,29 @@ class Settings(BaseSettings):
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
 
+    # WhatsApp bridge (PR D1). The poller reads the bridge's messages.db
+    # READ-ONLY; an empty path disables the poller. The gap groups messages
+    # into conversations (item 35); the overlap window (must stay smaller
+    # than the gap) makes restarts idempotent.
+    whatsapp_bridge_db: str = ""
+    whatsapp_gap_minutes: int = 60
+    whatsapp_overlap_minutes: int = 5
+    whatsapp_poll_interval_s: float = 30.0
+
     # Telegram bot (mobile capture channel). The token is a secret; the
     # allowlist is REQUIRED with a token — the bot never answers strangers.
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
+
+    # Email source (F2): a read-only Gmail label poller. The label ID is an
+    # immutable Gmail label id (never its display name); the OAuth refresh
+    # token lives in the macOS login keychain (never here, never in .env).
+    # credentials_path points at the Desktop-client secret JSON OUTSIDE the
+    # repo (the gmail-auth helper needs it; the poller does not).
+    gmail_label_id: str = ""
+    gmail_query: str = ""
+    gmail_poll_interval_s: int = 60
+    gmail_credentials_path: str = ""
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod
