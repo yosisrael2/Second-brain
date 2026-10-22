@@ -72,6 +72,10 @@ class ItemRead(BaseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+    # True only on the item an ingest call RETURNED because it was an exact
+    # duplicate of an already-stored row (see brain.services.dedupe); list/get
+    # responses always carry False.
+    deduplicated: bool = False
 
 
 class SearchResultRead(ItemRead):

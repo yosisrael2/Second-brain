@@ -294,6 +294,18 @@ class TestCore:
         assert "✅ <b>Saved</b> · 💬 WhatsApp" in reply.text
         assert len(repo.items) == 1
 
+    def test_capture_exact_duplicate_replies_already_saved(self, monkeypatch):
+        _Events().install(monkeypatch)
+        core, repo = _core()
+
+        first = core.route("Read the RAG paper and take notes", 111)
+        second = core.route("Read the RAG paper and take notes", 111)
+
+        assert len(repo.items) == 1  # no second row
+        assert first.text.startswith("✅ <b>Saved</b>")
+        assert "Already saved" in second.text
+        assert "Read the RAG paper" in second.text  # the existing card
+
     def test_capture_timezone_makes_occurred_at_aware(self, monkeypatch):
         _Events().install(monkeypatch)
         core, repo = _core()

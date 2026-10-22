@@ -495,8 +495,16 @@ class TelegramBot:
     # -- cards -------------------------------------------------------------------
 
     def _card_header(self, items: list[Any], notice: str | None = None) -> str:
-        """'✅ Saved · 💬 WhatsApp [· 2 items]' (+ optional notice line)."""
-        header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
+        """'✅ Saved · 💬 WhatsApp [· 2 items]' (+ optional notice line).
+
+        An exact-duplicate capture (every returned item flagged deduplicated
+        by the ingest guard) says 'Already saved' instead — the card below is
+        the EXISTING item.
+        """
+        if items and all(getattr(item, "deduplicated", False) for item in items):
+            header = f"ℹ️ <b>Already saved</b> · {self._kind_label(items)}"
+        else:
+            header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
         if len(items) > 1:
             header += f" · {len(items)} items"
         return f"{notice}\n{header}" if notice else header

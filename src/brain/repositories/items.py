@@ -33,6 +33,20 @@ class ItemsRepository:
         """Return the item with the given id, or None if absent."""
         return self._db.get(MemoryItem, item_id)
 
+    def get_by_fingerprint(self, fingerprint: str) -> MemoryItem | None:
+        """Return the first item carrying this content fingerprint, or None.
+
+        Oldest first: on (theoretically possible) multiple matches the
+        original capture wins.
+        """
+        stmt = (
+            select(MemoryItem)
+            .where(MemoryItem.fingerprint == fingerprint)
+            .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+            .limit(1)
+        )
+        return self._db.scalars(stmt).first()
+
     def get_many(self, item_ids: Sequence[uuid.UUID]) -> Sequence[MemoryItem]:
         """Return the items with the given ids, missing ones silently skipped."""
         if not item_ids:

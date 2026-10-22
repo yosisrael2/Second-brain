@@ -12,6 +12,7 @@ from brain.ai.embedder import EmbedderError
 from brain.ai.jev import JevError
 from brain.ai.vectorstore import VectorStoreError
 from brain.db.models import MemoryItem
+from brain.services.dedupe import content_fingerprint
 from brain.services.indexing import ItemIndexerProto
 from brain.services.items import ItemsRepositoryProto
 from brain.services.paste import ParsedPaste
@@ -67,6 +68,19 @@ class IngestService:
             occurred_at=data.occurred_at,
             meta=data.meta,
         )
+        item.fingerprint = content_fingerprint(
+            data.raw_text, data.occurred_at, data.source
+        )
+        if (existing := self._repo.get_by_fingerprint(item.fingerprint)) is not None:
+            # Exact duplicate: keep the original, surface it with a flag, and
+            # skip classification/indexing entirely (nothing new to process).
+            ops.record_event(
+                "ingest",
+                "dedupe_hit",
+                ok=True,
+                detail={"existing_id": str(existing.id)},
+            )
+            return self._dedupe_snapshot(existing)
         self._repo.add(item)
         if classify:
             with ops.span("ingest", "classify", edge="ingest->jev") as span:
@@ -81,6 +95,32 @@ class IngestService:
             self._repo.commit()
             span.detail = {"item_id": str(item.id), "chars": len(item.raw_text)}
         return item
+
+    def _dedupe_snapshot(self, existing: MemoryItem) -> MemoryItem:
+        """Detached copy of the existing item, flagged ``deduplicated``.
+
+        A copy (not the session object) so the flag reflects THIS call's
+        outcome: the same row returned by a later non-duplicate call must
+        not carry a stale True.
+        """
+        snapshot = MemoryItem(
+            raw_text=existing.raw_text,
+            source=existing.source,
+            type=existing.type,
+            project=existing.project,
+            importance=existing.importance,
+            actionability=existing.actionability,
+            confidence=existing.confidence,
+            status=existing.status,
+            occurred_at=existing.occurred_at,
+            meta=existing.meta,
+            fingerprint=existing.fingerprint,
+        )
+        snapshot.id = existing.id
+        snapshot.created_at = existing.created_at
+        snapshot.updated_at = existing.updated_at
+        snapshot.deduplicated = True
+        return snapshot
 
     def capture_parsed(
         self,
