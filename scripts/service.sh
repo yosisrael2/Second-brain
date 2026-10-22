@@ -199,6 +199,13 @@ install() {
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
 
+  # Pre-create the log files mode 600: launchd writes into the existing inode
+  # (preserving the mode) instead of creating them with the default umask.
+  for f in api api.err telegram telegram.err; do
+    touch "$LOG_DIR/$f.log" 2>/dev/null || true
+  done
+  chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
+
   say "install: bootstrapping agents"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"

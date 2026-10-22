@@ -9,6 +9,7 @@ status "down" with the error type in the details.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -474,20 +475,23 @@ def _background_check() -> dict[str, Any]:
             return {"available": False, "agents": {}}
         info: dict[str, Any] = {}
         if out.returncode == 0:
+            # Only TOP-LEVEL (one-tab) keys: deeper 'state = active' lines live
+            # in events/sockets sub-dicts and previously overwrote the job's
+            # real state (a running agent read as 'active' => 'down').
+            pattern = re.compile(r"^\t(state|pid|last exit code) = (.+)$")
             for line in out.stdout.splitlines():
-                key, sep, value = line.strip().partition(" = ")
-                if not sep:
+                match = pattern.match(line)
+                if match is None:
                     continue
+                key, value = match.group(1), match.group(2).strip()
                 if key == "state":
-                    info["state"] = value.strip()
+                    info.setdefault("state", value)
                 elif key == "pid":
-                    with_id = value.strip()
-                    if with_id.isdigit():
-                        info["pid"] = int(with_id)
+                    if value.isdigit():
+                        info.setdefault("pid", int(value))
                 elif key == "last exit code":
-                    with_id = value.strip()
-                    if with_id.lstrip("-").isdigit():
-                        info["last_exit"] = int(with_id)
+                    if value.lstrip("-").isdigit():
+                        info.setdefault("last_exit", int(value))
         agents[label] = info
     return {"available": True, "agents": agents}
 
