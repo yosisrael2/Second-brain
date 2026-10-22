@@ -3,7 +3,7 @@
 # dev-start.sh and dev-stop.sh, so both always agree on which compose project
 # they talk to and how the app process is stopped.
 
-LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIB_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"  # physical: lsof reports physical cwds (/tmp -> /private/tmp)
 
 # User-facing log line: plain stdout. Defined HERE so lib.sh is self-sufficient
 # when sourced alone (tests/tools source it in a bare `bash -c`): an undefined
@@ -87,10 +87,14 @@ is_protected_holder() {
 }
 
 wait_gone() {
-  # True once pid $1 no longer exists (polls up to ~10s).
-  local pid="$1" _
+  # True once pid $1 no longer exists (polls up to ~10s). A ZOMBIE still
+  # answers kill -0 (unreaped child), but it is dead for takeover purposes:
+  # ps stat starting with Z counts as gone.
+  local pid="$1" _ stat
   for _ in $(seq 1 20); do
-    kill -0 "$pid" 2>/dev/null || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    stat="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    case "$stat" in Z*|'') return 0 ;; esac
     sleep 0.5
   done
   return 1
