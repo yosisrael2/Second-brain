@@ -100,6 +100,7 @@ class MemoryItem(Base):
     # saved". Plain class attribute — SQLAlchemy does not map it.
     deduplicated = False
 
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(
@@ -120,7 +121,9 @@ class MemoryItem(Base):
     # times are interpreted in the TIMEZONE setting and stored as aware UTC;
     # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
     # original raw strings stay in meta for audit.
-    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Exact-duplicate guard: sha256 over (normalized text, occurred_at UTC
     # minute, source kind); computed by brain.services.dedupe at ingest and
     # backfilled by the fingerprint migration. Nullable: rows created before
@@ -247,7 +250,9 @@ class Entity(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -298,7 +303,9 @@ class MemoryFact(Base):
         Index("ix_memory_facts_status", "status"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     subject_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
     )
@@ -319,6 +326,33 @@ class MemoryFact(Base):
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class EmailMessage(Base):
+    """A processed Gmail message (the poller's seen-ledger, F2).
+
+    ``dedupe_id`` is unique: the RFC 5322 Message-ID, or ``fp:`` + sha256
+    over (sender, subject, internal minute) when the message has none —
+    the at-most-once guarantee for the email source.
+    """
+
+    __tablename__ = "email_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    dedupe_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    gmail_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="SET NULL"), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
@@ -371,6 +405,7 @@ class Attachment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
 
 
 class ItemSource(Base):
