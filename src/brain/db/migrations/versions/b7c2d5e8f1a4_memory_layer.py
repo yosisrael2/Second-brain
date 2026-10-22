@@ -34,7 +34,8 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         sa.CheckConstraint(
-            "kind IN ('person', 'group', 'place', 'org')", name="ck_entities_kind"
+            "kind IN ('person', 'group', 'place', 'org', 'channel')",
+            name="ck_entities_kind",
         ),
     )
     op.create_table(
