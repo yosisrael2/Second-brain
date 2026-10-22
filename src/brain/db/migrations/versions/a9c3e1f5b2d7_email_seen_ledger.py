@@ -1,7 +1,7 @@
 """email_messages: seen-message ledger for the Gmail label poller (F2)
 
 Revision ID: a9c3e1f5b2d7
-Revises: a1e5f7b9c3d2
+Revises: a9c4e7d2f1b6
 Create Date: 2026-10-22 23:30:00.000000
 
 One row per processed Gmail message; the unique ``dedupe_id`` is the RFC
@@ -17,8 +17,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a9c3e1f5b2d7"
-down_revision: str | None = "a1e5f7b9c3d2"  # was b7c2d5e8f1a4; re-pointed
-# after PR #33 (a1e5f7b9c3d2) landed first
+down_revision: str | None = "a9c4e7d2f1b6"  # was b7c2d5e8f1a4; re-pointed
+# after PR #33 (a1e5f7b9c3d2) and PR #37 (a9c4e7d2f1b6) landed first
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
