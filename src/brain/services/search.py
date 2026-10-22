@@ -6,6 +6,7 @@ import logging
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 
 from brain import ops
@@ -53,7 +54,14 @@ class SearchService:
         self._reranker = reranker
 
     def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
-        """Return up to ``limit`` items best matching ``query``."""
+        """Return up to ``limit`` items best matching ``query``.
+
+        Hybrid retrieval: semantic (vector) hits fused with full-text keyword
+        hits by reciprocal-rank fusion — exact words (e.g. Hebrew names the
+        embedder may blur) pull their items up without abandoning semantics.
+        Falls back to keyword-only when the embedder or vector store is
+        unavailable, so search never hard-fails on infrastructure.
+        """
         try:
             with ops.span("search", "embed", edge="search->embedder"):
                 vector = self._embedder.embed(query)
@@ -78,7 +86,45 @@ class SearchService:
         ]
         with ops.span("search", "rerank", edge="search->rerank"):
             ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
-        return self._load_items(ranked[offset : offset + limit])
+        fused = self._fuse_with_keywords(query, ranked, limit=limit + offset)
+        return self._load_items(fused[offset : offset + limit])
+
+    _RRF_K = 60
+
+    def _fuse_with_keywords(
+        self, query: str, ranked: list[Mapping[str, Any]], *, limit: int
+    ) -> list[Mapping[str, Any]]:
+        """Reciprocal-rank fusion of the semantic ranking with keyword hits.
+
+        Both lists contribute rank points (1/(K + rank)); items found by both
+        paths bubble up. Keyword-only items keep vector_score None. FTS
+        failures are non-fatal (the semantic list alone still answers).
+        """
+        try:
+            items = self._repo.search(query=query, limit=limit, offset=0)
+        except Exception:  # noqa: BLE001  (FTS is a recall booster, not a gate)
+            logger.debug("search: keyword fusion unavailable", exc_info=True)
+            return ranked
+        keyword_ids = [str(item.id) for item in items]
+        if not keyword_ids:
+            return ranked
+        fused: dict[str, dict[str, Any]] = {}
+        for rank, candidate in enumerate(ranked):
+            entry = fused.setdefault(
+                str(candidate.get("id")), {**candidate, "rrf": 0.0, "vector_rank": None}
+            )
+            entry["rrf"] += 1 / (self._RRF_K + rank + 1)
+            entry["vector_rank"] = rank
+        for rank, item_id in enumerate(keyword_ids):
+            entry = fused.setdefault(item_id, {"id": item_id, "rrf": 0.0, "vector_rank": None})
+            entry["rrf"] += 1 / (self._RRF_K + rank + 1)
+        ordered = sorted(fused.values(), key=lambda entry: entry["rrf"], reverse=True)
+        return ordered[:limit]
+
+    def by_occurrence(self, start: datetime, end: datetime, *, limit: int = 30) -> list[SearchHit]:
+        """Every item occurring inside [start, end), soonest first (no score)."""
+        items = self._repo.by_occurrence(start=start, end=end, limit=limit)
+        return [SearchHit(item=item, score=None) for item in items]
 
     def _keyword_fallback(self, query: str, *, limit: int, offset: int) -> list[SearchHit]:
         """Postgres full-text search, used when semantic search is down."""

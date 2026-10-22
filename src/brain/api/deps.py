@@ -6,6 +6,7 @@ are request-scoped and assembled here via ``Depends``.
 """
 
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends
 from sqlalchemy.orm import Session
@@ -151,4 +152,7 @@ def get_ask_service(
     llm: LLMClient = Depends(get_llm_client),
 ) -> AskService:
     """Provide an AskService wired to search and the shared LLM client."""
-    return AskService(search, llm)
+    settings = get_settings()
+    return AskService(
+        search, llm, top_k=settings.ask_top_k, tz=ZoneInfo(settings.timezone)
+    )

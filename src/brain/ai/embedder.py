@@ -138,9 +138,10 @@ class OpenAIEmbedder:
 class FastEmbedEmbedder:
     """Strategy producing local, offline embeddings via the fastembed library.
 
-    The model (default ``BAAI/bge-small-en-v1.5``, dim 384) is downloaded on
-    first use and cached by fastembed; afterwards it runs fully offline. Load
-    or inference failures raise :class:`EmbedderError`.
+    The model (default ``minishlab/potion-multilingual-128M``, dim 256,
+    multilingual — Hebrew + English) is downloaded on first use and cached by
+    fastembed; afterwards it runs fully offline. Load or inference failures
+    raise :class:`EmbedderError`.
     """
 
     def __init__(self, model: str = DEFAULT_FASTEMBED_MODEL) -> None:

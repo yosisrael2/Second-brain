@@ -2,8 +2,14 @@
 
 import enum
 
-FTS_LANGUAGE = "english"
-"""Postgres text-search configuration used by MemoryItem full-text search."""
+FTS_LANGUAGE = "simple"
+"""Postgres text-search config for MemoryItem full-text search.
+
+'simple' (not 'english') so HEBREW words match: the english config stems
+English only and reduces Hebrew tokens to noise — the user's data is
+mostly Hebrew. Stemming quality for English drops slightly; the vector
+path carries semantic matching anyway.
+"""
 
 IMPORTANCE_MIN = 1
 IMPORTANCE_MAX = 5

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -72,6 +73,24 @@ class ItemsRepository:
             )
             .limit(limit)
             .offset(offset)
+        )
+        return list(self._db.scalars(stmt))
+
+    def by_occurrence(
+        self, *, start: datetime, end: datetime, limit: int
+    ) -> Sequence[MemoryItem]:
+        """Every item with occurred_at inside [start, end), soonest first.
+
+        Drives temporal retrieval: day/date questions fetch ALL events in the
+        resolved range (top-k semantic search cannot express "everything on
+        Tuesday"). Items without occurred_at are naturally excluded.
+        """
+        stmt = (
+            select(MemoryItem)
+            .where(MemoryItem.occurred_at >= start)
+            .where(MemoryItem.occurred_at < end)
+            .order_by(MemoryItem.occurred_at.asc(), MemoryItem.id.desc())
+            .limit(limit)
         )
         return list(self._db.scalars(stmt))
 
