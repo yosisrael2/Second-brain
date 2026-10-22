@@ -25,6 +25,17 @@ class AskResult:
     model: str | None = None
 
 
+def _unique_by_text(hits: list[SearchHit]) -> list[SearchHit]:
+    """Collapse hits with identical raw_text (split WhatsApp chunks)."""
+    seen: set[str] = set()
+    unique: list[SearchHit] = []
+    for hit in hits:
+        if hit.item.raw_text not in seen:
+            seen.add(hit.item.raw_text)
+            unique.append(hit)
+    return unique
+
+
 class AskService:
     """Answers questions over the memory store: search top-k, then LLM.
 
@@ -43,7 +54,7 @@ class AskService:
             hits = self._search.search(question, limit=self._top_k)
         context = [
             {"id": str(hit.item.id), "text": hit.item.raw_text[:SOURCE_PROMPT_MAX_CHARS]}
-            for hit in hits
+            for hit in _unique_by_text(hits)
         ]
         with ops.span("ask", "llm", edge="ask->llm") as span:
             result = answer(question, context, llm=self._llm)
@@ -51,6 +62,6 @@ class AskService:
         return AskResult(
             answer=result["answer"],
             cited_ids=result["cited_ids"],
-            sources=hits,
+            sources=_unique_by_text(hits),
             model=result["model"],
         )

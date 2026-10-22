@@ -106,3 +106,22 @@ def test_full_suite_leaves_dev_db_rows_untouched() -> None:
 def test_suite_settings_point_at_a_test_database() -> None:
     """Whatever the ambient environment says, the suite resolves to *_test."""
     assert get_settings().database_url.endswith("/brain_test")
+
+
+def test_suite_never_targets_the_default_qdrant_collection() -> None:
+    """The vector store gets the same protection as the database.
+
+    Regression guard: capture e2e tests used to wire the real app settings,
+    whose qdrant_collection default is the live 'brain_items' — every run
+    upserted test items into the developer's real collection (2214 stray
+    points found on the user's instance). The conftest now pins a *_test
+    collection and refuses the suite otherwise.
+    """
+    from brain.config import DEFAULT_QDRANT_COLLECTION
+
+    resolved = get_settings().qdrant_collection
+    assert resolved != DEFAULT_QDRANT_COLLECTION, (
+        "suite would write to the live qdrant collection — "
+        "conftest must pin QDRANT_COLLECTION to a *_test collection"
+    )
+    assert resolved.endswith("_test")

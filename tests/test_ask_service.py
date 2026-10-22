@@ -107,3 +107,41 @@ def test_prompt_sources_are_truncated_but_api_sources_are_not():
     assert "filler " * 400 not in captured["prompt"]  # a run beyond 2000 chars is gone
     assert result.sources[0].item.raw_text == long_text  # API response keeps it whole
     assert result.cited_ids == [str(item.id)]
+
+
+def test_ask_context_dedupes_identical_raw_text():
+    """Split WhatsApp chunks can share text: the LLM sees each text once."""
+    repo = FakeRepository()
+    first = repo.add(MemoryItem(raw_text="identical text"))
+    second = repo.add(MemoryItem(raw_text="identical text"))
+    hits = [
+        SearchHit(item=first, score=0.9),
+        SearchHit(item=second, score=0.8),
+    ]
+    captured: dict = {}
+
+    def capture(prompt: str) -> str:
+        captured["prompt"] = prompt
+        return "I do not know."
+
+    service = AskService(StubSearch(hits), FakeLLMClient(reply=capture))  # type: ignore[arg-type]
+
+    service.ask("what?")
+
+    assert captured["prompt"].count("identical text") == 1
+
+
+def test_ask_cited_ids_dedupe_preserving_order():
+    """cited_ids lists each cited item once, in first-citation order."""
+    repo = FakeRepository()
+    hits = make_hits(repo, "fact one", "fact two")
+    order = [str(hits[1].item.id), str(hits[0].item.id), str(hits[1].item.id)]
+
+    from brain.ai.ask import extract_cited_ids
+
+    cited = extract_cited_ids(
+        f"x [{order[0]}] y [{order[1]}] z [{order[1]}]",
+        [{"id": str(hits[0].item.id)}, {"id": str(hits[1].item.id)}],
+    )
+
+    assert cited == [str(hits[1].item.id), str(hits[0].item.id)]
