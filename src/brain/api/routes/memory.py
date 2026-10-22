@@ -1,15 +1,15 @@
 """Memory-layer HTTP endpoints (thin router over MemoryService).
 
 The memory layer stores durable, confirmed knowledge about the user's world:
-entities (people/groups/places/orgs with aliases) and versioned facts.
-Facts are never updated in place: PATCH closes the old version and opens a
-new one (supersedes_id chain, history kept); DELETE is soft (status=rejected,
-valid_to set, history kept).
+entities (people/groups/places/orgs/channels with aliases) and versioned
+facts. Facts are never updated in place: PATCH closes the old version and
+opens a new one (supersedes_id chain, history kept); DELETE is soft
+(status=rejected, valid_to set, history kept).
 
 GET    /memory                    entities with facts (?status=proposed, ?q=)
 POST   /memory/entities           create an entity (+aliases)
 PATCH  /memory/entities/{id}      rename
-DELETE /memory/entities/{id}      hard delete (cascades aliases + facts)
+DELETE /memory/entities/{id}      delete (refused with 409 while current facts exist)
 POST   /memory/facts              add a fact (status=confirmed by default)
 PATCH  /memory/facts/{id}         new version (old one closed, history kept)
 DELETE /memory/facts/{id}         soft delete (rejected, history kept)
@@ -18,7 +18,8 @@ GET    /memory/facts/{id}/history the version chain, oldest first
 
 Error mapping (the service raises KeyError/MemoryError/ValueError):
 KeyError -> 404 unknown entity/fact; MemoryError -> 409 bad state transition
-(already closed / not proposed); ValueError -> 422 (fact without object/value).
+(already closed / not proposed / entity still has current facts);
+ValueError -> 422 (fact without object/value).
 """
 
 import uuid
@@ -90,11 +91,14 @@ def delete_entity(
     entity_id: uuid.UUID,
     service: MemoryService = Depends(get_memory_service),
 ) -> None:
-    """Hard-delete an entity (cascades aliases and its facts); 404 when missing."""
+    """Delete an entity; 409 while it still has current facts (soft-delete
+    them first), 404 when missing."""
     try:
         service.delete_entity(entity_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"entity '{entity_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
 
 
 @router.post("/facts", status_code=status.HTTP_201_CREATED, response_model=schemas.FactRead)
@@ -118,11 +122,15 @@ def edit_fact(
     data: schemas.FactPatch,
     service: MemoryService = Depends(get_memory_service),
 ) -> schemas.FactRead:
-    """Edit a fact = close this version + open a new one; history kept."""
+    """Edit a fact = close this version + open a new one; history kept.
+
+    409 when the fact is already closed (superseded or deleted)."""
     try:
         fact = service.patch_fact(fact_id, **data.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"fact '{fact_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     return schemas.FactRead.model_validate(fact)

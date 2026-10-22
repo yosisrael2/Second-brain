@@ -171,7 +171,7 @@ class MemoryOverview(BaseModel):
 class EntityCreate(BaseModel):
     """Payload for POST /memory/entities."""
 
-    kind: Literal["person", "group", "place", "org"]
+    kind: Literal["person", "group", "place", "org", "channel"]
     name: str = Field(min_length=1, max_length=ENTITY_NAME_MAX_LENGTH)
     aliases: list[str] = Field(
         default_factory=list,

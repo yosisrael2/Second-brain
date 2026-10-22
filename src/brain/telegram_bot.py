@@ -63,6 +63,7 @@ from brain.config import Settings, unwrap_secret
 from brain.schemas import ItemUpdate
 from brain.services.ask import AskResult
 from brain.services.ingest import IngestService
+from brain.services.memory import MemoryError
 from brain.services.paste import parse as parse_paste
 
 logger = logging.getLogger(__name__)
@@ -755,18 +756,17 @@ class TelegramBot:
     def profile(self) -> Reply:
         """Kids first (gender/class/grade/teacher), then remembered facts.
 
-        Every fact line gets a numbered ✖ button (soft delete; history kept).
+        Lines are numbered to match the ✖ buttons (soft delete; history kept).
         Fact ids ride in the pending registry so callback data stays < 64B.
         """
         with self._services_factory() as services:
             memory = getattr(services, "memory", None)
             if memory is None:
                 return Reply("Memory layer is not installed yet.")
-            overview = memory.overview(status="confirmed", q=None)
+            # MemoryService.overview returns a LIST of entity dicts
+            entities = memory.overview(status="confirmed", q=None)
         persons = [
-            e
-            for e in overview.get("entities", [])
-            if e.get("kind") == "person" and e.get("facts")
+            e for e in entities if e.get("kind") == "person" and e.get("facts")
         ]
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
@@ -780,7 +780,9 @@ class TelegramBot:
                 for fact in facts:
                     fact_ids.append(str(fact["id"]))
                     predicate = _esc(fact.get("predicate", "note"))
-                    lines.append(f"• {predicate}: {_one_line(fact.get('value'), 80)}")
+                    lines.append(
+                        f"{len(fact_ids)}. • {predicate}: {_one_line(fact.get('value'), 80)}"
+                    )
                 continue
             lines.append("")
             lines.append(f"🧒 <b>{_esc(entity.get('name', '?'))}</b>")
@@ -794,11 +796,16 @@ class TelegramBot:
                 lines.append(_esc(summary))
             for predicate, fact in by_predicate.items():
                 fact_ids.append(str(fact["id"]))
-                lines.append(f"{_esc(predicate)}: {_one_line(fact.get('value'), 80)}")
+                lines.append(
+                    f"{len(fact_ids)}. {_esc(predicate)}: {_one_line(fact.get('value'), 80)}"
+                )
         if not fact_ids:
             return Reply(
-                "👤 Profile is empty.\nTeach me about your kids, e.g.\n"
-                "/remember Rona is a girl in ה' ספיר (grade 5, teacher Rinat)"
+                "👤 Profile is empty.\n"
+                "Kids are set up once via the seed CLI:\n"
+                "  brain memory seed-kid --name Rona --gender girl --school <school> "
+                "--grade 5 --class <class> --teacher <teacher>\n"
+                "/remember <text> stores a free-text note (not kid facts)."
             )
         return Reply(text="\n".join(lines), keyboard=self._memory_remove_buttons(fact_ids))
 
@@ -830,6 +837,8 @@ class TelegramBot:
             try:
                 memory.delete_fact(pending.ids[index])
             except KeyError:
+                return Reply("⌛ That fact was already removed.")
+            except MemoryError:
                 return Reply("⌛ That fact was already removed.")
         return self.profile_reply(notice="🗑 Removed (history kept).")
 

@@ -137,13 +137,20 @@ def test_patch_entity_not_found(client: TestClient, clean_memory: None) -> None:
     assert response.status_code == 404
 
 
-def test_delete_entity_cascades(client: TestClient, clean_memory: None) -> None:
+def test_delete_entity_refused_while_current_facts_exist(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Delete-with-history: an entity with current facts is not deletable."""
     entity = _add_entity(client, name="Rona")
-    _add_fact(client, entity["id"])
+    fact = _add_fact(client, entity["id"])
 
     response = client.delete(f"{_ENDPOINT}/entities/{entity['id']}")
 
-    assert response.status_code == 204
+    assert response.status_code == 409
+    assert "current facts" in response.json()["detail"]
+    # soft-delete the fact first, then the entity goes through
+    assert client.delete(f"{_ENDPOINT}/facts/{fact['id']}").status_code == 204
+    assert client.delete(f"{_ENDPOINT}/entities/{entity['id']}").status_code == 204
     assert client.get(_ENDPOINT).json() == {"entities": []}
 
 
@@ -230,6 +237,21 @@ def test_patch_fact_not_found(client: TestClient, clean_memory: None) -> None:
     response = client.patch(f"{_ENDPOINT}/facts/{uuid.uuid4()}", json={"value": "x"})
 
     assert response.status_code == 404
+
+
+def test_patch_closed_fact_conflicts(client: TestClient, clean_memory: None) -> None:
+    """Editing a superseded fact is a 409, not a fork of history."""
+    rona = _add_entity(client, name="Rona")
+    v1 = _add_fact(client, rona["id"], value="5")
+    v2 = client.patch(f"{_ENDPOINT}/facts/{v1['id']}", json={"value": "6"}).json()
+
+    response = client.patch(f"{_ENDPOINT}/facts/{v1['id']}", json={"value": "7"})
+
+    assert response.status_code == 409
+    assert "closed" in response.json()["detail"]
+    # the chain is unchanged by the refused edit
+    chain = client.get(f"{_ENDPOINT}/facts/{v2['id']}/history").json()
+    assert [f["value"] for f in chain] == ["5", "6"]
 
 
 # --- DELETE /memory/facts/{id}: soft delete --------------------------------------
