@@ -1,10 +1,83 @@
 # Second Brain
 
-An AI-powered personal knowledge base: capture raw thoughts, organize them into
-typed, searchable memory items, and retrieve them with keyword and semantic
-search.
+Second Brain is a local-first personal knowledge base that turns raw captures
+(Telegram messages, pasted emails, WhatsApp threads, calendar one-liners, `.ics`
+files) into typed, searchable memory items, keeps durable facts about your
+world in a versioned memory layer, and answers questions over all of it with
+cited, grounded answers — running 24/7 on your own Mac, private by default.
 
-Roadmap, known limitations, and where to pick up work: see [Next steps](#next-steps).
+**Features (what works today on `main`):** see
+[Features](#features) — **status:** [Status and progress](#status-and-progress).
+Roadmap and known limitations: [Next steps](#next-steps).
+
+## Features
+
+Everything below is merged and running on `main`. One line per capability,
+linked to its section or doc.
+
+**Capture**
+- Telegram bot (long-polling, allowlist-only) and `POST /capture` API, both feeding the same paste parser — [Telegram bot](#telegram-bot), [Paste-aware capture](#memory-items-api)
+- Paste recognition: email, WhatsApp thread, calendar one-liner, or plain note; WhatsApp threads ask "save as one item or separately" first — `src/brain/services/paste.py`
+- Jev auto-classification (type / importance / actionability / confidence, routed at >= 0.9) with exact-duplicate guard (content fingerprint) — [Dogfood checklist](#dogfood-checklist-live-run-without-api-keys)
+- `.ics` calendar files captured as calendar items — [Telegram bot](#telegram-bot)
+
+**Retrieval**
+- Multilingual embeddings (local `fastembed`, `minishlab/potion-multilingual-128M`, 256 dims — Hebrew + English), Postgres FTS over raw text, reciprocal-rank fusion of the two — [AI layer](#ai-layer-and-the-brain-cli)
+- Temporal retrieval: English + Hebrew weekday names, `dd.mm` dates, today/tomorrow/yesterday — `src/brain/services/temporal.py`
+- Ask recall pool: rerank over 32 candidates, top 8 in the prompt — [Memory items API](#memory-items-api)
+
+**Ask**
+- Grounded answers with item-id citations; model visible in the reply (`claude-sonnet-5-5` default) — [Memory items API](#memory-items-api), [docs/ai-layer.md](docs/ai-layer.md)
+- Conflict rule: when two sources disagree about the same event, the answer opens with the conflict, quotes both versions with citations, and never claims "no conflict" — `src/brain/ai/ask.py` (PR #27)
+
+**Memory layer**
+- Entities (person / group / place / org + aliases) and versioned confirmed facts (`valid_from`/`valid_to`, `proposed -> confirmed -> rejected`, supersedes chain) — [Memory layer API](#memory-layer-api)
+- Kid/class/teacher profiles, channel -> child mapping and `applies_to` resolution; memory block injected into ask answers — `src/brain/services/memory.py`
+- REST `/memory` API, cockpit Memory tab, bot `/profile` and `/remember`, seed CLI (`brain memory seed-kid`, `seed-channel`) — [Memory layer API](#memory-layer-api)
+
+**Cockpit**
+- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone — [Cockpit](#cockpit-ops-dashboard)
+
+**Ops**
+- 24/7 launchd services (`scripts/service.sh`), single bot instance lock, live-store startup guard (`BRAIN_ALLOW_LIVE`), per-worker test databases, suite isolated from the live store — [Background services](#background-services-launchd-247), [Live-store startup guard](#live-store-startup-guard)
+
+**Evaluation**
+- `brain eval-extraction`: gold-set scorer for extraction candidates (per-type P/R/F1, date accuracy, applies_to, quote grounding, relations, `date_conflict` recall) — [docs/eval-extraction.md](docs/eval-extraction.md)
+
+## Status and progress
+
+| Area | Status | PRs |
+| --- | --- | --- |
+| Capture pipeline (items, paste parsing, Jev, dedupe) | **Done** | #1, #7, #17, #19 |
+| Retrieval (embeddings, FTS fusion, temporal, recall pool) | **Done** | #20, #21, #24 |
+| Ask (citations, model config, conflict rule) | **Done** | #6, #27 |
+| Memory layer (entities, versioned facts, ask block) | **Done** | #26, #28, #30 |
+| Telegram bot + launchd services | **Done** | #9-#12, #16, #18 |
+| Cockpit (ops dashboard + restyle) | **Done** | #13, #29 |
+| Ops safety (test isolation, live-store guard, dedicated ports) | **Done** | #10, #22, #23, #31 |
+| CI + extraction evaluation | **Done** | #4, #5, #25 |
+
+**In progress**
+
+- Meaning extraction PR A1: data model + async enrichment of captured items
+- Memory-aware recall for kid questions (PR 0d)
+- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp
+- Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user
+- WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
+- Bot timezone fix
+
+**Planned**
+
+- PR A2: LLM extraction scored against the frozen gold set + held-out data
+- PR B: relations between items + duplicate handling
+- PR C: bot proposal cards (Keep / Fix / Drop) for classification review
+- PR D: WhatsApp triage, reconciliation, media
+- Then: actions — approved items become Google Calendar events / tasks
+
+**Quality check** (22-23 Oct 2026, real questions): calendar questions **10/10**,
+school-email questions **11/12**, WhatsApp questions **6.5/11** (up from a
+**5.5** baseline before the memory layer). The WhatsApp gold set is held
+privately and is not part of the repo.
 
 ## Stack
 
@@ -185,7 +258,7 @@ Example:
 
 ```bash
 curl -X POST localhost:27800/memory/entities -H 'Content-Type: application/json' \
-  -d '{"kind": "person", "name": "Rona", "aliases": ["רונה"]}'
+  -d '{"kind": "person", "name": "Dana", "aliases": ["דנה"]}'
 curl -X POST localhost:27800/memory/facts -H 'Content-Type: application/json' \
   -d '{"subject_id": "<entity-id>", "predicate": "grade", "value": "5"}'
 curl 'localhost:27800/memory?status=confirmed'          # grouped overview
@@ -343,9 +416,8 @@ for MVP top-k use.
 `brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
 `pip install -e '.[telegram]'`). Plain messages are captured through the same
 paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent`,
-`/profile` and `/remember` use the same services as the API in-process; with
-feature/cockpit installed, `/status` shows live per-component health via the `brain.ops`
-shim — zero bot changes; without it the bot degrades to a stub reply. Access is
+`/profile` and `/remember` use the same services as the API in-process; `/status`
+shows live per-component health via the `brain.ops` shim — zero bot changes. Access is
 allowlist-only: with `TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS`
 (comma-separated ids) is required — anyone else gets no reply (their id is
 logged once at INFO). `brain telegram --whoami-hint` explains how to find
@@ -511,11 +583,9 @@ Behavior worth knowing:
   `DATABASE_URL=postgresql+psycopg://brain:brain@localhost:27432/brain_test
   QDRANT_COLLECTION=brain_items_test uvicorn brain.main:app` — and stop it
   by its own PID or port (`kill $(lsof -ti tcp:<port>)`), never by pattern.
-  Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store.
-  `scripts/dev-start.sh` deliberately does NOT set the flag: if it did, a
-  worktree running dev-start without `.env` would fall back to the live
-  defaults WITH permission. To run the dev stack against the live store, the
-  user opts in explicitly: `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
+  Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store. To run
+  `dev-start.sh` against the real store you opt in explicitly with
+  `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
 
 ## Setup
 
