@@ -498,6 +498,20 @@ Behavior worth knowing:
   quotes stripped; inline `#` comments and trailing whitespace are NOT
   stripped (keep values comment-free). The real environment always wins over
   `.env`, matching pydantic-settings. Secrets are never printed.
+- **Live-store startup guard** — Settings' defaults ARE the live service
+  (database `brain` on localhost:27432, collection `brain_items`), so a bare
+  `uvicorn brain.main:app` from a worktree without `.env` would silently
+  write to the live DB. The app therefore refuses to start against the live
+  store (`brain.config.assert_not_live_store`, checked in the app lifespan):
+  it raises `refusing to start against the LIVE store; set
+  DATABASE_URL/QDRANT_COLLECTION for a test instance, or BRAIN_ALLOW_LIVE=1
+  for the real service`. The launchd path (`scripts/run-server.sh`) exports
+  `BRAIN_ALLOW_LIVE=1`; a local instance must instead set an explicit
+  `DATABASE_URL` (a `*_test` database) and `QDRANT_COLLECTION`, e.g.
+  `DATABASE_URL=postgresql+psycopg://brain:brain@localhost:27432/brain_test
+  QDRANT_COLLECTION=brain_items_test uvicorn brain.main:app` — and stop it
+  by its own PID or port (`kill $(lsof -ti tcp:<port>)`), never by pattern.
+  Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store.
 
 ## Setup
 

@@ -177,6 +177,22 @@ class TestRunServer:
         assert "UNBUFFERED: 1" in result.stdout
         assert f"CWD: {REPO_ROOT}" in result.stdout
 
+    def test_run_server_exports_allow_live(self, tmp_path):
+        """run-server.sh is the launchd path: it MUST export BRAIN_ALLOW_LIVE=1
+        so the live-store startup guard (brain.config.assert_not_live_store)
+        lets the real service through, while a bare worktree uvicorn refuses."""
+        fake_bin = tmp_path / "bin3"
+        fake_bin.mkdir()
+        fake_uvicorn = fake_bin / "uvicorn"
+        fake_uvicorn.write_text('echo "ALLOW: ${BRAIN_ALLOW_LIVE-unset}"\n')
+        fake_uvicorn.chmod(0o755)
+        result = _run(
+            [str(SCRIPTS / "run-server.sh")],
+            env={"UVICORN_BIN": str(fake_uvicorn), "PORT": "27998"},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ALLOW: 1" in result.stdout
+
 
 class _LaunchctlStub:
     """PATH shim for launchctl: records invocations, fakes `print` output."""
