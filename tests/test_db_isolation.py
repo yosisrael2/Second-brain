@@ -1,9 +1,16 @@
 """Proof that the test suite can never wipe a developer's database.
 
 The conftest pins DATABASE_URL to a *_test database and the destructive
-teardown guards on the engine URL actually in use. These tests pin both
-contract points, end to end: a marker row seeded in the DEV database must
-survive a full run of the DB-backed suite.
+tardown guards on the engine URL actually in use. These tests pin both
+contract points, end to end: a marker row seeded in a disposable 'dev-like'
+database must survive a full run of the DB-backed suite.
+
+The dev-like database is NOT the developer's real database: it is derived
+from the suite's own *_test database name (``brain_w3_test`` ->
+``brain_w3_dev``), created + migrated by the test and dropped afterwards.
+The helper refuses any URL whose database is the live 'brain' or lacks a
+disposable suffix, so the suite can never seed or delete rows in a real
+database.
 """
 
 import os
@@ -20,8 +27,61 @@ from conftest import assert_test_database
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-DEV_DB_URL = "postgresql://brain:brain@localhost:27432/brain"
+MAINTENANCE_URL = "postgresql://brain:brain@localhost:27432/postgres"
 MARKER_RAW_TEXT = "__db_isolation_marker__"
+
+
+def _dev_like_db_url() -> str:
+    """Disposable 'dev-like' DB derived from the suite's own test DB.
+
+    brain_w3_test -> brain_w3_dev; brain_test (CI default) -> brain_dev.
+    Refuses to return anything that could be a real database: the name must
+    end with _dev and must not be 'brain'.
+    """
+    test_db = get_settings().database_url.rsplit("/", 1)[-1].split("?")[0]
+    assert test_db.endswith("_test"), f"suite is not pinned to a *_test db: {test_db!r}"
+    dev_name = test_db[: -len("_test")] + "_dev"
+    if dev_name == "brain" or not dev_name.endswith("_dev"):
+        pytest.fail(f"derived dev-like db is not disposable: {dev_name!r}")
+    return f"postgresql://brain:brain@localhost:27432/{dev_name}"
+
+
+def _drop_database(url: str) -> None:
+    name = url.rsplit("/", 1)[-1]
+    assert name.endswith("_dev"), f"refusing to drop non-disposable db {name!r}"
+    with psycopg.connect(MAINTENANCE_URL, connect_timeout=3, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def _create_and_migrate_dev_like_db(url: str) -> None:
+    """Create the disposable DB and migrate it to head (as dev-start would)."""
+    name = url.rsplit("/", 1)[-1]
+    with psycopg.connect(MAINTENANCE_URL, connect_timeout=3, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    migrated = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+        env={**os.environ, "DATABASE_URL": url},
+    )
+    if migrated.returncode != 0:
+        pytest.skip(
+            "dev-like DB could not be migrated: "
+            f"{migrated.stderr.strip()[:200]}"
+        )
+
+
+def test_marker_db_is_never_the_live_database() -> None:
+    """The isolation 'dev-like' DB must never be the user's live 'brain' DB.
+
+    It must be a disposable per-worker database whose name ends with _dev,
+    derived from the suite's own *_test database.
+    """
+    name = _dev_like_db_url().rsplit("/", 1)[-1].split("?")[0]
+    assert name != "brain", "isolation test would seed/delete rows in the LIVE db"
+    assert name.endswith("_dev"), f"dev-like db {name!r} is not disposable (_dev)"
 
 
 def test_guard_refuses_non_test_urls_and_accepts_test_ones() -> None:
@@ -31,42 +91,18 @@ def test_guard_refuses_non_test_urls_and_accepts_test_ones() -> None:
     assert_test_database("postgresql+psycopg://brain:brain@localhost:27432/brain_test?x=1")
 
 
-def _ensure_dev_like_schema() -> None:
-    """Migrate the dev-like DB when it has no schema (CI throwaway case).
-
-    No-op on a developer Mac (schema exists). In CI the 'brain' service
-    database is empty — only brain_test is migrated — so the guard has
-    nothing to protect until we apply the migrations, exactly as dev-start
-    would before serving. Migration failure skips with an explicit reason,
-    never a silent pass.
-    """
-    with psycopg.connect(DEV_DB_URL, connect_timeout=3) as conn:
-        exists = conn.execute(
-            "SELECT to_regclass('public.memory_items')"
-        ).fetchone()[0]
-        if exists is not None:
-            return
-    migrated = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        cwd=str(REPO_ROOT),
-        env={**os.environ, "DATABASE_URL": DEV_DB_URL},
-    )
-    if migrated.returncode != 0:
-        pytest.skip(
-            "dev-like DB has no schema and migrating it failed: "
-            f"{migrated.stderr.strip()[:200]}"
-        )
-
-
 def test_full_suite_leaves_dev_db_rows_untouched() -> None:
-    """Seed a marker in the dev DB, run the DB suite, assert the marker survives."""
+    """Seed a marker in a disposable dev-like DB, run the DB suite, assert it survives.
+
+    The dev-like DB is created fresh (empty), migrated to head exactly as
+    dev-start would, then dropped. If the suite ever connected to it, the
+    marker (or the whole schema) would vanish.
+    """
+    dev_url = _dev_like_db_url()
     try:
-        with psycopg.connect(DEV_DB_URL, connect_timeout=3) as conn:
-            conn.autocommit = True
-            _ensure_dev_like_schema()
+        _drop_database(dev_url)  # defensive: start from a clean slate
+        _create_and_migrate_dev_like_db(dev_url)
+        with psycopg.connect(dev_url, connect_timeout=3, autocommit=True) as conn:
             conn.execute(
                 "INSERT INTO memory_items (id, raw_text, source, status) "
                 "VALUES (%s, %s, 'manual', 'inbox')",
@@ -90,18 +126,14 @@ def test_full_suite_leaves_dev_db_rows_untouched() -> None:
         )
         assert result.returncode == 0, result.stdout + result.stderr
 
-        with psycopg.connect(DEV_DB_URL, connect_timeout=3) as conn:
+        with psycopg.connect(dev_url, connect_timeout=3) as conn:
             survived = conn.execute(
                 "SELECT count(*) FROM memory_items WHERE raw_text = %s",
                 (MARKER_RAW_TEXT,),
             ).fetchone()[0]
-        assert survived == 1, "the suite wiped a row from the dev database!"
+        assert survived == 1, "the suite wiped a row from the dev-like database!"
     finally:
-        with psycopg.connect(DEV_DB_URL, connect_timeout=3) as conn:
-            conn.autocommit = True
-            conn.execute(
-                "DELETE FROM memory_items WHERE raw_text = %s", (MARKER_RAW_TEXT,)
-            )
+        _drop_database(dev_url)
 
 
 def test_suite_settings_point_at_a_test_database() -> None:
