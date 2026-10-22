@@ -182,6 +182,11 @@ def test_capture_calendar_text(jerusalem_client: TestClient, clean_items: None) 
     assert body["extracted"]["title"] == "Team sync"
     assert body["extracted"]["location"] == "Meeting room 2"
     assert _instant(body["items"][0]["occurred_at"]).hour == 7  # 10:00 IDT -> 07:00Z
+    # the STORED item's raw_text is the human one-liner (original kept in meta)
+    assert body["items"][0]["raw_text"] == (
+        "Team sync — Wed 21 Oct 10:00–11:00 @ Meeting room 2"
+    )
+    assert body["items"][0]["meta"]["original_text"].startswith("Team sync")
 
 
 def test_capture_note_falls_back_to_plain_item(

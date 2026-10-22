@@ -471,15 +471,25 @@ class TelegramBot:
     def _capture_buttons(self, items: list[Any]) -> list[list[tuple[str, str]]]:
         """One action row: [✅ File] [🏷 Type] [🗑 Delete] [↩️ Undo].
 
-        File is hidden when every captured item is already filed.
+        File is hidden when every captured item is already filed. A deduped
+        capture ("Already saved") created NOTHING, so it must not offer Undo
+        — Undo deletes the items "created by this message", which here would
+        be the ORIGINAL item; the delete button is relabelled instead so the
+        destruction is explicit.
         """
         token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
         filed = bool(items) and all(item.status == "filed" for item in items)
+        deduped = bool(items) and all(
+            getattr(item, "deduplicated", False) for item in items
+        )
         row: list[tuple[str, str]] = []
         if not filed:
             row.append(("✅ File", f"{CB_FILE}:{token}"))
+        row.append(("🏷 Type", f"{CB_TYPE}:{token}"))
+        if deduped:
+            row.append(("🗑 Delete original", f"{CB_DELETE}:{token}"))
+            return [row]
         row += [
-            ("🏷 Type", f"{CB_TYPE}:{token}"),
             ("🗑 Delete", f"{CB_DELETE}:{token}"),
             ("↩️ Undo", f"{CB_UNDO}:{token}"),
         ]
@@ -495,8 +505,16 @@ class TelegramBot:
     # -- cards -------------------------------------------------------------------
 
     def _card_header(self, items: list[Any], notice: str | None = None) -> str:
-        """'✅ Saved · 💬 WhatsApp [· 2 items]' (+ optional notice line)."""
-        header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
+        """'✅ Saved · 💬 WhatsApp [· 2 items]' (+ optional notice line).
+
+        An exact-duplicate capture (every returned item flagged deduplicated
+        by the ingest guard) says 'Already saved' instead — the card below is
+        the EXISTING item.
+        """
+        if items and all(getattr(item, "deduplicated", False) for item in items):
+            header = f"ℹ️ <b>Already saved</b> · {self._kind_label(items)}"
+        else:
+            header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
         if len(items) > 1:
             header += f" · {len(items)} items"
         return f"{notice}\n{header}" if notice else header
