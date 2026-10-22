@@ -132,7 +132,7 @@ class EmailPoller:
         new = skipped = errors = 0
         for stub in stubs:
             try:
-                outcome = self._process_message(stub.id)
+                outcome = self._process_message(stub)
             except Exception as exc:  # noqa: BLE001 (one bad message never stops the poll)
                 errors += 1
                 ops.record_event(
@@ -168,9 +168,20 @@ class EmailPoller:
         )
         return PollSummary(state=state, detail={"error": str(exc)[:200]})
 
-    def _process_message(self, message_id: str) -> bool:
-        """Capture one message; returns False when it was already seen."""
-        msg = self._client.get_message(message_id)
+    def _process_message(self, stub: Any) -> bool:
+        """Capture one message; returns False when it was skipped as seen."""
+        # Fast path: the ledger already knows this gmail id (every processed
+        # message is marked with its gmail id) — skip without a GET. The
+        # Message-ID dedupe below stays as the backstop.
+        if self._seen.seen_gmail(stub.id):
+            return False
+        msg = self._client.get_message(stub.id)
+        # Defence in depth: get_message can fetch ANY message by id — only
+        # messages still carrying the polled label may be captured. Skipped
+        # messages are NOT marked, so a re-labelled message captures again.
+        if self._settings.gmail_label_id not in msg.label_ids:
+            logger.info("email: message %s no longer carries the polled label — skipped", msg.id)
+            return False
         dedupe_id = dedupe_id_for_message(msg)
         if self._seen.seen(dedupe_id):
             return False

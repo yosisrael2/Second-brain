@@ -77,7 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_channel.add_argument(
         "--applies-to",
         required=True,
-        help="Rona | Itamar | me | family (values handed over at seed time)",
+        help="<kid name> | me | family (values handed over at seed time)",
     )
     eval_extraction = subparsers.add_parser(
         "eval-extraction",

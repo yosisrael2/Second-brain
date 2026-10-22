@@ -17,6 +17,7 @@ Design (per the F2 investigation + decision):
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -24,11 +25,17 @@ from datetime import UTC, datetime
 from email import policy
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+
+# list_messages follows nextPageToken at most this many pages (Gmail's
+# default page is ~100 messages; a 60s poll is unlikely to need even two,
+# so the cap only bounds a pathological backlog walk).
+_MAX_LIST_PAGES = 5
 
 
 class GmailError(RuntimeError):
@@ -141,8 +148,33 @@ ServiceFactory = Callable[[str, str], Any]
 def default_service_factory(refresh_token: str, user_id: str) -> Any:
     """Production service factory: the ONLY place google libs are imported.
 
-    Kept out of :class:`RestGmailClient` so tests can run without the extra.
+    google-auth cannot refresh an access token with the refresh token alone:
+    Credentials also needs the OAuth client fields (client_id, client_secret,
+    token_uri) — they come from the Desktop client secret JSON, the SAME file
+    ``brain gmail-auth`` uses (outside the repo; GMAIL_CREDENTIALS_PATH).
     """
+    from brain.config import get_settings  # noqa: PLC0415  (lazy; config never imports ai)
+
+    path = get_settings().gmail_credentials_path
+    client_file = Path(path).expanduser() if path else None
+    if not client_file or not client_file.is_file():
+        raise GmailAuthError(
+            f"client secret missing/unreadable at {path!r} — re-run `brain gmail-auth "
+            "--client-secret /path/to/secret.json`"
+        )
+    try:
+        data = json.loads(client_file.read_text())
+    except (OSError, ValueError) as exc:
+        raise GmailAuthError(f"client secret unreadable at {path!r}: {type(exc).__name__}") from exc
+    client = data.get("installed") or data.get("web") or {}
+    client_id = client.get("client_id")
+    client_secret = client.get("client_secret")
+    token_uri = client.get("token_uri")
+    if not (client_id and client_secret and token_uri):
+        raise GmailAuthError(
+            f"client secret file at {path!r} is not an OAuth client JSON "
+            "(client_id/client_secret/token_uri missing)"
+        )
     try:
         # Lazy + importlib: keeps mypy clean whether or not the gmail extra is
         # installed (warn_unused_ignores would make static ignores flaky).
@@ -154,7 +186,14 @@ def default_service_factory(refresh_token: str, user_id: str) -> Any:
         raise GmailError(
             "google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    credentials = credentials_mod.Credentials(token=None, refresh_token=refresh_token)
+    credentials = credentials_mod.Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri=token_uri,
+        scopes=[GMAIL_SCOPE],
+    )
     return discovery.build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
 
@@ -194,11 +233,23 @@ class RestGmailClient:
     def list_messages(self, *, query: str, label_ids: Sequence[str]) -> list[GmailMessageStub]:
         params = gmail_list_params(query, label_ids)
         service = self._get_service()
-        result = self._execute(service.users().messages().list(userId=self._user_id, **params))
-        return [
-            GmailMessageStub(id=m["id"], thread_id=m.get("threadId", ""))
-            for m in (result.get("messages") or [])
-        ]
+        stubs: list[GmailMessageStub] = []
+        page_token: str | None = None
+        for _page in range(_MAX_LIST_PAGES):
+            call_params = dict(params)
+            if page_token:
+                call_params["pageToken"] = page_token
+            result = self._execute(
+                service.users().messages().list(userId=self._user_id, **call_params)
+            )
+            stubs.extend(
+                GmailMessageStub(id=m["id"], thread_id=m.get("threadId", ""))
+                for m in (result.get("messages") or [])
+            )
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
+        return stubs
 
     def get_message(self, message_id: str) -> GmailMessage:
         service = self._get_service()

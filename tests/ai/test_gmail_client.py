@@ -11,9 +11,11 @@ from typing import Any
 import pytest
 
 from brain.ai.gmail import (
+    GMAIL_SCOPE,
     GmailAuthError,
     GmailLabelError,
     RestGmailClient,
+    default_service_factory,
     gmail_list_params,
 )
 
@@ -142,3 +144,145 @@ class TestRestGmailClient:
         client, _ = _client(None, type("RefreshError", (Exception,), {})("invalid_grant"))
         with pytest.raises(GmailAuthError):
             client.list_messages(query="", label_ids=["L"])
+
+
+# --- production refresh needs the OAuth client fields --------------------------
+
+
+class TestDefaultServiceFactory:
+    """google-auth cannot refresh with refresh_token alone: Credentials also
+    needs client_id, client_secret and token_uri (from the Desktop client
+    JSON). The factory loads that file (outside the repo)."""
+
+    @staticmethod
+    def _inject_fake_google(monkeypatch, captured):
+        import sys
+        import types
+
+        creds_mod = types.ModuleType("google.oauth2.credentials")
+
+        class FakeCredentials:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        creds_mod.Credentials = FakeCredentials
+        disco_mod = types.ModuleType("googleapiclient.discovery")
+        disco_mod.build = lambda *args, **kwargs: "fake-service"
+        monkeypatch.setitem(sys.modules, "google.oauth2.credentials", creds_mod)
+        monkeypatch.setitem(sys.modules, "googleapiclient.discovery", disco_mod)
+
+    @staticmethod
+    def _write_client_secret(tmp_path):
+        import json
+
+        path = tmp_path / "client_secret.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "installed": {
+                        "client_id": "cid.apps.googleusercontent.com",
+                        "client_secret": "sekret",
+                        "token_uri": "https://oauth2.googleapis.com/token",
+                        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    }
+                }
+            )
+        )
+        return path
+
+    def test_credentials_receive_client_fields_and_scope(self, monkeypatch, tmp_path):
+        from brain.config import get_settings
+
+        captured: dict = {}
+        self._inject_fake_google(monkeypatch, captured)
+        path = self._write_client_secret(tmp_path)
+        monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", str(path))
+        get_settings.cache_clear()
+        try:
+            service = default_service_factory("1//tok", "me")
+        finally:
+            get_settings.cache_clear()
+        assert service == "fake-service"
+        assert captured["client_id"] == "cid.apps.googleusercontent.com"
+        assert captured["client_secret"] == "sekret"
+        assert captured["refresh_token"] == "1//tok"
+        assert captured["token_uri"] == "https://oauth2.googleapis.com/token"
+        assert captured["scopes"] == [GMAIL_SCOPE]
+
+    def test_missing_client_secret_path_is_a_clear_auth_error(self, monkeypatch):
+        from brain.config import get_settings
+
+        captured: dict = {}
+        self._inject_fake_google(monkeypatch, captured)
+        monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(GmailAuthError, match="client secret"):
+                default_service_factory("1//tok", "me")
+        finally:
+            get_settings.cache_clear()
+        assert captured == {}  # nothing constructed without the client file
+
+    def test_invalid_client_secret_json_is_a_clear_auth_error(self, monkeypatch, tmp_path):
+        from brain.config import get_settings
+
+        captured: dict = {}
+        self._inject_fake_google(monkeypatch, captured)
+        path = tmp_path / "broken.json"
+        path.write_text("{not json")
+        monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", str(path))
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(GmailAuthError, match="client secret"):
+                default_service_factory("1//tok", "me")
+        finally:
+            get_settings.cache_clear()
+
+
+class TestListPagination:
+    def test_follows_pagetoken_up_to_a_small_cap(self):
+        pages = [
+            {"messages": [{"id": "m1", "threadId": "t1"}], "nextPageToken": "p2"},
+            {"messages": [{"id": "m2", "threadId": "t1"}]},
+        ]
+
+        class PagingMessages:
+            def __init__(self):
+                self.calls = []
+
+            def list(self, **kwargs):
+                self.calls.append(kwargs)
+                result = pages[min(len(self.calls) - 1, len(pages) - 1)]
+                return _FakeRequest(result=result)
+
+        paging = PagingMessages()
+        client = RestGmailClient(
+            token_loader=lambda: "refresh-token",
+            service_factory=lambda token, user_id: _FakeService(_FakeUsers(paging)),
+        )
+        stubs = client.list_messages(query="", label_ids=["L"])
+        assert [s.id for s in stubs] == ["m1", "m2"]
+        assert paging.calls[1].get("pageToken") == "p2"
+
+    def test_cap_stops_the_walk(self):
+        class EndlessMessages:
+            def __init__(self):
+                self.calls = 0
+
+            def list(self, **kwargs):
+                self.calls += 1
+                return _FakeRequest(
+                    result={
+                        "messages": [{"id": f"m{self.calls}", "threadId": "t"}],
+                        "nextPageToken": f"p{self.calls}",
+                    }
+                )
+
+        endless = EndlessMessages()
+        client = RestGmailClient(
+            token_loader=lambda: "refresh-token",
+            service_factory=lambda token, user_id: _FakeService(_FakeUsers(endless)),
+        )
+        stubs = client.list_messages(query="", label_ids=["L"])
+        assert endless.calls <= 5  # small cap: bounded walk per poll
+        assert len(stubs) == endless.calls

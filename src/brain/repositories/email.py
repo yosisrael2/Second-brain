@@ -21,6 +21,12 @@ class EmailMessageRepository:
         stmt = select(EmailMessage.id).where(EmailMessage.dedupe_id == dedupe_id)
         return self._db.execute(stmt).first() is not None
 
+    def seen_gmail(self, gmail_id: str) -> bool:
+        """True when this Gmail message id was already processed (fast path:
+        lets the poller skip the full-message GET for known ids)."""
+        stmt = select(EmailMessage.id).where(EmailMessage.gmail_id == gmail_id)
+        return self._db.execute(stmt).first() is not None
+
     def mark(
         self,
         dedupe_id: str,

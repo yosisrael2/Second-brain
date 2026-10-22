@@ -63,3 +63,10 @@ def test_item_id_set_null_on_item_delete(email_repo, email_db, clean_items):
     row = email_db.query(EmailMessage).filter(EmailMessage.dedupe_id == "<m@x>").one()
     assert row.item_id is None  # FK SET NULL; the ledger row stays: no double-capture
     assert row.gmail_id == "gm1"
+
+
+def test_seen_gmail_fast_path(email_repo):
+    assert email_repo.seen_gmail("gm1") is False
+    email_repo.mark("<m@x>", "gm1", "<m@x>", None)
+    assert email_repo.seen_gmail("gm1") is True
+    assert email_repo.seen_gmail("gm2") is False

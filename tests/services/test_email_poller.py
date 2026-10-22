@@ -17,6 +17,7 @@ class FakeGmailClient:
         self._messages = {m.id: m for m in messages}
         self._list_error = list_error
         self.list_calls: list[dict[str, Any]] = []
+        self.get_calls: list[str] = []
 
     def list_messages(self, *, query: str, label_ids: list[str]) -> list[GmailMessageStub]:
         self.list_calls.append({"query": query, "label_ids": list(label_ids)})
@@ -25,6 +26,7 @@ class FakeGmailClient:
         return [GmailMessageStub(id=m.id, thread_id=m.thread_id) for m in self._messages.values()]
 
     def get_message(self, message_id: str) -> GmailMessage:
+        self.get_calls.append(message_id)
         return self._messages[message_id]
 
     def close(self) -> None: ...
@@ -54,13 +56,18 @@ class FakeIngest:
 class FakeSeenRepo:
     def __init__(self, seen: set[str] | None = None) -> None:
         self.seen_ids = set(seen or [])
+        self.seen_gmail_ids: set[str] = set()
         self.marked: list[tuple[str, str]] = []
 
     def seen(self, dedupe_id: str) -> bool:
         return dedupe_id in self.seen_ids
 
+    def seen_gmail(self, gmail_id: str) -> bool:
+        return gmail_id in self.seen_gmail_ids
+
     def mark(self, dedupe_id: str, gmail_id: str, rfc_message_id: str | None, item_id: Any) -> None:
         self.seen_ids.add(dedupe_id)
+        self.seen_gmail_ids.add(gmail_id)
         self.marked.append((dedupe_id, gmail_id))
 
 
@@ -70,6 +77,7 @@ def _message(
     body: str = "From: t@example.com\nSubject: hi\n\nbody text",
     date: str = "2026-10-22T10:00:00+00:00",
     attachments: list | None = None,
+    label_ids: list | None = None,
 ):
     from datetime import UTC, datetime
 
@@ -80,9 +88,9 @@ def _message(
         sender="teacher@example.com",
         subject="hi",
         internal_date=datetime.fromisoformat(date).astimezone(UTC),
-        label_ids=["Label_school"],
         body_text=body,
         attachments=list(attachments or []),
+        label_ids=list(label_ids or ["Label_school"]),
     )
 
 
@@ -267,3 +275,53 @@ class TestDedupeId:
         later = _message("m3", rfc=None, date="2026-10-22T10:01:00+00:00")
         assert dedupe_id_for_message(later) != a  # a different minute is a different key
         assert a.startswith("fp:")
+
+
+class TestLabelMembershipDefence:
+    """Defence in depth: get_message can fetch any id; only messages still
+    carrying the configured label may be captured."""
+
+    def test_message_without_the_label_is_skipped_and_not_ledgered(self):
+        msg = _message(rfc="<other@x>", label_ids=["Label_SOMETHING_ELSE"])
+        poller, ingest, seen = _poller(FakeGmailClient([msg]))
+        summary = poller.poll_once()
+        assert summary.new == 0
+        assert summary.skipped == 1
+        assert ingest.created == []
+        assert seen.marked == []  # NOT marked: if the label returns, it captures
+
+    def test_message_with_the_label_is_captured(self):
+        msg = _message(rfc="<in@x>", label_ids=["Label_school", "UNREAD"])
+        poller, ingest, seen = _poller(FakeGmailClient([msg]))
+        summary = poller.poll_once()
+        assert summary.new == 1
+        assert len(seen.marked) == 1
+
+
+class TestGmailIdFastPath:
+    """The ledger already knows gmail ids: known ids must not trigger a GET."""
+
+    def test_known_gmail_id_skips_get_entirely(self):
+        msg = _message("m1")
+        seen = FakeSeenRepo()
+        seen.mark(dedupe_id_for_message(msg), "m1", msg.rfc_message_id, None)
+        client = FakeGmailClient([msg])
+        poller, ingest, _ = _poller(client, seen=seen)
+        summary = poller.poll_once()
+        assert summary.skipped == 1
+        assert summary.new == 0
+        assert client.get_calls == []  # no GET for a known id
+
+    def test_unknown_gmail_id_still_gets_fetched(self):
+        client = FakeGmailClient([_message("m1")])
+        poller, _, _ = _poller(client)
+        poller.poll_once()
+        assert client.get_calls == ["m1"]
+
+    def test_second_poll_never_gets_the_known_id(self):
+        client = FakeGmailClient([_message("m1")])
+        poller, _, _ = _poller(client)
+        poller.poll_once()
+        gets_after_first = list(client.get_calls)
+        poller.poll_once()
+        assert client.get_calls == gets_after_first  # unchanged: fast path hit
