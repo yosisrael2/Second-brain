@@ -50,6 +50,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
     )
+    memory = subparsers.add_parser("memory", help="Memory layer commands")
+    memory_sub = memory.add_subparsers(dest="memory_command", required=True)
+    seed_kid = memory_sub.add_parser(
+        "seed-kid", help="Create/update a kid's profile facts (user-confirmed seed)"
+    )
+    seed_kid.add_argument("--name", required=True)
+    seed_kid.add_argument("--gender", required=True, help="'girl' or 'boy' (explicit fact)")
+    seed_kid.add_argument("--school", required=True)
+    seed_kid.add_argument("--grade", required=True)
+    seed_kid.add_argument("--class", dest="class_", required=True)
+    seed_kid.add_argument("--teacher", required=True)
+    seed_channel = memory_sub.add_parser(
+        "seed-channel",
+        help="Register a channel (WhatsApp group etc.) and who it is for",
+    )
+    seed_channel.add_argument("--name", required=True, help="Exact channel name")
+    seed_channel.add_argument(
+        "--kind",
+        required=True,
+        choices=["teacher", "parents", "kids", "club", "committee"],
+    )
+    seed_channel.add_argument(
+        "--applies-to",
+        required=True,
+        help="Rona | Itamar | me | family (values handed over at seed time)",
+    )
     eval_extraction = subparsers.add_parser(
         "eval-extraction",
         help="Score predicted extraction children against gold labels",
@@ -95,6 +121,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _telegram(whoami_hint=args.whoami_hint)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
+    if args.command == "memory":
+        if args.memory_command == "seed-kid":
+            return _memory_seed_kid(
+                name=args.name,
+                gender=args.gender,
+                school=args.school,
+                grade=args.grade,
+                class_=args.class_,
+                teacher=args.teacher,
+            )
+        if args.memory_command == "seed-channel":
+            return _memory_seed_channel(
+                name=args.name, kind=args.kind, applies_to=args.applies_to
+            )
+        parser.error(f"unknown memory command {args.memory_command!r}")
+        return 2
     if args.command == "eval-extraction":
         return _eval_extraction(args)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
@@ -112,6 +154,53 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
   5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
      people) and restart. Only those ids are ever answered.
 """
+
+
+def _memory_seed_kid(
+    *, name: str, gender: str, school: str, grade: str, class_: str, teacher: str
+) -> int:
+    """Store one kid's confirmed seed facts (the /profile 2-minute setup)."""
+    from brain.db.session import SessionLocal  # noqa: PLC0415  (deferred: CLI startup)
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    session = SessionLocal()
+    try:
+        kid = MemoryService(MemoryRepository(session)).set_kid(
+            name,
+            gender=gender,
+            school=school,
+            grade=grade,
+            class_=class_,
+            teacher=teacher,
+        )
+        attrs = ", ".join(f"{key} {value}" for key, value in kid.items() if key != "name")
+        print(f"seeded {name}: {attrs}")
+        return 0
+    except ValueError as exc:
+        print(f"seed-kid: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        session.close()
+
+
+def _memory_seed_channel(*, name: str, kind: str, applies_to: str) -> int:
+    """Register a channel and its audience (values handed over at seed time)."""
+    from brain.db.session import SessionLocal  # noqa: PLC0415  (deferred: CLI startup)
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    session = SessionLocal()
+    try:
+        service = MemoryService(MemoryRepository(session))
+        service.set_channel(name, kind=kind, applies_to=applies_to)
+        print(f"seeded channel {name}: kind {kind}, applies_to {applies_to}")
+        return 0
+    except ValueError as exc:
+        print(f"seed-channel: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        session.close()
 
 
 def _telegram(whoami_hint: bool) -> int:
