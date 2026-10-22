@@ -1,0 +1,57 @@
+"""Shared stub payloads for Playwright route interception (my instance only)."""
+
+STUB_FLOW = {
+    "nodes": [
+        {"id": "telegram", "label": "Telegram", "column": 0, "row": 0, "component": "telegram", "status": "ok", "summary": "ok"},
+        {"id": "telegram_bot", "label": "Telegram bot", "column": 0, "row": 1, "component": "telegram", "status": "degraded", "summary": "degraded: 2 errors/15m"},
+        {"id": "api", "label": "API /items,/capture", "column": 0, "row": 2, "component": "api", "status": "ok", "summary": "ok"},
+        {"id": "parser", "label": "Paste parser", "column": 1, "row": 0, "component": "api", "status": "ok", "summary": "ok"},
+        {"id": "ingest", "label": "Ingest", "column": 1, "row": 1, "component": "api", "status": "down", "summary": "down: unreachable"},
+        {"id": "search", "label": "Search", "column": 1, "row": 2, "component": "api", "status": "not probed", "summary": "not probed yet"},
+        {"id": "ask", "label": "Ask", "column": 1, "row": 3, "component": "llm", "status": "ok", "summary": "ok"},
+        {"id": "jev", "label": "Jev classify", "column": 2, "row": 0, "component": "jev", "status": "ok", "summary": "ok"},
+        {"id": "postgres", "label": "Postgres", "column": 2, "row": 1, "component": "postgres", "status": "ok", "summary": "ok"},
+        {"id": "embedder", "label": "Embedder", "column": 2, "row": 2, "component": "embedder", "status": "disabled", "summary": "disabled: no key"},
+        {"id": "qdrant", "label": "Qdrant", "column": 2, "row": 3, "component": "qdrant", "status": "not probed", "summary": "not probed"},
+        {"id": "rerank", "label": "Jev rerank", "column": 2, "row": 4, "component": "jev", "status": "ok", "summary": "ok"},
+        {"id": "llm", "label": "LLM", "column": 2, "row": 5, "component": "llm", "status": "ok", "summary": "ok"},
+        {"id": "docker", "label": "Docker", "column": 0, "row": 5, "band": "infra", "component": "docker", "status": "ok", "summary": "ok"},
+        {"id": "background", "label": "Background services", "column": 1, "row": 5, "band": "infra", "component": "telegram", "status": "degraded", "summary": "degraded"},
+        {"id": "disk", "label": "Disk", "column": 2, "row": 5, "band": "infra", "component": "disk", "status": "ok", "summary": "ok"},
+    ],
+    "edges": [
+        {"from": "telegram", "to": "telegram_bot", "hop": "telegram->bot", "status": "grey", "count": 0},
+        {"from": "telegram_bot", "to": "parser", "hop": "telegram->parser", "status": "amber", "count": 5, "p50": 40, "last_error": "timeout"},
+        {"from": "parser", "to": "ingest", "hop": "parser->ingest", "status": "green", "count": 9, "p50": 2},
+        {"from": "api", "to": "ingest", "hop": "api->ingest", "status": "red", "count": 3, "p50": 120, "last_error": "connection refused"},
+        {"from": "ingest", "to": "jev", "hop": "ingest->jev", "status": "green", "count": 12, "p50": 3},
+        {"from": "ingest", "to": "postgres", "hop": "ingest->postgres", "status": "green", "count": 7, "p50": 5},
+        {"from": "ingest", "to": "embedder", "hop": "ingest->embedder", "status": "grey", "count": 0},
+        {"from": "embedder", "to": "qdrant", "hop": "embedder->qdrant", "status": "grey", "count": 0},
+        {"from": "search", "to": "embedder", "hop": "search->embedder", "status": "grey", "count": 0},
+        {"from": "search", "to": "qdrant", "hop": "search->qdrant", "status": "grey", "count": 0},
+        {"from": "qdrant", "to": "rerank", "hop": "search->rerank", "status": "grey", "count": 0},
+        {"from": "ask", "to": "search", "hop": "ask->search", "status": "green", "count": 2, "p50": 30},
+        {"from": "ask", "to": "llm", "hop": "ask->llm", "status": "green", "count": 2, "p50": 900},
+    ],
+    "degraded": ["telegram_bot", "ingest"],
+}
+
+STUB_HEALTH = {
+    "overall": "degraded",
+    "degraded": ["telegram", "ingest"],
+    "components": {
+        "api": {"status": "ok", "summary": "ok", "details": {"version": "858f6e6abc1234"}},
+        "telegram": {"status": "degraded", "summary": "degraded", "details": {}},
+        "ingest": {"status": "down", "summary": "down", "details": {}},
+        "search": {"status": "not probed", "summary": "", "details": {}},
+        "jev": {"status": "ok", "summary": "ok", "details": {}},
+        "postgres": {"status": "ok", "summary": "ok", "details": {}},
+        "embedder": {"status": "disabled", "summary": "disabled", "details": {}},
+        "qdrant": {"status": "not probed", "summary": "", "details": {}},
+        "llm": {"status": "ok", "summary": "ok", "details": {}},
+        "docker": {"status": "ok", "summary": "ok", "details": {}},
+        "background": {"status": "degraded", "summary": "degraded", "details": {}},
+        "disk": {"status": "ok", "summary": "ok", "details": {}},
+    },
+}
