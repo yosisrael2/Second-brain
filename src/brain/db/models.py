@@ -95,7 +95,6 @@ class MemoryItem(Base):
     # saved". Plain class attribute — SQLAlchemy does not map it.
     deduplicated = False
 
-
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(
@@ -116,9 +115,7 @@ class MemoryItem(Base):
     # times are interpreted in the TIMEZONE setting and stored as aware UTC;
     # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
     # original raw strings stay in meta for audit.
-    occurred_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Exact-duplicate guard: sha256 over (normalized text, occurred_at UTC
     # minute, source kind); computed by brain.services.dedupe at ingest and
     # backfilled by the fingerprint migration. Nullable: rows created before
@@ -183,6 +180,36 @@ class OpsHeartbeat(Base):
     )
 
 
+class WhatsAppPollState(Base):
+    """Per-chat ingestion cursor for the WhatsApp poller (PR D1).
+
+    One row per allowlisted bridge chat. ``cursor_utc`` is the UTC instant of
+    the last message processed (never a fixed-offset wall clock — item 41);
+    polls re-read a small overlap window and dedupe on message ids, so a
+    restart never duplicates conversations. ``open_item_id`` points at the
+    source item of the conversation that may still receive messages (updated
+    in place until the time gap closes it).
+    """
+
+    __tablename__ = "whatsapp_poll_state"
+
+    chat_jid: Mapped[str] = mapped_column(String(255), primary_key=True)
+    channel_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cursor_utc: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Messages at/below this instant were deliberately SKIPPED as history when
+    # the channel was first seen (live-edge start, no backfill); the overlap
+    # window must not re-fetch them on the next poll.
+    history_until_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    messages_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversations_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    conversations_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    open_item_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
 class Entity(Base):
     """A durable thing in the user's world: person, group, place, or org.
 
@@ -199,9 +226,7 @@ class Entity(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -252,9 +277,7 @@ class MemoryFact(Base):
         Index("ix_memory_facts_status", "status"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     subject_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
     )

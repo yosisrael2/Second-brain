@@ -112,6 +112,15 @@ class Settings(BaseSettings):
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
 
+    # WhatsApp bridge (PR D1). The poller reads the bridge's messages.db
+    # READ-ONLY; an empty path disables the poller. The gap groups messages
+    # into conversations (item 35); the overlap window (must stay smaller
+    # than the gap) makes restarts idempotent.
+    whatsapp_bridge_db: str = ""
+    whatsapp_gap_minutes: int = 60
+    whatsapp_overlap_minutes: int = 5
+    whatsapp_poll_interval_s: float = 30.0
+
     # Telegram bot (mobile capture channel). The token is a secret; the
     # allowlist is REQUIRED with a token — the bot never answers strangers.
     telegram_bot_token: SecretStr | None = None
@@ -125,8 +134,7 @@ class Settings(BaseSettings):
             part = part.strip()
             if part and not part.lstrip("+").isdigit():
                 raise ValueError(
-                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
-                    f"got {value!r}"
+                    f"TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, got {value!r}"
                 )
         return value
 

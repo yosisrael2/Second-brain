@@ -90,9 +90,7 @@ class ItemsRepository:
         )
         return list(self._db.scalars(stmt))
 
-    def by_occurrence(
-        self, *, start: datetime, end: datetime, limit: int
-    ) -> Sequence[MemoryItem]:
+    def by_occurrence(self, *, start: datetime, end: datetime, limit: int) -> Sequence[MemoryItem]:
         """Every item with occurred_at inside [start, end), soonest first.
 
         Drives temporal retrieval: day/date questions fetch ALL events in the
@@ -116,6 +114,10 @@ class ItemsRepository:
     def commit(self) -> None:
         """Commit the current transaction."""
         self._db.commit()
+
+    def rollback(self) -> None:
+        """Discard the current transaction (used by batch pollers on failure)."""
+        self._db.rollback()
 
     def refresh(self, item: MemoryItem) -> None:
         """Reload server-generated fields (e.g. updated_at) from the DB."""
