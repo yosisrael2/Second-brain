@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -98,6 +98,42 @@ class Settings(BaseSettings):
     # IANA zone used to interpret zone-less pasted times (Gmail, WhatsApp,
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
+
+    # Telegram bot (mobile capture channel). The token is a secret; the
+    # allowlist is REQUIRED with a token — the bot never answers strangers.
+    telegram_bot_token: SecretStr | None = None
+    telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
+
+    @field_validator("telegram_allowed_user_ids")
+    @classmethod
+    def _validate_telegram_user_ids(cls, value: str) -> str:
+        """Keep the raw string but fail fast when it is not parseable ints."""
+        for part in value.split(","):
+            part = part.strip()
+            if part and not part.lstrip("+").isdigit():
+                raise ValueError(
+                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
+                    f"got {value!r}"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _telegram_token_requires_allowlist(self) -> "Settings":
+        if self.telegram_bot_token and not self.telegram_allowed_user_ids.strip():
+            raise ValueError(
+                "TELEGRAM_ALLOWED_USER_IDS is required when TELEGRAM_BOT_TOKEN "
+                "is set (run `brain telegram --whoami-hint` to find your id)"
+            )
+        return self
+
+    @property
+    def telegram_allowed_ids(self) -> frozenset[int]:
+        """The allowlist as ints (empty when no ids are configured)."""
+        return frozenset(
+            int(part.strip().lstrip("+"))
+            for part in self.telegram_allowed_user_ids.split(",")
+            if part.strip()
+        )
 
     @field_validator("timezone")
     @classmethod

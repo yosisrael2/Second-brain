@@ -167,6 +167,16 @@ Note: semantic `/search` ranks candidates per page (`limit + offset` fetched
 before ranking), so deep offsets approximate rather than globally rank — fine
 for MVP top-k use.
 
+### Telegram bot
+
+`brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
+`pip install -e '.[telegram]'`). Plain messages are captured through the same
+paste parser as `POST /capture`; `/search`, `/ask`, `/review` and `/status`
+reuse the same services as the API in-process. Access is allowlist-only: with
+`TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS` (comma-separated ids) is
+required — anyone else gets no reply (their id is logged once at INFO).
+`brain telegram --whoami-hint` explains how to find your id.
+
 The shared AI clients are app-lifetime singletons built in
 `src/brain/api/deps.py` (implementations picked by `LLM_PROVIDER` /
 `EMBEDDER_PROVIDER` in `src/brain/factories.py`) and closed on shutdown via
@@ -321,6 +331,8 @@ Copy `.env.example` to `.env`. Never commit `.env`.
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5`                                 | model for `/ask` on `anthropic` |
 | `EMBEDDER_PROVIDER` | `fastembed`                                       | `fastembed` (local) or `openai` |
 | `TIMEZONE` | machine's local IANA zone (e.g. `Asia/Jerusalem`)   | interprets zone-less pasted times (Gmail/WhatsApp/calendar) before storing them as aware UTC |
+| `TELEGRAM_BOT_TOKEN` | — (SecretStr; optional) | enables `brain telegram` (long-poll Telegram bot; needs `pip install -e '.[telegram]'`) |
+| `TELEGRAM_ALLOWED_USER_IDS` | — (REQUIRED when the token is set) | comma-separated Telegram user ids; the bot answers only these users (others get no reply) and refuses to start without this list |
 
 All settings live in `Settings` (`src/brain/config.py`); AI-layer variables
 (keys as `SecretStr`, base URLs, models, timeouts) are listed in

@@ -23,12 +23,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     reindex = subparsers.add_parser("reindex", help="Rebuild Qdrant vectors from Postgres")
     reindex.add_argument("--batch-size", type=int, default=500, help="Items per DB page")
+    telegram = subparsers.add_parser(
+        "telegram", help="Run the Telegram bot (long polling; no webhook)"
+    )
+    telegram.add_argument(
+        "--whoami-hint",
+        action="store_true",
+        help="Print how to find your Telegram user id for TELEGRAM_ALLOWED_USER_IDS",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
         return _reindex(batch_size=args.batch_size)
+    if args.command == "telegram":
+        return _telegram(whoami_hint=args.whoami_hint)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
+
+
+WHOAMI_HINT = """\
+How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
+
+  1. Set TELEGRAM_BOT_TOKEN (get a token from @BotFather).
+  2. Start the bot:  brain telegram
+  3. Open your bot in Telegram and send /start from YOUR account.
+  4. The log prints one line per rejected stranger:
+       telegram: rejected update from user id <ID>
+  5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
+     people) and restart. Only those ids are ever answered.
+"""
+
+
+def _telegram(whoami_hint: bool) -> int:
+    """Run the Telegram bot (long polling); --whoami-hint prints setup help."""
+    if whoami_hint:
+        print(WHOAMI_HINT)
+        return 0
+
+    from brain.telegram_bot import run as run_bot  # noqa: PLC0415  (deferred import)
+
+    return run_bot(get_settings())
 
 
 def _reindex(

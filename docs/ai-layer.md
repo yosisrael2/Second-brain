@@ -126,6 +126,8 @@ Revisit only if real production traffic shows a need.
 | `ANTHROPIC_TIMEOUT_S` | `60` | `ClaudeLLMClient` |
 | `QDRANT_URL` | `http://localhost:27333` | `QdrantVectorStore` |
 | `TIMEZONE` | machine's local IANA zone (e.g. `Asia/Jerusalem`) | capture: interprets zone-less pasted times (Gmail/WhatsApp/calendar text) before storing `occurred_at` as aware UTC |
+| `TELEGRAM_BOT_TOKEN` | — (SecretStr; optional) | `brain telegram`: long-poll Telegram bot over the same services (needs the `telegram` extra) |
+| `TELEGRAM_ALLOWED_USER_IDS` | — (required with the token) | allowlist of Telegram user ids; rejected ids are logged once, never replied to |
 | `QDRANT_API_KEY` | — | `QdrantVectorStore` |
 | `QDRANT_COLLECTION` | `brain_items` | `QdrantVectorStore` |
 | `QDRANT_TIMEOUT_S` | `10` | `QdrantVectorStore` |
@@ -172,6 +174,12 @@ The layer is wired into the app on this branch (see also README):
   items no longer in Postgres — then re-embeds and upserts one whole DB batch
   per round-trip (`Embedder.embed_batch` + `VectorStore.upsert_many`); exits 1
   with a clear message when embeddings or Qdrant are unavailable.
+- **Telegram bot** (`src/brain/telegram_bot.py`, via `brain telegram`):
+  long-polling getUpdates (no webhook); messages are parsed by the same paste
+  parser as `POST /capture` and ingested through the same services, built
+  per update over the API's shared singletons (`brain.api.deps`). Allowlist
+  is enforced before any reply; a getUpdates 409 conflict (a second poller)
+  is recorded and stops the bot.
 - **Collections**: `QdrantVectorStore.ensure_collection` is called with the
   active embedder's `dim` (384 for fastembed's `BAAI/bge-small-en-v1.5`, 1536
   for `text-embedding-3-small`); an existing collection with a different dim

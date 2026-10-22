@@ -13,6 +13,7 @@ from brain.ai.vectorstore import VectorStoreError
 from brain.db.models import MemoryItem
 from brain.services.indexing import ItemIndexerProto
 from brain.services.items import ItemsRepositoryProto
+from brain.services.paste import ParsedPaste
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,34 @@ class IngestService:
         self._index(item)
         self._repo.commit()
         return item
+
+    def capture_parsed(
+        self,
+        parsed: ParsedPaste,
+        *,
+        source: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
+    ) -> list[MemoryItem]:
+        """Create one item per parsed chunk (shared capture path).
+
+        Used by POST /capture and the Telegram bot: ``source`` defaults to
+        the detected paste kind, ``extra_meta`` is merged over each chunk's
+        meta. Classification/indexing failures never block creation (same
+        contract as :meth:`create`).
+        """
+        items: list[MemoryItem] = []
+        for chunk in parsed.chunks:
+            items.append(
+                self.create(
+                    schemas.ItemCreate(
+                        raw_text=chunk.raw_text,
+                        source=source or parsed.kind,
+                        occurred_at=chunk.occurred_at,
+                        meta={**chunk.meta, **(extra_meta or {})},
+                    )
+                )
+            )
+        return items
 
     def reindex(self, batch_size: int = 500) -> int:
         """Full vector rebuild from Postgres; returns the number indexed.

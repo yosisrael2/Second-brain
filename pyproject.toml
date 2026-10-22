@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+telegram = [
+    "python-telegram-bot>=21,<23",
+]
 dev = [
     "pytest>=8,<9",
     "httpx>=0.27,<1",
