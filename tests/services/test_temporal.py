@@ -94,3 +94,51 @@ def test_dst_boundary_is_honored_in_the_range_edges() -> None:
     sunday = parse_question_ranges("on Sunday October 25?", JLM, NOW)[0]
     assert sunday[0].utcoffset() == UTC.utcoffset(None)  # ranges are aware UTC
     assert sunday[0].astimezone(JLM).utcoffset().total_seconds() == 3 * 3600  # IDT
+
+
+# --- Hebrew weekday left boundary (PR: temporal hardening) -------------------
+
+
+def test_ordinal_hebrew_is_not_a_weekday() -> None:
+    """'השני'/'הראשון' are ordinals ('the second/first'), not day names."""
+    assert _ranges("מה קורה עם התשלום השני?") == []
+    assert _ranges("הפעם הראשונה הייתה טובה") == []
+
+
+def test_preposition_prefixed_hebrew_weekdays_resolve() -> None:
+    monday = ["Mon 26 Oct 00:00..Tue 27 Oct 00:00"]  # Thu 22 + 4 days
+    assert _ranges("בשני יש לי פגישה") == monday
+    assert _ranges("ביום שני יש לי פגישה") == monday
+    assert _ranges("מה יש לי בשבת?") == ["Sat 24 Oct 00:00..Sun 25 Oct 00:00"]
+
+
+def test_vav_prefix_hebrew_weekday_resolves() -> None:
+    assert _ranges("ניפגש ושני נסגור") == ["Mon 26 Oct 00:00..Tue 27 Oct 00:00"]
+
+
+# --- numeric dates DD.MM / DD/MM / DD.MM.YY(YY) ------------------------------
+
+
+def test_numeric_day_month_day_first() -> None:
+    assert _ranges("מבחן ב-22.10") == ["Thu 22 Oct 00:00..Fri 23 Oct 00:00"]
+    assert _ranges("פגישה ב-19/10 בבוקר") == [
+        "Mon 19 Oct 06:00..Mon 19 Oct 12:00"
+    ]
+
+
+def test_numeric_date_with_two_digit_year() -> None:
+    assert _ranges("טיול 15.10.26") == ["Thu 15 Oct 00:00..Fri 16 Oct 00:00"]
+
+
+def test_numeric_date_with_full_year() -> None:
+    assert _ranges("טיול 15.10.2026") == ["Thu 15 Oct 00:00..Fri 16 Oct 00:00"]
+
+
+def test_numeric_date_year_rollover_and_invalids() -> None:
+    # YY expansion crosses the year the question is asked in
+    assert _ranges("אירוע 5.1.27") == ["Tue 05 Jan 00:00..Wed 06 Jan 00:00"]
+    # no valid date (Feb 30) -> no range
+    assert _ranges("חגיגה ב-30.2") == []
+    # fractions / version numbers are not dates
+    assert _ranges("הציון הוא 3.14 נקודות") == []
+    assert _ranges("גרסה 1.2.3 שוחררה") == []

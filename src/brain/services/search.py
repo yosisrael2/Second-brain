@@ -93,7 +93,7 @@ class SearchService:
 
     def _fuse_with_keywords(
         self, query: str, ranked: list[Mapping[str, Any]], *, limit: int
-    ) -> list[Mapping[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Reciprocal-rank fusion of the semantic ranking with keyword hits.
 
         Both lists contribute rank points (1/(K + rank)); items found by both
@@ -104,10 +104,10 @@ class SearchService:
             items = self._repo.search(query=query, limit=limit, offset=0)
         except Exception:  # noqa: BLE001  (FTS is a recall booster, not a gate)
             logger.debug("search: keyword fusion unavailable", exc_info=True)
-            return ranked
+            return [dict(hit) for hit in ranked]
         keyword_ids = [str(item.id) for item in items]
         if not keyword_ids:
-            return ranked
+            return [dict(hit) for hit in ranked]
         fused: dict[str, dict[str, Any]] = {}
         for rank, candidate in enumerate(ranked):
             entry = fused.setdefault(

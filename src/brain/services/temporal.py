@@ -20,8 +20,6 @@ import re
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-UTC = UTC
-
 # Daypart windows, local time (inclusive start, exclusive end).
 _DAYPARTS: dict[str, tuple[time, time]] = {
     "morning": (time(6, 0), time(12, 0)),
@@ -52,6 +50,13 @@ _MONTHS_EN = {
 _MONTH_PATTERN = "|".join(_MONTHS_EN)
 # Longest-first so "יום שישי" wins over a bare "שישי" substring check.
 _HE_DAY_NAMES = sorted(_WEEKDAYS_HE, key=len, reverse=True)
+
+# Numeric dates: DD.MM, DD/MM, DD.MM.YY(YY) — day-first (Israeli usage):
+# 'ב-22.10', '19/10', '15.10.26', '15.10.2026'. Boundaries reject matches
+# inside longer numbers ("2026.10" -> only "26.10" would match) and partial
+# tokens ("15.103"); the chain checks in _find_numeric_date reject dotted
+# runs that are not dates ("version 1.2.3" must not parse as a day).
+_NUMERIC_DATE = re.compile(r"(?<!\d)(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?!\d)")
 
 
 def parse_question_ranges(
@@ -142,14 +147,49 @@ def _find_explicit_date(text: str, year_hint: int) -> date | None:
             day, month = int(first), _MONTHS_EN[second.strip()]
         else:
             month, day = _MONTHS_EN[first.strip()], int(second)
-        # prefer this year when the day is still ahead, else next year
-        for year in (year_hint, year_hint + 1):
-            try:
-                return date(year, month, day)
-            except ValueError:
-                continue
-        return None
+        # Prefer ``year_hint``; roll to the next year only when the date is
+        # invalid in it (Feb 29). We never skip ahead on a valid date —
+        # school-year questions legitimately ask about earlier terms.
+        return _first_valid_date(year_hint, month, day)
+    numeric = _find_numeric_date(text, year_hint)
+    if numeric is not None:
+        return numeric
     return None
+
+
+def _first_valid_date(year_hint: int, month: int, day: int) -> date | None:
+    for year in (year_hint, year_hint + 1):
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    return None
+
+
+def _find_numeric_date(text: str, year_hint: int) -> date | None:
+    """DD.MM, DD/MM, DD.MM.YY(YY) — day-first, Israel-style."""
+    for match in _NUMERIC_DATE.finditer(text):
+        before = text[match.start() - 1] if match.start() else ""
+        after = text[match.end() : match.end() + 2]
+        chain_continues = len(after) == 2 and after[0] in "./" and after[1].isdigit()
+        if before in (".", "/") or chain_continues:
+            continue  # inside a dotted run: version number, not a date
+        return _numeric_date_from(match, year_hint)
+    return None
+
+
+def _numeric_date_from(match: re.Match[str], year_hint: int) -> date | None:
+    day, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return None
+    if match.group(3):
+        short_year = int(match.group(3))
+        year = 2000 + short_year if short_year < 100 else short_year
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+    return _first_valid_date(year_hint, month, day)
 
 
 def _find_relative_day(text: str, local_now: datetime) -> date | None:
@@ -163,8 +203,12 @@ def _find_relative_day(text: str, local_now: datetime) -> date | None:
 
 
 def _find_weekday(text: str) -> int | None:
+    # A Hebrew day name needs a left boundary too: bare 'שני'/'ראשון'/'שבת'
+    # are ordinary words ("התשלום השני" = the second payment). Valid when the
+    # name starts the text, follows whitespace, or carries a ב/ו/ל preposition
+    # ('בשני', 'ושבת', 'לשישי'); invalid right after ה (the ordinal form).
     for name in _HE_DAY_NAMES:
-        if re.search(rf"{name}(?![א-ת])", text):
+        if re.search(rf"(?:^|\s)(?:[בול])?{name}(?![א-ת])", text):
             return _WEEKDAYS_HE[name]
     for name, index in _WEEKDAYS_EN.items():
         if re.search(rf"\b{name}\b", text):
