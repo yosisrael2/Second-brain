@@ -22,7 +22,10 @@ DEFAULT_SDK_TIMEOUT_S = 120.0
 DEFAULT_OPENAI_URL = "https://api.openai.com/v1"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_OPENAI_TIMEOUT_S = 30.0
-DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# Multilingual (Hebrew + English) — chosen by the calendar-question eval in
+# tests/eval/test_calendar_questions.py: 10/11 retrieval hits vs 6/11 for the
+# old English-only BAAI/bge-small-en-v1.5. dim 256.
+DEFAULT_FASTEMBED_MODEL = "minishlab/potion-multilingual-128M"
 DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_JEV_MODEL = "jev-latest"
 DEFAULT_JEV_TIMEOUT_S = 5.0
@@ -83,6 +86,9 @@ class Settings(BaseSettings):
 
     # Local embeddings (used when embedder_provider="fastembed", the default)
     fastembed_model: str = DEFAULT_FASTEMBED_MODEL
+    # Ask context size for semantic search. Day/date questions bypass this via
+    # temporal retrieval (they fetch every item in the resolved range).
+    ask_top_k: int = 8
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None

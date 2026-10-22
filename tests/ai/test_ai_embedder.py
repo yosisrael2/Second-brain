@@ -193,7 +193,7 @@ class TestFastEmbedEmbedder:
 
         class FakeTextEmbedding:
             def __init__(self, model_name: str) -> None:
-                assert model_name == "BAAI/bge-small-en-v1.5"
+                assert model_name == "minishlab/potion-multilingual-128M"
                 self._inner = backend
 
             def embed(self, texts: list[str]) -> list[list[float]]:

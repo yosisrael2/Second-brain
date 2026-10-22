@@ -123,7 +123,41 @@ def clean_items_fixture(database: None) -> Iterator[None]:
 
 
 def _run_migrations() -> None:
-    """Apply Alembic migrations up to head against the configured database."""
+    """Apply Alembic migrations up to head against the configured database.
+
+    brain_test is SHARED between worker checkouts: a sibling worker's
+    unmerged branch can leave it stamped at a revision this tree does not
+    know (ResolutionError on upgrade). The test database is disposable, so
+    in that case drop and recreate it, then migrate from scratch — guarded
+    by assert_test_database like every destructive fixture.
+    """
+    try:
+        _upgrade_head()
+    except Exception as exc:
+        unknown = "Can't locate revision" in str(exc) or "not a valid upgrade target" in str(exc)
+        if not unknown:
+            raise
+        assert_test_database(_database_url())
+        _drop_test_database()
+        _ensure_test_database()
+        _upgrade_head()
+
+
+def _upgrade_head() -> None:
     cfg = Config(str(_REPO_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(_REPO_ROOT / "src/brain/db/migrations"))
     command.upgrade(cfg, "head")
+
+
+def _drop_test_database() -> None:
+    """DROP DATABASE <the *_test db> via the admin connection (idempotent)."""
+    url = _database_url()
+    db_name = _database_name(url)
+    admin_url = url.rsplit("/", 1)[0].replace("postgresql+psycopg", "postgresql") + "/postgres"
+    with psycopg.connect(admin_url, autocommit=True, connect_timeout=3) as conn:
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()",
+            (db_name,),
+        )
+        conn.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
