@@ -366,3 +366,139 @@ def test_seed_channel_cli_roundtrip(memory: MemoryService, capsys):
     )
     out = capsys.readouterr().out
     assert "seeded channel" in out
+
+
+# --- review round 1 fixes ---------------------------------------------------------
+
+
+def test_set_kid_rejects_invalid_gender(memory: MemoryService):
+    """'Girl'/'female' must fail loudly, not silently mis-resolve audiences."""
+    with pytest.raises(ValueError):
+        memory.set_kid("X", gender="Girl")
+    with pytest.raises(ValueError):
+        memory.set_kid("X", gender="female")
+
+
+def test_set_channel_rejects_unknown_applies_to(memory: MemoryService):
+    with pytest.raises(ValueError):
+        memory.set_channel("ערוץ", kind="parents", applies_to="rona")  # case matters
+    with pytest.raises(ValueError):
+        memory.set_channel("ערוץ", kind="parents", applies_to="everyone")
+
+
+def test_set_channel_reseeds_versioned_not_stacked(memory: MemoryService):
+    _seed_world(memory)
+    memory.set_channel("ערוץ הורים", kind="parents", applies_to="Itamar")
+    assert memory.resolve_applies_to({"channel": "ערוץ הורים"}) == ["Itamar"]
+
+    memory.set_channel("ערוץ הורים", kind="parents", applies_to="family")
+    assert memory.resolve_applies_to({"channel": "ערוץ הורים"}) == [
+        "Itamar",
+        "Rona",
+        "me",
+    ]
+    # history shows 2 versions for applies_to
+    channel = memory._repo.find_entity(kind="channel", name="ערוץ הורים")
+    versions = [
+        f
+        for f in memory._repo.facts_about(channel.id)
+        if f.predicate == "applies_to"
+    ]
+    assert [v.value for v in versions] == ["Itamar", "family"]
+    assert versions[1].supersedes_id == versions[0].id
+
+    # re-seeding the same value adds no row
+    before = len(
+        [f for f in memory._repo.facts_about(channel.id) if f.predicate == "applies_to"]
+    )
+    memory.set_channel("ערוץ הורים", kind="parents", applies_to="family")
+    after = len(
+        [f for f in memory._repo.facts_about(channel.id) if f.predicate == "applies_to"]
+    )
+    assert before == after
+
+
+def test_seed_channel_cli_invalid_value_fails_loudly(memory: MemoryService, capsys):
+    from brain.cli import main
+
+    code = main(
+        [
+            "memory",
+            "seed-channel",
+            "--name",
+            "ערוץ",
+            "--kind",
+            "parents",
+            "--applies-to",
+            "rona",
+        ]
+    )
+    assert code == 1
+    assert "applies_to must be" in capsys.readouterr().err
+
+
+def test_seed_kid_cli_invalid_gender_fails_loudly(memory: MemoryService, capsys):
+    from brain.cli import main
+
+    code = main(
+        [
+            "memory",
+            "seed-kid",
+            "--name",
+            "X",
+            "--gender",
+            "female",
+            "--school",
+            "s",
+            "--grade",
+            "1",
+            "--class",
+            "c",
+            "--teacher",
+            "t",
+        ]
+    )
+    assert code == 1
+    assert "gender must be" in capsys.readouterr().err
+
+
+def test_hebrew_teen_grades(memory: MemoryService):
+    """ל=30 and מ=40 in Hebrew numerals — grades 11/12 are יא/יב only."""
+    _seed_world(memory)
+    memory.set_kid("Noa", gender="girl", school="בראשית", grade="11", class_="יא א", teacher="T")
+    assert memory.resolve_applies_to({"school": "בראשית", "grades": "יא-יב"}) == ["Noa"]
+    assert memory.resolve_applies_to({"school": "בראשית", "grades": "יג"}) == [
+        "nobody"
+    ]  # יג parses as 13 (a real value) — no kid in it is a KNOWN mismatch
+
+
+def test_grade_spellings_from_real_emails(memory: MemoryService):
+    """Geresh, gershayim, maqaf and dashes all parse (textnorm first)."""
+    _seed_world(memory)
+    for spelling in ("ה'", "ה׳", "ה־ו", "ה–ו", "ה-ו"):
+        assert memory.resolve_applies_to({"school": "בראשית", "grades": spelling}) == [
+            "Rona"
+        ], spelling
+
+
+def test_patch_closed_fact_raises(memory: MemoryService):
+    """Editing a superseded or soft-deleted fact must not resurrect it."""
+    _seed_world(memory)
+    old = _find_fact(memory, "grade", "5")
+    new_version = memory.patch_fact(old.id, value="6")
+    with pytest.raises(MemoryError):
+        memory.patch_fact(old.id, value="7")  # superseded -> closed
+    memory.delete_fact(uuid.UUID(new_version["id"]))
+    with pytest.raises(MemoryError):
+        memory.patch_fact(uuid.UUID(new_version["id"]), value="7")  # rejected -> closed
+
+
+def test_delete_entity_refused_while_current_facts_exist(memory: MemoryService):
+    _seed_world(memory)
+    rona = memory._repo.find_entity(kind="person", name="Rona")
+    with pytest.raises(MemoryError):
+        memory.delete_entity(rona.id)  # has current facts
+    for fact in memory._repo.current_facts(subject_ids=[rona.id]):
+        memory.delete_fact(fact.id)
+    memory.delete_entity(rona.id)  # now allowed (history rows cascade)
+    assert memory._repo.find_entity(kind="person", name="Rona") is None

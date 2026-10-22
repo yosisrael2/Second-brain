@@ -35,7 +35,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "kind IN ('person', 'group', 'place', 'org', 'channel')",
-            name="ck_entities_kind",
+            name=op.f("ck_entities_kind"),
         ),
     )
     op.create_table(
@@ -94,11 +94,11 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "status IN ('proposed', 'confirmed', 'rejected')",
-            name="ck_memory_facts_status",
+            name=op.f("ck_memory_facts_status"),
         ),
         sa.CheckConstraint(
             "object_id IS NOT NULL OR value IS NOT NULL",
-            name="ck_memory_facts_has_object_or_value",
+            name=op.f("ck_memory_facts_has_object_or_value"),
         ),
     )
     op.create_index("ix_memory_facts_subject", "memory_facts", ["subject_id"])
