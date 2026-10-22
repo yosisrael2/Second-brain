@@ -126,9 +126,9 @@ def test_missing_required_field_fails_cleanly(capsys, tmp_path):
     assert "failed" in capsys.readouterr().err
 
 
-def test_aware_pred_runs_via_cli_default_timezone(capsys):
+def test_aware_pred_runs_via_cli_default_timezone(capsys, tmp_path):
     # an offset-bearing pred is converted to the configured local zone, not rejected
-    pred = Path(__file__).parent / "fixtures" / "pred_aware_tiny.jsonl"
+    pred = tmp_path / "pred_aware.jsonl"
     pred.write_text(
         '{"email_id": "school-01", "child_id": "p1", "type": "event", '
         '"title": "כינוס באמפי", "start": "2026-10-17T21:00:00+00:00", '

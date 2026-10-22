@@ -287,13 +287,15 @@ def test_aware_datetime_converted_to_local_wall_clock():
     )
     assert "matched: 1" in out
     assert "date_exact_match_rate: 1.0" in out
-    # (c) mixed aware pred / naive gold must not raise TypeError
+    # (c) mixed aware pred / naive gold must not raise TypeError — with the
+    # DEFAULT tz (UTC, no explicit zone) the aware value folds to 06:00
+    # wall-clock vs the naive 09:00 gold: 3h apart, over the ±1h tolerance,
+    # so no match (and no crash)
     out = agg(
         [row(start="2026-10-19T09:00:00")],
         [row(child_id="p1", start="2026-10-19T06:00:00+00:00")],
-        tz=jerusalem,
     )
-    assert "matched: 1" in out
+    assert "matched: 0" in out
 
 
 def test_all_day_inferred_from_effective_field_only():
