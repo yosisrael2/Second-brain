@@ -188,8 +188,10 @@ Interaction details:
 - a multi-message WhatsApp thread is **not saved immediately**: the bot asks
   "Save as 1 item / Save separately" first (the paste is held in memory,
   expiring after 10 minutes).
-- forwarded messages record `meta.sender` + `meta.forwarded = true` and use
-  the forward date as `occurred_at` (source stays the parsed kind).
+- forwarded messages record `meta.sender` (an `@username`, "First Last",
+  or chat title — resolved locally from the forward origin, no extra API
+  call) + `meta.forwarded = true` + `meta.sender_id`, and use the forward
+  date as `occurred_at` (source stays the parsed kind).
 - any text ending in `?` (without a slash) is an ask; the bot shows the
   TYPING indicator while waiting and answers with the model name plus one
   "Open" button per cited item.
