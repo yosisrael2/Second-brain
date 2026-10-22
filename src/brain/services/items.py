@@ -12,6 +12,7 @@ from brain.ai.embedder import EmbedderError
 from brain.ai.vectorstore import VectorStoreError
 from brain.db.enums import ItemStatus, ItemType
 from brain.db.models import MemoryItem
+from brain.services.dedupe import content_fingerprint
 from brain.services.indexing import ItemIndexerProto
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 # Payload fields mirrored into the vector index; changing any of them on
 # PATCH triggers a re-index so vectors never go stale.
 _INDEXED_FIELDS = frozenset({"raw_text", "source", "project"})
+# Fields the dedupe fingerprint is derived from; changing any of them on
+# PATCH must recompute it, or the guard matches the item's OLD text.
+_FINGERPRINT_FIELDS = frozenset({"raw_text", "source", "occurred_at"})
 
 
 class ItemNotFound(Exception):
@@ -85,6 +89,11 @@ class ItemsService:
         changes = data.model_dump(exclude_unset=True)
         for field, value in changes.items():
             setattr(item, field, value)
+        if _FINGERPRINT_FIELDS.intersection(changes):
+            # keep the dedupe guard aligned with the edited content
+            item.fingerprint = content_fingerprint(
+                item.raw_text, item.occurred_at, item.source
+            )
         self._repo.commit()  # commit flushes the pending UPDATE
         self._repo.refresh(item)  # reload server-generated updated_at
         self._reindex_if_indexed_fields_changed(item, changes)

@@ -7,17 +7,17 @@ meta['ics_raw'] (calendar-text path: meta['original_text']); all parsed
 fields stay in meta. `brain normalize-calendar` rewrites pre-existing items.
 """
 
-from datetime import UTC, datetime
 import sys
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from tests.fakes import FakeRepository
 
-from brain.db.models import MemoryItem
 from brain.config import get_settings
+from brain.db.models import MemoryItem
 from brain.services.dedupe import content_fingerprint
 from brain.services.paste import parse as parse_paste
-from zoneinfo import ZoneInfo
 
 JERUSALEM = ZoneInfo("Asia/Jerusalem")
 

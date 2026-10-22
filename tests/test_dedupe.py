@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 from qdrant_client import QdrantClient
+from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 from brain import schemas
 from brain.ai.embedder import FakeEmbedder
@@ -23,7 +24,6 @@ from brain.services.dedupe import content_fingerprint, normalize_text
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.paste import parse as parse_paste
-from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 _ICS = (
     "BEGIN:VEVENT\n"
@@ -78,7 +78,8 @@ def test_fingerprint_separates_on_occurred_at_minute_and_source():
 
 def test_fingerprint_uses_utc_minute_regardless_of_offset():
     when_utc = datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
-    same_instant = datetime(2026, 10, 29, 17, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))  # UTC+2 after DST end
+    # Jerusalem is UTC+2 on Oct 29 2026 (DST ended Oct 25)
+    same_instant = datetime(2026, 10, 29, 17, 0, tzinfo=ZoneInfo("Asia/Jerusalem"))
     assert content_fingerprint("t", when_utc, "calendar") == content_fingerprint(
         "t", same_instant, "calendar"
     )
@@ -166,6 +167,59 @@ def test_different_occurred_at_is_not_a_duplicate():
     assert len(repo.items) == 2
 
 
+# ---- PATCH keeps the fingerprint fresh -----------------------------------------
+
+
+def test_patch_raw_text_recomputes_fingerprint():
+    from brain.services.items import ItemsService
+
+    repo = FakeRepository()
+    service = make_service(repo)
+    item = service.create(schemas.ItemCreate(raw_text="original text", source="note"))
+
+    ItemsService(repo).update(item.id, schemas.ItemUpdate(raw_text="edited text"))
+
+    stored = repo.items[item.id]
+    assert stored.raw_text == "edited text"
+    assert stored.fingerprint == content_fingerprint(
+        "edited text", stored.occurred_at, "note"
+    )
+
+
+def test_patch_source_change_recomputes_fingerprint():
+    from brain.services.items import ItemsService
+
+    repo = FakeRepository()
+    service = make_service(repo)
+    item = service.create(schemas.ItemCreate(raw_text="same text", source="note"))
+    before = item.fingerprint
+
+    ItemsService(repo).update(item.id, schemas.ItemUpdate(source="calendar"))
+
+    stored = repo.items[item.id]
+    assert stored.fingerprint != before
+    assert stored.fingerprint == content_fingerprint(
+        "same text", stored.occurred_at, "calendar"
+    )
+
+
+def test_edited_item_guards_new_text_not_old():
+    from brain.services.items import ItemsService
+
+    repo = FakeRepository()
+    ingest = make_service(repo)
+    item = ingest.create(schemas.ItemCreate(raw_text="original text", source="note"))
+    ItemsService(repo).update(item.id, schemas.ItemUpdate(raw_text="edited text"))
+
+    again = ingest.create(schemas.ItemCreate(raw_text="edited text", source="note"))
+    assert again.id == item.id  # new text is now guarded by the edited item
+    assert again.deduplicated is True
+
+    old = ingest.create(schemas.ItemCreate(raw_text="original text", source="note"))
+    assert old.id != item.id  # the stale fingerprint no longer matches
+    assert len(repo.items) == 2
+
+
 # ---- e2e over the real repository (needs Postgres) ------------------------------
 
 
@@ -200,3 +254,24 @@ def test_capture_recurring_same_title_two_dates_creates_two_items(
         response = jerusalem_client.post("/capture", json={"text": ics, "kind_hint": "auto"})
         assert response.status_code == 201
     assert len(jerusalem_client.get("/items?limit=200").json()) == 2
+
+
+@pytest.mark.usefixtures("clean_items")
+def test_patch_then_capture_of_new_text_dedupes_to_edited_item(
+    jerusalem_client: TestClient,
+) -> None:
+    created = jerusalem_client.post(
+        "/items", json={"raw_text": "original text", "source": "note"}
+    )
+    assert created.status_code == 201
+    patched = jerusalem_client.patch(
+        f"/items/{created.json()['id']}", json={"raw_text": "edited text"}
+    )
+    assert patched.status_code == 200
+
+    capture = jerusalem_client.post("/capture", json={"text": "edited text"})
+    assert capture.status_code == 201
+    body = capture.json()
+    assert len(jerusalem_client.get("/items?limit=200").json()) == 1
+    assert body["items"][0]["id"] == created.json()["id"]
+    assert body["items"][0]["deduplicated"] is True
