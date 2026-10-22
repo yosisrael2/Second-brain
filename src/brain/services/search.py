@@ -116,8 +116,9 @@ class SearchService:
                     candidates.append(
                         {"id": key, "text": item.raw_text, "vector_score": None}
                     )
-        with ops.span("search", "rerank", edge="search->rerank"):
+        with ops.span("search", "rerank", edge="search->rerank") as span:
             ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
+            span.detail = {"pre_rerank_ids": [c["id"] for c in candidates]}
         fused = self._fuse_with_keywords(query, ranked, limit=limit + offset)
         return self._load_items(fused[offset : offset + limit])
 

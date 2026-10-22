@@ -114,14 +114,20 @@ class AskService:
         ``now`` anchors relative date expressions ("today", "this week");
         production passes nothing (real clock), tests pin it.
         """
-        with ops.span("ask", "search", edge="ask->search"):
+        with ops.span("ask", "search", edge="ask->search") as span:
             # rerank sees the whole pool; only the top_k best reach the prompt
+            kid_items = self._kid_recall_items(question)
             pool = self._search.search(
                 question,
                 limit=self._recall_pool,
-                extra_items=self._kid_recall_items(question),
+                extra_items=kid_items,
             )
             hits = pool[: self._top_k]
+            span.detail = {
+                "kid_leg_fired": bool(kid_items),
+                "kid_leg_ids": [str(item.id) for item in kid_items],
+                "pool_ids": [str(hit.item.id) for hit in pool],
+            }
         context_hits = self._temporal_hits(question, now) + hits
         context_hits = _unique_by_text(self._unique_by_id(context_hits))
         context = [
@@ -204,9 +210,18 @@ class AskService:
         needles = [needle for needle in dict.fromkeys(needles) if needle]
         if not needles:
             return []
-        return list(
+        items = list(
             self._items_repo.by_text_any(needles, limit=self._kid_recall_limit)
         )
+        ops.record_event(
+            "ask", "kid_recall", ok=True,
+            detail={
+                "needles": needles,
+                "fetched": len(items),
+                "ids": [str(item.id) for item in items],
+            },
+        )
+        return items
 
     def _temporal_hits(self, question: str, now: datetime | None) -> list[SearchHit]:
         """Fetch every item inside the question's resolved date ranges."""
