@@ -16,7 +16,7 @@ from brain.ai.ask import (
 )
 
 ITEMS = [
-    {"id": "item-1", "text": "The server runs on port 8000."},
+    {"id": "item-1", "text": "The server runs on port 27800."},
     {"id": "item-2", "text": "Deployments go through Jenkins."},
 ]
 
@@ -49,7 +49,7 @@ class TestAnswer:
 
         prompt = llm.prompts[0]
         assert "Question: what port?" in prompt
-        assert "- [item-1] The server runs on port 8000." in prompt
+        assert "- [item-1] The server runs on port 27800." in prompt
         assert "- [item-2] Deployments go through Jenkins." in prompt
         assert CITATION_RULES in prompt
 
@@ -85,7 +85,7 @@ class TestClaudeLLMClient:
                     "content": [
                         {"type": "text", "text": "Port "},
                         {"type": "tool_use", "id": "t1"},
-                        {"type": "text", "text": "8000."},
+                        {"type": "text", "text": "27800."},
                     ]
                 },
             )
@@ -98,7 +98,7 @@ class TestClaudeLLMClient:
         assert seen["version"] == "2023-06-01"
         assert seen["body"]["model"] == "claude-sonnet-5-5"
         assert seen["body"]["messages"] == [{"role": "user", "content": "which port?"}]
-        assert text == "Port 8000."  # non-text blocks skipped, texts joined
+        assert text == "Port 27800."  # non-text blocks skipped, texts joined
 
     def test_model_override_via_config(self):
         seen = {}

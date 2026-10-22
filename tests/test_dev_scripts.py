@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import socket
 import subprocess
 import sysconfig
 from pathlib import Path
@@ -10,6 +11,13 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 REPO_ROOT = SCRIPTS.parent
+
+
+def _free_port() -> int:
+    """A port free right now (bound, then released) — tests never collide."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _shellcheck_binary() -> str | None:
@@ -70,6 +78,39 @@ def test_lib_sh_defines_say_as_a_function():
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "function"
+
+
+def test_warns_on_legacy_default_ports():
+    """URLs pinned to the old 5432/6333 defaults draw a warning naming both
+    dedicated ports (27432/27333) with the exact lines to change."""
+    code = (
+        f"source {SCRIPTS}/lib.sh && "
+        "DATABASE_URL='postgresql+psycopg://brain:brain@localhost:5432/brain' "
+        "QDRANT_URL='http://localhost:6333' "
+        "warn_if_legacy_ports"
+    )
+    result = _bash_snippet(code)
+
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert "27432" in result.stderr
+    assert "27333" in result.stderr
+    # Exact lines to change: the corrected URLs, ready to paste into .env.
+    assert "DATABASE_URL=postgresql+psycopg://brain:brain@localhost:27432/brain" in result.stderr
+    assert "QDRANT_URL=http://localhost:27333" in result.stderr
+
+
+def test_no_legacy_port_warning_for_current_ports():
+    code = (
+        f"source {SCRIPTS}/lib.sh && "
+        "DATABASE_URL='postgresql+psycopg://brain:brain@localhost:27432/brain' "
+        "QDRANT_URL='http://localhost:27333' "
+        "warn_if_legacy_ports"
+    )
+    result = _bash_snippet(code)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
 
 
 def test_dev_start_help_exits_zero_without_side_effects():
@@ -166,6 +207,7 @@ def test_kill_tree_kills_children_and_supervisor():
 
 def test_dev_start_stops_a_never_healthy_server(tmp_path):
     """If /health never turns 200, dev-start kills the server it started."""
+    port = _free_port()
     shim = tmp_path / "shim"
     shim.mkdir()
     # Fail only the app's health endpoint; pass everything else through so the
@@ -173,14 +215,14 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
     shim_curl = shim / "curl"
     shim_curl.write_text(
         '#!/usr/bin/env bash\n'
-        'case "$*" in *"127.0.0.1:18765/health"*) exit 7 ;; esac\n'
+        f'case "$*" in *"127.0.0.1:{port}/health"*) exit 7 ;; esac\n'
         'exec /usr/bin/curl "$@"\n'
     )
     shim_curl.chmod(0o755)
     # Stub docker too: this test owns the SERVER lifecycle (health-fail ->
     # kill), not container management. A real compose up would fight whatever
-    # already serves 5432/6333 (CI service containers, a dev stack) — the stub
-    # makes the run hermetic on any machine with or without docker.
+    # already serves the infra ports (CI service containers, a dev stack) —
+    # the stub makes the run hermetic on any machine with or without docker.
     shim_docker = shim / "docker"
     shim_docker.write_text(
         '#!/usr/bin/env bash\n'
@@ -191,12 +233,13 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
 
     env = dict(os.environ)
     env["PATH"] = f"{shim}:{env['PATH']}"
-    # Point dev-start at the suite's own brain_test (already migrated to head
-    # by the conftest): dev-start's migrate step is then a no-op and the run
-    # never touches the real dev database. Everything else (.env reuse checks,
-    # pid/log state, ports) stays on the script's real code path.
-    env["DATABASE_URL"] = "postgresql+psycopg://brain:brain@localhost:5432/brain_test"
-    env["PORT"] = "18765"
+    # Inherit the suite's own brain_test URL (already migrated to head by the
+    # conftest; correct in CI and locally whatever ports the stack publishes):
+    # dev-start's migrate step is then a no-op and the run never touches the
+    # real dev database. Everything else (.env reuse checks, pid/log state,
+    # ports) stays on the script's real code path.
+    env["DATABASE_URL"] = os.environ["DATABASE_URL"]
+    env["PORT"] = str(port)
     env["HEALTH_TIMEOUT_S"] = "2"
     # Throwaway compose project + isolated .dev state: a test run must never
     # see (or stop) the real project or pid file.
@@ -216,7 +259,7 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
     # The half-started server must be gone (real curl, shim only in that run).
     probe_code = (
         "import urllib.request; "
-        "urllib.request.urlopen('http://127.0.0.1:18765/health', timeout=1)"
+        f"urllib.request.urlopen('http://127.0.0.1:{port}/health', timeout=1)"
     )
     probe = subprocess.run(
         [".venv/bin/python", "-c", probe_code],
@@ -231,7 +274,7 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
 def test_is_our_server_cmd_matches_only_our_uvicorn():
     code = (
         f"source {SCRIPTS}/lib.sh && "
-        'is_our_server_cmd ".venv/bin/uvicorn brain.main:app --port 8000 --reload" && echo ours; '
+        'is_our_server_cmd ".venv/bin/uvicorn brain.main:app --port 27800 --reload" && echo ours; '
         'is_our_server_cmd "python -m http.server 8099" || echo foreign; '
         'is_our_server_cmd "bash scripts/dev-start.sh" || echo script'
     )
@@ -295,18 +338,22 @@ def test_stop_uvicorn_app_never_kills_other_clones(tmp_path):
 
     foreign_cwd = tmp_path / "other-clone"
     foreign_cwd.mkdir()
+    port = _free_port()
     code = (
         f"source {SCRIPTS}/lib.sh && "
-        f"stop_uvicorn_app {tmp_path / 'no-such.pid'} 8098 && "
-        'echo "survivor=$(pgrep -f \'brain.main:app --port 8098( |$)\' | wc -l | tr -d \' \')"'
+        f"stop_uvicorn_app {tmp_path / 'no-such.pid'} {port} && "
+        'echo "survivor=$(pgrep -f \'brain.main:app --port '
+        f'{port}( |$)\' | wc -l | tr -d \' \')"'
     )
     foreign_pid = _spawn_uvicorn_cwd(
-        8098, foreign_cwd, {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+        port, foreign_cwd, {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
     )
     try:
         result = _bash_snippet(code)
     finally:
-        subprocess.run(["pkill", "-9", "-f", "brain.main:app --port 8098"], timeout=15)
+        subprocess.run(
+            ["pkill", "-9", "-f", f"brain.main:app --port {port}"], timeout=15
+        )
 
     assert result.returncode == 0, result.stderr
     assert "survivor=0" not in result.stdout  # the foreign-cwd instance survived the pass
@@ -322,20 +369,26 @@ def test_stop_uvicorn_app_kills_our_cwd_instance_and_honors_pid_file(tmp_path):
 
     foreign_cwd = tmp_path / "other-clone"
     foreign_cwd.mkdir()
+    spawn_port = _free_port()
+    scan_port = _free_port()
+    while scan_port == spawn_port:
+        scan_port = _free_port()
     foreign_pid = _spawn_uvicorn_cwd(
-        8097, foreign_cwd, {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+        spawn_port, foreign_cwd, {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
     )
     pid_file = tmp_path / "uvicorn.pid"
     pid_file.write_text(str(foreign_pid))  # pid file points at the OTHER clone's pid
     code = (
         f"source {SCRIPTS}/lib.sh && "
-        f"stop_uvicorn_app {pid_file} 8098; "
+        f"stop_uvicorn_app {pid_file} {scan_port}; "
         f"ps -p {foreign_pid} >/dev/null 2>&1 && echo foreign-alive || echo foreign-dead"
     )
     try:
         result = _bash_snippet(code)
     finally:
-        subprocess.run(["pkill", "-9", "-f", "brain.main:app --port 8097"], timeout=15)
+        subprocess.run(
+            ["pkill", "-9", "-f", f"brain.main:app --port {spawn_port}"], timeout=15
+        )
         time.sleep(0.2)
 
     assert result.returncode == 0, result.stderr

@@ -60,7 +60,7 @@ def anthropic_handler_factory(seen: dict) -> httpx.MockTransport:
         seen["payload"] = json.loads(request.content.decode("utf-8"))
         return httpx.Response(
             200,
-            json={"content": [{"type": "text", "text": "Port 8000."}], "model": MODEL},
+            json={"content": [{"type": "text", "text": "Port 27800."}], "model": MODEL},
         )
 
     return httpx.MockTransport(handler)

@@ -124,7 +124,7 @@ Revisit only if real production traffic shows a need.
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | `ClaudeLLMClient` |
 | `ANTHROPIC_MAX_TOKENS` | `1024` | `ClaudeLLMClient` |
 | `ANTHROPIC_TIMEOUT_S` | `60` | `ClaudeLLMClient` |
-| `QDRANT_URL` | `http://localhost:6333` | `QdrantVectorStore` |
+| `QDRANT_URL` | `http://localhost:27333` | `QdrantVectorStore` |
 | `TIMEZONE` | machine's local IANA zone (e.g. `Asia/Jerusalem`) | capture: interprets zone-less pasted times (Gmail/WhatsApp/calendar text) before storing `occurred_at` as aware UTC |
 | `TELEGRAM_BOT_TOKEN` | — (SecretStr; optional) | `brain telegram`: long-poll Telegram bot over the same services (needs the `telegram` extra) |
 | `TELEGRAM_ALLOWED_USER_IDS` | — (required with the token) | allowlist of Telegram user ids; rejected ids are logged once, never replied to |

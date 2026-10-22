@@ -9,7 +9,7 @@ cd "$ROOT"
 # shellcheck disable=SC1091  # dynamic path: lib.sh sits next to this script
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-PORT="${PORT:-8000}"
+PORT="${PORT:-27800}"
 FORCE_PORT=0
 RELOAD=1
 REINDEX=0
@@ -33,13 +33,12 @@ port) is stopped automatically, so running dev-start twice just restarts.
                 (never docker/rancher/colima proxies or infra ports)
   --help        show this help
 
-Environment: PORT (default 8000), COMPOSE_PROJECT_NAME (default
+Environment: PORT (default 27800), COMPOSE_PROJECT_NAME (default
 second-brain-dev, .env may set it), DOCKER_CONTEXT (falls back to the
 rancher-desktop context), HEALTH_TIMEOUT_S (default 30).
 EOF
 }
 
-say() { printf '%s\n' "$*"; }
 die() { printf 'dev-start: %s\n' "$*" >&2; exit 1; }
 
 check_docker() {
@@ -60,6 +59,7 @@ check_env_file() {
     say "env: created .env from .env.example — fill in what you need (JEV_API_KEY for classification; nothing required for LLM/embeddings). Values are never printed by this script."
   fi
   load_env_file
+  warn_if_legacy_ports
   if grep -q '^JEV_API_KEY=..*' .env; then
     say "jev: API key set"
   else
@@ -109,7 +109,7 @@ resolve_port_conflicts() {
   fi
 
   if [ -n "$(port_listener "$qdrant")" ]; then
-    if curl -sf "${QDRANT_URL:-http://localhost:6333}/healthz" >/dev/null 2>&1; then
+    if curl -sf "${QDRANT_URL:-http://localhost:27333}/healthz" >/dev/null 2>&1; then
       holders="$(compose_holders "$qdrant" | tr '\n' ' ')"
       say "qdrant: reusing what already serves localhost:${qdrant}${holders:+ (held by: $holders)} — left untouched"
       start_qdrant=0

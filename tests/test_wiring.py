@@ -103,7 +103,7 @@ def test_get_search_q_required(wired):
 def test_post_ask_answers_with_citations(wired):
     app, _, _ = wired
     created = TestClient(app).post(
-        "/items?classify=false", json={"raw_text": "The server runs on port 8000."}
+        "/items?classify=false", json={"raw_text": "The server runs on port 27800."}
     ).json()
     app.dependency_overrides[deps.get_llm_client] = lambda: FakeLLMClient(
         reply=lambda prompt: "Port: "
