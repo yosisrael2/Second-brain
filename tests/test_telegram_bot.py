@@ -63,6 +63,9 @@ class _StubIndexer:
     def probe(self) -> None:
         return None
 
+    def remove(self, item_id) -> None:
+        return None
+
     def purge(self) -> int:
         return 0
 
@@ -142,13 +145,20 @@ def _core(
     ask: Any = None,
     inbox: list[MemoryItem] | None = None,
 ) -> tuple:
-    """A TelegramBot wired to fakes; returns (core, repo)."""
+    """A TelegramBot wired to fakes; returns (core, repo).
+
+    ``inbox`` items are seeded into the repo (real ItemsService) so v2
+    keyboard actions (File/Type/Delete) operate on real service methods.
+    """
+    from brain.services.items import ItemsService
 
     repo = repo or FakeRepository()
+    for item in inbox or []:
+        repo.add(item)
     indexer = _StubIndexer()
     search = _StubSearch(search_hits)
     ask_service = ask or AskService(search, FakeLLMClient(reply="42"))
-    items_service = _StubItems(inbox or [])
+    items_service = ItemsService(repo, indexer)
 
     @contextmanager
     def factory():
@@ -213,15 +223,27 @@ class _FakeTG:
             raise batch[0]
         return batch
 
-    async def send_message(self, chat_id=None, text=None):
-        self.sent.append((chat_id, text))
+    async def send_message(self, chat_id=None, text=None, **kwargs):
+        self.sent.append({"chat_id": chat_id, "text": text, **kwargs})
 
 
-def _run_poll(tg, core):
-    """poll_loop with a short poll timeout so a broken loop fails fast."""
-    from brain.telegram_bot import poll_loop as pl
+def _run_poll(tg, core, *, expect_runtime_error: bool = True):
+    """Run poll_loop to completion; swallow the tests' RuntimeError("stop")."""
+    from brain.telegram_bot import poll_loop
 
-    return pl(tg, core, poll_timeout_s=1)
+    try:
+        asyncio.run(poll_loop(tg, core, poll_timeout_s=1))
+    except RuntimeError as exc:
+        if not (expect_runtime_error and str(exc) == "stop"):
+            raise
+
+
+# Aliases used by tests/test_telegram_v2.py (same fixtures, explicit names).
+make_core = _core
+
+
+def make_core_with_repo(*, repo=None, ask=None) -> tuple:
+    return _core(repo=repo, ask=ask)
 
 
 # --- configuration -----------------------------------------------------------
@@ -253,24 +275,21 @@ class TestCore:
 
         reply = core.route("Read the RAG paper and take notes", 111)
 
-        assert reply.startswith("✅ Captured 1 item(s) (note)")
+        assert reply.text.startswith("📝 Captured 1 item(s) (note)")  # card header: kind emoji
         assert len(repo.items) == 1
         item = next(iter(repo.items.values()))
         assert item.meta["channel"] == "telegram"
         assert item.source == "note"
         assert item.occurred_at is None
 
-    def test_capture_whatsapp_thread_joins(self, monkeypatch):
+    def test_capture_single_message_whatsapp_saves_directly(self, monkeypatch):
         _Events().install(monkeypatch)
         core, repo = _core()
 
-        reply = core.route(
-            "[21/10/2026, 09:00:00] Dana: one\n[21/10/2026, 09:01:00] Rami: two", 111
-        )
+        reply = core.route("[21/10/2026, 09:00:00] Dana: one", 111)
 
-        assert "1 item(s) (whatsapp)" in reply
+        assert "1 item(s) (whatsapp)" in reply.text
         assert len(repo.items) == 1
-        assert next(iter(repo.items.values())).meta["count"] == 2
 
     def test_capture_timezone_makes_occurred_at_aware(self, monkeypatch):
         _Events().install(monkeypatch)
@@ -281,6 +300,18 @@ class TestCore:
         item = next(iter(repo.items.values()))
         assert item.occurred_at == datetime(2026, 10, 21, 6, 0, tzinfo=UTC)
 
+    def test_capture_multi_message_whatsapp_asks_before_saving(self, monkeypatch):
+        core, repo = _core()
+
+        reply = core.route(
+            "[21/10/2026, 09:00:00] Dana: one\n[21/10/2026, 09:01:00] Rami: two", 111
+        )
+
+        assert repo.items == {}  # choice first
+        token = reply.keyboard[0][0][1].split(":", 1)[1]
+        core.handle_callback(f"w1:{token}")
+        assert len(repo.items) == 1
+
     def test_search_returns_hits(self, monkeypatch):
         _Events().install(monkeypatch)
         item = MemoryItem(id=uuid.uuid4(), raw_text="Found the meeting notes", source="note")
@@ -288,22 +319,22 @@ class TestCore:
 
         reply = core.route("/search meeting", 111)
 
-        assert "1 result(s) for 'meeting'" in reply
-        assert "Found the meeting notes" in reply
+        assert "1 result(s) for 'meeting'" in reply.text
+        assert "Found the meeting notes" in reply.text
 
     def test_search_empty_query_gets_usage(self, monkeypatch):
         events = _Events()
         events.install(monkeypatch)
         core, _ = _core()
 
-        assert core.route("/search", 111).startswith("Usage:")
+        assert core.route("/search", 111).text.startswith("Usage:")
         assert events.events[-1] == ("search", False, {"error": "empty query"})
 
     def test_ask_answers(self, monkeypatch):
         _Events().install(monkeypatch)
         core, _ = _core()
 
-        assert "42" in core.route("/ask meaning of life?", 111)
+        assert "42" in core.route("/ask meaning of life?", 111).text
 
     def test_ask_llm_error_is_friendly(self, monkeypatch):
         events = _Events()
@@ -312,7 +343,7 @@ class TestCore:
 
         reply = core.route("/ask what?", 111)
 
-        assert reply.startswith("⚠️ LLM unavailable")
+        assert reply.text.startswith("⚠️ LLM unavailable")
         assert events.events[-1][0] == "ask" and events.events[-1][1] is False
 
     def test_review_lists_inbox(self, monkeypatch):
@@ -324,20 +355,20 @@ class TestCore:
 
         reply = core.route("/review", 111)
 
-        assert "Inbox" in reply and "inbox candidate" in reply
+        assert "Inbox" in reply.text and "inbox candidate" in reply.text
 
     def test_status_without_cockpit(self, monkeypatch):
         _Events().install(monkeypatch)
         core, _ = _core()
 
-        assert core.route("/status", 111) == "cockpit not installed yet"
+        assert core.route("/status", 111).text == "cockpit not installed yet"
 
     def test_start_and_help(self, monkeypatch):
         _Events().install(monkeypatch)
         core, _ = _core()
 
-        assert "Second Brain bot ready" in core.route("/start", 111)
-        assert "/search" in core.route("/help", 111)
+        assert "Second Brain bot ready" in core.route("/start", 111).text
+        assert "/search" in core.route("/help", 111).text
 
 
 # --- poll loop ---------------------------------------------------------------
@@ -350,11 +381,10 @@ class TestPollLoop:
         core, repo = _core()
         tg = _FakeTG([[_fake_update(text="hello note")], [RuntimeError("stop")]])
 
-        with pytest.raises(RuntimeError, match="stop"):
-            asyncio.run(_run_poll(tg, core))
+        _run_poll(tg, core)
 
-        assert len(tg.sent) == 1 and tg.sent[0][0] == 555
-        assert "✅" in tg.sent[0][1]
+        assert len(tg.sent) == 1 and tg.sent[0]["chat_id"] == 555
+        assert "📝" in tg.sent[0]["text"]  # card header
         assert len(repo.items) == 1
         assert events.heartbeats and events.heartbeats[0][1]["pending"] == 1
         assert events.events[0][0] == "capture"
@@ -367,7 +397,7 @@ class TestPollLoop:
         tg = _FakeTG([[telegram.error.Conflict("terminated by other getUpdates request")]])
 
         with pytest.raises(telegram.error.Conflict):
-            asyncio.run(_run_poll(tg, core))
+            _run_poll(tg, core, expect_runtime_error=False)
 
         assert events.events[0][0] == "conflict" and events.events[0][1] is False
         assert tg.shutdowns == 1
@@ -380,8 +410,7 @@ class TestPollLoop:
         tg = _FakeTG([[_fake_update(user_id=999, text="sneak")], [RuntimeError("stop")]])
 
         with caplog.at_level(logging.INFO, logger="brain.telegram_bot"):
-            with pytest.raises(RuntimeError, match="stop"):
-                asyncio.run(_run_poll(tg, core))
+            _run_poll(tg, core)
 
         assert tg.sent == []  # strangers never get a reply
         assert repo.items == {}
@@ -398,11 +427,10 @@ class TestPollLoop:
             ]
         )
 
-        with pytest.raises(RuntimeError, match="stop"):
-            asyncio.run(_run_poll(tg, core))
+        _run_poll(tg, core)
 
-        assert "📎 Saved contract.pdf" in tg.sent[0][1]
-        assert any(i.raw_text.startswith("Document: contract.pdf") for i in repo.items.values())
+        assert "not supported yet" in tg.sent[0]["text"].lower()  # non-.ics in v2
+        assert repo.items == {}
 
     def test_callback_query_is_acknowledged(self, monkeypatch):
         pytest.importorskip("telegram")
@@ -415,8 +443,7 @@ class TestPollLoop:
         callback = SimpleNamespace(answer=_answer)
         tg = _FakeTG([[_fake_update(callback=callback)], [RuntimeError("stop")]])
 
-        with pytest.raises(RuntimeError, match="stop"):
-            asyncio.run(_run_poll(tg, core))
+        _run_poll(tg, core)
 
         assert acked == [True]
 
@@ -426,8 +453,7 @@ class TestPollLoop:
         core, _ = _core()
         tg = _FakeTG([[], [RuntimeError("stop")]])
 
-        with pytest.raises(RuntimeError, match="stop"):
-            asyncio.run(_run_poll(tg, core))
+        _run_poll(tg, core)
 
         component, detail = events.heartbeats[0]
         assert component == "telegram"
@@ -464,10 +490,13 @@ class TestCli:
         assert main(["telegram", "--whoami-hint"]) == 0
         assert "rejected update from user id" in capsys.readouterr().out
 
-    def test_telegram_without_token_exits_nonzero(self, capsys):
+    def test_telegram_without_token_exits_zero_disabled(self, caplog):
+        import logging
+
         from brain import telegram_bot
 
-        # Explicit token=None (over env/.env): run() must refuse before any network.
+        # Explicit token=None (over env/.env): the service reports "disabled".
         settings = telegram_bot.Settings(TELEGRAM_BOT_TOKEN=None, _env_file=None)
-        assert telegram_bot.run(settings) == 2
-        assert "TELEGRAM_BOT_TOKEN is not set" in capsys.readouterr().err
+        with caplog.at_level(logging.ERROR, logger="brain.telegram_bot"):
+            assert telegram_bot.run(settings) == 0
+        assert "telegram bot disabled (no token)" in caplog.text
