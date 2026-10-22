@@ -33,17 +33,20 @@ Ops integration (cockpit): :func:`heartbeat` and :func:`record_event` call
 otherwise; neither ever raises. ``/status`` uses the same health service when
 available and replies "cockpit not installed yet" when it is not.
 
-Exit codes (launchd service contract): token unset → 0 ("disabled"); 409
-conflict or invalid token (Unauthorized) → 78 (EX_CONFIG, no restart loop);
-transient failures → 1 (the service restarts).
+Exit codes (launchd service contract): token unset → 0 ("disabled"); another
+bot instance already running (machine-wide flock, per bot id) or 409 conflict
+persisting past the retry window, or invalid token (Unauthorized) → 78
+(EX_CONFIG, no restart loop); transient failures → 1 (the service restarts).
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import html
 import importlib
 import logging
+import os
 import re
 import secrets
 import sys
@@ -52,6 +55,7 @@ import uuid as uuid_mod
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -880,15 +884,26 @@ class TelegramBot:
 # --- polling adapter (needs python-telegram-bot) -----------------------------
 
 
-async def poll_loop(tg: Any, core: TelegramBot, *, poll_timeout_s: int = 50) -> None:
+async def poll_loop(
+    tg: Any,
+    core: TelegramBot,
+    *,
+    poll_timeout_s: int = 50,
+    conflict_window_s: float = 600.0,
+    conflict_backoff_s: float = 5.0,
+) -> None:
     """Long-poll getUpdates and process updates until an exception escapes.
 
     ``tg`` is a python-telegram-bot ``Bot`` (or anything with async
     ``initialize``/``shutdown``/``set_my_commands``/``get_updates``/
     ``send_message``/``send_chat_action``/``get_file`` — fakes in tests).
     Registers bot commands once, heartbeats once per poll cycle; a 409
-    conflict (another getUpdates consumer) or an Unauthorized token is
-    recorded and stops the bot; per-update failures never stop the loop.
+    conflict is usually TRANSIENT (the previous poller's long-poll lingers
+    after a restart/takeover), so it is retried with backoff (5s doubling to
+    60s) for ``conflict_window_s`` (default 10 minutes), recording an ops
+    "conflict" event per retry; only a conflict persisting past the window
+    stops the bot. An Unauthorized token is recorded and stops the bot;
+    per-update failures never stop the loop.
     """
     from telegram import BotCommand  # noqa: PLC0415
     from telegram.error import Conflict, InvalidToken, NetworkError  # noqa: PLC0415
@@ -901,19 +916,51 @@ async def poll_loop(tg: Any, core: TelegramBot, *, poll_timeout_s: int = 50) -> 
         logger.debug("telegram: set_my_commands failed", exc_info=True)
     offset: int | None = None
     last_update_id = 0
+    conflict_until: float | None = None
+    backoff = conflict_backoff_s
     try:
         while True:
             try:
                 updates = await tg.get_updates(offset=offset, timeout=poll_timeout_s)
             except Conflict as exc:
+                now = time.monotonic()
+                if conflict_until is None:
+                    conflict_until = now + conflict_window_s
+                if now >= conflict_until:
+                    record_event(
+                        "telegram",
+                        "conflict",
+                        ok=False,
+                        detail={
+                            "error": f"{type(exc).__name__}: conflict persisted past "
+                            f"{conflict_window_s:.0f}s window"[:200],
+                            "gave_up": True,
+                        },
+                    )
+                    logger.error(
+                        "telegram: getUpdates conflict persisted %.0fs — stopping (%s)",
+                        conflict_window_s,
+                        exc,
+                    )
+                    raise
                 record_event(
                     "telegram",
                     "conflict",
                     ok=False,
-                    detail={"error": f"{type(exc).__name__}: another getUpdates is running"[:200]},
+                    detail={
+                        "error": f"{type(exc).__name__}: another getUpdates is running"[:200],
+                        "retry_in_s": round(backoff, 2),
+                    },
                 )
-                logger.error("telegram: getUpdates conflict — stopping (%s)", exc)
-                raise
+                logger.warning(
+                    "telegram: getUpdates conflict — another poller may be starting; "
+                    "retrying in %.0fs (%s)",
+                    backoff,
+                    exc,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                continue
             except InvalidToken as exc:
                 record_event(
                     "telegram",
@@ -927,6 +974,9 @@ async def poll_loop(tg: Any, core: TelegramBot, *, poll_timeout_s: int = 50) -> 
                 logger.warning("telegram: network error, retrying (%s)", type(exc).__name__)
                 await asyncio.sleep(3)
                 continue
+            # A successful poll means the other poller is gone: fresh window.
+            conflict_until = None
+            backoff = conflict_backoff_s
             heartbeat(
                 "telegram",
                 {
@@ -1150,6 +1200,83 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
     # stickers/other unsupported message types: nothing to capture yet
 
 
+def _repo_lock_dir() -> Path:
+    """<repo>/.dev — repo root from this file's location (editable install ⇒
+    the repo; .dev is already gitignored). Fallback lock location."""
+    return Path(__file__).resolve().parents[2] / ".dev"
+
+
+def _cache_lock_dir() -> Path:
+    """Machine-wide lock dir: ~/Library/Caches/second-brain (override via
+    SECOND_BRAIN_CACHE_DIR for tests).
+
+    NOTE: the env var must be checked for emptiness BEFORE wrapping in Path —
+    Path('') is PosixPath('.') (truthy!), which would silently make the CWD
+    the lock dir and downgrade the lock to per-checkout again.
+    """
+    env = os.environ.get("SECOND_BRAIN_CACHE_DIR")
+    return Path(env) if env else Path.home() / "Library" / "Caches" / "second-brain"
+
+
+def _lock_paths(token: str | None) -> list[Path]:
+    """Lock locations, most specific first.
+
+    The preferred lock is MACHINE-WIDE and per bot: the unexplained-second-
+    poller class was a bot started from ANOTHER checkout with the same token;
+    a per-repo lock cannot see it. The name carries only the token's numeric
+    bot id (before ':'), never the secret half. The repo-local .dev path is
+    the fallback when the cache dir is unwritable.
+    """
+    bot_id = (token or "").split(":", 1)[0] or "unknown"
+    return [
+        _cache_lock_dir() / f"telegram-{bot_id}.lock",
+        _repo_lock_dir() / "telegram.lock",
+    ]
+
+
+def _acquire_instance_lock(token: str | None) -> tuple[Any, int | None]:
+    """Exclusive, non-blocking flock for the single-instance guarantee.
+
+    Tries :func:`_lock_paths` in order; the first usable path wins. Returns
+    ``(handle, None)`` when this process holds the lock — keep the handle
+    referenced for the process lifetime (closing it releases). Returns
+    ``(None, other_pid)`` when another live instance holds it (pid best-effort
+    read from the file for the error message; None when unreadable/stale).
+    The lock dies with the process: no stale-lock cleanup is ever needed.
+    Raises OSError only when NO location is usable (real misconfiguration).
+    """
+    last_error: OSError | None = None
+    for lock_path in _lock_paths(token):
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a")
+        except OSError as exc:  # unwritable dir: try the fallback
+            last_error = exc
+            continue
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            other: int | None = None
+            try:
+                other = int(lock_path.read_text().strip() or 0) or None
+            except (OSError, ValueError):
+                other = None
+            return None, other
+        except OSError as exc:
+            handle.close()
+            last_error = exc
+            continue
+        # Append mode was used at open so a losing instance can still read
+        # the holder's pid; now that we own the lock, rewrite it cleanly.
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        return handle, None
+    raise last_error or OSError("no usable single-instance lock location")
+
+
 def build_bot(settings: Settings) -> tuple[TelegramBot, Any]:
     """Assemble the core + a telegram Bot (requires the telegram extra)."""
     from telegram import Bot  # noqa: PLC0415
@@ -1165,12 +1292,52 @@ def build_bot(settings: Settings) -> tuple[TelegramBot, Any]:
 
 
 def run(settings: Settings) -> int:
-    """Run the long-poll loop; returns the process exit code."""
+    """Run the long-poll loop; returns the process exit code.
+
+    Installs a stderr root logging handler first (launchd jobs start with no
+    logging config): without it, the startup line and errors below WARNING
+    would vanish from StandardErrorPath.
+    """
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            stream=sys.stderr,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
     if settings.telegram_bot_token is None:
         logger.error("telegram bot disabled (no token)")
         return EXIT_DISABLED
+    token = unwrap_secret(settings.telegram_bot_token)
+    try:
+        lock, other_pid = _acquire_instance_lock(token)
+    except OSError as exc:
+        logger.error("telegram: cannot create the single-instance lock (%s)", exc)
+        print(f"telegram: cannot create the single-instance lock: {exc}", file=sys.stderr)
+        return EXIT_TRANSIENT
+    if lock is None:
+        message = "another bot instance is running"
+        if other_pid is not None:
+            message += f" (pid {other_pid})"
+        logger.error("telegram: %s — refusing to double-poll (409 ahead)", message)
+        print(f"telegram: {message}", file=sys.stderr)
+        return EXIT_CONFIG
     try:
         core, tg = build_bot(settings)
+        logger.info("telegram: long polling started")
+        try:
+            asyncio.run(poll_loop(tg, core))
+        except KeyboardInterrupt:
+            logger.info("telegram: stopped")
+            return EXIT_DISABLED
+        except Exception as exc:  # noqa: BLE001  (CLI: map to the launchd contract)
+            # PTB v22 renamed Unauthorized -> InvalidToken; treat both + Forbidden
+            # (bot blocked) as configuration errors so launchd does not restart-loop.
+            if type(exc).__name__ in ("Conflict", "Unauthorized", "InvalidToken", "Forbidden"):
+                print(f"telegram: {type(exc).__name__}: {exc}", file=sys.stderr)
+                return EXIT_CONFIG
+            logger.exception("telegram: polling stopped with an error")
+            print(f"telegram: stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_TRANSIENT
     except ImportError:
         print(
             "telegram: python-telegram-bot is not installed — run "
@@ -1178,22 +1345,8 @@ def run(settings: Settings) -> int:
             file=sys.stderr,
         )
         return EXIT_CONFIG
-    logger.info("telegram: long polling started")
-    try:
-        asyncio.run(poll_loop(tg, core))
-    except KeyboardInterrupt:
-        logger.info("telegram: stopped")
-        return EXIT_DISABLED
-    except Exception as exc:  # noqa: BLE001  (CLI: map to the launchd contract)
-        # PTB v22 renamed Unauthorized -> InvalidToken; treat both + Forbidden
-        # (bot blocked) as configuration errors so launchd does not restart-loop.
-        if type(exc).__name__ in ("Conflict", "Unauthorized", "InvalidToken", "Forbidden"):
-            print(f"telegram: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return EXIT_CONFIG
-        logger.exception("telegram: polling stopped with an error")
-        print(f"telegram: stopped: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_TRANSIENT
     finally:
+        lock.close()  # release the single-instance lock on EVERY exit path
         from brain.api import deps  # noqa: PLC0415
 
         deps.close_shared_clients()

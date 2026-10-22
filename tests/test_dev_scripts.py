@@ -13,6 +13,20 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 REPO_ROOT = SCRIPTS.parent
 
 
+def _venv_ready() -> bool:
+    """True when REPO_ROOT/.venv is provisioned. Tests that run real scripts
+    skip otherwise: dev-start would CREATE a bare .venv/.env in the repo
+    (repo mutation), and uvicorn spawns would fail confusingly."""
+    return (REPO_ROOT / ".venv/bin/python").exists()
+
+
+need_venv = pytest.mark.skipif(
+    not _venv_ready(),
+    reason="REPO_ROOT/.venv is not provisioned (run scripts/dev-start.sh once; "
+    "these tests run real scripts and must not create a venv themselves)",
+)
+
+
 def _free_port() -> int:
     """A port free right now (bound, then released) — tests never collide."""
     with socket.socket() as sock:
@@ -170,6 +184,7 @@ def test_start_and_stop_use_the_same_project():
     assert _resolve_project() == "second-brain-dev"
 
 
+@need_venv
 def test_pg_check_survives_apostrophe_in_password():
     """DATABASE_URL rides via env, never interpolated: an apostrophe password
     must yield a clean connection error, not a python SyntaxError."""
@@ -205,6 +220,7 @@ def test_kill_tree_kills_children_and_supervisor():
     assert "leftover=0" in result.stdout
 
 
+@need_venv
 def test_dev_start_stops_a_never_healthy_server(tmp_path):
     """If /health never turns 200, dev-start kills the server it started."""
     port = _free_port()
@@ -331,6 +347,7 @@ def _spawn_uvicorn_cwd(port: int, cwd: Path, python_env: dict[str, str]) -> int:
     raise AssertionError(f"uvicorn on port {port} did not become healthy (cwd={cwd})")
 
 
+@need_venv
 def test_stop_uvicorn_app_never_kills_other_clones(tmp_path):
     """An identical cmdline from ANOTHER cwd must survive; ours is killed."""
     import shutil
@@ -363,6 +380,7 @@ def test_stop_uvicorn_app_never_kills_other_clones(tmp_path):
     time.sleep(0.2)
 
 
+@need_venv
 def test_stop_uvicorn_app_kills_our_cwd_instance_and_honors_pid_file(tmp_path):
     """Our cwd-matching instance is killed; a foreign-cwd pid in the pid file is ignored."""
     import time

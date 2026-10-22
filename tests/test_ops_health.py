@@ -204,3 +204,101 @@ class TestSecrets:
             assert "super-secret-token-value" not in probe.text
         finally:
             get_settings.cache_clear()
+
+
+class TestBackgroundComponent:
+    """The cockpit's Background-services node: launchd agent states from
+    `launchctl print` (scripts/service.sh install)."""
+
+    @staticmethod
+    def _ctx(background) -> ops_health.HealthContext:
+        return ops_health.HealthContext(
+            db=lambda: {"reachable": True, "latency_ms": 1.0, "drift": False,
+                        "items_by_status": {}, "size": "1 kB"},
+            qdrant=lambda: {"reachable": True, "collection_exists": True,
+                            "vectors": 0, "items": 0, "dims_ok": True},
+            embedder=lambda: {"provider": "fastembed", "model": None, "loaded": False},
+            jev=lambda: {"configured": False},
+            llm=lambda: {"provider": "claude_sdk", "model": None},
+            telegram=lambda: {"token_set": False, "allowlist_set": False,
+                              "heartbeat_age_s": None},
+            docker=lambda: {"available": False},
+            disk=lambda: {"free_gb": 42.0},
+            background=background,
+        )
+
+    def test_disabled_when_launchd_unavailable(self):
+        ops_health.reset_cache()
+        body = ops_health.run_health_checks(self._ctx(lambda: {"available": False, "agents": {}}))
+        node = body["components"]["background"]
+        assert node["status"] == "disabled"
+        assert "launchd unavailable" in node["summary"]
+
+    def test_disabled_when_no_agents_installed(self):
+        ops_health.reset_cache()
+        body = ops_health.run_health_checks(self._ctx(lambda: {"available": True, "agents": {}}))
+        node = body["components"]["background"]
+        assert node["status"] == "disabled"
+        assert "service.sh install" in node["summary"]
+
+    def test_ok_when_both_agents_running(self):
+        ops_health.reset_cache()
+        agents = {
+            "com.secondbrain.api": {"state": "running", "pid": 100},
+            "com.secondbrain.telegram": {"state": "running", "pid": 101},
+        }
+        raw = lambda: {"available": True, "agents": agents}  # noqa: E731
+        body = ops_health.run_health_checks(self._ctx(raw))
+        node = body["components"]["background"]
+        assert node["status"] == "ok"
+        assert node["summary"] == "2/2 agents running"
+
+    def test_degraded_when_one_agent_dead_with_exit_code(self):
+        ops_health.reset_cache()
+        agents = {
+            "com.secondbrain.api": {"state": "running", "pid": 100},
+            "com.secondbrain.telegram": {"state": "exited", "last_exit": 78},
+        }
+        raw = lambda: {"available": True, "agents": agents}  # noqa: E731
+        body = ops_health.run_health_checks(self._ctx(raw))
+        node = body["components"]["background"]
+        assert node["status"] == "degraded"
+        assert "1/2 agents running" in node["summary"]
+        assert "telegram: exited (exit 78)" in node["summary"]
+
+    def test_down_when_installed_but_none_running(self):
+        ops_health.reset_cache()
+        agents = {
+            "com.secondbrain.api": {"state": "exited", "last_exit": 1},
+            "com.secondbrain.telegram": {"state": "not installed"},
+        }
+        raw = lambda: {"available": True, "agents": agents}  # noqa: E731
+        body = ops_health.run_health_checks(self._ctx(raw))
+        node = body["components"]["background"]
+        assert node["status"] == "down"
+        assert "0/2 agents running" in node["summary"]
+
+    def test_default_adapter_parses_launchctl_print(self, monkeypatch, tmp_path):
+        """The default adapter shells out to `launchctl print gui/<uid>/<label>`;
+        here a PATH stub keeps the test hermetic."""
+        import os
+
+        stub = tmp_path / "stubbin"
+        stub.mkdir()
+        (stub / "launchctl").write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$2" in\n'
+            "  *com.secondbrain.api) printf '  state = running\\n  pid = 4242\\n"
+            "  last exit code = 0\\n';;\n"
+            '  *) echo "Could not find service" >&2; exit 3;;\n'
+            "esac\n"
+        )
+        (stub / "launchctl").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
+        ops_health.reset_cache()
+        body = ops_health.run_health_checks(ops_health.HealthContext())
+        raw = body["components"]["background"]
+        assert raw["status"] == "ok"  # api running; telegram not installed => not counted
+        assert raw["summary"] == "1/1 agents running"
+        assert raw["details"]["agents"]["com.secondbrain.api"]["pid"] == 4242
+        assert raw["details"]["agents"]["com.secondbrain.telegram"] == {}
