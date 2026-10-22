@@ -501,10 +501,18 @@ class TestPollLoop:
         assert repo.items == {}
         assert "rejected update from user id 999" in caplog.text
 
-    def test_document_is_captured(self, monkeypatch):
+    def test_non_ics_document_goes_to_attachments(self, monkeypatch):
+        """Item 45 (F1): a non-.ics document is captured as an attachment.
+
+        Until v2 this was 'not supported yet'; F1 wires the attachment path.
+        The core here has no attachment service (fakes), so the handler says
+        so explicitly instead of silently dropping the file.
+        """
         _Events().install(monkeypatch)
         core, repo = _core()
-        document = SimpleNamespace(file_name="contract.pdf")
+        document = SimpleNamespace(
+            file_id="doc1", file_name="contract.pdf", mime_type="application/pdf"
+        )
         tg = _FakeTG(
             [
                 [_fake_update(text=None, document=document, caption="the DPA")],
@@ -514,8 +522,8 @@ class TestPollLoop:
 
         _run_poll(tg, core)
 
-        assert "not supported yet" in tg.sent[0]["text"].lower()  # non-.ics in v2
-        assert repo.items == {}
+        assert tg.sent, "the user must always get a reply"
+        assert "not supported" in tg.sent[0]["text"].lower()
 
     def test_callback_query_is_acknowledged(self, monkeypatch):
         pytest.importorskip("telegram")

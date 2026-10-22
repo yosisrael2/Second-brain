@@ -20,6 +20,8 @@ dependencies = [
     # embeddings via fastembed (downloads its model on first run).
     "claude-agent-sdk>=0.2.16,<0.3",
     "fastembed>=0.6,<2",
+    # PDF text-layer extraction for attachments (item 44; BSD-3-Clause).
+    "pypdf>=5,<7",
 ]
 
 [project.optional-dependencies]

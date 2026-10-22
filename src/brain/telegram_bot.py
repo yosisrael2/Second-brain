@@ -280,6 +280,7 @@ class BotServices:
     search: Any  # SearchService
     ask: Any  # AskService
     memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
+    attachments: Any = None  # AttachmentService (F1; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -345,6 +346,7 @@ def _one_line(text: str, limit: int) -> str:
         flat = flat[:limit].rstrip() + "…"
     return _esc(flat)
 
+
 _SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
@@ -399,9 +401,7 @@ class TelegramBot:
         stripped = text.strip()
         return bool(stripped) and not stripped.startswith("/") and stripped.endswith("?")
 
-    def route(
-        self, text: str, user_id: int, *, forward: dict[str, Any] | None = None
-    ) -> Reply:
+    def route(self, text: str, user_id: int, *, forward: dict[str, Any] | None = None) -> Reply:
         """Dispatch one allowed text message; returns the reply."""
         stripped = text.strip()
         if not stripped.startswith("/"):
@@ -440,8 +440,7 @@ class TelegramBot:
             count = self._message_count(parsed)
             return Reply(
                 text=(
-                    f"💬 WhatsApp thread with {count} messages — save as "
-                    "one item or separately?"
+                    f"💬 WhatsApp thread with {count} messages — save as one item or separately?"
                 ),
                 keyboard=[
                     [("Save as 1 item", f"{CB_WA_JOIN}:{token}")],
@@ -454,12 +453,49 @@ class TelegramBot:
         """Capture an .ics document's contents as a calendar item."""
         parsed = parse_paste(text or "", kind_hint="calendar", tz=self._timezone)
         reply = self._save_parsed(parsed)
-        record_event(
-            "telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")}
-        )
-        return Reply(
-            text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard
-        )
+        record_event("telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")})
+        return Reply(text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard)
+
+    def capture_attachment_parent(self, text: str) -> Any:
+        """Capture the caption as an attachment's parent item (item 45).
+
+        The caption is the parent's text; on an exact-duplicate caption the
+        EXISTING item is the parent (ingest dedupe returns its snapshot).
+        """
+        parsed = parse_paste(text, tz=self._timezone)
+        with self._services_factory() as services:
+            items = services.ingest.capture_parsed(parsed, extra_meta={"channel": "telegram"})
+        return items[0]
+
+    def read_attachment(self, attachment_id: Any) -> Any:
+        """Run one attachment read through the (shared) attachment service."""
+        with self._services_factory() as services:
+            if services.attachments is None:
+                return "unsupported"
+            return services.attachments.process(attachment_id)
+
+    def attachment_summary(self, attachment_id: Any, status: str) -> Reply:
+        """Short follow-up for a finished (or failed) attachment read."""
+        with self._services_factory() as services:
+            att = services.attachments.get(attachment_id) if services.attachments else None
+        if att is None:
+            return Reply(text="📎 attachment saved")
+        name = _esc(att.filename)
+        if status == "done":
+            with self._services_factory() as services:
+                own = services.attachments.own_item(attachment_id)
+            description = (own.meta or {}).get("description", "") if own else ""
+            if description:
+                return Reply(text=f"📎 {name}\n{description}")
+            head = (att.text or "").strip().splitlines()
+            preview = head[0][:160] if head else ""
+            return Reply(text=f"📎 {name}\n{preview}" if preview else f"📎 {name}")
+        if status == "unsupported":
+            return Reply(text=f"📎 {name} — saved (searchable by filename only)")
+        if status == "too_large":
+            return Reply(text=f"📎 {name} — too large to read (over 20 MB), not stored")
+        # failed or queued
+        return Reply(text=f"📎 {name} — ⚠️ reading failed; recorded in ops")
 
     def _save_parsed(self, parsed: Any, *, forward: dict[str, Any] | None = None) -> Reply:
         extra_meta: dict[str, Any] = {"channel": "telegram"}
@@ -500,9 +536,7 @@ class TelegramBot:
         """
         token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
         filed = bool(items) and all(item.status == "filed" for item in items)
-        deduped = bool(items) and all(
-            getattr(item, "deduplicated", False) for item in items
-        )
+        deduped = bool(items) and all(getattr(item, "deduplicated", False) for item in items)
         row: list[tuple[str, str]] = []
         if not filed:
             row.append(("✅ File", f"{CB_FILE}:{token}"))
@@ -765,9 +799,7 @@ class TelegramBot:
                 return Reply("Memory layer is not installed yet.")
             # MemoryService.overview returns a LIST of entity dicts
             entities = memory.overview(status="confirmed", q=None)
-        persons = [
-            e for e in entities if e.get("kind") == "person" and e.get("facts")
-        ]
+        persons = [e for e in entities if e.get("kind") == "person" and e.get("facts")]
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
         lines = ["👤 <b>Profile</b>"]
@@ -817,13 +849,8 @@ class TelegramBot:
 
     def _memory_remove_buttons(self, fact_ids: list[str]) -> list[list[tuple[str, str]]]:
         """Numbered ✖ buttons (rows of 4), numbered like the profile lines."""
-        token = self.registry.put(
-            Pending(ids=tuple(uuid_mod.UUID(fid) for fid in fact_ids))
-        )
-        buttons = [
-            (f"✖ {n}", f"{CB_MEM_DEL}:{token}:{n - 1}")
-            for n in range(1, len(fact_ids) + 1)
-        ]
+        token = self.registry.put(Pending(ids=tuple(uuid_mod.UUID(fid) for fid in fact_ids)))
+        buttons = [(f"✖ {n}", f"{CB_MEM_DEL}:{token}:{n - 1}") for n in range(1, len(fact_ids) + 1)]
         return [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
 
     def _remove_profile_fact(self, pending: Pending, index: int) -> Reply:
@@ -964,8 +991,10 @@ class TelegramBot:
                     continue
         if not items:
             return Reply("🗑 Deleted", edit=True)
-        text = self._card_header(items, notice=notice) + "\n" + "\n".join(
-            self._item_card(item) for item in items
+        text = (
+            self._card_header(items, notice=notice)
+            + "\n"
+            + "\n".join(self._item_card(item) for item in items)
         )
         return Reply(text=text, keyboard=self._capture_buttons(items), edit=True)
 
@@ -1191,19 +1220,27 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
         if edit_message is not None:
             try:
                 await edit_message(
-                    chat_id=chat_id, message_id=message_id, text=text,
-                    parse_mode="HTML", reply_markup=markup,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
                 )
                 return
             except Exception as exc:  # noqa: BLE001
                 if _is_parse_entity_error(exc):
                     record_event(
-                        "telegram", EVENT_ERROR, ok=False,
+                        "telegram",
+                        EVENT_ERROR,
+                        ok=False,
                         detail={"error": f"edit fallback: {type(exc).__name__}: {exc!s}"[:200]},
                     )
                     await edit_message(
-                        chat_id=chat_id, message_id=message_id,
-                        text=_strip_html(text), parse_mode=None, reply_markup=markup,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=_strip_html(text),
+                        parse_mode=None,
+                        reply_markup=markup,
                     )
                     return
                 logger.debug("telegram: edit_message_text failed, sending new (%s)", exc)
@@ -1282,6 +1319,12 @@ async def _download_text(tg: Any, document: Any) -> str:
     return bytes(file.download_as_bytearray()).decode("utf-8", errors="replace")
 
 
+async def _download_bytes(tg: Any, file_id: str) -> bytes:
+    """Download a file's raw bytes (attachments keep them verbatim)."""
+    file = await tg.get_file(file_id=file_id)
+    return bytes(file.download_as_bytearray())
+
+
 async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: str) -> Reply:
     """Run the (blocking) ask in a thread, sending TYPING every 4 seconds."""
     stop = asyncio.Event()
@@ -1303,6 +1346,49 @@ async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: s
     finally:
         stop.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _handle_attachment(
+    tg: Any,
+    chat_id: int,
+    core: TelegramBot,
+    message: Any,
+    *,
+    filename: str,
+    mime: str | None,
+    file_id: str,
+) -> None:
+    """Item 45: save the attachment + caption-parent, reply, read, report."""
+    with core._services_factory() as services:
+        if services.attachments is None:  # feature not wired (older factory)
+            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            return
+        caption = getattr(message, "caption", None) or f"[attachment: {filename}]"
+        content = await _download_bytes(tg, file_id)
+        parent = core.capture_attachment_parent(caption)
+        att = services.attachments.capture(
+            parent.id,
+            content,
+            filename,
+            mime,
+            "telegram",
+            str(getattr(message, "message_id", "") or ""),
+        )
+        await _send(tg, chat_id, Reply(text="📎 saved, reading…"))
+        attachment_id = att.id
+    task = asyncio.create_task(_read_and_report(tg, chat_id, core, attachment_id))
+    logger.info("telegram: attachment %s reading in background", attachment_id)
+    del task  # fire and forget; failures are recorded on the row
+
+
+async def _read_and_report(tg: Any, chat_id: int, core: TelegramBot, attachment_id: Any) -> None:
+    """Read the attachment (budget/queue aware) and send a short summary."""
+    try:
+        status = await core.read_attachment(attachment_id)
+        await _send(tg, chat_id, core.attachment_summary(attachment_id, status))
+    except Exception as exc:  # noqa: BLE001 — never crash the bot on a follow-up
+        logger.error("telegram: attachment follow-up failed: %s", exc, exc_info=True)
+        record_event("telegram", "attachment_report", ok=False, detail={"error": str(exc)})
 
 
 async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
@@ -1336,19 +1422,39 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
     document = getattr(message, "document", None)
     if document is not None:
         file_name = document.file_name or "document"
-        is_ics = file_name.lower().endswith(".ics") or getattr(document, "mime_type", "") == "text/calendar"  # noqa: E501
+        is_ics = (
+            file_name.lower().endswith(".ics")
+            or getattr(document, "mime_type", "") == "text/calendar"
+        )  # noqa: E501
         if is_ics:
             text = await _download_text(tg, document)
             await _send(tg, chat_id, core.capture_document(file_name, text))
         else:
-            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            await _handle_attachment(
+                tg,
+                chat_id,
+                core,
+                message,
+                filename=file_name,
+                mime=getattr(document, "mime_type", None),
+                file_id=document.file_id,
+            )
         return
-    if (
-        getattr(message, "photo", None)
-        or getattr(message, "voice", None)
-        or getattr(message, "video_note", None)
-    ):
-        await _send(tg, chat_id, core.unsupported("Photos, voice and video"))
+    photo = getattr(message, "photo", None)
+    if photo:
+        largest = photo[-1]  # Telegram lists sizes ascending; take the largest
+        await _handle_attachment(
+            tg,
+            chat_id,
+            core,
+            message,
+            filename="photo.jpg",
+            mime="image/jpeg",
+            file_id=largest.file_id,
+        )
+        return
+    if getattr(message, "voice", None) or getattr(message, "video_note", None):
+        await _send(tg, chat_id, core.unsupported("Voice and video"))
         return
     if message.text:
         if core.is_question(message.text):
@@ -1504,8 +1610,7 @@ def run(settings: Settings) -> int:
             return EXIT_TRANSIENT
     except ImportError:
         print(
-            "telegram: python-telegram-bot is not installed — run "
-            "`pip install -e '.[telegram]'`",
+            "telegram: python-telegram-bot is not installed — run `pip install -e '.[telegram]'`",
             file=sys.stderr,
         )
         return EXIT_CONFIG
