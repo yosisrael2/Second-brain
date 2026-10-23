@@ -100,6 +100,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     extract_eval.add_argument(
         "--limit", type=int, default=None, help="Only the first N emails (smoke runs)"
     )
+    extract_eval.add_argument(
+        "--memory",
+        default=None,
+        help="Read-only LIVE memory export (entities+facts JSON) to import "
+        "into the TEST DB before running (audience resolution needs it)",
+    )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     seed_kid = memory_sub.add_parser(
@@ -202,7 +208,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "enrich":
         return _enrich(since=args.since, limit=args.limit, budget=args.budget)
     if args.command == "extract-eval":
-        return _extract_eval(input_path=args.input, out_path=args.out, limit=args.limit)
+        return _extract_eval(
+            input_path=args.input,
+            out_path=args.out,
+            limit=args.limit,
+            memory_snapshot=args.memory,
+        )
     if args.command == "memory":
         if args.memory_command == "seed-kid":
             return _memory_seed_kid(
@@ -240,7 +251,13 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
 """
 
 
-def _extract_eval(*, input_path: str, out_path: str, limit: int | None) -> int:
+def _extract_eval(
+    *,
+    input_path: str,
+    out_path: str,
+    limit: int | None,
+    memory_snapshot: str | None,
+) -> int:
     """Offline extraction-eval runner: emails file -> pred.jsonl (never live)."""
     import os  # noqa: PLC0415
     from zoneinfo import ZoneInfo  # noqa: PLC0415
@@ -283,6 +300,7 @@ def _extract_eval(*, input_path: str, out_path: str, limit: int | None) -> int:
                 session,
                 extractor,
                 tz=ZoneInfo(settings.timezone),
+                memory_snapshot=Path(memory_snapshot) if memory_snapshot else None,
             )
     finally:
         close = getattr(llm, "close", None)

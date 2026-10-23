@@ -134,12 +134,20 @@ def run_extraction_eval(
     extractor: Any,  # noqa: ANN001 — Extractor
     *,
     tz: Any,
+    memory_snapshot: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Extract children for every email and write the pred file.
 
     Returns the rows (also written as JSONL). Runs against the session's DB
     (a TEST database — the CLI guard refuses the live store); cleans its own
     rows before and after.
+
+    ``memory_snapshot``: a read-only export of the LIVE memory layer
+    (entities + aliases + current confirmed facts, as produced by the
+    export SQL) imported into the TEST database first. Without it the
+    audience resolution has nothing to resolve against (run #1 lesson:
+    109/109 'unknown' with an empty memory layer) and the R1 sender
+    default has no teacher facts to match.
     """
     emails = split_emails(input_path.read_text(encoding="utf-8"))
     memory = MemoryService(MemoryRepository(session))
@@ -149,6 +157,8 @@ def run_extraction_eval(
         ItemsRepository(session), session, extractor=extractor, memory=memory
     )
     _wipe(session)
+    if memory_snapshot is not None:
+        _import_memory_snapshot(session, memory_snapshot)
     rows: list[dict[str, Any]] = []
     now = datetime.now(tz=UTC)
     for email in emails:
@@ -175,6 +185,47 @@ def run_extraction_eval(
         encoding="utf-8",
     )
     return rows
+
+
+def _import_memory_snapshot(session: Any, snapshot_path: Path) -> None:  # noqa: ANN001
+    """Import a read-only LIVE memory export into the TEST database (A2).
+
+    Same ids and fact timestamps as live so teacher/channel matching
+    behaves identically. The export contains ONLY the memory layer
+    (entities/aliases/facts) — never captures or children.
+    """
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    for entity in snapshot.get("entities", []):
+        session.execute(
+            text(
+                "INSERT INTO entities (id, kind, name, created_at) "
+                "VALUES (:id, :kind, :name, :created_at) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            entity,
+        )
+    for alias in snapshot.get("aliases", []):
+        session.execute(
+            text(
+                "INSERT INTO entity_aliases (entity_id, alias) "
+                "VALUES (:entity_id, :alias) ON CONFLICT DO NOTHING"
+            ),
+            alias,
+        )
+    for fact in snapshot.get("facts", []):
+        fact = dict(fact)
+        fact["provenance"] = json.dumps(fact.get("provenance") or {})
+        session.execute(
+            text(
+                "INSERT INTO memory_facts (id, subject_id, predicate, object_id, "
+                "value, valid_from, valid_to, status, provenance) "
+                "VALUES (:id, :subject_id, :predicate, :object_id, :value, "
+                ":valid_from, :valid_to, :status, "
+                "CAST(:provenance AS jsonb)) ON CONFLICT (id) DO NOTHING"
+            ),
+            fact,
+        )
+    session.commit()
 
 
 def _wipe(session: Any) -> None:  # noqa: ANN001
