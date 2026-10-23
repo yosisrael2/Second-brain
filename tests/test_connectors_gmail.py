@@ -404,6 +404,36 @@ class TestHistoryPath:
         assert result.records[0].deleted is True
         assert result.next_cursor == "9003"
 
+    def test_limit_never_stops_mid_entry(self):
+        """One coalesced Gmail entry can carry many messages (dragging a
+        whole folder into the label). The limit must stop BETWEEN entries:
+        stopping mid-entry would drop the tail of the entry AND advance the
+        cursor past it — silent message loss. The batch may exceed the
+        limit by one entry; the cursor only covers FULLY emitted entries."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.history_pages = {
+            "first": {
+                "history": [
+                    {
+                        "id": "9001",
+                        "labelsAdded": [
+                            {"labelIds": [LABEL], "message": {"id": f"m{i}"}}
+                            for i in (1, 2, 3)
+                        ],
+                    }
+                ]
+            }
+        }
+        for i in (1, 2, 3):
+            state.messages[f"m{i}"] = _msg_fixture(f"m{i}")
+        connector = _connector(state)
+        result = connector.fetch("9000", limit=2)
+        # The whole entry is emitted despite limit=2 — no silent tail loss.
+        assert sorted(r.external_id for r in result.records) == ["m1", "m2", "m3"]
+        # The entry was fully emitted, so the cursor may cover it.
+        assert result.next_cursor == "9001"
+
     def test_label_removed_keeps_the_record_text(self):
         """A message leaving the label is DELETED for the source, but the
         record still carries the body so the runner preserves the item text

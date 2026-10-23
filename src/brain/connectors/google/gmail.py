@@ -301,7 +301,7 @@ class GmailConnector(GoogleConnector):
         label = self._label_id()
         client = self._gmail()
         pending: list[tuple[str, bool]] = []  # (gmail_id, deleted) last-state-wins
-        last_entry: str | None = None
+        emitted_entry: str | None = None  # last FULLY consumed entry id
 
         def _history_pages() -> list[dict[str, Any]]:
             # Materialize INSIDE the error boundary: the generator body (the
@@ -310,7 +310,11 @@ class GmailConnector(GoogleConnector):
 
         for page in self._boundary(_history_pages):
             for entry in page.get("history") or []:
-                last_entry = str(entry.get("id")) if entry.get("id") else last_entry
+                # The limit stops BETWEEN entries only: one coalesced Gmail
+                # entry can carry many messages (dragging a folder into the
+                # label), so stopping mid-entry would drop the entry's tail
+                # AND advance the cursor past it — silent message loss. The
+                # batch may therefore exceed the limit by one entry.
                 for removed in entry.get("labelsRemoved") or []:
                     if label in (removed.get("labelIds") or []):
                         mid = str((removed.get("message") or {}).get("id"))
@@ -324,18 +328,20 @@ class GmailConnector(GoogleConnector):
                         pending.append((str((m or {}).get("id")), True))
                 for m in entry.get("messagesAdded") or []:
                     pending.append((str((m or {}).get("id")), False))
+                if entry.get("id"):
+                    emitted_entry = str(entry.get("id"))
                 if len(pending) >= limit:
-                    break
+                    break  # the entry above is fully consumed — safe checkpoint
             if len(pending) >= limit:
                 break
         # Last state wins per message (added after removed -> present again).
         final: dict[str, bool] = {}
-        for mid, deleted in pending[:limit]:
+        for mid, deleted in pending:
             final[mid] = deleted
         records = [self._record(mid, deleted=deleted) for mid, deleted in final.items()]
         return FetchResult(
             records=records,
-            next_cursor=last_entry or start_history_id,
+            next_cursor=emitted_entry or start_history_id,
             reset=False,
         )
 

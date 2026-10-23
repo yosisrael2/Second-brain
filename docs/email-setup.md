@@ -11,6 +11,15 @@ Since the connectors port (C5) the launchd agent, `brain gmail-poll` and
 `brain connectors sync email` all drive the SAME connector through the shared
 runner — there is one live Gmail path.
 
+Historical note (for the record): before C5, a payload-parser bug meant the
+RFC Message-ID was never read from real Gmail payloads, so the fallback
+dedupe id hashed (sender=None, subject=None, minute) — two messages arriving
+in the SAME minute collided and the second was silently dropped. The parser
+is fixed in C5, so a first sync over a mailbox with such history will ingest
+those previously dropped mails as new items (correct, but more items than
+the old poller ever showed). Gmail has never been consented on live, so no
+existing data is affected.
+
 Privacy model:
 
 - The app requests **read-only** Gmail access (`gmail.readonly`) and only
