@@ -160,6 +160,18 @@ class Settings(BaseSettings):
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
 
+    # Google Drive source (connectors ticket, C3).
+    gdrive_folders: str = Field(default="", validation_alias="BRAIN_GDRIVE_FOLDERS")
+    gdrive_text_cap: int = Field(default=50_000, validation_alias="BRAIN_GDRIVE_TEXT_CAP")
+    gdrive_depth: int = Field(default=1, validation_alias="BRAIN_GDRIVE_DEPTH")
+
+    # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
+    # comma-separated list of immutable Drive folder ids; EMPTY (the default)
+    # means the connector fetches nothing at all. gdrive_text_cap bounds each
+    # file's exported text in chars (truncation flagged in the record's meta);
+    # gdrive_depth bounds how many folder levels below the allowlisted folders
+    # the full listing walks (the connector hard-caps it at 5).
+
     @field_validator("telegram_allowed_user_ids")
     @classmethod
     def _validate_telegram_user_ids(cls, value: str) -> str:
