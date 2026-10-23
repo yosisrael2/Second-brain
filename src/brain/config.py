@@ -33,6 +33,12 @@ DEFAULT_QDRANT_COLLECTION = "brain_items"
 DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
 
 
+# Connectors (connectors ticket): canonical source names. The Gmail adapter
+# registers under "email" (items.source compatibility with existing data);
+# "gmail" resolves to it as a registry alias at sync time.
+KNOWN_CONNECTOR_NAMES = frozenset({"email", "gcal", "gdrive", "gtasks"})
+
+
 def unwrap_secret(value: SecretStr | None) -> str | None:
     """Unwrap an optional SecretStr for client constructors (single shared helper)."""
     return value.get_secret_value() if value else None
@@ -159,6 +165,45 @@ class Settings(BaseSettings):
     gmail_query: str = ""
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
+
+    # Connectors (connectors ticket): the enabled data sources, comma
+    # separated (BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"). Default empty
+    # = none enabled; `brain connectors sync` refuses disabled names and
+    # `brain connectors auth google` requests the union of their scopes.
+    # Field name mirrors the env var (pydantic-settings convention).
+    brain_connectors: str = ""
+
+    @field_validator("brain_connectors")
+    @classmethod
+    def _validate_connectors(cls, value: str) -> str:
+        """Fail fast on unknown connector names (a typo must not disable a
+        source silently). Canonical names only; 'gmail' is accepted too and
+        means 'email'."""
+        for part in value.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            if name == "gmail":
+                name = "email"
+            if name not in KNOWN_CONNECTOR_NAMES:
+                raise ValueError(
+                    f"BRAIN_CONNECTORS: unknown connector {part.strip()!r} "
+                    f"(known: {', '.join(sorted(KNOWN_CONNECTOR_NAMES))})"
+                )
+        return value
+
+    @property
+    def connectors_enabled(self) -> tuple[str, ...]:
+        """The enabled connector names (canonical, deduped, order kept)."""
+        enabled: list[str] = []
+        for part in self.brain_connectors.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            canonical = "email" if name == "gmail" else name
+            if canonical not in enabled:
+                enabled.append(canonical)
+        return tuple(enabled)
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod

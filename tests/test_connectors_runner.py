@@ -173,6 +173,53 @@ def test_null_version_stored_and_incoming_is_unchanged(runner_db):
     assert second.skipped == 1
 
 
+def test_user_edited_item_keeps_its_text_on_version_bump(runner_db):
+    """The user edited the item (text != the framework's last-written text):
+    a source-side version bump never overwrites their edit (verification a)."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", text="SOURCE says something else now")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    item.raw_text = "USER edited this"  # e.g. PATCH /items or a bot edit
+    h.repo.commit()
+
+    summary = runner.run()
+
+    assert summary.updated == 0
+    item = h.item("r1")
+    assert item is not None
+    assert item.raw_text == "USER edited this"  # the user's text survives
+    assert item.meta["version"] == "v2"  # only the marker moved
+
+
+def test_user_deleted_item_is_never_recaptured(runner_db):
+    """Deleting the item is a user decision: the ledger row stays (item_id
+    NULL via ON DELETE SET NULL) and the runner never re-captures it."""
+    h = Harness(runner_db)
+    connector = FakeConnector(batches=[_batch(make_record()), _batch(make_record())])
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    h.repo.delete(item)
+    h.repo.commit()
+
+    summary = runner.run()
+
+    assert summary.created == 0  # NOT re-captured
+    assert summary.skipped == 1
+    row = h.records.get("gcal", "r1")
+    assert row is not None and row.item_id is None  # tombstone remains
+    assert h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0) == []
+
+
 def test_new_version_updates_item_in_place_and_reindexes(runner_db):
     h = Harness(runner_db)
     connector = FakeConnector(

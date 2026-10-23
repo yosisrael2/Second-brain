@@ -176,6 +176,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Run one poll cycle and exit (also used by tests)",
     )
+    connectors = subparsers.add_parser(
+        "connectors", help="Pluggable data sources (connectors ticket)"
+    )
+    connectors_sub = connectors.add_subparsers(dest="connectors_command", required=True)
+    connectors_sub.add_parser(
+        "list",
+        help="List known connectors: enabled, last ok, cursor present, last error",
+    )
+    connectors_sync = connectors_sub.add_parser(
+        "sync", help="Run one sync cycle for a connector (BRAIN_CONNECTORS must enable it)"
+    )
+    connectors_sync.add_argument("name", help="Connector name (email|gcal|gdrive|gtasks)")
+    connectors_sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and print the records; write NOTHING (no items, no cursor)",
+    )
+    connectors_sync.add_argument(
+        "--limit", type=int, default=200, help="Max records per batch (default 200)"
+    )
+    connectors_auth = connectors_sub.add_parser(
+        "auth",
+        help="Google OAuth consent for the enabled connectors (stores ONLY the "
+        "refresh token in the macOS login keychain, same item as gmail-auth)",
+    )
+    connectors_auth.add_argument("provider", choices=["google"], help="Only google today")
+    connectors_auth.add_argument(
+        "--client-secret",
+        default=None,
+        help="Path to the Desktop-client secret JSON "
+        "(default: GMAIL_CREDENTIALS_PATH; keep it OUTSIDE the repo)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
@@ -208,6 +240,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _gmail_auth(args)
     if args.command == "gmail-poll":
         return _gmail_poll(args)
+    if args.command == "connectors":
+        if args.connectors_command == "list":
+            return _connectors_list()
+        if args.connectors_command == "sync":
+            return _connectors_sync(args)
+        if args.connectors_command == "auth":
+            return _connectors_auth(args)
+        parser.error(f"unknown connectors command {args.connectors_command!r}")
+        return 2
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
 
@@ -758,6 +799,223 @@ def _gmail_poll(args: argparse.Namespace) -> int:
         )
         return 0
     return poller.run_forever()
+
+
+# --- connectors (connectors ticket) -------------------------------------------
+
+
+def _connectors_list() -> int:
+    """Known connectors + their persisted state (name, enabled, cursor, health)."""
+    import os  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store, get_settings  # noqa: F401 (guard below)
+    from brain.connectors import all_names, ensure_registered, get
+    from brain.connectors.state import ConnectorRecordRepo, ConnectorStateRepo
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    enabled = set(settings.connectors_enabled)
+    ensure_registered()
+    names = sorted(set(all_names()) | {"email", "gcal", "gdrive", "gtasks"})
+    print(f"{'name':<8}  {'enabled':<7}  {'registered':<10}  {'last ok':<20}  cursor  last error")
+    with SessionLocal() as session:
+        states = {row.name: row for row in ConnectorStateRepo(session).all()}
+        counts = ConnectorRecordRepo(session).counts()
+        for name in names:
+            state = states.get(name)
+            try:
+                get(name)  # registered on this install (adapters register on import)
+                registered = "yes"
+            except KeyError:
+                registered = "no"
+            last_ok_at = state.last_ok_at if state else None
+            last_ok = last_ok_at.strftime("%Y-%m-%d %H:%M") if last_ok_at else "never"
+            has_cursor = "yes" if state and state.cursor else "no"
+            last_error = (state.last_error if state else "") or ""
+            print(
+                f"{name:<8}  {'yes' if name in enabled else 'no':<8}  {registered:<10}  "
+                f"{last_ok:<16}  {has_cursor:<6}  {last_error[:60]}"
+            )
+    records = counts
+    if records:
+        print("records: " + ", ".join(f"{source}={n}" for source, n in sorted(records.items())))
+    return 0
+
+
+def _build_connector(name: str) -> Any:
+    """Instantiate the registry's connector with production seams: the shared
+    keychain token (same item as gmail-auth — one OAuth client, one token)
+    and the default google service factory. Registry aliases resolve."""
+    from brain.connectors import get
+    from brain.connectors.google.base import default_service_factory
+    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+
+    cls: Any = get(name)
+    token = Keychain().read(GMAIL_ACCOUNT)
+    if not token:
+        print(
+            "connectors: no Google refresh token in the keychain — run "
+            "`brain connectors auth google` first",
+            file=sys.stderr,
+        )
+        raise SystemExit(78)
+    return cls(token_loader=lambda: token, service_factory=default_service_factory)
+
+
+def _connectors_sync(args: argparse.Namespace) -> int:
+    """One runner cycle (or a dry-run fetch) for one enabled connector."""
+    import os  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store, get_settings
+    from brain.connectors import all_names, ensure_registered
+    from brain.connectors import get as get_connector
+    from brain.connectors.runner import ConnectorRunner
+    from brain.connectors.state import ConnectorRecordRepo, ConnectorStateRepo
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    canonical = "email" if args.name.lower() == "gmail" else args.name.lower()
+    if canonical not in settings.connectors_enabled:
+        print(
+            f"connectors: {args.name!r} is not enabled — add it to BRAIN_CONNECTORS "
+            f"(currently: {','.join(settings.connectors_enabled) or 'none'})",
+            file=sys.stderr,
+        )
+        return 78
+    ensure_registered()
+    try:
+        get_connector(args.name)  # resolves aliases; KeyError when absent
+    except KeyError:
+        print(
+            f"connectors: {args.name!r} is enabled but not available on this install "
+            f"(registered: {', '.join(all_names()) or 'none'})",
+            file=sys.stderr,
+        )
+        return 78
+    with SessionLocal() as session:
+        from brain.api import deps  # noqa: PLC0415 (deferred: shared singletons)
+        from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+
+        if args.dry_run:
+            connector = _build_connector(args.name)
+            state = ConnectorStateRepo(session).get(connector.name)
+            result = connector.fetch(state.cursor if state else None, limit=args.limit)
+            print(
+                f"dry-run: {len(result.records)} record(s), next_cursor={result.next_cursor!r}, "
+                f"reset={result.reset} (nothing written)"
+            )
+            for record in result.records:
+                when = record.occurred_at.strftime("%Y-%m-%d %H:%M") if record.occurred_at else "-"
+                print(
+                    f"  {record.source:<8} {record.external_id:<24} v={record.version!s:<12} "
+                    f"{when} {'DELETED ' if record.deleted else ''}{record.title[:48]}"
+                )
+            connector.close()
+            return 0
+
+        ingest = IngestService(
+            ItemsRepository(session),
+            deps.get_classifier(),
+            deps.get_item_indexer(),
+        )
+        connector = _build_connector(args.name)
+        runner = ConnectorRunner(
+            connector,
+            ingest=ingest,
+            repo=ItemsRepository(session),
+            state=ConnectorStateRepo(session),
+            records=ConnectorRecordRepo(session),
+        )
+        summary = runner.run(limit=args.limit)
+        connector.close()
+    print(
+        f"connectors sync {summary.connector}: state={summary.state} "
+        f"created={summary.created} updated={summary.updated} deleted={summary.deleted} "
+        f"skipped={summary.skipped} errors={summary.errors} "
+        f"cursor_saved={summary.cursor_saved}"
+        + (f" error={summary.error}" if summary.error else "")
+    )
+    return {"ok": 0, "retry_error": 1, "auth_error": 78}.get(summary.state, 1)
+
+
+# pragma: no cover - needs google libs
+def _build_connectors_oauth_flow(client_secret_path: str, scopes: list[str]) -> Any:
+    """Build the installed-app OAuth flow for the union of enabled scopes
+    (patched with fakes in tests; never run against a real account there)."""
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise SystemExit(
+            "connectors: google libraries not installed — run `pip install -e '.[gmail]'`"
+        ) from exc
+    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=scopes)
+
+
+def _connectors_auth(args: argparse.Namespace) -> int:
+    """Google consent for the UNION of enabled connectors' scopes; stores ONLY
+    the refresh token in the login keychain (same item as gmail-auth: one
+    OAuth client, one token, re-consent unions the scopes)."""
+    from brain.config import get_settings
+    from brain.connectors.google.base import scopes_for
+    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+
+    if args.provider != "google":  # pragma: no cover - argparse choices guard
+        print(f"connectors auth: unknown provider {args.provider!r}", file=sys.stderr)
+        return 78
+    settings = get_settings()
+    enabled = settings.connectors_enabled
+    if not enabled:
+        print(
+            "connectors auth: no connectors enabled — set BRAIN_CONNECTORS "
+            '(e.g. "email,gcal,gdrive,gtasks") first',
+            file=sys.stderr,
+        )
+        return 78
+    scopes = scopes_for(enabled)
+    path = args.client_secret or settings.gmail_credentials_path
+    if not path:
+        print(
+            "connectors auth: no client secret — pass --client-secret /path/to/secret.json "
+            "(or set GMAIL_CREDENTIALS_PATH). Keep the file OUTSIDE the repo.",
+            file=sys.stderr,
+        )
+        return 78
+    if not Path(path).exists():
+        print(f"connectors auth: client secret file not found: {path}", file=sys.stderr)
+        return 78
+    flow = _build_connectors_oauth_flow(path, scopes)
+    print(
+        "connectors auth: opening the browser for Google consent "
+        f"(read-only scopes: {', '.join(scopes)})…"
+    )
+    try:
+        creds = flow.run_local_server(port=0)
+    except KeyboardInterrupt:
+        print("connectors auth: cancelled", file=sys.stderr)
+        return 130
+    token = creds.refresh_token
+    if not token:
+        print(
+            "connectors auth: Google did not return a refresh token — revoke the app at "
+            "https://myaccount.google.com/permissions and re-run (prompt=consent).",
+            file=sys.stderr,
+        )
+        return 78
+    Keychain().store(GMAIL_ACCOUNT, token)
+    print(
+        f"connectors auth: refresh token stored in the login keychain "
+        f"(service second-brain-gmail, account {GMAIL_ACCOUNT}) for scopes: "
+        f"{', '.join(scopes)}"
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

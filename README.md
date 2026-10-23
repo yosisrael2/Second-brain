@@ -409,6 +409,54 @@ brain reindex [--batch-size 500]
 # exit 0 + "indexed N item(s)"; exit 1 with a clear error when embeddings/Qdrant are unavailable
 ```
 
+## Connectors (pluggable data sources)
+
+`src/brain/connectors/` is the pluggable source framework: adding a source =
+one subclass + one `@register` line. All sources are READ-ONLY this ticket
+(gmail.readonly / calendar.readonly / drive.readonly / tasks.readonly);
+write-back is a later stage. Enable sources via `BRAIN_CONNECTORS`
+(comma list, default empty = none): `BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"`.
+One OAuth client + one refresh token (keychain item `second-brain-gmail`, the
+same one `brain gmail-auth` creates) serves every Google source: consent
+requests the UNION of enabled connectors' scopes, so re-running
+`brain connectors auth google` after enabling a source grants the extra
+scopes (never run consent from tests — the user does it once).
+
+```bash
+brain connectors list                    # name, enabled, last ok, cursor, last error
+brain connectors sync gcal --dry-run     # print the records; write NOTHING
+brain connectors sync gcal --limit 100   # one sync cycle through the runner
+brain connectors auth google             # consent, union of enabled scopes
+```
+
+Runner semantics (per connector, idempotent — safe to re-run): new external
+id -> capture via the standard ingest path (`source` = connector name, meta
+carries connector/external_id/version/url); same version -> skipped; new
+version -> updated in place (text/occurred_at/meta, re-indexed, enrichment
+re-enqueued; your own fields are never touched); `deleted=True` -> never
+hard-deleted: the item gets `meta.source_deleted=true` and is hidden from
+list/search/ask (the superseded-item mechanism). The cursor moves ONLY after
+a whole batch succeeds; an auth error stops the connector (`state.last_error`
+says re-consent is needed), transient errors back off. `reset=True` batches
+are upserted as-is — deletions are never inferred from absent records.
+
+### How to add a new source (the recipe, ≤15 lines)
+
+1. `src/brain/connectors/google/<name>.py`: `class MyConnector(GoogleConnector):`
+   with `name = "<source>"` (== the items.source value) and `SCOPES = (...,)`;
+   decorate with `@register`.
+2. Implement `fetch(cursor, *, limit) -> FetchResult`: list via the injected
+   service, map each payload to `SourceRecord` in a pure
+   `record_from_<thing>(payload, tz)` function (tz-aware times; Asia/Jerusalem
+   in `text`), return `next_cursor` (the source's native incremental token).
+3. Cursor expired (410)? Catch `ConnectorRetryableError` with `status == 410`
+   and return `reset=True` from scratch — never infer deletions.
+4. Tests: unit tests with a fake service (fixtures under
+   `tests/fixtures/connectors/<name>/`) + one runner-level test using
+   `brain.connectors.testing`. No network in tests, ever.
+5. One README row + one settings knob (allowlists) if needed; NO migrations
+   (the framework owns them).
+
 ## Background services (launchd, 24/7)
 
 `scripts/service.sh` installs two per-user LaunchAgents that survive logins

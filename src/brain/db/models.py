@@ -566,8 +566,9 @@ class ConnectorRecord(Base):
     """One synced external record -> the item it produced (idempotency ledger).
 
     The runner consults this before writing: unknown external_id -> create,
-    same version -> skip, new version -> update in place. ON DELETE CASCADE
-    on item_id: a user-deleted item makes the next sync re-capture it.
+    same version -> skip, new version -> update in place. ON DELETE SET NULL
+    on item_id: a user-deleted item keeps its ledger row (item_id NULL) and
+    the runner never re-captures it — deleting is a user decision.
     """
 
     __tablename__ = "connector_records"
@@ -576,10 +577,14 @@ class ConnectorRecord(Base):
     source: Mapped[str] = mapped_column(String(_SOURCE_MAX_LENGTH), primary_key=True)
     external_id: Mapped[str] = mapped_column(Text, primary_key=True)
     version: Mapped[str | None] = mapped_column(Text, nullable=True)
-    item_id: Mapped[uuid.UUID] = mapped_column(
+    # Nullable + ON DELETE SET NULL: a user who DELETES the item has acted on
+    # it — the record stays with item_id NULL and the runner never re-captures
+    # it (re-capturing a deliberately deleted item was the CASCADE behavior's
+    # flaw; see the runner's "user-deleted" rule).
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("memory_items.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("memory_items.id", ondelete="SET NULL"),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

@@ -18,6 +18,7 @@ __all__ = [
     "Connector",
     "all_names",
     "alias",
+    "ensure_registered",
     "get",
     "register",
 ]
@@ -54,3 +55,30 @@ def get(name: str) -> type[Connector]:
 def all_names() -> list[str]:
     """All registered connector names, sorted (canonical names, not aliases)."""
     return sorted(_REGISTRY)
+
+
+# The adapter modules this ticket plans; each registers itself at import.
+# Missing modules (not merged yet) are skipped silently — the CLI and the
+# runner call this so a merged adapter is usable with no extra wiring.
+_ADAPTER_MODULES = (
+    "brain.connectors.google.gmail",
+    "brain.connectors.google.calendar",
+    "brain.connectors.google.drive",
+    "brain.connectors.google.tasks",
+)
+
+
+def ensure_registered() -> None:
+    """Import the known adapter modules so their @register lines run.
+
+    Best-effort by design: an adapter that is not on this install (not yet
+    merged, extra not installed) is simply absent from the registry; the CLI
+    reports it as not available. Idempotent (import_module is cached).
+    """
+    import importlib  # noqa: PLC0415
+
+    for module in _ADAPTER_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            continue

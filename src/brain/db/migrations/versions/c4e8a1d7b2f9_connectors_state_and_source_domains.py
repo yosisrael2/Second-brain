@@ -10,7 +10,8 @@ The connectors ticket's ONE migration (owned by worker_8; adapters add none):
   counters)`` — per-connector cursor + heartbeat fields.
 - ``connector_records(source, external_id, version, item_id,
   PK(source, external_id))`` — the idempotency ledger; FK to memory_items is
-  ON DELETE CASCADE so a user-deleted item is re-captured on the next sync.
+  ON DELETE SET NULL so a user-deleted item keeps its ledger row (item_id
+  NULL) and the runner never re-captures it.
 - Source domains widened for the connector names (read-only this ticket):
   ``memory_items.source`` gets its CHECK here (it never had one; the live
   table predates it, so it is added NOT VALID — new rows are enforced,
@@ -74,8 +75,8 @@ def upgrade() -> None:
         sa.Column(
             "item_id",
             postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("memory_items.id", ondelete="CASCADE"),
-            nullable=False,
+            sa.ForeignKey("memory_items.id", ondelete="SET NULL"),
+            nullable=True,
         ),
         sa.Column(
             "created_at",
