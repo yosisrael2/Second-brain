@@ -65,12 +65,12 @@ linked to its section or doc.
 - Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user (setup: docs/email-setup.md)
 - WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
 - Bot timezone fix
+- Bot proposal cards (PR C): Keep / Fix / Drop on one card per source + 48h pings — built; fires only when the enrichment worker is switched on (worker stays OFF for now)
 
 **Planned**
 
 - PR A2: LLM extraction scored against the frozen gold set + held-out data
 - PR B: relations between items + duplicate handling
-- PR C: bot proposal cards (Keep / Fix / Drop) for classification review
 - PR D: WhatsApp triage, reconciliation, media
 - Then: actions — approved items become Google Calendar events / tasks
 

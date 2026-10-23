@@ -20,6 +20,8 @@ dependencies = [
     # embeddings via fastembed (downloads its model on first run).
     "claude-agent-sdk>=0.2.16,<0.3",
     "fastembed>=0.6,<2",
+    # PDF text-layer extraction for attachments (item 44; BSD-3-Clause).
+    "pypdf>=5,<7",
     # Hebrew-calendar date conversion for extraction (delta item 2a).
     "pyluach>=2.0,<3",
 ]
@@ -36,6 +38,8 @@ gmail = [
 ]
 dev = [
     "pytest>=8,<9",
+    # CI hang insurance: per-test timeout so a stuck test names itself.
+    "pytest-timeout>=2.1,<3",
     "httpx>=0.27,<1",
     "ruff>=0.17,<0.18",
     "mypy>=2.4,<3",

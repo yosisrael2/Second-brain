@@ -54,6 +54,19 @@ def post_ops_probe(component: str) -> dict[str, Any]:
     return ops_health.run_probe(component)
 
 
+@router.get("/ops/attachments")
+def get_ops_attachments() -> dict[str, Any]:
+    """Attachment queue depth + today's reading budget (design item 43/44)."""
+    from brain.api.deps import _attachment_service  # noqa: PLC0415 (deferred)
+
+    svc = _attachment_service()
+    return {
+        "queue_depth": svc.queue_depth(),
+        "read_today": svc.read_today(),
+        "daily_budget": svc.daily_budget,
+    }
+
+
 @router.get("/ops/flow")
 def get_ops_flow() -> dict[str, Any]:
     """Flow-diagram payload: nodes/edges with live status + hop stats."""
@@ -132,7 +145,9 @@ def get_ops_events(
         rows = conn.execute(
             text(
                 "SELECT id, ts, component, kind, ok, latency_ms, edge, detail "
-                + base + where + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
+                + base
+                + where
+                + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).mappings()

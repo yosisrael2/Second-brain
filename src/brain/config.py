@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8
+    # Attachments (design delta items 43-45): original files are stored OUTSIDE
+    # the repo and the DB, content-addressed by sha256, exact duplicates stored
+    # once. The dir must not live inside the checkout.
+    files_dir: Path = Path.home() / ".second-brain-files"
+    # Daily reading budget (Claude reads + text-layer extractions), item 44.
+    attachment_daily_budget: int = 50
     # Candidates fetched for the reranker before truncating to ask_top_k.
     # Reranking is cheap relative to the LLM call, and the reranker can only
     # surface what reaches it: a Hebrew email corpus scores an English
@@ -155,8 +161,7 @@ class Settings(BaseSettings):
             part = part.strip()
             if part and not part.lstrip("+").isdigit():
                 raise ValueError(
-                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
-                    f"got {value!r}"
+                    f"TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, got {value!r}"
                 )
         return value
 

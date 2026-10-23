@@ -19,11 +19,17 @@ from brain.ai.jev import JevClient
 from brain.ai.rerank import JevReranker
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.config import get_settings, unwrap_secret
-from brain.db.session import get_db
+from brain.db.session import SessionLocal, get_db
 from brain.factories import build_embedder, build_llm_client
 from brain.repositories.items import ItemsRepository
 from brain.repositories.memory import MemoryRepository
 from brain.services.ask import AskService
+from brain.services.attachments import (
+    AttachmentFileStore,
+    AttachmentService,
+    ClaudeFileReader,
+    PdfTextLayerReader,
+)
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsService
@@ -143,6 +149,25 @@ def get_ingest_service(
 def get_memory_repository(db: Session = Depends(get_db)) -> MemoryRepository:
     """Provide a request-scoped MemoryRepository."""
     return MemoryRepository(db)
+
+
+@lru_cache
+def _attachment_service() -> "AttachmentService":
+    """Process-wide attachment service — the reading queue must outlive one update."""
+    settings = get_settings()
+    return AttachmentService(
+        store=AttachmentFileStore(root=settings.files_dir),
+        pdf_reader=PdfTextLayerReader(),
+        claude_reader=ClaudeFileReader(),
+        indexer=get_item_indexer(),
+        session_factory=SessionLocal,
+        daily_budget=settings.attachment_daily_budget,
+    )
+
+
+def get_attachment_service() -> "AttachmentService":
+    """Provide the shared attachment service (one queue/budget per process)."""
+    return _attachment_service()
 
 
 def get_memory_service(
