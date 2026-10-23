@@ -155,6 +155,66 @@ def test_tie_group_larger_than_limit_is_emitted_whole(runner_db):
     assert second.skipped == 120  # all re-delivered, all skipped by version
 
 
+def test_tie_group_at_watermark_with_newer_tasks_progresses(runner_db):
+    # REGRESSION (re-review of fbad2d3): a tie group >= limit FOLLOWED BY newer
+    # tasks still livelocked — run 2 re-emitted the whole tie group (extended),
+    # broke at the first newer task and left the cursor at the tie watermark
+    # forever, so the 30 newer tasks were never ingested. Fix: records whose
+    # updated == the incoming watermark are known re-deliveries — they are
+    # emitted but do NOT count toward the limit, so the cursor always advances
+    # when anything newer exists.
+    ties = [
+        {
+            "id": f"tie{position:03d}",
+            "title": f"tie {position}",
+            "updated": "2026-03-01T00:00:00.000Z",
+            "status": "needsAction",
+        }
+        for position in range(120)
+    ]
+    newer = [
+        {
+            "id": f"new{position:03d}",
+            "title": f"new {position}",
+            "updated": _stamp(60 + position),  # strictly after the tie stamp
+            "status": "needsAction",
+        }
+        for position in range(30)
+    ]
+    everything = ties + newer  # API order interleaved is irrelevant (sorted)
+    h = GTasksHarness(runner_db)
+    connector = _connector(
+        FakeTasksService(
+            tasklists_pages=[_fixture("tasklists_page1.json")],
+            tasks_pages={PERSONAL: [{"items": everything}]},
+        )
+    )
+    runner = h.runner(connector)
+    first = runner.run(limit=100)
+
+    def _fresh() -> FakeTasksService:
+        return FakeTasksService(
+            tasklists_pages=[_fixture("tasklists_page1.json")],
+            tasks_pages={PERSONAL: [{"items": everything}]},
+        )
+
+    def _swap() -> None:
+        # one fresh fake PER RUN (a lambda calling _fresh() would build a new
+        # service per request and iter_pages would loop on page 1 forever)
+        fresh = _fresh()
+        connector._service = lambda: fresh  # type: ignore[method-assign]
+
+    _swap()
+    second = runner.run(limit=100)
+    _swap()
+    third = runner.run(limit=100)
+
+    assert first.created == 120  # the whole tie group, extended
+    assert second.created == 30  # the newer tasks — reachable now
+    assert third.created == 0  # the loop ends
+    assert first.created + second.created + third.created == 150
+
+
 def test_new_tasks_create_items_with_framework_meta(runner_db):
     h = GTasksHarness(runner_db)
     summary = h.runner(_connector(_full_service())).run()

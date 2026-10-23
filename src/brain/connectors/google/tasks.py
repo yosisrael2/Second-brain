@@ -372,8 +372,12 @@ class GTasksConnector(GoogleConnector):
         resume watermark (updatedMin is inclusive) always moves forward no
         matter what order the API returned. A tie group of equal ``updated``
         is extended past ``limit`` — otherwise a group larger than the limit
-        would resume at its own watermark forever. Re-delivered unchanged
-        records are skipped by the runner (idempotent by external_id+version).
+        would resume at its own watermark forever. Records AT the incoming
+        watermark are known re-deliveries: emitted but not counted toward
+        ``limit`` (a tie group at the watermark followed by newer tasks would
+        otherwise re-fill the limit every run and the newer tasks would never
+        be reached). Re-delivered unchanged records are skipped by the runner
+        (idempotent by external_id+version).
         """
         tz = _local_tz()
         entries: list[tuple[tuple[datetime, str, str, str], dict[str, Any], str, str]] = []
@@ -404,9 +408,26 @@ class GTasksConnector(GoogleConnector):
         missing_parents: dict[tuple[str, str], str | None] = {}
         records: list[SourceRecord] = []
         last_emitted: str | None = None
+        counted = 0
         for _key, task, list_id, list_title in entries:
             updated = task.get("updated") or None
-            if len(records) >= limit and (updated or "") != (last_emitted or ""):
+            # A record AT the incoming watermark was necessarily emitted by
+            # the previous batch (emission is oldest-first and the cursor is
+            # the last emitted stamp): it is a known re-delivery — emitted for
+            # the runner to skip by version, but never counted toward limit.
+            # Without this, a tie group at the watermark followed by newer
+            # tasks would re-fill the whole limit every run and the newer
+            # tasks would never be reached (livelock). It is NOT skipped
+            # entirely: after a failed batch the cursor did not advance, so
+            # the watermark records may never have been applied at all.
+            is_redelivery = (
+                updated is not None and updated_min is not None and updated == updated_min
+            )
+            if (
+                not is_redelivery
+                and counted >= limit
+                and (updated or "") != (last_emitted or "")
+            ):
                 break  # limit reached, past the last emitted tie group
             parent_id = task.get("parent")
             parent_title = None
@@ -427,6 +448,8 @@ class GTasksConnector(GoogleConnector):
                 )
             )
             last_emitted = updated
+            if not is_redelivery:
+                counted += 1
         return records, last_emitted
 
     def _resolve_parent_title(
