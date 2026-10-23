@@ -9,7 +9,11 @@ from typing import Any, Protocol
 
 from qdrant_client import QdrantClient, models
 
-from brain.config import DEFAULT_QDRANT_COLLECTION, DEFAULT_QDRANT_TIMEOUT_S
+from brain.config import (
+    DEFAULT_QDRANT_COLLECTION,
+    DEFAULT_QDRANT_TIMEOUT_S,
+    assert_not_live_collection,
+)
 
 
 class VectorStoreError(RuntimeError):
@@ -69,6 +73,12 @@ class QdrantVectorStore:
         timeout_s: int = DEFAULT_QDRANT_TIMEOUT_S,
         client: QdrantClient | None = None,
     ) -> None:
+        if client is None:
+            # Construction-time guard: a store that will talk to a REAL
+            # qdrant must not point at the live collection unless allowed.
+            # An injected client (tests' in-memory store) is never the live
+            # server, so its collection name alone is not guarded.
+            assert_not_live_collection(collection)
         self._collection = collection
         self._client = client or self._build_client(url, api_key, timeout_s)
 
