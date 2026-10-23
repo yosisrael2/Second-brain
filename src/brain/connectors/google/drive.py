@@ -47,7 +47,10 @@ Sync model (per the connectors contract + C3 feature plan):
   upgrading never mis-classifies walked subfolder files as deleted.
 - CONTENT: Docs export text/plain, Sheets export text/csv, Slides export
   text/plain — each capped at ``BRAIN_GDRIVE_TEXT_CAP`` chars (default
-  50000) with truncation flagged in meta. PDFs and images become
+  10000, i.e. ``schemas.RAW_TEXT_MAX_LENGTH``) with truncation flagged in
+  meta. Note the runner clamps item text to the item max anyway
+  (#53 makes that clamp central), so the two defaults agree; the setting
+  exists to cap API-side work (export bytes) below that line. PDFs and images become
   AttachmentRefs fetched lazily via :meth:`DriveConnector.fetch_attachment`
   (the existing attachments pipeline reads them). Any other binary is
   metadata-only. A per-file export failure never kills the batch: 4xx notes
@@ -85,11 +88,12 @@ from brain.connectors.base import (
     SourceRecord,
 )
 from brain.connectors.google.base import GoogleConnector, default_service_factory
+from brain.schemas import RAW_TEXT_MAX_LENGTH
 
 SOURCE_NAME = "gdrive"
 GDRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
-DEFAULT_TEXT_CAP = 50_000
+DEFAULT_TEXT_CAP = RAW_TEXT_MAX_LENGTH  # runner clamps item text to this max anyway
 DEFAULT_DEPTH = 1
 MAX_DEPTH = 5  # hard cap on BRAIN_GDRIVE_DEPTH
 _PAGE_SIZE = 200

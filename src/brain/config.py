@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from brain.schemas import RAW_TEXT_MAX_LENGTH
+
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
 DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com/v1"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
@@ -162,7 +164,10 @@ class Settings(BaseSettings):
 
     # Google Drive source (connectors ticket, C3).
     gdrive_folders: str = Field(default="", validation_alias="BRAIN_GDRIVE_FOLDERS")
-    gdrive_text_cap: int = Field(default=50_000, validation_alias="BRAIN_GDRIVE_TEXT_CAP")
+    gdrive_text_cap: int = Field(
+        default=RAW_TEXT_MAX_LENGTH,  # the runner clamps to the item max anyway
+        validation_alias="BRAIN_GDRIVE_TEXT_CAP",
+    )
     gdrive_depth: int = Field(default=1, validation_alias="BRAIN_GDRIVE_DEPTH")
 
     # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a

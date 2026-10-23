@@ -38,6 +38,7 @@ from brain.connectors.google.drive import (
     parse_folder_ids,
 )
 from brain.connectors.testing import RecordingEnrichment
+from brain.schemas import RAW_TEXT_MAX_LENGTH
 
 TZ = ZoneInfo("Asia/Jerusalem")
 FIXTURES = Path(__file__).parent / "fixtures" / "connectors" / "gdrive"
@@ -180,7 +181,7 @@ class FakeDriveService:
 def make_connector(
     *,
     folders: tuple[str, ...] = (ROOT,),
-    text_cap: int = 50_000,
+    text_cap: int = RAW_TEXT_MAX_LENGTH,
     max_depth: int = 1,
     files: FakeFiles | None = None,
     changes: FakeChanges | None = None,
@@ -284,7 +285,7 @@ class TestSettings:
         finally:
             get_settings.cache_clear()
         assert settings.gdrive_folders == ""
-        assert settings.gdrive_text_cap == 50_000
+        assert settings.gdrive_text_cap == RAW_TEXT_MAX_LENGTH  # the runner clamps anyway
         assert settings.gdrive_depth == 1
 
 
@@ -403,7 +404,7 @@ class TestContentMapping:
         result = connector.fetch(None, limit=10)
         record = next(r for r in result.records if r.external_id == SHEET_ID)
         assert record.meta["truncated"] is True
-        assert record.meta["text_cap"] == 50_000
+        assert record.meta["text_cap"] == RAW_TEXT_MAX_LENGTH
         assert record.text.count("\n") < 40_000  # actually capped
         assert ("export", SHEET_ID, "text/csv") in files.calls
 
@@ -422,13 +423,13 @@ class TestContentMapping:
         exports = exports_for((DOC_ID, "text/plain", long_text.encode()))
         pages = {ROOT: [{"files": [_fixture("doc")]}]}
         connector, _, _ = make_connector(
-            files=FakeFiles(pages, exports=exports), text_cap=50_000
+            files=FakeFiles(pages, exports=exports),  # default cap: the item max
         )
         result = connector.fetch(None, limit=10)
         record = next(r for r in result.records if r.external_id == DOC_ID)
         assert record.meta["truncated"] is True
-        assert record.meta["text_cap"] == 50_000
-        assert record.text.count("x") == 50_000  # exactly the cap
+        assert record.meta["text_cap"] == RAW_TEXT_MAX_LENGTH
+        assert record.text.count("x") == RAW_TEXT_MAX_LENGTH  # exactly the cap
 
     def test_pdf_becomes_attachment_ref_and_fetch_attachment_bytes(self):
         pages = {ROOT: [{"files": [_fixture("pdf")]}]}
