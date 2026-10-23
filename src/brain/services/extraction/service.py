@@ -367,9 +367,12 @@ class EnrichmentService:
             "run_id": None,  # set at storage time
         }
         if candidate.derived_from is not None:
-            # item 22: the link lands in extraction_meta until PR B's
-            # item_relations table; the target is the candidate INDEX the
-            # extractor used (stable within one extraction pass)
+            # item 22: interim link until PR B's item_relations table.
+            # EXACT SHAPE: meta["derived_from"] is the 0-based INDEX of the
+            # source candidate WITHIN THIS EXTRACTION PASS's candidate list
+            # (the LLM's own numbering — stable only within the pass, not a
+            # child id). PR B (worker_3) will convert this write path to a
+            # real relation row keyed by child id.
             meta["derived_from"] = candidate.derived_from
         if conflict_note:
             meta["date_conflict_note"] = conflict_note  # both readings survive (item 2b)
