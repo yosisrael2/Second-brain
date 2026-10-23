@@ -1195,3 +1195,34 @@ def test_v4_prompt_pins(world: World):
     assert "sign, pay, reply" in prompt  # task = the PARENT's action
     assert "Tuesday at 18:30" in prompt  # the MUST time example
     assert "MUST" in prompt
+
+
+def test_v5_prompt_pins(world: World):
+    """The v5 prompt: a recurring bring/wear item is ONE reminder, a task
+    survives gentle phrasing, a fact never describes a one-time dated thing
+    (but a standing rule effective FROM a date stays a fact), one sentence
+    may hold several children, and administrative boilerplate gets no child.
+    Also pins that every example is generic — no phrase lifted from the
+    scored eval emails (checked by its distinctive tokens)."""
+    from brain.services.extraction.llm_extractor import LLMExtractor
+
+    llm = FakeLLM([GOOD_REPLY])
+    extractor = LLMExtractor(llm)
+    source = _capture(world.repo, "מייל כלשהו לבניית הפרומפט", source="email")
+    extractor.extract(source, memory_context="Confirmed memory:")
+    prompt = llm.prompts[0]
+    assert "RECURRING" in prompt and "ONE reminder" in prompt  # lever 1
+    assert "phrased gently" in prompt  # lever 3
+    assert "one-time" in prompt  # lever 2
+    assert "takes effect FROM a date" in prompt  # lever 2's standing-change exception
+    assert "SEVERAL children" in prompt  # lever 4
+    assert "boilerplate" in prompt  # lever 4
+    # lever 5: audience names WHO the child concerns, not who must act —
+    # a kid happening vs a reader action are never swapped
+    assert "WHO the child concerns" in prompt
+    assert "Never swap them" in prompt
+    # generic examples only — no eval-email phrases
+    assert "7.10" not in prompt
+    assert "6.10" not in prompt
+    assert "12:55" not in prompt
+    assert "starts in November" not in prompt
