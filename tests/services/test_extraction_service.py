@@ -1029,6 +1029,15 @@ def test_item_level_audience_narrows_the_sender_default(world: World):
     assert child.applies_to == ["nobody"]  # narrowed: Itamar is a boy
 
 
+def test_extraction_worker_disabled_by_default():
+    """A2 acceptance: the extraction pass is OFF unless explicitly enabled
+    (enrichment_worker_enabled defaults to False; live behaviour changes
+    only on a separate GO)."""
+    from brain.config import get_settings
+
+    assert get_settings().enrichment_worker_enabled is False
+
+
 def test_within_pass_duplicate_removed_counted(world: World):
     """The same thing extracted twice in one reply stores ONE child."""
     body = "הגיעו עם כובע לטיול ביום חמישי 22.10"
@@ -1061,9 +1070,9 @@ def test_within_pass_duplicate_removed_counted(world: World):
 
 
 def test_within_pass_duplicate_merges_quotes(world: World):
-    """v6 Lever A: the dedupe pass keeps ONE child and merges the dropped
-    duplicate's verbatim quote into extraction_meta['extra_quotes'] — the
-    evidence is never discarded."""
+    """Item 7 (many-to-many): the dedupe pass keeps ONE child and stores the
+    dropped duplicate's verbatim quote as an ADDITIONAL item_sources row —
+    the evidence lives in the link table, never in extraction_meta."""
     body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
     source = _capture(world.repo, body, source="email")
     candidates = [
@@ -1084,9 +1093,56 @@ def test_within_pass_duplicate_merges_quotes(world: World):
     assert report.deduped_removed == 1
     assert report.children_created == 1  # only the reminder + ... just it
     child = _children(world.session)[0]
-    extras = child.extraction_meta.get("extra_quotes") or []
-    assert "יש להצטייד בכובע" in extras  # the dropped child's quote survives
+    quotes = [
+        row.quote
+        for row in world.session.query(ItemSource).filter_by(child_id=child.id).all()
+    ]
+    assert quotes == [  # two link rows: the primary quote + the merged one
+        "הגיעו עם כובע לטיול ביום חמישי 22.10",
+        "יש להצטייד בכובע",
+    ]
+    assert "extra_quotes" not in (child.extraction_meta or {})
     assert child.extraction_meta["when_raw"] == "יום חמישי 22.10"
+
+
+def test_rerun_with_a_different_quote_adds_a_source_row(world: World):
+    """Item 7 (many-to-many): a re-run of the SAME source whose matched
+    child now carries a DIFFERENT grounded quote adds a second item_sources
+    row for that pair — it does not overwrite and does not touch meta."""
+    body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
+    source = _capture(world.repo, body, source="email")
+    first = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם כובע לטיול",
+            quote="הגיעו עם כובע לטיול ביום חמישי 22.10",
+            when_raw="יום חמישי 22.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(first))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    # a job re-opens for the same source (backfill/re-run) and proposes the
+    # same child grounded through a DIFFERENT verbatim span
+    job = world.session.query(EnrichmentJob).one()
+    job.state = "queued"
+    world.session.commit()
+    second = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם כובע לטיול",  # same child (0.93)
+            quote="יש להצטייד בכובע",  # a DIFFERENT verbatim span
+            when_raw="יום חמישי 22.10",
+        ),
+    ]
+    service2 = world.with_extractor(CountingExtractor(second))
+    report = service2.run_once(NOW)
+    assert report.children_updated == 1
+    quotes = [
+        row.quote
+        for row in world.session.query(ItemSource).filter_by(child_id=child.id).all()
+    ]
+    assert quotes == ["הגיעו עם כובע לטיול ביום חמישי 22.10", "יש להצטייד בכובע"]
+    assert "extra_quotes" not in (child.extraction_meta or {})
 
 
 def test_dedupe_threshold_keeps_similar_but_distinct_things(world: World):

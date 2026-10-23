@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -390,16 +390,13 @@ class EnrichmentService:
                     break
             if dup:
                 removed += 1
-                # v6 Lever A: the dropped duplicate's verbatim quote is
-                # EVIDENCE — merge it into the kept child instead of
-                # discarding it (stored as an extra quote; one link per
-                # (child, source) — see the UNIQUE constraint comment).
+                # Item 7 (many-to-many): the dropped duplicate's verbatim
+                # quote is EVIDENCE — it becomes an ADDITIONAL item_sources
+                # row of the kept child at storage time, never meta.
                 quote = child.candidate.quote
                 if quote and quote != prior.candidate.quote:
-                    extras = list(prior.meta.get("extra_quotes") or [])
-                    if quote not in extras:
-                        extras.append(quote)
-                    prior.meta["extra_quotes"] = extras
+                    if quote not in prior.extra_quotes:
+                        prior.extra_quotes.append(quote)
                 continue
             kept.append(child)
         if removed:
@@ -680,9 +677,7 @@ class EnrichmentService:
         )
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
-        self._session.add(
-            ItemSource(child_id=child.id, source_id=source.id, quote=candidate.quote)
-        )
+        self._add_quote_links(child, source, resolved)
         existing_children[child.id] = child  # visible to later candidates this run
         self._repo.commit()
         self._index_child(child)
@@ -717,20 +712,39 @@ class EnrichmentService:
         child.date_conflict = resolved.date_conflict
         child.status = ItemStatus.NEEDS_REVIEW if resolved.date_conflict else child.status
         child.extraction_meta = {**resolved.meta, "run_id": str(run_id)}
-        # one link per (child, source): a DIFFERENT quote of the same pair is
-        # an extra quote, not a second link row (UNIQUE(child_id, source_id))
-        link = (
-            self._session.query(ItemSource)
+        # Item 7 (many-to-many): one quote per link ROW. A DIFFERENT verbatim
+        # span for the same (child, source) pair is an additional row, not an
+        # overwrite — but never a duplicate of a quote already linked.
+        existing_quotes = {
+            row.quote
+            for row in self._session.query(ItemSource)
             .filter(
                 ItemSource.child_id == child.id, ItemSource.source_id == source.id
             )
-            .one_or_none()
-        )
-        if link is not None and link.quote != resolved.candidate.quote:
-            extras = list(child.extraction_meta.get("extra_quotes", []))
-            if resolved.candidate.quote not in extras:
-                extras.append(resolved.candidate.quote)
-            child.extraction_meta["extra_quotes"] = extras
+            .all()
+        }
+        self._add_quote_links(child, source, resolved, skip_quotes=existing_quotes)
+
+    def _add_quote_links(
+        self,
+        child: MemoryItem,
+        source: MemoryItem,
+        resolved: _ResolvedChild,
+        *,
+        skip_quotes: set[str] | None = None,
+    ) -> None:
+        """The ONE place that writes quote links (item 7, many-to-many).
+
+        The primary quote leads; merged dedupe quotes follow. Empty quotes
+        (derived children) never link. ``skip_quotes`` dedupes against rows
+        already in the table (the update path); a fresh child has none.
+        """
+        for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
+            if not quote or (skip_quotes and quote in skip_quotes):
+                continue
+            self._session.add(
+                ItemSource(child_id=child.id, source_id=source.id, quote=quote)
+            )
 
 
 @dataclass(frozen=True)
@@ -743,3 +757,4 @@ class _ResolvedChild:
     applies_to: list[str]
     date_conflict: bool
     meta: dict[str, Any]
+    extra_quotes: list[str] = field(default_factory=list)

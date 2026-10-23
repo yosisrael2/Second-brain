@@ -89,10 +89,11 @@ def _child_rows(
         ),
         {"sid": str(source.id)},
     ).all()
-    # v6 Lever A: ONE row per CHILD, not per link — a child carrying merged
-    # duplicate quotes (extraction_meta['extra_quotes']) must still yield a
-    # single pred row (the schema requires a unique child_id per file). The
-    # quote is the kept link's (first in creation order, i.e. candidate order).
+    # v6 Lever A: ONE row per CHILD, not per link — a child carrying several
+    # merged/grounded quote rows (item 7, many-to-many item_sources) must
+    # still yield a single pred row (the schema requires a unique child_id
+    # per file). The quote is the kept link's (first in creation order, i.e.
+    # candidate order).
     first_quote: dict[Any, str] = {}
     child_order: list[Any] = []
     for child_id, quote in links:
