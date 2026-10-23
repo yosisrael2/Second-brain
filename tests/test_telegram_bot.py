@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import SecretStr
-
 from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 from brain.ai.ask import FakeLLMClient, LLMError
@@ -326,9 +325,7 @@ class TestCore:
         labels = [label for row in second.keyboard for label, _cb in row]
         assert any("Delete original" in label for label in labels)
         # the destructive button still targets the existing item explicitly
-        delete_cb = next(
-            cb for row in second.keyboard for label, cb in row if "Delete" in label
-        )
+        delete_cb = next(cb for row in second.keyboard for label, cb in row if "Delete" in label)
         assert delete_cb.startswith(f"{CB_DELETE}:")
 
     def test_capture_timezone_makes_occurred_at_aware(self, monkeypatch):
@@ -418,13 +415,17 @@ class TestCore:
         _Events().install(monkeypatch)
         from brain.ops import health as ops_health
 
-        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
-            "components": {
-                "postgres": {"status": "ok", "summary": "3 items"},
-                "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
-                "telegram": {"status": "disabled", "summary": "no token"},
-            }
-        })
+        monkeypatch.setattr(
+            ops_health,
+            "run_health_checks",
+            lambda: {
+                "components": {
+                    "postgres": {"status": "ok", "summary": "3 items"},
+                    "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
+                    "telegram": {"status": "disabled", "summary": "no token"},
+                }
+            },
+        )
         core, _ = _core()
         reply = core.route("/status", 111)
         assert "🟠 brain: degraded" in reply.text
@@ -435,9 +436,11 @@ class TestCore:
         _Events().install(monkeypatch)
         from brain.ops import health as ops_health
 
-        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
-            "components": {"qdrant": {"status": "down", "summary": "unreachable"}}
-        })
+        monkeypatch.setattr(
+            ops_health,
+            "run_health_checks",
+            lambda: {"components": {"qdrant": {"status": "down", "summary": "unreachable"}}},
+        )
         core, _ = _core()
         assert "🔴 brain: down" in core.route("/status", 111).text
 
@@ -464,7 +467,9 @@ class TestPollLoop:
         assert len(tg.sent) == 1 and tg.sent[0]["chat_id"] == 555
         assert "✔️ Task" in tg.sent[0]["text"]  # card header (classified type)
         assert len(repo.items) == 1
-        assert events.heartbeats and events.heartbeats[0][1]["pending"] == 1
+        # The success heartbeat now follows the pre-poll liveness one.
+        success = [hb for _, hb in events.heartbeats if "pending" in (hb or {})]
+        assert success and success[0]["pending"] == 1
         assert events.events[0][0] == "capture"
 
     def test_conflict_records_and_stops_after_the_window(self, monkeypatch):
@@ -480,8 +485,11 @@ class TestPollLoop:
 
         with pytest.raises(telegram.error.Conflict):
             _run_poll(
-                tg, core, expect_runtime_error=False,
-                conflict_window_s=0.05, conflict_backoff_s=0.01,
+                tg,
+                core,
+                expect_runtime_error=False,
+                conflict_window_s=0.05,
+                conflict_backoff_s=0.01,
             )
 
         conflicts = [e for e in events.events if e[0] == "conflict"]
@@ -550,7 +558,8 @@ class TestPollLoop:
 
         _run_poll(tg, core)
 
-        component, detail = events.heartbeats[0]
+        success = [hb for _, hb in events.heartbeats if "pending" in (hb or {})]
+        component, detail = ("telegram", success[0])
         assert component == "telegram"
         assert detail["allowed_users"] == 2
         assert detail["last_update_id"] == 0
@@ -705,9 +714,7 @@ class TestConflictBackoff:
         from brain import telegram_bot
 
         events: list[tuple] = []
-        monkeypatch.setattr(
-            telegram_bot, "record_event", lambda *a, **k: events.append((a, k))
-        )
+        monkeypatch.setattr(telegram_bot, "record_event", lambda *a, **k: events.append((a, k)))
         tg = _ScriptedPollTG([Conflict("c1"), Conflict("c2"), []])
 
         _run_poll(tg, self._core(), conflict_window_s=5.0, conflict_backoff_s=0.01)
@@ -780,6 +787,7 @@ class TestSingleInstanceLock:
         monkeypatch.setenv("SECOND_BRAIN_CACHE_DIR", str(tmp_path / "cache"))
         lock, _ = telegram_bot._acquire_instance_lock("123:placeholder")
         try:
+
             def _fail_build(_settings):
                 raise AssertionError("build_bot must not run in a second instance")
 
@@ -921,6 +929,7 @@ class TestPollLoopLivenessHeartbeats:
             raise _Stop()
 
         monkeypatch.setattr(tb, "poll_loop", fake_poll_loop)
+
         class _FakeLock:
             def close(self) -> None: ...
 
@@ -931,9 +940,7 @@ class TestPollLoopLivenessHeartbeats:
 
             async def close(self) -> None: ...
 
-        monkeypatch.setattr(
-            tb, "build_bot", lambda settings: (_core()[0], _FakeTgForRun())
-        )
+        monkeypatch.setattr(tb, "build_bot", lambda settings: (_core()[0], _FakeTgForRun()))
         monkeypatch.setattr(tb, "_acquire_instance_lock", lambda token: (_FakeLock(), None))
         fake_settings = SimpleNamespace(
             telegram_bot_token=SecretStr("1234:abcdef"),

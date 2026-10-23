@@ -44,6 +44,8 @@ class HealthContext:
         disk: Callable[[], dict[str, Any]] | None = None,
         background: Callable[[], dict[str, Any]] | None = None,
         email: Callable[[], dict[str, Any]] | None = None,
+        attachments: Callable[[], dict[str, Any]] | None = None,
+        enrichment: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -55,6 +57,8 @@ class HealthContext:
         self.disk = disk or _disk_check
         self.background = background or _background_check
         self.email = email or _email_check
+        self.attachments = attachments or _attachments_check
+        self.enrichment = enrichment or _enrichment_check
 
 
 def reset_cache() -> None:
@@ -99,9 +103,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", "collection missing — run brain reindex", raw)
         vectors, items = raw.get("vectors"), raw.get("items")
         if isinstance(vectors, int) and isinstance(items, int) and vectors != items:
-            return _entry(
-                "degraded", f"vectors {vectors}/{items} — run brain reindex", raw
-            )
+            return _entry("degraded", f"vectors {vectors}/{items} — run brain reindex", raw)
         if not raw.get("dims_ok", True):
             return _entry("degraded", "embedder dim != collection dim", raw)
         return _entry("ok", f"vectors {vectors}/{items}", raw)
@@ -131,9 +133,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", f"{provider} — last call failed", raw)
         if activity is not None:
             return _entry("ok", f"{provider} · answered {activity['kind']}", raw)
-        return _entry(
-            "not probed", f"{provider} configured — run a probe to verify", raw
-        )
+        return _entry("not probed", f"{provider} configured — run a probe to verify", raw)
     if component == "telegram":
         if not raw.get("token_set", False):
             return _entry("disabled", "TELEGRAM_BOT_TOKEN unset", raw)
@@ -144,16 +144,15 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("down", "bot never heartbeated", raw)
         if age > 1800:
             return _entry("down", f"heartbeat {age:.0f}s ago", raw)
-        if age > 60:
+        degraded_after = raw.get("degraded_after_s", 60)
+        if age > degraded_after:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"heartbeat {age:.0f}s ago", raw)
     if component == "email":
         if not raw.get("label_set", False):
             return _entry("disabled", "GMAIL_LABEL_ID unset", raw)
         if not raw.get("token_set", False):
-            return _entry(
-                "disabled", "no refresh token — run brain gmail-auth", raw
-            )
+            return _entry("disabled", "no refresh token — run brain gmail-auth", raw)
         state = raw.get("state")
         if state == "needs re-auth":
             return _entry("degraded", "needs re-auth", raw)
@@ -167,6 +166,27 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         if age > 150:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"poll ok · heartbeat {age:.0f}s ago", raw)
+    if component == "attachments":
+        last_error = raw.get("last_error")
+        if last_error:
+            return _entry(
+                "degraded",
+                f"queue {raw.get('queue_depth', 0)} · last error {last_error.get('kind')}",
+                raw,
+            )
+        return _entry(
+            "ok",
+            f"queue {raw.get('queue_depth', 0)} · read today {raw.get('read_today', 0)}"
+            f"/{raw.get('daily_budget', '?')}",
+            raw,
+        )
+    if component == "enrichment":
+        worker = raw.get("worker_enabled")
+        summary = (
+            f"queue {raw.get('queue_depth', 0)} · cap {raw.get('cap_used_today', 0)}"
+            f"/{raw.get('cap_limit', '?')} · worker {'on' if worker else 'off (inert)'}"
+        )
+        return _entry("ok", summary, raw)
     if component == "docker":
         if not raw.get("available", False):
             return _entry("disabled", "docker unavailable", raw)
@@ -203,15 +223,15 @@ def run_health_checks(
         "llm": _safe(context.llm),
         "telegram": _safe(context.telegram),
         "email": _safe(context.email),
+        "attachments": _safe(context.attachments),
+        "enrichment": _safe(context.enrichment),
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
     }
     components = {name: _derive_status(name, data) for name, data in raw.items()}
     downs = [name for name, entry in components.items() if entry["status"] == "down"]
-    degradeds = [
-        name for name, entry in components.items() if entry["status"] == "degraded"
-    ]
+    degradeds = [name for name, entry in components.items() if entry["status"] == "degraded"]
     overall = "ok"
     if degradeds:
         overall = "degraded"
@@ -314,7 +334,8 @@ def _qdrant_check() -> dict[str, Any]:
 
     settings = get_settings()
     client = QdrantClient(
-        url=settings.qdrant_url, api_key=unwrap_secret(settings.qdrant_api_key),
+        url=settings.qdrant_url,
+        api_key=unwrap_secret(settings.qdrant_api_key),
         timeout=settings.qdrant_timeout_s,
     )
     try:
@@ -410,6 +431,9 @@ def _llm_check() -> dict[str, Any]:
     return {"provider": settings.llm_provider, "model": model or None}
 
 
+TELEGRAM_HEARTBEAT_MARGIN_S = 30
+
+
 def _email_check() -> dict[str, Any]:
     """Raw email-poller facts: label + keychain token + last heartbeat state.
 
@@ -455,10 +479,16 @@ def _telegram_check() -> dict[str, Any]:
     token_set = settings.telegram_bot_token is not None
     allowlist_set = bool(settings.telegram_allowed_user_ids.strip())
     age = ops.heartbeat_age_seconds("telegram")
+    # The heartbeat threshold follows the bot's ACTUAL long-poll timeout: a
+    # quiet getUpdates can occupy the whole window, so anything up to
+    # timeout + margin is a healthy quiet poll, not a flap (ops polish).
+    poll_timeout_s = int(settings.telegram_poll_timeout_s)
     details: dict[str, Any] = {
         "token_set": token_set,
         "allowlist_set": allowlist_set,
         "heartbeat_age_s": age,
+        "poll_timeout_s": poll_timeout_s,
+        "degraded_after_s": poll_timeout_s + TELEGRAM_HEARTBEAT_MARGIN_S,
     }
     last_error = ops.latest_event("telegram", ok=False)
     if last_error:
@@ -482,7 +512,10 @@ def _docker_check() -> dict[str, Any]:
     try:
         out = subprocess.run(
             ["docker", "compose", "ps", "--format", "json", "--all"],
-            capture_output=True, text=True, timeout=3, check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
         )
         if out.returncode != 0:
             return {"available": False}
@@ -529,7 +562,10 @@ def _background_check() -> dict[str, Any]:
         try:
             out = subprocess.run(
                 ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-                capture_output=True, text=True, timeout=3, check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return {"available": False, "agents": {}}
@@ -568,9 +604,7 @@ def _derive_background(raw: dict[str, Any]) -> dict[str, Any]:
     agents: dict[str, Any] = raw.get("agents") or {}
     installed = {label: info for label, info in agents.items() if info}
     if not installed:
-        return _entry(
-            "disabled", "launchd agents not installed — scripts/service.sh install", raw
-        )
+        return _entry("disabled", "launchd agents not installed — scripts/service.sh install", raw)
     total = len(installed)
     running = [label for label, info in installed.items() if info.get("state") == "running"]
     stopped = [
@@ -583,9 +617,7 @@ def _derive_background(raw: dict[str, Any]) -> dict[str, Any]:
         return _entry("ok", f"{total}/{total} agents running", raw)
     if not running:
         return _entry("down", f"0/{total} agents running — {', '.join(stopped)}", raw)
-    return _entry(
-        "degraded", f"{len(running)}/{total} agents running — {', '.join(stopped)}", raw
-    )
+    return _entry("degraded", f"{len(running)}/{total} agents running — {', '.join(stopped)}", raw)
 
 
 def _disk_check() -> dict[str, Any]:
@@ -597,9 +629,12 @@ def _disk_check() -> dict[str, Any]:
     cache = Path.home() / ".cache" / "fastembed"
     if cache.exists():
         fastembed_free_gb = shutil.disk_usage(cache).free / 1e9
-    return {"free_gb": round(free_gb, 1), "fastembed_free_gb": (
-        round(fastembed_free_gb, 1) if fastembed_free_gb is not None else None
-    )}
+    return {
+        "free_gb": round(free_gb, 1),
+        "fastembed_free_gb": (
+            round(fastembed_free_gb, 1) if fastembed_free_gb is not None else None
+        ),
+    }
 
 
 # --- on-demand probes ---------------------------------------------------------
@@ -633,16 +668,29 @@ def run_probe(component: str, ctx: HealthContext | None = None) -> dict[str, Any
         latency = round((time.perf_counter() - started) * 1000, 1)
         # Record the probe so config-only components become "proven" (never raises).
         ops.record_event(
-            component, "probe", bool(result.get("ok", True)), latency_ms=latency,
-            detail={k: result[k] for k in ("summary", "dims", "model", "confidence")
-                    if result.get(k) is not None},
+            component,
+            "probe",
+            bool(result.get("ok", True)),
+            latency_ms=latency,
+            detail={
+                k: result[k]
+                for k in ("summary", "dims", "model", "confidence")
+                if result.get(k) is not None
+            },
         )
-        return {"component": component, "ok": result.get("ok", True),
-                "latency_ms": latency, **result, "checked_at": _now()}
+        return {
+            "component": component,
+            "ok": result.get("ok", True),
+            "latency_ms": latency,
+            **result,
+            "checked_at": _now(),
+        }
     except Exception as exc:  # noqa: BLE001  (probes report failures, never raise)
         return {
-            "component": component, "ok": False,
-            "error": f"{type(exc).__name__}: {exc!s}"[:200], "checked_at": _now(),
+            "component": component,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc!s}"[:200],
+            "checked_at": _now(),
         }
 
 
@@ -656,8 +704,12 @@ def _probe_embedder() -> dict[str, Any]:
     started = time.perf_counter()
     vector = deps.get_embedder().embed(_PROBE_EMBED_TEXT)
     latency = round((time.perf_counter() - started) * 1000, 1)
-    return {"ok": True, "dims": len(vector), "latency_ms": latency,
-            "summary": f"embedded {len(vector)} dims"}
+    return {
+        "ok": True,
+        "dims": len(vector),
+        "latency_ms": latency,
+        "summary": f"embedded {len(vector)} dims",
+    }
 
 
 def _probe_jev() -> dict[str, Any]:
@@ -673,8 +725,7 @@ def _probe_jev() -> dict[str, Any]:
     return {
         "ok": result.get("confidence", 0) > 0,
         "labels": {
-            k: str(v) for k, v in result.items()
-            if k in {"type", "importance", "actionability"}
+            k: str(v) for k, v in result.items() if k in {"type", "importance", "actionability"}
         },
         "confidence": result.get("confidence"),
         "latency_ms": latency,
@@ -695,3 +746,47 @@ def _probe_llm() -> dict[str, Any]:
         "latency_ms": latency,
         "summary": f"{completion.model or '?'} answered in {latency:.0f}ms",
     }
+
+
+def _attachments_check() -> dict[str, Any]:
+    """Attachment reading (F1): queue depth, budget usage, last error.
+
+    Mirrors GET /ops/attachments (same in-process service — the API process
+    owns the reading queue); read-only, never raises past _safe().
+    """
+    from brain.api.deps import _attachment_service  # noqa: PLC0415 (deferred: api cycle)
+
+    svc = _attachment_service()
+    details: dict[str, Any] = {
+        "queue_depth": svc.queue_depth(),
+        "read_today": svc.read_today(),
+        "daily_budget": svc.daily_budget,
+    }
+    last_error = ops.latest_event("attachments", ok=False)
+    if last_error:
+        details["last_error"] = {"kind": last_error["kind"], "ts": _iso(last_error["ts"])}
+    return details
+
+
+def _enrichment_check() -> dict[str, Any]:
+    """Extraction/enrichment (A1): queue depth, cap usage, worker on/off.
+
+    Mirrors GET /ops/enrichment. The worker being OFF is the designed inert
+    state (no children, no cards, no pings) — reported, never degraded.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+
+    now = datetime.now(tz=UTC)
+    with SessionLocal() as session:
+        service = EnrichmentService(ItemsRepository(session), session)
+        details: dict[str, Any] = {
+            "worker_enabled": get_settings().enrichment_worker_enabled,
+            "queue_depth": service.queue_depth(),
+            "cap_used_today": service.cap_used_today(now),
+            "cap_limit": get_settings().enrichment_daily_cap,
+        }
+    return details

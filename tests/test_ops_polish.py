@@ -141,8 +141,7 @@ class TestAskRecordOpsFlag:
         with ops._get_engine().connect() as conn:
             rows = conn.execute(
                 sa_text(
-                    "SELECT count(*) FROM ops_events WHERE component IN"
-                    " ('ask', 'search', 'llm')"
+                    "SELECT count(*) FROM ops_events WHERE component IN ('ask', 'search', 'llm')"
                 )
             ).scalar_one()
         assert rows == 0, "diagnostics must not poison /ops/health's llm view"
