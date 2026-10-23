@@ -454,7 +454,13 @@ class EnrichmentService:
         if not item_kids:
             return item_level
         overlap = item_kids & set(default)
-        return sorted(overlap) if overlap else ["nobody"]
+        if not overlap:
+            # review round 2, bug 1: nothing of the kid-set survives the
+            # narrowing — but the reader's own half ("me", role-based) is
+            # never narrowed by a kid-set default
+            return ["me"] if "me" in item_level else ["nobody"]
+        kept = sorted(overlap)
+        return kept + ["me"] if "me" in item_level else kept
 
     def _validate(
         self, candidate: ChildCandidate, source: MemoryItem, now: datetime

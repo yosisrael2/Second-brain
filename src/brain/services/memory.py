@@ -16,6 +16,7 @@ from typing import Any
 
 from brain.db.models import Entity, EntityAlias, MemoryFact
 from brain.repositories.memory import MemoryRepository, utcnow
+from brain.services.triage import mentions_name
 
 # Hebrew-letter numerals used in school emails ("כיתות ה-ו" = grades 5-6).
 # Note ל=30 and מ=40 in real Hebrew numerals — they are NOT grades here.
@@ -261,18 +262,19 @@ class MemoryService:
         """
         if not sender:
             return None
-        needle = _norm_label(sender)
-        if not needle:
-            return None
         matched: list[str] = []
         for kid in self.kids():
             teacher = kid.get("teacher")
-            if teacher is None:
+            if teacher is None or not str(teacher).strip():
                 continue
-            t = _norm_label(teacher)
-            if not t:
-                continue
-            if t in needle or needle in t:
+            # review round 2, bug 2: the SHARED whole-word matcher, one
+            # direction only (does the sender mention the teacher?). Raw
+            # containment matched a same-first-name parent ('Rinat Levi'),
+            # a word containing the name ('Rinatech') and a short sender
+            # inside a long teacher name. A first-name-only teacher fact
+            # can still match a same-named parent — acceptable for now:
+            # the results are proposals (D2 Keep/Fix/Drop), not actions.
+            if mentions_name(str(teacher), sender):
                 matched.append(kid["name"])
         return sorted(matched) or None
 

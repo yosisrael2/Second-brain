@@ -15,6 +15,7 @@ import logging
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from brain import ops
 from brain.ai.ask import LLMClient
 from brain.config import get_settings
 from brain.db.models import MemoryItem
@@ -199,12 +200,19 @@ class LLMExtractor:
                 "extraction: retrying %s after parse error (%s)", source.id, first_error
             )
             reply = self._llm.complete(retry_prompt).text
-            candidates = self._parse(reply, source)
+            # review round 2, bug 4: the retry parses LENIENTLY — valid
+            # candidates survive, each invalid one is dropped with an ops
+            # event. Only a non-JSON reply or a missing candidates list
+            # still fails the job (one bad row must not destroy the valid
+            # children of the whole email).
+            candidates = self._parse(reply, source, lenient=True)
         return candidates
 
     # --- parsing ---------------------------------------------------------
 
-    def _parse(self, reply: str, source: MemoryItem) -> list[ChildCandidate]:
+    def _parse(
+        self, reply: str, source: MemoryItem, *, lenient: bool = False
+    ) -> list[ChildCandidate]:
         payload = _loads_strict(reply)
         if not isinstance(payload, dict) or "candidates" not in payload:
             raise ExtractionError("reply is not a JSON object with a 'candidates' key")
@@ -215,10 +223,31 @@ class LLMExtractor:
         for index, raw in enumerate(raw_candidates):
             try:
                 parsed.append(self._candidate_from(raw, index))
-            except ExtractionError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — schema violations fail the job
-                raise ExtractionError(f"candidate {index}: {type(exc).__name__}: {exc}") from exc
+                continue
+            except ExtractionError as exc:
+                if not lenient:
+                    raise
+                reason = str(exc)
+            except Exception as exc:  # noqa: BLE001 — one bad row is not a bad reply
+                if not lenient:
+                    raise ExtractionError(
+                        f"candidate {index}: {type(exc).__name__}: {exc}"
+                    ) from exc
+                reason = f"{type(exc).__name__}: {exc}"
+            # lenient mode (review round 2, bug 4): drop the invalid
+            # candidate with its reason in ops — never a silent drop
+            ops.record_event(
+                "enrichment",
+                "candidate_invalid",
+                ok=True,
+                detail={"item_id": str(source.id), "index": index, "reason": reason},
+            )
+            logger.info(
+                "extraction: dropped invalid candidate %s from %s (%s)",
+                index,
+                source.id,
+                reason,
+            )
         return parsed
 
     def _candidate_from(self, raw: Any, index: int) -> ChildCandidate:

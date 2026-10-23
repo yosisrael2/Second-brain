@@ -44,7 +44,8 @@ def downgrade() -> None:
         USING item_sources b
         WHERE a.child_id = b.child_id
           AND a.source_id = b.source_id
-          AND a.created_at > b.created_at
+          AND (a.created_at > b.created_at
+               OR (a.created_at = b.created_at AND a.id > b.id))
         """
     )
     op.drop_index(_IX_CHILD, table_name="item_sources")
