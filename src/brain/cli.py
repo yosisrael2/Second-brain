@@ -408,7 +408,10 @@ def _whatsapp(interval_s: float | None, since: str | None) -> int:
             backfill_since=backfill,
             commit=True,
             attachments=_cli_attachment_service(settings),
-            media_client=WhatsAppMediaClient(settings.whatsapp_bridge_url),
+            media_client=WhatsAppMediaClient(
+                settings.whatsapp_bridge_url,
+                store_root=Path(settings.whatsapp_bridge_db).expanduser().parent,
+            ),
         )
     except PollerError as exc:
         print(f"whatsapp: {exc}", file=sys.stderr)

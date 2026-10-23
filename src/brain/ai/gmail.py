@@ -274,7 +274,11 @@ class RestGmailClient:
             .attachments()
             .get(userId=self._user_id, messageId=message_id, id=attachment_id)
         )
-        data = raw.get("data", "")
+        # Real shape: {'size': int, 'data': base64url}. A missing/empty 'data'
+        # is an error, never an empty attachment (F3 round 1).
+        data = raw.get("data") if isinstance(raw, dict) else None
+        if not data:
+            raise GmailError(f"attachment {attachment_id} of {message_id} carries no 'data'")
         import base64  # noqa: PLC0415
 
         return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))

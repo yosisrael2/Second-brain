@@ -291,29 +291,83 @@ class ItemIndexerProto(Protocol):
     def index(self, item: MemoryItem) -> bool: ...
 
 
+class MediaDownloadError(Exception):
+    """The bridge media download failed, returned a bad payload, or the
+    returned path is outside the bridge store root — refused, never stored."""
+
+
 class WhatsAppMediaClient:
-    """F3 (item 47): fetch media bytes from the bridge's local REST download.
+    """F3 (item 47): fetch media through the bridge's local REST download.
+
+    The REAL bridge contract (whatsapp-bridge/main.go ``/api/download``): it
+    downloads the media to its own store dir and responds application/json
+    ``DownloadMediaResponse {success, message, filename, path}`` — NEVER the
+    bytes (HTTP 500 + ``success:false`` on failure). This client parses that
+    JSON, requires ``success``, then VALIDATES the path: realpath must lie
+    inside the bridge store root (derived from ``WHATSAPP_BRIDGE_DB``'s
+    directory) and must be a regular file; symlinks resolving outside are
+    refused. Only then are the bytes read. Anything else raises
+    ``MediaDownloadError`` — refused, never stored.
 
     Read-only from our side, structurally: the client exposes ONLY
-    ``download`` (``POST {base}/api/download`` with ``{message_id, chat_jid}``)
-    — there is no send capability on this class at all, and the private CDN
-    url / media keys from the store are never copied anywhere.
+    ``download`` — there is no send capability on this class at all, and the
+    private CDN url / media keys from the store are never copied anywhere.
     """
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8085", timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8085",
+        timeout_s: float = 30.0,
+        store_root: str | Path | None = None,
+        transport: Any | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_s = timeout_s
+        self._store_root = Path(store_root).expanduser().resolve() if store_root else None
+        self._transport = transport
 
     def download(self, message_id: str, chat_jid: str) -> bytes:
         import httpx  # noqa: PLC0415
 
-        response = httpx.post(
-            f"{self._base_url}/api/download",
-            json={"message_id": message_id, "chat_jid": chat_jid},
-            timeout=self._timeout_s,
-        )
-        response.raise_for_status()
-        return response.content
+        client = httpx.Client(transport=self._transport) if self._transport else httpx.Client()
+        try:
+            response = client.post(
+                f"{self._base_url}/api/download",
+                json={"message_id": message_id, "chat_jid": chat_jid},
+                timeout=self._timeout_s,
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                # The real bridge answers failure as 500 + {success: false,
+                # message}; prefer its message over a bare HTTP error.
+                if not payload.get("success"):
+                    raise MediaDownloadError(
+                        f"bridge download failed: {str(payload.get('message') or 'unknown error')[:200]}"
+                    )
+            elif response.is_error:
+                response.raise_for_status()  # non-JSON HTTP error
+            else:
+                raise MediaDownloadError("bridge download returned non-JSON response")
+            path = payload.get("path")
+            if not path:
+                raise MediaDownloadError("bridge response carries no 'path'")
+            resolved = Path(str(path)).expanduser().resolve()
+            if self._store_root is None:
+                raise MediaDownloadError(
+                    "no bridge store root configured — refusing to read downloads"
+                )
+            if resolved != self._store_root and self._store_root not in resolved.parents:
+                raise MediaDownloadError(
+                    f"refusing path outside the bridge store root: {str(path)[:200]}"
+                )
+            if not resolved.is_file():
+                raise MediaDownloadError(f"downloaded media is not a regular file: {str(path)[:200]}")
+            return resolved.read_bytes()
+        finally:
+            client.close()
 
 
 # --- poller -----------------------------------------------------------------------

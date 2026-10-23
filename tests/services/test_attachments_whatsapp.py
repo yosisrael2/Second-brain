@@ -8,7 +8,9 @@ the client has no send capability at all. The conversation's
 item. Budget/limits/sandbox are the attachments core's (already proven).
 """
 
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from tests.services.test_whatsapp_ingest import (  # noqa: F401
@@ -28,19 +30,61 @@ from tests.test_attachments import (  # noqa: F401
 from brain.services.whatsapp import BridgeStore, WhatsAppPoller
 
 
-class FakeBridgeMedia:
-    """Scripted /api/download client: records calls, returns canned bytes."""
+class FakeBridgeHTTP:
+    """The REAL /api/download contract over a mocked transport.
 
-    def __init__(self, blobs: dict[str, bytes] | None = None, error: Exception | None = None):
+    Behaves like whatsapp-bridge/main.go: POST {message_id, chat_jid} ->
+    downloads the media into store/<chat_jid>/<filename> and answers
+    application/json {success, message, filename, path} (success:false on
+    failure). The poller test then drives the REAL WhatsAppMediaClient,
+    so the JSON parsing + store-path validation run for real.
+    """
+
+    def __init__(
+        self,
+        store_root: Any,
+        blobs: dict[str, bytes] | None = None,
+        fail: bool = False,
+    ) -> None:
+        import httpx
+
+        self.store_root = store_root
         self._blobs = blobs or {}
-        self._error = error
+        self._fail = fail
         self.calls: list[dict[str, Any]] = []
 
-    def download(self, message_id: str, chat_jid: str) -> bytes:
-        self.calls.append({"message_id": message_id, "chat_jid": chat_jid})
-        if self._error is not None:
-            raise self._error
-        return self._blobs[message_id]
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(body)
+            if self._fail:
+                return httpx.Response(
+                    500, json={"success": False, "message": "Failed to download media: expired"}
+                )
+            message_id = body["message_id"]
+            chat_jid = body["chat_jid"]
+            blob = self._blobs[message_id]
+            chat_dir = Path(self.store_root) / chat_jid
+            chat_dir.mkdir(parents=True, exist_ok=True)
+            media_path = chat_dir / f"{message_id}.bin"
+            media_path.write_bytes(blob)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "message": "Successfully downloaded image media",
+                    "filename": media_path.name,
+                    "path": str(media_path),
+                },
+            )
+
+        self.transport = httpx.MockTransport(handler)
+
+    def client(self) -> Any:
+        from brain.services.whatsapp import WhatsAppMediaClient
+
+        return WhatsAppMediaClient(
+            "http://127.0.0.1:8085", store_root=self.store_root, transport=self.transport
+        )
 
 
 class FakeIndexer:
@@ -92,7 +136,7 @@ class _RealAttachments:
 
 
 def _media_poller(
-    world: SimpleWorld, bridge: BridgeStore, media: FakeBridgeMedia, att: Any
+    world: SimpleWorld, bridge: BridgeStore, media: FakeBridgeHTTP, att: Any
 ) -> WhatsAppPoller:
     return WhatsAppPoller(
         bridge=bridge,
@@ -103,7 +147,7 @@ def _media_poller(
         zone_name="Asia/Jerusalem",
         commit=True,
         attachments=att,
-        media_client=media,
+        media_client=media.client(),
     )
 
 
@@ -131,7 +175,7 @@ class TestWhatsappMedia:
             [(CHAT_A_JID, "Chat A")],
             [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC), content="anchor")],
         )
-        media = FakeBridgeMedia({"m1": b"\x89PNG fake image bytes"})
+        media = FakeBridgeHTTP(tmp_path / "store", {"m1": b"\x89PNG fake image bytes"})
         att = _RealAttachments(
             _make_service(tmp_path, FakeQuery(reply="hat list\nDESCRIPTION: a note"))
         )
@@ -162,7 +206,7 @@ class TestWhatsappMedia:
             [(CHAT_A_JID, "Chat A"), ("other@g.us", "Random Chat")],
             [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC), content="anchor")],
         )
-        media = FakeBridgeMedia({"m1": b"bytes"})
+        media = FakeBridgeHTTP(tmp_path / "store", {"m1": b"bytes"})
         att = FakeAttachmentRecorder()
         poller = _media_poller(world, BridgeStore(path), media, att)
         poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))
@@ -194,7 +238,7 @@ class TestWhatsappMedia:
             [(CHAT_A_JID, "Chat A")],
             [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC), content="anchor")],
         )
-        media = FakeBridgeMedia({"m1": b"\x89PNG one", "m2": b"\x89PNG two"})
+        media = FakeBridgeHTTP(tmp_path / "store", {"m1": b"\x89PNG one", "m2": b"\x89PNG two"})
         att = _RealAttachments(_make_service(tmp_path, FakeQuery(reply="txt"), daily_budget=1))
         poller = _media_poller(world, BridgeStore(path), media, att)
         poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))
@@ -229,7 +273,7 @@ class TestWhatsappMedia:
             [(CHAT_A_JID, "Chat A")],
             [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC), content="anchor")],
         )
-        media = FakeBridgeMedia({}, error=RuntimeError("bridge down"))
+        media = FakeBridgeHTTP(tmp_path / "store", fail=True)
         att = FakeAttachmentRecorder()
         poller = _media_poller(world, BridgeStore(path), media, att)
         poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))
@@ -264,7 +308,7 @@ class TestWhatsappMedia:
             [(CHAT_A_JID, "Chat A")],
             [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC), content="anchor")],
         )
-        media = FakeBridgeMedia({"m1": b"x" * 16})
+        media = FakeBridgeHTTP(tmp_path / "store", {"m1": b"x" * 16})
         att = FakeAttachmentRecorder()
         poller = _media_poller(world, BridgeStore(path), media, att)
         poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))
