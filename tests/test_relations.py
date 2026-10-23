@@ -18,10 +18,10 @@ from typing import Any
 
 import pytest
 from sqlalchemy import text as sa_text
+from sqlalchemy.orm import Session
 
 from brain.db.models import MemoryItem
 from brain.db.session import SessionLocal
-from sqlalchemy.orm import Session
 from brain.repositories.items import ItemsRepository
 
 
