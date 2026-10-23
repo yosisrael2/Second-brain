@@ -37,6 +37,12 @@ Sync model (per the connectors contract + C3 feature plan):
   ingested from their own changes). A walked folder that is trashed /
   removed / moved out drops from the set; its files then surface as
   deleted('moved_out') on their own next change (documented gap until then).
+- SYMMETRIC GAP, move-IN: an EXISTING folder (with files) moved INTO the
+  allowlisted tree joins membership via its own folder change, but its files
+  themselves produce no change entries — they are never ingested until each
+  is edited. A reset (cursor cleared: a BRAIN_GDRIVE_FOLDERS change with a
+  matching runner state reset, or a manual one) re-walks the tree and picks
+  them up.
   Cursor JSON version 2: a v1 cursor decodes as invalid -> reset, so
   upgrading never mis-classifies walked subfolder files as deleted.
 - CONTENT: Docs export text/plain, Sheets export text/csv, Slides export
