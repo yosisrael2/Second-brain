@@ -742,6 +742,14 @@ function inspectorLink(otherId) {
   return link;
 }
 
+// Directional labels per relation kind, from the viewed item's perspective.
+const RELATION_LABELS = {
+  supersedes: (outgoing) => (outgoing ? "replaces" : "replaced by"),
+  corrects: (outgoing) => (outgoing ? "corrects" : "corrected by"),
+  derived_from: (outgoing) => (outgoing ? "derived from" : "source of"),
+  same_as: () => "same as",
+};
+
 function renderRelations(itemId, relations) {
   const wrap = el("div", { class: "irelations" });
   wrap.append(el("div", { class: "ik", text: "relations" }));
@@ -753,13 +761,8 @@ function renderRelations(itemId, relations) {
   for (const relation of live) {
     const outgoing = relation.from_id === itemId;
     const otherId = outgoing ? relation.to_id : relation.from_id;
-    const labels = {
-      supersedes: outgoing ? "replaces" : "replaced by",
-      corrects: outgoing ? "corrects" : "corrected by",
-      derived_from: outgoing ? "derived from" : "source of",
-      same_as: "same as",
-    };
-    const label = labels[relation.kind] || relation.kind;
+    const labeler = RELATION_LABELS[relation.kind];
+    const label = labeler ? labeler(outgoing) : relation.kind;
     const proposed = relation.provenance?.state === "proposed" ? " (proposed)" : "";
     wrap.append(el("div", { class: "ifield rel-row" },
       el("span", { class: "ik", text: label + proposed }),

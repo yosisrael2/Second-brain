@@ -265,29 +265,28 @@ def get_ops_whatsapp() -> dict[str, Any]:
             .mappings()
             .all()
         )
-        conv = {
-            row["jid"]: {"today": int(row["today"]), "total": int(row["total"])}
-            for row in conn.execute(
+        # One scan over the poller's own conversation items; every per-channel
+        # stat (conv today/total, media read/not-read) aggregates from these rows.
+        conv_rows = (
+            conn.execute(
                 text(
                     "SELECT meta->>'chat_jid' AS jid, "
-                    "count(*) FILTER (WHERE created_at >= date_trunc('day', now())) AS today, "
-                    "count(*) AS total "
+                    "(created_at >= date_trunc('day', now())) AS is_today, "
+                    "meta->'messages' AS messages "
                     "FROM memory_items "
-                    "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL GROUP BY 1"
+                    "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL"
                 )
             )
             .mappings()
             .all()
-        }
-        media_rows = conn.execute(
-            text(
-                "SELECT meta->>'chat_jid' AS jid, meta->'messages' AS messages "
-                "FROM memory_items "
-                "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL"
-            )
-        ).mappings().all()
+        )
+    conv: dict[str, dict[str, int]] = {}
     media: dict[str, dict[str, int]] = {}
-    for row in media_rows:
+    for row in conv_rows:
+        agg = conv.setdefault(row["jid"], {"today": 0, "total": 0})
+        agg["total"] += 1
+        if row["is_today"]:
+            agg["today"] += 1
         bucket = media.setdefault(row["jid"], {"read": 0, "not_read": 0})
         for entry in row["messages"] or []:
             media_entry = entry.get("media") if isinstance(entry, dict) else None
