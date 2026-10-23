@@ -26,7 +26,10 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c4e8a1d7b2f9"
-down_revision: str | None = "b8c4f2a6e9d1"
+# Re-pointed onto the whatsapp-triage migration when this branch merged main
+# (feature-plans.md: whoever merges second re-points down_revision so the PR
+# branch keeps a single alembic head).
+down_revision: str | None = "c9d2e7f4a1b8"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
