@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -159,6 +159,16 @@ class Settings(BaseSettings):
     gmail_query: str = ""
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
+
+    # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
+    # of task lists to sync, comma-separated list IDs or titles (titles matched
+    # case-insensitively); empty = sync every list. IDs are stable while titles
+    # can be renamed, so prefer IDs; an allowlist change invalidates the sync
+    # cursor (full resync) so old tasks of newly-allowed lists are picked up.
+    gtasks_lists: str = Field(
+        default="",
+        validation_alias=AliasChoices("BRAIN_GTASKS_LISTS", "GTASKS_LISTS"),
+    )
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod
