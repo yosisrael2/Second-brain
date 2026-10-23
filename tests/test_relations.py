@@ -21,6 +21,7 @@ from sqlalchemy import text as sa_text
 
 from brain.db.models import MemoryItem
 from brain.db.session import SessionLocal
+from sqlalchemy.orm import Session
 from brain.repositories.items import ItemsRepository
 
 
@@ -380,3 +381,133 @@ class TestRelationsApi:
         a, b = _item(raw_text="a"), _item(raw_text="b")
         response = client.post(f"/items/{a}/relations", json={"to_id": str(b), "kind": "loves"})
         assert response.status_code == 422
+
+
+class TestSupersededHiddenFromAskLegs:
+    """Review round 1, fix 1: /ask's temporal + kid-recall legs must honour D4."""
+
+    def test_temporal_leg_hides_superseded(self, ops_env, items_repo):
+        old = _item(raw_text="trip on Tuesday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        new = _item(raw_text="trip moved to Monday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        svc = _svc()
+        svc.apply_supersede(new_id=new, old_id=old)
+        hits = items_repo.by_occurrence(
+            start=datetime(2026, 10, 6, 0, 0), end=datetime(2026, 10, 7, 0, 0), limit=30
+        )
+        assert new in [i.id for i in hits]
+        assert old not in [i.id for i in hits]
+
+    def test_temporal_leg_include_superseded_opts_in(self, ops_env, items_repo):
+        old = _item(raw_text="trip on Tuesday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        new = _item(raw_text="trip moved to Monday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        svc = _svc()
+        rel = svc.apply_supersede(new_id=new, old_id=old)
+        hits = items_repo.by_occurrence(
+            start=datetime(2026, 10, 6, 0, 0),
+            end=datetime(2026, 10, 7, 0, 0),
+            limit=30,
+            include_superseded=True,
+        )
+        assert old in [i.id for i in hits]
+        svc.undo_supersede(rel.id)
+
+    def test_kid_recall_leg_hides_superseded(self, ops_env, items_repo):
+        old = _item(raw_text="zebra crossing duty Tuesday")
+        new = _item(raw_text="zebra crossing duty moved to Monday")
+        svc = _svc()
+        svc.apply_supersede(new_id=new, old_id=old)
+        hits = items_repo.by_text_any(["zebra"], limit=30)
+        assert new in [i.id for i in hits]
+        assert old not in [i.id for i in hits]
+
+    def test_kid_recall_leg_include_superseded_opts_in(self, ops_env, items_repo):
+        old = _item(raw_text="zebra crossing duty Tuesday")
+        new = _item(raw_text="zebra crossing duty moved to Monday")
+        svc = _svc()
+        svc.apply_supersede(new_id=new, old_id=old)
+        hits = items_repo.by_text_any(["zebra"], limit=30, include_superseded=True)
+        assert old in [i.id for i in hits]
+
+    def test_undo_restores_temporal_recall(self, ops_env, items_repo):
+        old = _item(raw_text="trip on Tuesday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        new = _item(raw_text="trip moved to Monday", occurred_at=datetime(2026, 10, 6, 8, 0))
+        svc = _svc()
+        rel = svc.apply_supersede(new_id=new, old_id=old)
+        svc.undo_supersede(rel.id)
+        hits = items_repo.by_occurrence(
+            start=datetime(2026, 10, 6, 0, 0), end=datetime(2026, 10, 7, 0, 0), limit=30
+        )
+        assert old in [i.id for i in hits]
+
+
+class _FailOnNthCommit:
+    """Raise from Session.commit on the Nth commit, across all sessions."""
+
+    def __init__(self, n: int) -> None:
+        self._remaining = n
+        self._orig = Session.commit
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        outer = self
+
+        def commit(session, *args, **kwargs):
+            if outer._remaining == 1:
+                outer._remaining = 0
+                raise RuntimeError("forced strike failure")
+            if outer._remaining > 1:
+                outer._remaining -= 1
+            return outer._orig(session, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "commit", commit)
+
+    def restore(self) -> None:
+        Session.commit = self._orig  # type: ignore[method-assign]
+
+
+class TestSupersedeAtomicity:
+    """Review round 1, fix 2: relation + strike share ONE transaction."""
+
+    def test_failed_strike_leaves_no_relation(self, ops_env, monkeypatch):
+        old = _item(raw_text="trip on Tuesday")
+        new = _item(raw_text="trip moved to Monday")
+        # A failure inside the single shared transaction must leave NO
+        # residue. (Red evidence pre-fix, with a raise on the strike's
+        # second commit: the relation row had already persisted.)
+        failer = _FailOnNthCommit(1)
+        failer.install(monkeypatch)
+        try:
+            with pytest.raises(RuntimeError, match="forced strike failure"):
+                _svc().apply_supersede(new_id=new, old_id=old)
+        finally:
+            failer.restore()
+        assert _svc().relations_of(new) == []
+        assert _get(old).superseded_by is None
+
+    def test_apply_supersede_uses_one_commit(self, ops_env, monkeypatch):
+        """Structural guard: relation + strike commit together, once."""
+        old = _item(raw_text="trip on Tuesday")
+        new = _item(raw_text="trip moved to Monday")
+        calls: list[Session] = []
+        orig = Session.commit
+
+        def commit(session, *args, **kwargs):
+            calls.append(session)
+            return orig(session, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "commit", commit)
+        _svc().apply_supersede(new_id=new, old_id=old)
+        assert len(calls) == 1
+
+    def test_failed_confirm_strike_leaves_state_proposed(self, ops_env, monkeypatch):
+        old = _item(raw_text="trip on Tuesday")
+        new = _item(raw_text="trip moved to Monday")
+        rel = _svc().propose_supersede(new_id=new, old_id=old)
+        failer = _FailOnNthCommit(1)
+        failer.install(monkeypatch)
+        try:
+            with pytest.raises(RuntimeError, match="forced strike failure"):
+                _svc().confirm_supersede(rel.id)
+        finally:
+            failer.restore()
+        assert _svc().get(rel.id).provenance["state"] == "proposed"
+        assert _get(old).superseded_by is None

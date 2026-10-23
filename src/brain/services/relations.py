@@ -155,10 +155,34 @@ class RelationsService:
         old_id: uuid.UUID,
         provenance: dict[str, Any] | None = None,
     ) -> ItemRelation:
-        """Same-thread correction: applied immediately, visible + undoable."""
-        rel = self.add(new_id, old_id, kind="supersedes", provenance=provenance, state="applied")
-        self._strike(old_id, by=new_id)
-        return rel
+        """Same-thread correction: applied immediately, visible + undoable.
+
+        The relation row and the strike (``superseded_by``) share ONE
+        transaction: if the strike fails, no half-applied correction is
+        left behind (review round 1, fix 2).
+        """
+        with self._sessions() as session:
+            found = {
+                row
+                for (row,) in session.execute(
+                    select(MemoryItem.id).where(MemoryItem.id.in_([new_id, old_id]))
+                )
+            }
+            missing = [str(i) for i in (new_id, old_id) if i not in found]
+            if missing:
+                raise RelationsError(f"no such item(s): {', '.join(missing)}")
+            rel = ItemRelation(
+                from_id=new_id,
+                to_id=old_id,
+                kind="supersedes",
+                provenance={"state": "applied", **(provenance or {})},
+            )
+            session.add(rel)
+            old = session.get(MemoryItem, old_id)
+            old.superseded_by = new_id
+            session.commit()
+            session.refresh(rel)
+            return rel
 
     def propose_supersede(
         self,

@@ -90,7 +90,9 @@ class ItemsRepository:
         # UNLISTED in /recent and /review until kept; dropped children stay
         # hidden too. Kept children list normally.
         if not include_children:
-            stmt = stmt.where(MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept"))
+            stmt = stmt.where(
+                MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept")
+            )
         # PR B (item 20/D4): superseded items are hidden by default.
         if not include_superseded:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
@@ -120,12 +122,16 @@ class ItemsRepository:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt))
 
-    def by_occurrence(self, *, start: datetime, end: datetime, limit: int) -> Sequence[MemoryItem]:
+    def by_occurrence(
+        self, *, start: datetime, end: datetime, limit: int, include_superseded: bool = False
+    ) -> Sequence[MemoryItem]:
         """Every item with occurred_at inside [start, end), soonest first.
 
         Drives temporal retrieval: day/date questions fetch ALL events in the
         resolved range (top-k semantic search cannot express "everything on
         Tuesday"). Items without occurred_at are naturally excluded.
+        Superseded (struck-through) items are hidden by default (item 20/D4);
+        ``include_superseded=True`` opts back in.
         """
         stmt = (
             select(MemoryItem)
@@ -134,9 +140,13 @@ class ItemsRepository:
             .order_by(MemoryItem.occurred_at.asc(), MemoryItem.id.desc())
             .limit(limit)
         )
+        if not include_superseded:
+            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt))
 
-    def by_text_any(self, needles: Sequence[str], *, limit: int) -> Sequence[MemoryItem]:
+    def by_text_any(
+        self, needles: Sequence[str], *, limit: int, include_superseded: bool = False
+    ) -> Sequence[MemoryItem]:
         """Items whose raw_text contains ANY needle (case-insensitive), newest first.
 
         Drives the kid-recall leg of /ask: a captured WhatsApp message keeps
@@ -148,6 +158,8 @@ class ItemsRepository:
         Extracted children with ``child_state = 'dropped'`` (user-rejected by
         the meaning-extraction lifecycle, item 19) are never recalled;
         ordinary captures, 'proposed' and 'kept' children are.
+        Superseded (struck-through) items are hidden by default (item 20/D4);
+        ``include_superseded=True`` opts back in.
         """
         if not needles:
             return []
@@ -165,6 +177,8 @@ class ItemsRepository:
             .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)
         )
+        if not include_superseded:
+            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt))
 
     def delete(self, item: MemoryItem) -> None:
