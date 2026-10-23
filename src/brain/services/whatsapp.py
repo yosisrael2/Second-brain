@@ -62,6 +62,7 @@ from brain.repositories.items import ItemsRepository
 from brain.repositories.memory import MemoryRepository
 from brain.repositories.whatsapp import WhatsAppStateRepository
 from brain.services.dedupe import content_fingerprint
+from brain.services.triage import TrierProto
 
 logger = logging.getLogger(__name__)
 
@@ -411,6 +412,7 @@ class WhatsAppPoller:
         items: ItemsRepository,
         memory: MemoryRepository,
         indexer: ItemIndexerProto | None = None,
+        trier: TrierProto | None = None,
         zone_name: str,
         gap_minutes: int = DEFAULT_GAP_MINUTES,
         overlap_minutes: int = DEFAULT_OVERLAP_MINUTES,
@@ -429,6 +431,7 @@ class WhatsAppPoller:
         self._items = items
         self._memory = memory
         self._indexer = indexer
+        self._trier = trier
         self._zone = ZoneInfo(zone_name)
         self._zone_name = zone_name
         self._gap = timedelta(minutes=gap_minutes)
@@ -717,6 +720,7 @@ class WhatsAppPoller:
         }
         item.fingerprint = content_fingerprint(item.raw_text, item.occurred_at, SOURCE_WHATSAPP)
         self._index_item(item)
+        self._triage_item(item)
 
     def _create_conversation(
         self, channel: str, chat_jid: str, messages: list[BridgeMessage]
@@ -733,7 +737,39 @@ class WhatsAppPoller:
         item.fingerprint = content_fingerprint(raw_text, item.occurred_at, SOURCE_WHATSAPP)
         self._items.add(item)
         self._index_item(item)
+        self._triage_item(item)
         return item
+
+    def _triage_item(self, item: MemoryItem) -> None:
+        """D2a (item 36): best-effort relevance triage; never blocks the poll.
+
+        Runs on conversation CREATE and on every UPDATE (a conversation can
+        turn relevant). A trier failure (exception or None) leaves the item
+        untriaged and is recorded as an ops event — never silent, never
+        fatal to the poll.
+        """
+        if self._trier is None:
+            return
+        try:
+            result = self._trier(item)
+        except Exception as exc:  # noqa: BLE001 — triage never blocks capture
+            ops.record_event(
+                "triage", "failed", ok=False,
+                detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+            )
+            return
+        if result is None:
+            ops.record_event(
+                "triage", "failed", ok=False,
+                detail={"error": "no decision"},
+            )
+            return
+        item.triage_label = result.label
+        item.triage_confidence = result.confidence
+        item.triage_method = result.method
+        item.triage_version = result.version
+        if self._items is not None:
+            self._items.commit()
 
     def _index_item(self, item: MemoryItem) -> None:
         """Best-effort vector indexing; failures defer to 'brain reindex'."""

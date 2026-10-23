@@ -47,6 +47,7 @@ class HealthContext:
         email: Callable[[], dict[str, Any]] | None = None,
         attachments: Callable[[], dict[str, Any]] | None = None,
         enrichment: Callable[[], dict[str, Any]] | None = None,
+        triage: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -58,6 +59,7 @@ class HealthContext:
         self.disk = disk or _disk_check
         self.background = background or _background_check
         self.whatsapp = whatsapp or _whatsapp_check
+        self.triage = triage or _triage_check
         self.email = email or _email_check
         self.attachments = attachments or _attachments_check
         self.enrichment = enrichment or _enrichment_check
@@ -208,6 +210,8 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             f"/{raw.get('cap_limit', '?')} · worker {'on' if worker else 'off (inert)'}"
         )
         return _entry("ok", summary, raw)
+    if component == "triage":
+        return _entry("ok", raw.get("summary", "no decisions today"), raw)
     if component == "docker":
         if not raw.get("available", False):
             return _entry("disabled", "docker unavailable", raw)
@@ -246,6 +250,7 @@ def run_health_checks(
         "email": _safe(context.email),
         "attachments": _safe(context.attachments),
         "enrichment": _safe(context.enrichment),
+        "triage": _safe(context.triage),
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
@@ -830,6 +835,37 @@ def _attachments_check() -> dict[str, Any]:
     if last_error:
         details["last_error"] = {"kind": last_error["kind"], "ts": _iso(last_error["ts"])}
     return details
+
+
+def _triage_check() -> dict[str, Any]:
+    """WhatsApp relevance triage (D2a): decisions recorded today by label.
+
+    Reads today's ops_events rows (component='triage', kind='decided') —
+    the same rows the triage service writes per decision. Counts only.
+    """
+    from datetime import UTC, datetime, time  # noqa: PLC0415
+
+    from sqlalchemy import text as sql_text  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    day_start = datetime.combine(datetime.now(UTC).date(), time.min, tzinfo=UTC)
+    with SessionLocal() as session:
+        rows = session.execute(
+            sql_text(
+                "SELECT detail->>'label' AS label, count(*) AS n FROM ops_events "
+                "WHERE component = 'triage' AND kind = 'decided' AND ok "
+                "AND ts >= :day GROUP BY label"
+            ),
+            {"day": day_start},
+        ).fetchall()
+    counts = {row.label: row.n for row in rows}
+    relevant = counts.get("relevant", 0)
+    return {
+        "relevant_today": relevant,
+        "noise_today": counts.get("noise", 0),
+        "summary": f"relevant {relevant} / noise {counts.get('noise', 0)} today",
+    }
 
 
 def _enrichment_check() -> dict[str, Any]:

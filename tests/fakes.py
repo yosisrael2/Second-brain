@@ -50,6 +50,7 @@ class FakeRepository:
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_noise: bool = False,
     ) -> list[MemoryItem]:
         items = [
             item
@@ -62,6 +63,13 @@ class FakeRepository:
                 include_children
                 or item.child_state is None
                 or item.child_state == "kept"
+            )
+            # D2a (item 36): triaged-noise WhatsApp conversations are
+            # unlisted by default; noise stays searchable either way
+            and (
+                include_noise
+                or item.source != "whatsapp"
+                or item.triage_label != "noise"
             )
         ]
         items.sort(key=lambda item: item.created_at, reverse=True)

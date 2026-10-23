@@ -145,6 +145,20 @@ class MemoryItem(Base):
     # extraction_meta: provenance for extracted children (item 7): model,
     # prompt_version, run_id, extracted_at, date-resolution notes.
     extraction_meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # --- WhatsApp relevance triage (D2a; design delta item 36) ------------
+    # triage_label: 'relevant' | 'noise' for conversation items (source
+    # 'whatsapp'); NULL = not triaged yet (always listed). Columns, not
+    # meta: the /recent filter is a WHERE on every listing (indexable,
+    # same style as the A1 child_state columns) and re-triage overwrites
+    # typed values instead of parsing JSON. Noise stays stored and
+    # searchable but is hidden from default listings and never enqueued
+    # for enrichment; triage never deletes anything.
+    triage_label: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    triage_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # triage_method: 'jev' | 'llm' — Jev's typed choice first, the LLM only
+    # below the confidence band; triage_version pins the prompt version.
+    triage_method: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    triage_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Format-specific extraction result (email headers, WhatsApp messages,
     # event fields). Always a JSON object; empty for plain notes.
     meta: Mapped[dict[str, Any]] = mapped_column(
