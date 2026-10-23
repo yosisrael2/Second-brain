@@ -199,11 +199,37 @@ def make_connector(
     return connector, files, changes
 
 
-def incr_cursor(*, token: str = "90210", known: list[str] | None = None) -> str:
+def incr_cursor(
+    *,
+    token: str = "90210",
+    known: list[str] | None = None,
+    folders: list[tuple[str, int]] | None = None,
+) -> str:
     return json.dumps(
-        {"v": 1, "mode": "incr", "token": token, "queue": [], "page": None,
-         "folder": None, "depth": 0, "known": known or []}
+        {"v": 2, "mode": "incr", "token": token, "queue": [], "page": None,
+         "folder": None, "depth": 0, "known": known or [],
+         "folders": [list(f) for f in folders or []]}
     )
+
+
+def _http_error(status: int, *, reason: str = "") -> _HttpishError:
+    """Duck-typed HttpError with the JSON error body in ``.content`` (the
+    shape googleapiclient raises; the reason strings live in
+    error.errors[].reason / error.details[].reason)."""
+    error = _HttpishError(status)
+    error.content = json.dumps(
+        {
+            "error": {
+                "code": status,
+                "errors": [{"reason": reason, "message": f"http {status}"}],
+                "details": [
+                    {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                     "reason": reason}
+                ],
+            }
+        }
+    ).encode()
+    return error
 
 
 def exports_for(*pairs: tuple[str, str, bytes]) -> dict[tuple[str, str], bytes]:
@@ -728,3 +754,181 @@ class TestRunnerSemantics:
         assert row is not None  # still in the DB
         assert row.meta["source_deleted"] is True
         assert row.superseded_by == row.id  # hidden from ask retrieval
+
+
+# --- review round 1: subfolder incrementality + rate-limit 403 ------------------
+
+
+class TestSubfolderIncremental:
+    """Review bug 1: the walk ingests subfolder files (depth > 1), so the
+    changes feed must treat walked subfolders as membership, not as
+    'moved out'. The cursor carries the walked folder set with depths."""
+
+    def test_edit_of_file_in_walked_subfolder_is_kept_not_deleted(self):
+        pages = {
+            ROOT: [_fixture("files_page_1"), _fixture("files_page_2")],
+            SUB: [_fixture("files_page_sub")],
+        }
+        connector, files, _ = make_connector(
+            max_depth=2,
+            files=FakeFiles(pages, exports=exports_for((DOC_ID, "text/plain", b"t"))),
+        )
+        full = connector.fetch(None, limit=100)
+        state = json.loads(full.next_cursor)
+        assert state["folders"] == [[SUB, 2]]  # the walked subfolder rides along
+        # Next edit of the subfolder file: parents={SUB} — must KEEP.
+        page = {
+            "newStartPageToken": "901",
+            "changes": [
+                {
+                    "fileId": "1Sh33tN3st3dM0ck456789abcdefghijklmno",
+                    "file": _fixture("sheet_in_sub"),
+                }
+            ],
+        }
+        connector2, files2, _ = make_connector(
+            max_depth=2,
+            files=FakeFiles(exports=exports_for(
+                ("1Sh33tN3st3dM0ck456789abcdefghijklmno", "text/csv", b"a,b")
+            )),
+            changes=FakeChanges([page]),
+        )
+        result = connector2.fetch(
+            incr_cursor(token="900", known=["1Sh33tN3st3dM0ck456789abcdefghijklmno"],
+                        folders=[[SUB, 2]]),
+            limit=100,
+        )
+        assert len(result.records) == 1
+        assert result.records[0].external_id == "1Sh33tN3st3dM0ck456789abcdefghijklmno"
+        assert result.records[0].deleted is False
+
+    def test_new_subfolder_then_file_ingested_incrementally(self):
+        new_folder = {
+            "kind": "drive#file",
+            "id": "1N3wSubF0ld3r00000000000000000000004",
+            "name": "New folder",
+            "mimeType": "application/vnd.google-apps.folder",
+            "version": "1",
+            "modifiedTime": "2026-10-22T10:00:00.000Z",
+            "parents": [ROOT],
+            "trashed": False,
+        }
+        new_file = {
+            "kind": "drive#file",
+            "id": "1F1l3N3wSubF0ld3r00000000000000000004",
+            "name": "Inside new folder",
+            "mimeType": "application/vnd.google-apps.document",
+            "version": "7",
+            "modifiedTime": "2026-10-22T10:05:00.000Z",
+            "webViewLink": "https://docs.google.com/document/d/x/edit",
+            "parents": ["1N3wSubF0ld3r00000000000000000000004"],
+            "trashed": False,
+        }
+        # Same page: the folder change comes AFTER the file change (API order
+        # is not guaranteed) — the connector must still ingest the file.
+        page = {
+            "newStartPageToken": "950",
+            "changes": [
+                {"fileId": "1F1l3N3wSubF0ld3r00000000000000000004",
+                 "file": new_file},
+                {"fileId": "1N3wSubF0ld3r00000000000000000000004",
+                 "file": new_folder},
+            ],
+        }
+        connector, _, _ = make_connector(
+            folders=(ROOT,),
+            max_depth=2,  # the new subfolder sits at depth 2, within the cap
+            changes=FakeChanges([page]),
+            files=FakeFiles(exports=exports_for(
+                ("1F1l3N3wSubF0ld3r00000000000000000004", "text/plain", b"content")
+            )),
+        )
+        result = connector.fetch(incr_cursor(token="900", folders=[]), limit=100)
+        assert [r.external_id for r in result.records if not r.deleted] == [
+            "1F1l3N3wSubF0ld3r00000000000000000004"
+        ]
+        final = json.loads(result.next_cursor)
+        assert ["1N3wSubF0ld3r00000000000000000000004", 2] in final["folders"]
+
+    def test_walked_folder_trashed_drops_out_files_surface_moved_out(self):
+        sub_change = {
+            "kind": "drive#file",
+            "id": SUB,
+            "name": "ארכיון / Archive",
+            "mimeType": "application/vnd.google-apps.folder",
+            "version": "5",
+            "modifiedTime": "2026-10-22T11:00:00.000Z",
+            "webViewLink": "https://drive.google.com/drive/folders/x",
+            "parents": [ROOT],
+            "trashed": True,
+        }
+        drop_page = {"newStartPageToken": "960", "changes": [
+            {"fileId": SUB, "file": sub_change}
+        ]}
+        later_page = {
+            "newStartPageToken": "970",
+            "changes": [
+                {"fileId": "1Sh33tN3st3dM0ck456789abcdefghijklmno",
+                 "file": dict(_fixture("sheet_in_sub"), version="34")}
+            ],
+        }
+        connector, _, _ = make_connector(
+            changes=FakeChanges([drop_page, later_page]),
+            files=FakeFiles(),
+        )
+        cursor = incr_cursor(
+            token="900", known=["1Sh33tN3st3dM0ck456789abcdefghijklmno"],
+            folders=[[SUB, 2]],
+        )
+        batch1 = connector.fetch(cursor, limit=100)  # the folder drops out
+        assert batch1.records == []  # folders never become records
+        state = json.loads(batch1.next_cursor)
+        assert state["folders"] == []  # dropped from membership
+        batch2 = connector.fetch(batch1.next_cursor, limit=100)
+        assert len(batch2.records) == 1
+        deleted = batch2.records[0]
+        assert deleted.deleted is True
+        assert deleted.meta["delete_reason"] == "moved_out"
+
+    def test_old_version_cursor_resets(self):
+        connector, _, changes = make_connector(
+            files=FakeFiles(), changes=FakeChanges(start_token="811")
+        )
+        old = json.dumps({"v": 1, "mode": "incr", "token": "t", "known": []})
+        result = connector.fetch(old, limit=100)
+        assert result.reset is True
+
+
+class TestRateLimitExport:
+    """Review bug 2: Drive rate-limits with HTTP 403 + reason
+    rateLimitExceeded / userRateLimitExceeded (Drive 'handle errors' doc).
+    Those must be retryable, not silent permanent content loss."""
+
+    def _doc_change_page(self) -> dict[str, Any]:
+        return {
+            "newStartPageToken": "5",
+            "changes": [{"fileId": DOC_ID, "file": _fixture("doc")}],
+        }
+
+    def test_rate_limit_403_is_retryable(self):
+        files = FakeFiles()
+        files.export_errors = {
+            (DOC_ID, "text/plain"): _http_error(
+                403, reason="userRateLimitExceeded"
+            )
+        }
+        connector, _, _ = make_connector(
+            files=files, changes=FakeChanges([self._doc_change_page()])
+        )
+        with pytest.raises(ConnectorRetryableError):
+            connector.fetch(incr_cursor(), limit=100)
+
+    def test_plain_403_forbidden_is_content_error(self):
+        files = FakeFiles()
+        files.export_errors = {(DOC_ID, "text/plain"): _http_error(403, reason="forbidden")}
+        connector, _, _ = make_connector(
+            files=files, changes=FakeChanges([self._doc_change_page()])
+        )
+        result = connector.fetch(incr_cursor(), limit=100)
+        assert len(result.records) == 1
+        assert result.records[0].meta["content_error"].startswith("http 403")

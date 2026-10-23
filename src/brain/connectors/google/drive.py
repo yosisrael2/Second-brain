@@ -26,19 +26,34 @@ Sync model (per the connectors contract + C3 feature plan):
   memory, so the incremental cursor carries the set of known in-allowlist
   file ids inside the opaque JSON blob (the cursor is runner-opaque; gtasks'
   plan blesses the same JSON-cursor pattern). For a KNOWN id: trashed /
-  removed=true / parents no longer allowlisted -> ``deleted=True`` record
-  (the runner marks the item ``source_deleted``; never a hard delete). For an
-  unknown id outside the allowlist: skipped.
+  removed=true / parents no longer inside the membership folders ->
+  ``deleted=True`` record (the runner marks the item ``source_deleted``;
+  never a hard delete). For an unknown id outside: skipped.
+- FOLDER MEMBERSHIP BEYOND THE TOP LEVEL: the cursor also carries the walked
+  subfolder set with depths. Incremental membership = the allowlist OR that
+  set, so files inside walked subfolders stay kept (their parents are the
+  subfolder, not a top-level id). A change that IS a folder under a known
+  folder at depth < cap is added at depth+1 (files created inside it are
+  ingested from their own changes). A walked folder that is trashed /
+  removed / moved out drops from the set; its files then surface as
+  deleted('moved_out') on their own next change (documented gap until then).
+  Cursor JSON version 2: a v1 cursor decodes as invalid -> reset, so
+  upgrading never mis-classifies walked subfolder files as deleted.
 - CONTENT: Docs export text/plain, Sheets export text/csv, Slides export
   text/plain — each capped at ``BRAIN_GDRIVE_TEXT_CAP`` chars (default
   50000) with truncation flagged in meta. PDFs and images become
   AttachmentRefs fetched lazily via :meth:`DriveConnector.fetch_attachment`
   (the existing attachments pipeline reads them). Any other binary is
   metadata-only. A per-file export failure never kills the batch: 4xx notes
-  ``meta["content_error"]`` and ships metadata-only (a 403 on one file is not
-  an auth problem — the LIST call just succeeded with the same token);
-  401/invalid_grant raises ConnectorAuthError via the base translation, and
-  429/5xx/network raise ConnectorRetryableError so the runner backs off.
+  ``meta["content_error"]`` and ships metadata-only — EXCEPT rate limiting:
+  Drive answers HTTP 403 with reason ``rateLimitExceeded`` /
+  ``userRateLimitExceeded`` (Drive API "handle errors" guide) when
+  throttled, and a metadata-only record there would silently lose the
+  content forever (the runner never re-exports an unchanged file), so those
+  raise ConnectorRetryableError. A plain 403 (forbidden: the file itself is
+  unreadable) stays a content_error. 401/invalid_grant raises
+  ConnectorAuthError via the base translation, and 429/5xx/network raise
+  ConnectorRetryableError so the runner backs off.
 - version = the file's ``version`` (falls back to ``modifiedTime``);
   occurred_at = ``modifiedTime``; url = ``webViewLink``; text renders the
   modified time in the connector's tz (Asia/Jerusalem per contract).
@@ -109,7 +124,11 @@ _FILE_FIELDS = "id, name, mimeType, version, modifiedTime, webViewLink, size, pa
 _CHANGES_FIELDS = (
     f"nextPageToken, newStartPageToken, changes(fileId, removed, file({_FILE_FIELDS}))"
 )
-_CURSOR_VERSION = 1
+_CURSOR_VERSION = 2
+
+# Drive "handle errors" doc: throttling answers HTTP 403 with one of these
+# reasons in the error body (error.errors[].reason or error.details[].reason).
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
 
 def parse_folder_ids(raw: str) -> tuple[str, ...]:
@@ -262,18 +281,24 @@ def classify_file(file_payload: dict[str, Any]) -> _Decision:
 
 
 def classify_change(
-    change: dict[str, Any], allowlist: frozenset[str], known: frozenset[str]
+    change: dict[str, Any],
+    allowlist: frozenset[str],
+    known: frozenset[str],
+    folders: dict[str, int],
 ) -> tuple[_Decision, frozenset[str]]:
-    """Classify one ``changes.list`` entry; returns (decision, new_known).
+    """Classify one FILE ``changes.list`` entry; returns (decision, new_known).
 
-    ``known`` is the set of file ids previously emitted as in-allowlist
-    records (carried inside the cursor). Rules:
-      - removed=true                    -> deleted (known ids only)
-      - the allowlisted folder itself   -> skip (folders are never records)
-      - parents intersect the allowlist, not trashed -> keep (+ known)
-      - known id, now trashed           -> deleted("trashed")
-      - known id, no longer allowlisted -> deleted("moved_out")
-      - anything else (never known, outside allowlist) -> skip
+    Folder changes are handled beforehand by :func:`apply_folder_change`
+    (two-pass per page — API ordering is not guaranteed, so a new subfolder
+    must be membership BEFORE its files are classified). ``folders`` maps
+    walked subfolder ids to their depths; membership = allowlist | folders.
+    Rules for files:
+      - removed=true                       -> deleted (known ids only)
+      - parents intersect membership,
+        not trashed                        -> keep (+ known)
+      - known id, now trashed              -> deleted("trashed")
+      - known id, outside membership       -> deleted("moved_out")
+      - anything else (never known, outside) -> skip
     """
     file_payload = change.get("file") or {}
     file_id = change.get("fileId") or file_payload.get("id") or ""
@@ -286,16 +311,61 @@ def classify_change(
                 known - {file_id},
             )
         return _Decision("skip"), known
-    if file_id in allowlist:
-        return _Decision("skip"), known  # allowlisted folder itself changed
     parents = {str(p) for p in file_payload.get("parents") or []}
     trashed = bool(file_payload.get("trashed"))
-    if parents & allowlist and not trashed:
+    if (parents & (allowlist | set(folders))) and not trashed:
         return _Decision("keep", file_id, file_payload), known | {file_id}
     if file_id in known:
         reason = "trashed" if trashed else "moved_out"
         return _Decision("deleted", file_id, file_payload, reason), known - {file_id}
-    return _Decision("skip"), known  # outside the allowlist and never tracked
+    return _Decision("skip"), known  # outside membership and never tracked
+
+
+def apply_folder_change(
+    change: dict[str, Any],
+    *,
+    allowlist: frozenset[str],
+    folders: dict[str, int],
+    max_depth: int,
+) -> bool:
+    """Update the walked-folder membership for one FOLDER change entry.
+
+    Returns True when ``folders`` changed (the caller re-encodes the cursor).
+    A new subfolder under a known folder (allowlisted root = depth 1) joins
+    membership at parent_depth + 1 when within the cap; a walked folder that
+    is trashed / removed / moved outside the membership drops out, so its
+    files surface as deleted('moved_out') on their own next change.
+    Allowlisted roots are config, never cursor state.
+    """
+    payload = change.get("file") or {}
+    folder_id = change.get("fileId") or payload.get("id") or ""
+    if not folder_id or folder_id in allowlist:
+        return False
+    if folder_id in folders:
+        gone = (
+            bool(change.get("removed"))
+            or bool(payload.get("trashed"))
+            or not {str(p) for p in payload.get("parents") or []}
+            & (allowlist | set(folders))
+        )
+        if gone:
+            del folders[folder_id]
+            return True
+        return False
+    if change.get("removed") or payload.get("trashed"):
+        return False  # a folder we never walked: nothing to add or drop
+    parent_depths = [
+        1 if str(p) in allowlist else folders.get(str(p))
+        for p in (payload.get("parents") or [])
+    ]
+    depths = [d for d in parent_depths if d is not None]
+    if not depths:
+        return False  # not under the allowlisted tree
+    new_depth = min(depths) + 1
+    if new_depth > max_depth:
+        return False  # beyond the walk cap: its files stay out of scope
+    folders[folder_id] = new_depth
+    return True
 
 
 def encode_cursor(
@@ -306,10 +376,11 @@ def encode_cursor(
     folder: str | None,
     depth: int,
     known: frozenset[str] | set[str],
+    folders: dict[str, int] | None = None,
 ) -> str:
     """The opaque cursor: a JSON blob (changes token + walk resume state +
-    known-allowlist membership). Bare Drive tokens are never JSON, so any
-    non-JSON cursor decodes to "invalid -> reset"."""
+    known file ids + walked-folder membership). Bare Drive tokens are never
+    JSON, so any non-JSON cursor decodes to "invalid -> reset"."""
     return json.dumps(
         {
             "v": _CURSOR_VERSION,
@@ -320,6 +391,7 @@ def encode_cursor(
             "folder": folder,
             "depth": depth,
             "known": sorted(known),
+            "folders": sorted((fid, d) for fid, d in (folders or {}).items()),
         },
         separators=(",", ":"),
     )
@@ -341,6 +413,31 @@ def _decode_cursor(cursor: str | None) -> tuple[dict[str, Any] | None, bool]:
 def _status_of(exc: BaseException | None) -> int | None:
     """Duck-typed HTTP status of a raw Google error (``exc.resp.status``)."""
     return getattr(getattr(exc, "resp", None), "status", None)
+
+
+def _rate_limit_reason(exc: BaseException | None) -> str | None:
+    """The throttle reason when a (403) error body carries one, else None.
+
+    Reads the JSON error body googleapiclient exposes as ``exc.content``:
+    reason lives in error.errors[].reason and, on newer payloads, in
+    error.details[].reason (google.rpc.ErrorInfo)."""
+    if exc is None:
+        return None
+    content = getattr(exc, "content", b"")
+    try:
+        data = json.loads(content if isinstance(content, (bytes, str)) else "")
+    except ValueError:
+        return None
+    error = data.get("error") or {} if isinstance(data, dict) else {}
+    for entry in error.get("errors") or []:
+        reason = entry.get("reason")
+        if reason in _RATE_LIMIT_REASONS:
+            return reason
+    for detail in error.get("details") or []:
+        reason = detail.get("reason") or (detail.get("metadata") or {}).get("reason")
+        if reason in _RATE_LIMIT_REASONS:
+            return reason
+    return None
 
 
 @register
@@ -406,19 +503,26 @@ class DriveConnector(GoogleConnector):
             for folder_id, d in (state.get("queue") or [(fid, 1) for fid in self._folder_ids])
         ]
         known: set[str] = set(state.get("known") or [])
+        folders: dict[str, int] = {
+            fid: int(d) for fid, d in (state.get("folders") or [])
+        }
         folder: str | None = state.get("folder")
         depth = int(state.get("depth") or 0)
         page: str | None = state.get("page")
         records: list[SourceRecord] = []
 
         def walk_cursor() -> str:
-            return encode_cursor("full", token, queue, page, folder, depth, known)
+            return encode_cursor(
+                "full", token, queue, page, folder, depth, known, folders
+            )
 
         while True:
             if folder is None:
                 if not queue:
                     break
                 folder, depth = queue.pop(0)
+                if folder not in self._allowlist:
+                    folders[folder] = depth  # walked subfolder = membership
                 page = None
             response = self._execute(
                 self._service().files().list(
@@ -458,7 +562,9 @@ class DriveConnector(GoogleConnector):
             if len(records) >= limit and queue:
                 return FetchResult(records, walk_cursor(), reset=reset)
         return FetchResult(
-            records, encode_cursor("incr", token, [], None, None, 0, known), reset=reset
+            records,
+            encode_cursor("incr", token, [], None, None, 0, known, folders),
+            reset=reset,
         )
 
     def _start_page_token(self) -> str:
@@ -475,6 +581,9 @@ class DriveConnector(GoogleConnector):
         if not page_token:
             return self._fetch_full(limit=limit, reset=True)
         known: frozenset[str] = frozenset(state.get("known") or [])
+        folders: dict[str, int] = {
+            fid: int(d) for fid, d in (state.get("folders") or [])
+        }
         records: list[SourceRecord] = []
         while True:
             try:
@@ -494,8 +603,30 @@ class DriveConnector(GoogleConnector):
                 if exc.status == 404:  # Drive: unknown/expired page token
                     return self._fetch_full(limit=limit, reset=True)
                 raise
-            for change in response.get("changes") or []:
-                decision, known = classify_change(change, self._allowlist, known)
+            changes = response.get("changes") or []
+            # Pass 1 — folder membership: additions/drops happen BEFORE file
+            # classification so a same-page new subfolder + its file both work
+            # (changes.list orders by file id, not causal order).
+            for change in changes:
+                payload = change.get("file") or {}
+                is_folder = file_kind(payload.get("mimeType", "")) == "folder"
+                if is_folder or (
+                    change.get("removed") and (change.get("fileId") or "") in folders
+                ):
+                    apply_folder_change(
+                        change,
+                        allowlist=self._allowlist,
+                        folders=folders,
+                        max_depth=self._max_depth,
+                    )
+            # Pass 2 — files (folder changes were consumed by pass 1).
+            for change in changes:
+                payload = change.get("file") or {}
+                if file_kind(payload.get("mimeType", "")) == "folder":
+                    continue  # folders are membership, never records
+                decision, known = classify_change(
+                    change, self._allowlist, known, folders
+                )
                 if decision.action == "keep":
                     if decision.file is None:  # defensive: keeps always carry it
                         raise ConnectorError(
@@ -512,12 +643,14 @@ class DriveConnector(GoogleConnector):
             new_token = response.get("newStartPageToken")
             if next_page:
                 if len(records) >= limit:  # page-aligned stop
-                    cursor = encode_cursor("incr", next_page, [], None, None, 0, known)
+                    cursor = encode_cursor(
+                        "incr", next_page, [], None, None, 0, known, folders
+                    )
                     return FetchResult(records, cursor, reset=False)
                 page_token = next_page
                 continue
             cursor = encode_cursor(
-                "incr", new_token or page_token, [], None, None, 0, known
+                "incr", new_token or page_token, [], None, None, 0, known, folders
             )
             return FetchResult(records, cursor, reset=False)
 
@@ -560,6 +693,16 @@ class DriveConnector(GoogleConnector):
             )
             if status == 401 or refresh_broken:
                 raise self._translate_error(exc) from exc  # base mapper: single source
+            if status == 403 and _rate_limit_reason(exc):
+                # Drive "handle errors": throttling is a 403 carrying reason
+                # rateLimitExceeded / userRateLimitExceeded. A metadata-only
+                # record here would silently drop the content forever (the
+                # runner never re-exports an unchanged file) — back off and
+                # re-fetch the whole batch instead.
+                raise ConnectorRetryableError(
+                    f"drive export {file_id}: rate limited (http 403)",
+                    status=403,
+                ) from exc
             if status is None or status == 429 or status >= 500:
                 raise ConnectorRetryableError(
                     f"drive export {file_id}: http {status or 'network error'}",
