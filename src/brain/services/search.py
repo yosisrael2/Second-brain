@@ -85,7 +85,9 @@ class SearchService:
                 "search: semantic search unavailable; falling back to keywords", exc_info=True
             )
             ops.record_event(
-                "search", "keyword_fallback", ok=True,
+                "search",
+                "keyword_fallback",
+                ok=True,
                 detail={"reason": "semantic unavailable", "query_chars": len(query)},
             )
             fallback = self._keyword_fallback(query, limit=limit, offset=offset)
@@ -93,9 +95,7 @@ class SearchService:
                 return fallback
             seen: set[uuid.UUID] = {hit.item.id for hit in fallback}
             extras = [
-                SearchHit(item=item, score=None)
-                for item in extra_items
-                if item.id not in seen
+                SearchHit(item=item, score=None) for item in extra_items if item.id not in seen
             ]
             for hit in extras:
                 seen.add(hit.item.id)
@@ -114,9 +114,7 @@ class SearchService:
                 key = str(item.id)
                 if key not in candidate_ids:
                     candidate_ids.add(key)
-                    candidates.append(
-                        {"id": key, "text": item.raw_text, "vector_score": None}
-                    )
+                    candidates.append({"id": key, "text": item.raw_text, "vector_score": None})
         with ops.span("search", "rerank", edge="search->rerank") as span:
             pre_ids = [c["id"] for c in candidates]
             span.detail = {
@@ -182,6 +180,10 @@ class SearchService:
         by_id = {
             item.id: item
             for item in self._repo.get_many(_parse_uuids(ranked))
+            # PR B (item 20/D4): superseded (struck-through) items are hidden
+            # from search by default — the vector store still holds their
+            # points until reindexing, so filter here.
+            if item.superseded_by is None
         }
         hits: list[SearchHit] = []
         seen: set[uuid.UUID] = set()

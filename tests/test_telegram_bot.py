@@ -108,10 +108,23 @@ class _StubItems:
     def __init__(self, items: list[MemoryItem] | None = None) -> None:
         self._items = items or []
 
-    def list(self, *, item_type=None, project=None, status=None, limit=50, offset=0):
-        return [item for item in self._items if status is None or item.status == status][
-            offset : offset + limit
-        ]
+    def list(
+        self,
+        *,
+        item_type=None,
+        project=None,
+        status=None,
+        limit=50,
+        offset=0,
+        include_children=False,
+        include_superseded=False,
+    ):
+        return [
+            item
+            for item in self._items
+            if (status is None or item.status == status)
+            and (include_superseded or getattr(item, "superseded_by", None) is None)
+        ][offset : offset + limit]
 
 
 @dataclass

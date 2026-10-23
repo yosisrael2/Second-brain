@@ -70,11 +70,14 @@ class ItemsRepository:
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_superseded: bool = False,
     ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status.
 
         ``include_children=True`` opts IN to extracted children (used by the
         parent's child list); default listings never show them (item 19).
+        ``include_superseded=True`` opts IN to superseded (struck-through)
+        items; default listings never show them (item 20/D4).
         """
         stmt = select(MemoryItem).order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
         if item_type is not None:
@@ -87,13 +90,20 @@ class ItemsRepository:
         # UNLISTED in /recent and /review until kept; dropped children stay
         # hidden too. Kept children list normally.
         if not include_children:
-            stmt = stmt.where(
-                MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept")
-            )
+            stmt = stmt.where(MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept"))
+        # PR B (item 20/D4): superseded items are hidden by default.
+        if not include_superseded:
+            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt.limit(limit).offset(offset)))
 
-    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
-        """Full-text search over raw_text via Postgres FTS, best match first."""
+    def search(
+        self, *, query: str, limit: int, offset: int, include_superseded: bool = False
+    ) -> Sequence[MemoryItem]:
+        """Full-text search over raw_text via Postgres FTS, best match first.
+
+        Superseded (struck-through) items are hidden by default (item 20/D4);
+        ``include_superseded=True`` opts back in (the bot's Undo/Restore views).
+        """
         tsquery = func.websearch_to_tsquery(FTS_LANGUAGE, query)
         stmt = (
             select(MemoryItem)
@@ -106,11 +116,11 @@ class ItemsRepository:
             .limit(limit)
             .offset(offset)
         )
+        if not include_superseded:
+            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt))
 
-    def by_occurrence(
-        self, *, start: datetime, end: datetime, limit: int
-    ) -> Sequence[MemoryItem]:
+    def by_occurrence(self, *, start: datetime, end: datetime, limit: int) -> Sequence[MemoryItem]:
         """Every item with occurred_at inside [start, end), soonest first.
 
         Drives temporal retrieval: day/date questions fetch ALL events in the
