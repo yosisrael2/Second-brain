@@ -23,7 +23,7 @@ depends_on: str | Sequence[str] | None = None
 _COLUMNS = (
     ("triage_label", sa.String(length=16)),
     ("triage_confidence", sa.Float()),
-    ("triage_method", sa.String(length=8)),
+    ("triage_method", sa.String(length=16)),
     ("triage_version", sa.String(length=16)),
 )
 

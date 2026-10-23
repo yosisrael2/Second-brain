@@ -152,9 +152,10 @@ class MemoryItem(Base):
     # for enrichment; triage never deletes anything.
     triage_label: Mapped[str | None] = mapped_column(String(16), nullable=True)
     triage_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    # triage_method: 'jev' | 'llm' — Jev's typed choice first, the LLM only
-    # below the confidence band; triage_version pins the prompt version.
-    triage_method: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # triage_method: 'jev' | 'llm' | 'kid_named' — the deterministic kid
+    # override first (v3), Jev's typed choice next, the LLM only below the
+    # confidence band; triage_version pins the prompt version.
+    triage_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
     triage_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # PR B (item 20/D4): when this item is superseded by a newer version
     # (relation kind 'supersedes'/'corrects', applied), it stays in the DB

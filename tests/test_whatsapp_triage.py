@@ -245,6 +245,27 @@ def test_retriage_overwrites_the_previous_label() -> None:
     session.close()
 
 
+def test_kid_named_method_fits_the_column_and_commits() -> None:
+    """Red-first (review round 2, bug 1): 'kid_named' is 9 chars but the
+    triage_method column was String(8) — the commit raised 'value too
+    long', which in the poller fails the whole channel poll and in the
+    backfill CLI aborts the run."""
+    _wipe_items()
+    session = SessionLocal()
+    repo = ItemsRepository(session)
+    item = repo.add(_conversation())
+    repo.apply_triage(
+        item, TriageResult("relevant", 1.0, "kid_named", TRIAGE_VERSION)
+    )
+    session.commit()  # must not raise StringDataRightTruncation
+
+    stored = repo.get(item.id)
+    assert stored is not None
+    assert stored.triage_label == "relevant"
+    assert stored.triage_method == "kid_named"
+    session.close()
+
+
 # --- listing vs search ------------------------------------------------------------
 
 
@@ -385,6 +406,135 @@ def test_triage_failure_is_recorded_never_silent(monkeypatch) -> None:
 
     assert events and events[0]["component"] == "triage" and events[0]["ok"] is False
     assert item.triage_label is None, "a failed triage leaves the item untriaged"
+
+
+def test_update_never_downgrades_relevant_to_noise(monkeypatch) -> None:
+    """Red-first (review round 2, bug 3): re-triage on UPDATE must never hide
+    something real — appending chatter ('תודה 🙏') to a RELEVANT conversation
+    keeps it relevant. noise->relevant stays allowed (the other test); the
+    blocked downgrade is still recorded as an ops event, never silent."""
+    from brain.services import whatsapp as wa  # noqa: PLC0415
+    from brain.services.whatsapp import WhatsAppPoller  # noqa: PLC0415
+
+    events: list[dict] = []
+    monkeypatch.setattr(
+        wa.ops, "record_event",
+        lambda component, kind, **kw: events.append(
+            {"component": component, "kind": kind, **kw}
+        ),
+    )
+
+    def trier(item: MemoryItem) -> TriageResult | None:
+        # first decision: relevant (a real school notice), then the thread
+        # degrades to chatter and the trier says noise on the update
+        return TriageResult(
+            "noise" if "תודה" in item.raw_text else "relevant", 0.97, "jev", TRIAGE_VERSION
+        )
+
+    service = WhatsAppPoller.__new__(WhatsAppPoller)
+    service._trier = trier  # type: ignore[attr-defined]
+    service._items = None  # type: ignore[attr-defined]
+
+    item = _conversation("[WhatsApp · ב] מעין: מחר חולצה לבנה וקלמר")
+    service._triage_item(item)  # type: ignore[attr-defined]
+    assert item.triage_label == "relevant"
+
+    item.raw_text += "\n[21/10/2026, 19:00] מעין: תודה 🙏"
+    service._triage_item(item)  # type: ignore[attr-defined]  # trier now says noise
+
+    assert item.triage_label == "relevant", "relevant may never become noise on update"
+    assert item.triage_method == "jev", "the first (relevant) decision stands"
+    blocked = [e for e in events if e["kind"] == "downgrade_blocked"]
+    assert blocked, "the blocked downgrade is recorded, never silent"
+
+
+def test_poll_failure_after_triage_rolls_back_the_triaged_conversation(tmp_path) -> None:
+    """Red-first (review round 2, bug 2): the triage hook must not commit
+    mid-poll. A failure AFTER triage in the same poll (here: the poller's
+    state/cursor bookkeeping) must roll the conversation back with the rest
+    of the channel's writes — the poll's single commit point owns the triage
+    columns too."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        ZONE,
+        FakeIndexer,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+    from tests.services.test_whatsapp_ingest import (
+        DEFAULT_GAP_MINUTES as INGEST_GAP,
+    )
+
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.repositories.whatsapp import WhatsAppStateRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore, WhatsAppPoller  # noqa: PLC0415
+
+    _wipe_items()
+    session = SessionLocal()
+    try:
+        session.execute(sql_text("DELETE FROM whatsapp_poll_state"))
+        session.commit()
+        memory_repo = MemoryRepository(session)
+        MemoryService(memory_repo).set_channel("Chat A", kind="teacher", applies_to="me")
+
+        path = tmp_path / "messages.db"
+        _write_bridge(
+            path,
+            [(CHAT_A_JID, "Chat A")],
+            [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="hello")],
+        )
+
+        def trier(item: MemoryItem) -> TriageResult | None:
+            return TriageResult("relevant", 0.95, "jev", TRIAGE_VERSION)
+
+        class _BoomState:
+            """Delegates to the real state repo; record_poll succeeds for the
+            init poll, then always raises — a failure strictly AFTER the
+            conversation was triaged in a later poll."""
+
+            def __init__(self, inner: WhatsAppStateRepository) -> None:
+                self._inner = inner
+                self._calls = 0
+
+            def __getattr__(self, name: str):
+                return getattr(self._inner, name)
+
+            def record_poll(self, *args, **kwargs):
+                self._calls += 1
+                if self._calls >= 2:
+                    raise RuntimeError("state write down")
+                return self._inner.record_poll(*args, **kwargs)
+
+        poller = WhatsAppPoller(
+            bridge=BridgeStore(path),
+            state=_BoomState(WhatsAppStateRepository(session)),
+            items=ItemsRepository(session),
+            memory=MemoryRepository(session),
+            indexer=FakeIndexer(),
+            trier=trier,
+            zone_name=ZONE,
+            gap_minutes=INGEST_GAP,
+            commit=True,
+        )
+        poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init at the live edge
+        _add_row(
+            path,
+            _bridge_row("m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC), content="fresh"),
+        )
+        results = poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+        assert results == [], "the failed channel contributes no result"
+
+        session.expire_all()
+        count = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar_one()
+        assert count == 0, (
+            "the triaged conversation must roll back with the failed poll, "
+            "not stay committed ahead of the cursor"
+        )
+    finally:
+        session.rollback()
+        session.close()
 
 
 # --- the backfill command -------------------------------------------------------------

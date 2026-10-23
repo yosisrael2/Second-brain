@@ -747,9 +747,18 @@ class WhatsAppPoller:
         turn relevant). A trier failure (exception or None) leaves the item
         untriaged and is recorded as an ops event — never silent, never
         fatal to the poll.
+
+        v3 review rules: (1) NO mid-poll commit here — the poll's single
+        commit point persists the triage columns together with the poller's
+        own state/cursor bookkeeping, so a later failure in the same poll
+        rolls the conversation back with the rest of the channel's writes.
+        (2) On update, RELEVANT may never become NOISE (appending chatter
+        must not hide something real); noise->relevant stays allowed. The
+        blocked downgrade is recorded, never silent.
         """
         if self._trier is None:
             return
+        prior = item.triage_label
         try:
             result = self._trier(item)
         except Exception as exc:  # noqa: BLE001 — triage never blocks capture
@@ -764,12 +773,23 @@ class WhatsAppPoller:
                 detail={"error": "no decision"},
             )
             return
+        if prior == "relevant" and result.label == "noise":
+            # Asymmetry rule (v3 review): hiding something real is worse than
+            # showing chatter — keep the stronger label on update.
+            ops.record_event(
+                "triage", "downgrade_blocked", ok=True,
+                detail={
+                    "item_id": str(item.id),
+                    "kept": "relevant",
+                    "rejected": "noise",
+                    "version": result.version,
+                },
+            )
+            return
         item.triage_label = result.label
         item.triage_confidence = result.confidence
         item.triage_method = result.method
         item.triage_version = result.version
-        if self._items is not None:
-            self._items.commit()
 
     def _index_item(self, item: MemoryItem) -> None:
         """Best-effort vector indexing; failures defer to 'brain reindex'."""
