@@ -61,7 +61,7 @@ linked to its section or doc.
 
 - Meaning extraction PR A1: data model + async enrichment of captured items
 - Memory-aware recall for kid questions (PR 0d)
-- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp
+- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp. PR F3 wires email + WhatsApp IN: the Gmail poller fetches stored attachment references (`users.messages.attachments.get`, still read-only) and WhatsApp downloads media for allowlisted channels via the bridge's local `/api/download` — both captured as their own attachment item (20 MB / daily-budget / sandbox respected), replacing the "not read yet" markers
 - Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user (setup: docs/email-setup.md)
 - WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
 - Bot timezone fix

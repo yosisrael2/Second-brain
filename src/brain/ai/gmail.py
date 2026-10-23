@@ -111,6 +111,14 @@ class GmailClient(Protocol):
         """Fetch one full message."""
         ...
 
+    def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        """Fetch one attachment's bytes (users.messages.attachments.get).
+
+        Still read-only and label-scoped by construction: the caller only
+        reaches here for message ids listed under the configured label.
+        """
+        ...
+
     def close(self) -> None: ...
 
 
@@ -257,6 +265,19 @@ class RestGmailClient:
             service.users().messages().get(userId=self._user_id, id=message_id, format="full")
         )
         return _message_from_payload(raw)
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        service = self._get_service()
+        raw = self._execute(
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId=self._user_id, messageId=message_id, id=attachment_id)
+        )
+        data = raw.get("data", "")
+        import base64  # noqa: PLC0415
+
+        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 def _header(payload: dict[str, Any], name: str) -> str | None:

@@ -106,11 +106,18 @@ class EmailPoller:
         ingest: IngestProto,
         seen_repo: Any,
         settings: Settings,
+        attachments: Any | None = None,
     ) -> None:
         self._client = client
         self._ingest = ingest
         self._seen = seen_repo
         self._settings = settings
+        # F3 (item 46): optional attachments core. When wired, every stored
+        # attachment reference is fetched (users.messages.attachments.get,
+        # still label-scoped) and captured as its own attachment item with
+        # source='email', parent = the email item. Reading goes through the
+        # attachments core's daily budget (one drain per poll cycle).
+        self._attachments = attachments
         self.failures = 0
 
     # --- single cycle -------------------------------------------------------
@@ -147,6 +154,16 @@ class EmailPoller:
                 new += 1
             else:
                 skipped += 1
+        if self._attachments is not None:
+            try:
+                self._attachments.drain()
+            except Exception as exc:  # noqa: BLE001 — reading never fails the poll
+                ops.record_event(
+                    "email",
+                    "attachment_drain_error",
+                    ok=False,
+                    detail={"error": f"{type(exc).__name__}: {exc}"[:200]},
+                )
         summary = PollSummary(
             listed=len(stubs),
             new=new,
@@ -209,7 +226,49 @@ class EmailPoller:
         )
         item_id = items[0].id if items else None
         self._seen.mark(dedupe_id, msg.id, msg.rfc_message_id, item_id)
+        if self._attachments is not None and item_id is not None:
+            self._collect_attachments(msg, item_id, self._attachments)
         return True
+
+    def _collect_attachments(self, msg: GmailMessage, item_id: Any, attachments: Any) -> None:
+        """F3: fetch + capture each referenced attachment (item 46).
+
+        Per-attachment failures are recorded, never raised: one broken
+        attachment must not lose the email or its siblings.
+        """
+        from brain.services.attachments import MAX_FILE_BYTES
+
+        for ref in msg.attachments:
+            if ref.size is not None and ref.size > MAX_FILE_BYTES:
+                ops.record_event(
+                    "email",
+                    "attachment_skip_too_large",
+                    ok=False,
+                    detail={"gmail_id": msg.id, "filename": ref.filename, "size": ref.size},
+                )
+                continue
+            try:
+                content = self._client.get_attachment(msg.id, ref.attachment_id)
+                att = attachments.capture(
+                    parent_item_id=item_id,
+                    content=content,
+                    filename=ref.filename,
+                    mime=ref.mime_type,
+                    source="email",
+                    source_ref=msg.id,
+                )
+                attachments.submit(att.id)
+            except Exception as exc:  # noqa: BLE001 — recorded, never silent
+                ops.record_event(
+                    "email",
+                    "attachment_fetch_error",
+                    ok=False,
+                    detail={
+                        "gmail_id": msg.id,
+                        "attachment_id": ref.attachment_id,
+                        "error": f"{type(exc).__name__}: {exc}"[:200],
+                    },
+                )
 
     # --- loop ---------------------------------------------------------------
 

@@ -186,3 +186,9 @@ def _drop_test_database() -> None:
             (db_name,),
         )
         conn.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+
+
+# F3: the attachments-core fixture (tests/test_attachments.py) shared with the
+# poller test modules. Module-level alias — pytest collects fixture objects by
+# value, so the same fixture instance is available as `svc_env` everywhere.
+from tests.test_attachments import svc_env_fixture as svc_env  # noqa: E402,F401
