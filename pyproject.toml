@@ -38,6 +38,8 @@ gmail = [
 ]
 dev = [
     "pytest>=8,<9",
+    # CI hang insurance: per-test timeout so a stuck test names itself.
+    "pytest-timeout>=2.1,<3",
     "httpx>=0.27,<1",
     "ruff>=0.17,<0.18",
     "mypy>=2.4,<3",
