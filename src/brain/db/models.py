@@ -604,3 +604,15 @@ class ConnectorRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Poison-record quarantine (review round 2): consecutive record-level
+    # failures. 3 in a row -> status 'failed' and the runner stops retrying
+    # that record (the batch no longer counts it as an error, so the cursor
+    # can advance) until the source bumps the version. A successful sync
+    # resets all three (ConnectorRecordRepo.put).
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="synced", server_default="synced"
+    )
+    fail_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

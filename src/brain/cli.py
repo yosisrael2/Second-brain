@@ -901,10 +901,14 @@ def _connectors_list() -> int:
     enabled = set(settings.connectors_enabled)
     ensure_registered()
     names = sorted(set(all_names()) | {"email", "gcal", "gdrive", "gtasks"})
-    print(f"{'name':<8}  {'enabled':<7}  {'registered':<10}  {'last ok':<20}  cursor  last error")
+    print(
+        f"{'name':<8}  {'enabled':<7}  {'registered':<10}  {'last ok':<20}  cursor  "
+        "quarantined  last error"
+    )
     with SessionLocal() as session:
         states = {row.name: row for row in ConnectorStateRepo(session).all()}
         counts = ConnectorRecordRepo(session).counts()
+        quarantined = ConnectorRecordRepo(session).quarantined_counts()
         for name in names:
             state = states.get(name)
             try:
@@ -916,9 +920,10 @@ def _connectors_list() -> int:
             last_ok = last_ok_at.strftime("%Y-%m-%d %H:%M") if last_ok_at else "never"
             has_cursor = "yes" if state and state.cursor else "no"
             last_error = (state.last_error if state else "") or ""
+            quarantined_n = quarantined.get(name, 0)
             print(
                 f"{name:<8}  {'yes' if name in enabled else 'no':<8}  {registered:<10}  "
-                f"{last_ok:<16}  {has_cursor:<6}  {last_error[:60]}"
+                f"{last_ok:<16}  {has_cursor:<6}  {quarantined_n:<11}  {last_error[:60]}"
             )
     records = counts
     if records:
