@@ -447,14 +447,31 @@ class TestSideProcessIndexerWiring:
         monkeypatch.setattr(deps, "get_item_indexer", lambda: sentinel)
         assert cli._side_process_indexer() is sentinel
 
-    def test_side_process_indexer_returns_none_when_deps_unavailable(self, monkeypatch):
+    def test_side_process_indexer_returns_none_when_deps_unavailable(self, monkeypatch, caplog):
+        """The fallback stays, but it must never be SILENT: a warning with the
+        exception type+message AND an indexer_unavailable ops event, otherwise
+        the poller would ingest unsearchable conversations with no trace."""
         import brain.cli as cli
 
         def _boom():
             raise RuntimeError("no embedder here")
 
         monkeypatch.setattr("brain.api.deps.get_item_indexer", _boom)
-        assert cli._side_process_indexer() is None
+        with caplog.at_level("WARNING"):
+            assert cli._side_process_indexer() is None
+        assert "RuntimeError" in caplog.text
+        assert "no embedder here" in caplog.text
+        from brain.db.session import engine
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT detail FROM ops_events WHERE component = 'whatsapp'"
+                    " AND kind = 'indexer_unavailable'"
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0]["error"] == "RuntimeError"
 
     def test_cli_attachment_service_forwards_the_indexer(self, monkeypatch):
         """Attachment items captured by the poller path are indexed by the

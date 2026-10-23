@@ -354,7 +354,28 @@ def _side_process_indexer() -> Any:
         from brain.api import deps  # noqa: PLC0415
 
         return deps.get_item_indexer()
-    except Exception:  # noqa: BLE001 — no embedder/qdrant here: poll unindexed
+    except Exception as exc:  # noqa: BLE001 — fallback, but never a silent one
+        logger.warning(
+            "whatsapp: vector indexer unavailable (%s: %s); conversations will be "
+            "indexed by 'brain reindex'",
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            from brain.ops import record_event  # noqa: PLC0415
+
+            record_event(
+                "whatsapp",
+                "indexer_unavailable",
+                ok=False,
+                detail={"error": type(exc).__name__, "message": str(exc)},
+            )
+        except Exception as tele_exc:  # noqa: BLE001 — telemetry must not mask the fallback
+            logger.warning(
+                "whatsapp: could not record indexer_unavailable (%s: %s)",
+                type(tele_exc).__name__,
+                tele_exc,
+            )
         return None
 
 
