@@ -14,7 +14,16 @@ from typing import Any, ClassVar
 
 
 class ConnectorError(Exception):
-    """Base class for connector failures."""
+    """Base class for connector failures.
+
+    ``status`` carries the HTTP status when the error came from a response
+    (None otherwise) — e.g. an adapter catches a retryable with status 410
+    and returns reset=True for a full resync.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class ConnectorAuthError(ConnectorError):
@@ -77,6 +86,8 @@ class Connector(ABC):
     """A pluggable data source. Adding a source = one subclass + one register."""
 
     # == SourceRecord.source == the items.source value for records it yields.
+    # ClassVar in the contract; adapters set it as a plain class attribute
+    # (``name = "gcal"``), which mypy treats as an override-compatible value.
     name: ClassVar[str]
 
     @abstractmethod
