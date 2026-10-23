@@ -467,28 +467,30 @@ Shipped sources:
 
 ## Background services (launchd, 24/7)
 
-`scripts/service.sh` installs two per-user LaunchAgents that survive logins
-and reboots (never run it in CI — it writes to `~/Library/LaunchAgents`):
+`scripts/service.sh` installs per-user LaunchAgents that survive logins and
+reboots (never run it in CI — it writes to `~/Library/LaunchAgents`):
 
 ```bash
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
 scripts/service.sh status      # per-agent state/pid/last-exit + sleep + docker notes
-scripts/service.sh restart     # kickstart -k both agents
-scripts/service.sh logs [api|telegram]
+scripts/service.sh restart     # kickstart -k installed agents (skips the rest)
+scripts/service.sh logs [api|telegram|email|whatsapp]
 scripts/service.sh uninstall
 ```
 
 - **com.secondbrain.api** runs `scripts/run-server.sh` (foreground uvicorn);
-  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, which maps the bot's
-  exit codes onto launchd's KeepAlive (`SuccessfulExit=false`): disabled (0)
-  and permanent config errors (78, incl. a 409 conflict that outlasts the
-  10-minute retry window) exit 0 → no restart; transient failures exit 1 →
-  restart with backoff.
+  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, **com.secondbrain.email**
+  runs `scripts/run-email.sh` (the Gmail connector loop — OPT-IN: installed only
+  when `GMAIL_LABEL_ID` is set, else install prints a skipped line and removes any
+  stale plist), and **com.secondbrain.whatsapp** runs `scripts/run-whatsapp.sh`.
+  All map their exit codes onto launchd's KeepAlive (`SuccessfulExit=false`):
+  disabled (0) and permanent config errors (78) exit 0 → no restart; transient
+  failures exit 1 → restart with backoff.
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
   checkout exits 78 with `another bot instance is running (pid N)`.
-- Both agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
+- All agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
   the plists (the app reads `.env` itself via its working directory). Logs:
   `~/Library/Logs/second-brain/`.
 - Accepted deviation: the API launcher does NOT wait for docker and does NOT
