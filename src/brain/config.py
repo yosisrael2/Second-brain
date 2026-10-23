@@ -160,6 +160,11 @@ class Settings(BaseSettings):
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
 
+    # Google Calendar connector (connectors ticket): comma-separated calendar
+    # ids to sync (allowlist, order preserved). 'primary' is the authenticated
+    # user's main calendar; an empty value syncs nothing.
+    brain_gcal_calendars: str = "primary"
+
     @field_validator("telegram_allowed_user_ids")
     @classmethod
     def _validate_telegram_user_ids(cls, value: str) -> str:
@@ -189,6 +194,11 @@ class Settings(BaseSettings):
             for part in self.telegram_allowed_user_ids.split(",")
             if part.strip()
         )
+
+    @property
+    def gcal_calendar_ids(self) -> tuple[str, ...]:
+        """The calendar allowlist in order; empty means the gcal connector syncs nothing."""
+        return tuple(part.strip() for part in self.brain_gcal_calendars.split(",") if part.strip())
 
     @field_validator("timezone")
     @classmethod

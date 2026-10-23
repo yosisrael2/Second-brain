@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from brain.connectors import Connector, all_names, alias, get, register
+from brain.connectors import Connector, alias, all_names, get, register
 from brain.connectors.base import (
     AttachmentRef,
     ConnectorAuthError,
