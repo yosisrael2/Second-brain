@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -21,6 +22,7 @@ from brain.services.memory import MemoryService
 from conftest import assert_test_database
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
+_JLM = ZoneInfo("Asia/Jerusalem")
 
 TWO_DATES = "אספה 22.10 בבוקר ואז טיול 23.10"
 
@@ -920,3 +922,36 @@ def test_derived_child_skips_grounding_and_records_the_link(world: World):
     assert len(derived) == 1
     assert derived[0].type.value == "task"  # derived = a TASK, not a reminder
     assert derived[0].extraction_meta["derived_from"] == "0"
+
+
+def test_compound_weekday_date_when_raw_survives_to_a_conflict_flag(world: World):
+    """Item 2b, end to end: when_raw carries the WHOLE phrase ('יום שלישי
+    7.10'), so resolve_when sees the weekday AND the numeric date; 7.10.2026
+    is a Wednesday -> the stored child is flagged date_conflict. Synthetic
+    example only (never the eval set)."""
+    body = "הטיול יתקיים ביום שלישי 7.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="event", title="טיול", quote="הטיול יתקיים ביום שלישי 7.10",
+            when_raw="יום שלישי 7.10",
+        ),
+        # the broken variant: the model copied ONLY the numeric part — the
+        # check has nothing to compare, so NO conflict can ever be flagged
+        ChildCandidate(
+            kind="event", title="טיול (חתוך)", quote="הטיול יתקיים ביום שלישי 7.10",
+            when_raw="7.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.children_created == 2
+    rows = _children(world.session)
+    whole = next(r for r in rows if r.raw_text == "טיול")
+    cut = next(r for r in rows if r.raw_text == "טיול (חתוך)")
+    assert whole.date_conflict is True  # weekday vs numeric date disagreement seen
+    assert cut.date_conflict is False  # silent pass — the reason the prompt rule exists
+    assert whole.occurred_at is not None
+    local = whole.occurred_at.astimezone(_JLM)
+    assert local.date().isoformat() == "2026-10-07"
