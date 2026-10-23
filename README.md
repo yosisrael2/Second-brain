@@ -324,6 +324,20 @@ Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 | GET    | `/ops/trace/search?q=`| Search pipeline trace (before/after rerank, fallback decision)  |
 | POST   | `/ops/trace/ask`      | Ask trace — runs the real LLM (user-initiated)                  |
 
+Diagnostics note: live checks that exercise the ask path with a FAKE LLM must
+call `AskService.ask(..., record_ops=False)` — that skips the `ask→search` /
+`ask→llm` spans and the kid_recall event, so `/ops/health`'s llm component is
+not marked "last call failed" until the next real call. Real requests keep
+the default (`record_ops=True`); nothing else changes.
+
+Health components `attachments` (queue depth, read today / daily budget, last
+error) and `enrichment` (queue depth, cap used / limit, worker on/off — off is
+the designed inert state) mirror `GET /ops/attachments` and `GET
+/ops/enrichment`; the cockpit renders their cards automatically. The telegram
+heartbeat threshold follows the bot's actual long-poll timeout
+(`telegram_poll_timeout_s` + margin), and the poll loop heartbeats on the
+conflict/network retry paths too — a quiet chat no longer flaps "degraded".
+
 Privacy contract: the ops layer never records secrets (tokens appear only as
 `set`/`unset` + last 4 chars) and never note bodies — events/traces carry
 item ids, lengths and error types; item text appears only in the inspector
