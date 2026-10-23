@@ -39,7 +39,16 @@ _MAX_LIST_PAGES = 5
 
 
 class GmailError(RuntimeError):
-    """A Gmail call failed transiently (network, 5xx) — retry with backoff."""
+    """A Gmail call failed transiently (network, 5xx) — retry with backoff.
+
+    ``status`` carries the HTTP status when the error came from a response
+    (None otherwise); the connector adapter reads it for the cursor-invalid
+    (404 history) and retryable (429/5xx) decisions.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class GmailAuthError(GmailError):
@@ -123,27 +132,24 @@ class GmailClient(Protocol):
 
 
 def _translate_error(exc: Exception) -> Exception:
-    """Map duck-typed Google errors onto the Gmail error taxonomy.
+    """Map duck-typed Google errors onto the Gmail error taxonomy — THIN by
+    design: the HTTP status table lives ONCE in
+    :meth:`brain.connectors.google.base.GoogleConnector._translate_error` and
+    this wrapper only re-labels the connector errors into the Gmail classes
+    the client's callers expect (C5 consolidation, single mapping)."""
+    from brain.connectors.base import ConnectorAuthError  # noqa: PLC0415 (lazy)
+    from brain.connectors.google.base import GoogleConnector  # noqa: PLC0415 (lazy: no cycle)
 
-    Works without google libs importable: HttpError carries ``.resp.status``,
-    RefreshError is recognized by type name.
-    """
-    if type(exc).__name__ == "RefreshError" or "invalid_grant" in str(exc):
-        return GmailAuthError(f"refresh token rejected ({exc})")
-    resp = getattr(exc, "resp", None)
-    status = getattr(resp, "status", None)
-    if status is not None:
-        if status in (401,):
-            return GmailAuthError(f"gmail http {status}")
-        if status == 404:
-            return GmailLabelError("label or message not found (404)")
-        if status >= 500 or status == 429:
-            return GmailError(f"gmail http {status}")
-        content = getattr(exc, "content", b"") or b""
-        if b"Invalid label" in content or b"Requested entity was not found" in content:
-            return GmailLabelError("label not found")
-        return GmailError(f"gmail http {status}")
-    return GmailError(f"gmail call failed: {type(exc).__name__}: {exc}")
+    translated = GoogleConnector._translate_error(exc)
+    status = getattr(translated, "status", None)
+    if isinstance(translated, ConnectorAuthError):
+        return GmailAuthError(str(translated), status=status)
+    if status == 404:
+        return GmailLabelError(str(translated), status=status)
+    content = getattr(exc, "content", b"") or b""
+    if b"Invalid label" in content or b"Requested entity was not found" in content:
+        return GmailLabelError(str(translated), status=status)
+    return GmailError(str(translated), status=status)
 
 
 TokenLoader = Callable[[], str]
@@ -215,18 +221,21 @@ class RestGmailClient:
     def __init__(
         self,
         *,
-        token_loader: TokenLoader,
+        token_loader: TokenLoader | None = None,
         service_factory: ServiceFactory = default_service_factory,
         user_id: str = "me",
+        service: Any | None = None,
     ) -> None:
         self._token_loader = token_loader
         self._service_factory = service_factory
         self._user_id = user_id
-        self._service: Any = None
+        # Optional pre-built service (the connector passes the shared OAuth
+        # service it already built — ONE service per connector, not two).
+        self._service: Any = service
 
     def _get_service(self) -> Any:
         if self._service is None:
-            token = self._token_loader()
+            token = self._token_loader() if self._token_loader else None
             if not token:
                 raise GmailAuthError("no refresh token in the keychain — run brain gmail-auth")
             self._service = self._service_factory(token, self._user_id)
@@ -274,18 +283,58 @@ class RestGmailClient:
             .attachments()
             .get(userId=self._user_id, messageId=message_id, id=attachment_id)
         )
-        # Real shape: {'size': int, 'data': base64url}. A missing/empty 'data'
-        # is an error, never an empty attachment (F3 round 1).
-        data = raw.get("data") if isinstance(raw, dict) else None
-        if not data:
-            raise GmailError(f"attachment {attachment_id} of {message_id} carries no 'data'")
-        import base64  # noqa: PLC0415
+        return decode_attachment_payload(raw, attachment_id, message_id)
 
-        return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+    def list_history(self, *, start_history_id: str, label_id: str) -> Iterator[dict[str, Any]]:
+        """Yield raw history pages after ``start_history_id`` for one label.
+
+        The cursor-invalid case (an expired historyId) surfaces as a 404 —
+        the CALLER (the connector) decides what a 404 means here; the client
+        only translates transport errors.
+        """
+        service = self._get_service()
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "startHistoryId": start_history_id,
+                "labelId": label_id,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            page = self._execute(service.users().history().list(userId=self._user_id, **params))
+            yield page
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                return
+
+    def profile_history_id(self) -> str | None:
+        """The mailbox's CURRENT historyId (a fresh sync cursor)."""
+        service = self._get_service()
+        raw = self._execute(service.users().getProfile(userId=self._user_id))
+        history_id = raw.get("historyId") if isinstance(raw, dict) else None
+        return str(history_id) if history_id else None
+
+
+def decode_attachment_payload(raw: Any, attachment_id: str, message_id: str) -> bytes:
+    """Decode an attachments.get response (real shape: {'size', 'data': b64url}).
+
+    A missing/empty 'data' is an error, never an empty attachment (F3).
+    Module-level so the connector's fetch_attachment reuses the same decode.
+    """
+    import base64  # noqa: PLC0415
+
+    data = raw.get("data") if isinstance(raw, dict) else None
+    if not data:
+        raise GmailError(f"attachment {attachment_id} of {message_id} carries no 'data'")
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 def _header(payload: dict[str, Any], name: str) -> str | None:
-    for header in payload.get("payload", {}).get("headers", []):
+    # NOTE: callers pass the MESSAGE payload (raw["payload"]), so headers sit
+    # directly on it. (The old double lookup payload["payload"]["headers"]
+    # never matched anything — headers parsed as None; fixed with the C5
+    # payload-fixture tests.)
+    for header in payload.get("headers", []):
         if header.get("name", "").lower() == name.lower():
             return header.get("value")
     return None
@@ -356,11 +405,6 @@ def _header_block(payload: dict[str, Any]) -> bytes:
 
 
 def _iter_attachment_parts(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    body = payload.get("body", {}) or {}
-    if body.get("attachmentId"):
-        yield payload
-    for part in payload.get("parts", []) or []:
-        yield from _iter_attachment_parts(part)
     body = payload.get("body", {}) or {}
     if body.get("attachmentId"):
         yield payload

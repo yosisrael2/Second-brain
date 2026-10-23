@@ -157,7 +157,7 @@ def test_sync_dry_run_prints_records_and_writes_nothing(
             )
         ]
     )
-    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None: connector)
 
     with SessionLocal() as session:
         before_items = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
@@ -189,7 +189,7 @@ def test_sync_runs_the_runner_end_to_end_with_a_registered_connector(
     from brain.db.session import SessionLocal
 
     connector = _StubGcal(batches=[FetchResult(records=[make_record()], next_cursor="c1")])
-    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None: connector)
 
     assert cli.main(["connectors", "sync", "gcal"]) == 0
     out = capsys.readouterr().out

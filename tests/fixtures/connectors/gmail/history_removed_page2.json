@@ -1,0 +1,14 @@
+{
+  "history": [
+    {
+      "id": "9003",
+      "labelsRemoved": [
+        {
+          "labelIds": ["Label_school"],
+          "message": {"id": "m2", "threadId": "t2"}
+        }
+      ]
+    }
+  ],
+  "historyId": "9004"
+}

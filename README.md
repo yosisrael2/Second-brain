@@ -440,6 +440,14 @@ a whole batch succeeds; an auth error stops the connector (`state.last_error`
 says re-consent is needed), transient errors back off. `reset=True` batches
 are upserted as-is — deletions are never inferred from absent records.
 
+Shipped sources:
+
+| name (items.source) | module | scope | cursor | notes |
+| --- | --- | --- | --- | --- |
+| `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner |
+
+### How to add a new source (the recipe, ≤15 lines)
+
 ### How to add a new source (the recipe, ≤15 lines)
 
 1. `src/brain/connectors/google/<name>.py`: `class MyConnector(GoogleConnector):`
