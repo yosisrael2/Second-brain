@@ -342,7 +342,44 @@ def _telegram(whoami_hint: bool) -> int:
 EX_CONFIG = 78  # sysexits: permanent configuration problem — launchd must NOT restart
 
 
-def _cli_attachment_service(settings: Any) -> Any:
+def _side_process_indexer() -> Any:
+    """The real vector indexer for side-process pollers, or None.
+
+    The API and the telegram bot index through the app-lifetime deps
+    singletons; a side process builds the same one. When that is impossible
+    (no embedder/qdrant), polling still works — indexing defers to
+    'brain reindex' (the poller's best-effort policy).
+    """
+    try:
+        from brain.api import deps  # noqa: PLC0415
+
+        return deps.get_item_indexer()
+    except Exception as exc:  # noqa: BLE001 — fallback, but never a silent one
+        logger.warning(
+            "whatsapp: vector indexer unavailable (%s: %s); conversations will be "
+            "indexed by 'brain reindex'",
+            type(exc).__name__,
+            exc,
+        )
+        try:
+            from brain.ops import record_event  # noqa: PLC0415
+
+            record_event(
+                "whatsapp",
+                "indexer_unavailable",
+                ok=False,
+                detail={"error": type(exc).__name__, "message": str(exc)},
+            )
+        except Exception as tele_exc:  # noqa: BLE001 — telemetry must not mask the fallback
+            logger.warning(
+                "whatsapp: could not record indexer_unavailable (%s: %s)",
+                type(tele_exc).__name__,
+                tele_exc,
+            )
+        return None
+
+
+def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
     """F3: the attachments core for side-process pollers (own queue/budget)."""
     from brain.services.attachments import (  # noqa: PLC0415
         AttachmentFileStore,
@@ -355,7 +392,7 @@ def _cli_attachment_service(settings: Any) -> Any:
         store=AttachmentFileStore(root=settings.files_dir),
         pdf_reader=PdfTextLayerReader(),
         claude_reader=ClaudeFileReader(),
-        indexer=None,  # vectors come from 'brain reindex' when run as a side process
+        indexer=indexer,  # attachment items are indexed by the service itself
         session_factory=SessionLocal,
         daily_budget=settings.attachment_daily_budget,
     )
@@ -388,6 +425,7 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
     )
 
     settings = get_settings()
+    indexer = _side_process_indexer()
     # One definition of 'live store' (brain.config): the CLI must not silently
     # write the live store either; run-whatsapp.sh exports BRAIN_ALLOW_LIVE=1.
     try:
@@ -434,13 +472,13 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
             state=WhatsAppStateRepository(session),
             items=ItemsRepository(session),
             memory=MemoryRepository(session),
-            indexer=None,  # vectors come from 'brain reindex' when run as a side process
+            indexer=indexer,  # side processes index like the API does (best-effort)
             zone_name=settings.timezone,
             gap_minutes=settings.whatsapp_gap_minutes,
             overlap_minutes=settings.whatsapp_overlap_minutes,
             backfill_since=backfill,
             commit=True,
-            attachments=_cli_attachment_service(settings),
+            attachments=_cli_attachment_service(settings, indexer=indexer),
             media_client=WhatsAppMediaClient(
                 settings.whatsapp_bridge_url,
                 store_root=Path(settings.whatsapp_bridge_db).expanduser().parent,

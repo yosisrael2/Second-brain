@@ -19,6 +19,12 @@ cd "$ROOT" || exit 1
 # Test seam: BRAIN_BIN overrides the binary path (tests never touch the venv).
 BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
 
+# The bot builds a vector store and DB sessions at construction, and the
+# construction-time live-store guard refuses the live store without an
+# explicit opt-in — the bot IS the real service, so opt in here (same
+# contract as run-server.sh).
+export BRAIN_ALLOW_LIVE=1
+
 [ -x "$BRAIN" ] || {
   echo "run-bot: $BRAIN missing — provision the venv first" >&2
   exit 0  # EX_CONFIG-shaped, but as 0: a missing venv is permanent; never restart-loop

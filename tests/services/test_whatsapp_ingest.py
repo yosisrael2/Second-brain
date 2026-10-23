@@ -225,13 +225,14 @@ def _poller(
     bridge: BridgeStore,
     *,
     gap: int = DEFAULT_GAP_MINUTES,
+    indexer: Any | None = None,
 ) -> WhatsAppPoller:
     return WhatsAppPoller(
         bridge=bridge,
         state=world.state,
         items=world.items,
         memory=world.memory_repo,
-        indexer=FakeIndexer(),
+        indexer=indexer if indexer is not None else FakeIndexer(),
         zone_name=ZONE,
         gap_minutes=gap,
         commit=True,
@@ -470,6 +471,54 @@ def test_new_message_after_live_edge_is_ingested(tmp_path: Path, world: SimpleWo
     assert "fresh" in item.raw_text
     # The skipped history message is not re-ingested via the overlap window.
     assert "old" not in item.raw_text
+
+
+class _BoomIndexer:
+    """An indexer whose vector store is down: index() always raises."""
+
+    def index(self, item: MemoryItem) -> bool:
+        raise RuntimeError("qdrant down")
+
+
+def test_poll_indexes_created_and_updated_conversations(tmp_path: Path, world: SimpleWorld):
+    """The poller indexes every conversation it creates AND every update in
+    place — otherwise polled conversations stay invisible to semantic search
+    until someone happens to run 'brain reindex'."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="hello")],
+    )
+    fake = FakeIndexer()
+    poller = _poller(world, BridgeStore(path), indexer=fake)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init at the live edge
+    _add_row(path, _bridge_row("m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC), content="fresh"))
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # creates the conversation
+    _add_row(path, _bridge_row("m3", datetime(2026, 10, 22, 13, 30, tzinfo=UTC), content="more"))
+    poller.poll(now=datetime(2026, 10, 22, 14, 0, tzinfo=UTC))  # appends: update in place
+    assert world.item_count() == 1
+    item = world.session.query(MemoryItem).one()
+    assert [str(i.id) for i in fake.indexed] == [str(item.id), str(item.id)]
+
+
+def test_indexer_failure_never_blocks_the_poll(tmp_path: Path, world: SimpleWorld):
+    """Same best-effort policy as capture: a down vector store degrades to
+    'indexed by the next brain reindex', the poll still completes."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="hello")],
+    )
+    poller = _poller(world, BridgeStore(path), indexer=_BoomIndexer())
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init
+    _add_row(path, _bridge_row("m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC), content="fresh"))
+    result = poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # must not raise
+    assert sum(r.created for r in result) == 1
+    assert world.item_count() == 1
 
 
 def test_cursor_idempotent_across_restarts(tmp_path: Path, world: SimpleWorld):

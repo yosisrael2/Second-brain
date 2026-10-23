@@ -82,8 +82,14 @@ class TestLibShPhysicalRoot:
         # Fake server: real process whose command line matches our uvicorn
         # pattern, cwd = repo (physical).
         proc = subprocess.Popen(
-            ["python3", "-c", "import time; time.sleep(30)",
-             "uvicorn brain.main:app", "--port", "27800"],
+            [
+                "python3",
+                "-c",
+                "import time; time.sleep(30)",
+                "uvicorn brain.main:app",
+                "--port",
+                "27800",
+            ],
             cwd=repo,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -112,7 +118,7 @@ class TestLibShPhysicalRoot:
         shutil.copy(SCRIPTS / "lib.sh", repo / "scripts" / "lib.sh")
         alias = tmp_path / "alias2"
         alias.symlink_to(repo)
-        code = f"cd {alias} && source scripts/lib.sh && " 'printf "%s" "$LIB_ROOT"'
+        code = f'cd {alias} && source scripts/lib.sh && printf "%s" "$LIB_ROOT"'
         result = _bash_snippet(code)
         assert result.returncode == 0, result.stderr
         assert result.stdout == str(repo), (
@@ -364,13 +370,35 @@ class TestServiceOtherCommands:
         assert "not installed" in result.stdout
 
     def test_restart_kickstarts_both_labels(self, tmp_path):
-        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=_service_env(tmp_path))
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        for label in ("com.secondbrain.api", "com.secondbrain.telegram"):
+            (plist_dir / f"{label}.plist").write_text("<plist/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         calls = _calls(tmp_path)
         assert any("kickstart" in c and "-k" in c and "com.secondbrain.api" in c for c in calls)
         assert any(
             "kickstart" in c and "-k" in c and "com.secondbrain.telegram" in c for c in calls
         )
+
+    def test_restart_skips_labels_without_plists(self, tmp_path):
+        """'restart' must work BEFORE 'install': labels with no plist are
+        skipped with a note instead of failing the whole command."""
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.api.plist").write_text("<plist/>\n")
+        # telegram + whatsapp deliberately not installed
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = _calls(tmp_path)
+        assert any("kickstart" in c and "com.secondbrain.api" in c for c in calls)
+        assert not any("com.secondbrain.telegram" in c for c in calls)
+        assert not any("com.secondbrain.whatsapp" in c for c in calls)
+        assert "skipped" in result.stdout
+        assert "com.secondbrain.whatsapp" in result.stdout
 
     def test_logs_tails_both_components(self, tmp_path):
         env = _service_env(tmp_path)
