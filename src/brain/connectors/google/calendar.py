@@ -269,9 +269,17 @@ class GCalConnector(GoogleConnector):
             days=self._settings().brain_gcal_past_days
         )
         records: list[SourceRecord] = []
-        next_states: dict[str, dict[str, Any]] = {}
+        allowlist = self._calendar_ids()
+        # Seed with every allowlisted calendar's STORED state: calendars the
+        # limit never let us walk this run keep their held sync/page token —
+        # dropping it would downgrade them to full re-lists, and a full list
+        # is not a change feed (their deletions would be missed). Walked
+        # calendars overwrite their entry below; dropped ones vanish.
+        next_states: dict[str, dict[str, Any]] = {
+            cal: calendar_states[cal] for cal in allowlist if cal in calendar_states
+        }
         reset = False
-        for calendar_id in self._calendar_ids():
+        for calendar_id in allowlist:
             if len(records) >= limit:
                 break
             state = calendar_states.get(calendar_id) or {}

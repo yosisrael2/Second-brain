@@ -983,3 +983,33 @@ def test_walk_stopped_at_a_page_boundary_produces_no_gaps_or_repeats(
     assert (first.created, second.created) == (250, 50)
     items = h.repo.list(item_type=None, project=None, status=None, limit=500, offset=0)
     assert len(items) == 300  # every instance exactly once
+
+
+def test_unwalked_calendars_keep_their_stored_state(monkeypatch: pytest.MonkeyPatch):
+    """RED (re-review of #55 @ f4005cc): when the limit stops the calendar
+    loop, the calendars AFTER the break must keep their stored state — a
+    lost sync token would silently downgrade them to full re-lists, and a
+    full list is not a change feed (deletions would be missed)."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary, secondary")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue_page("primary", "", {"items": _instance_page(0, 250), "nextPageToken": "p2"})
+    conn = _connector(fake)
+    cursor = json.dumps(
+        {
+            "cutoff": _FROZEN_CUTOVER.isoformat(),
+            "calendars": {
+                "primary": _state(None, None),  # never synced
+                "secondary": _state("S_B", None),  # holds a sync token
+            },
+        }
+    )
+
+    result = conn.fetch(cursor, limit=100)
+
+    # primary filled the batch: boundary stop, resume position stored...
+    states = json.loads(result.next_cursor or "{}")["calendars"]
+    assert states["primary"] == {"sync_token": None, "page_token": "p2", "mode": "full"}
+    # ...and secondary did NOT lose its held sync token.
+    assert states["secondary"] == {"sync_token": "S_B", "page_token": None, "mode": "incr"}
+    assert all(call["calendarId"] == "primary" for call in fake.calls)
