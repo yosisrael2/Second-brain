@@ -18,7 +18,7 @@ from typing import Any, Protocol
 from brain import ops
 from brain.ai.jev import JevError
 
-TRIAGE_VERSION = "triage-v1"
+TRIAGE_VERSION = "triage-v2"
 # Below this Jev confidence the LLM gets the final say (item 36: LLM only
 # when Jev is unsure — a band keeps the cheap path dominant).
 JEV_CONFIDENT_BAND = 0.9
@@ -34,20 +34,43 @@ _TRIAGE_QUESTION = (
 )
 _TRIAGE_CRITERIA: dict[str, str] = {
     "relevant": (
-        "carries information worth remembering: school/kids logistics that "
-        "require action, health, dates, plans, decisions, requests"
+        "anything with a date/time/place change, a request to parents, a class "
+        "activity, a safety/health notice, or naming one of OUR kids"
     ),
     "noise": (
-        "small talk, thanks/emoji-only, stickers, forwarded chain mail, "
-        "logistics among other parents that requires nothing from the family"
+        "pure reactions (thanks, emoji, 'how fun', '+1', 'told her'); media-only "
+        "messages ([image]/[document]/[sticker] with no text or a one-word "
+        "caption) unless a date/task/event/change is stated; logistics about "
+        "OTHER families' children (pick-ups, 'tell X her grandma is coming'); "
+        "lost & found / giveaways / marketplace; contact sheets, phone lists, "
+        "group admin"
     ),
 }
 # The strict, versioned LLM prompt: ONE call, JSON-only answer.
 _PROMPT_TEMPLATE = """You triage a WhatsApp conversation for a family's memory system.
-Decide whether the conversation is RELEVANT (school/kids logistics requiring
-action, health, dates, plans, decisions, requests) or NOISE (small talk,
-thanks/emoji-only, stickers, chain mail, other parents' logistics that
-require nothing).
+Our children's names are known to the system; messages about other families'
+children (pick-up arrangements, 'tell X her grandma is coming', 'Y is waiting
+at the gate') are NOISE.
+
+Label RELEVANT when the conversation carries any of:
+- a date, time or place change; a plan or event (even a tentative one)
+- a request directed at parents (bring something, sign, volunteer, confirm)
+- a class or school activity description worth remembering
+- a safety or health notice
+- something about one of our kids by name
+
+Label NOISE when the conversation is any of:
+- pure reactions: thanks, emoji-only, 'how fun', '+1', 'told her'
+- media-only: an [image]/[document]/[sticker] placeholder with no text or only
+  a one-word caption, UNLESS the caption or surrounding messages state a date,
+  task, event or change (the attachment itself is triaged separately later)
+- logistics about other families' children: pick-up arrangements, relays like
+  'tell X her grandma is coming', 'Y is waiting at the gate'
+- lost & found, giveaways, marketplace offers
+- contact sheets, phone lists, group-admin notices
+
+When in doubt between the two, prefer RELEVANT: hiding something real is worse
+than showing chatter.
 
 Conversation:
 {text}
