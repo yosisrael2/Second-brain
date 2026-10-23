@@ -77,7 +77,17 @@ def world_fixture(database: None) -> World:
     _wipe(session)
     repo = ItemsRepository(session)
     memory = MemoryService(MemoryRepository(session))
-    yield World(repo, session, memory, EnrichmentService(repo, session, memory=memory))
+    yield World(
+        repo,
+        session,
+        memory,
+        # the default service carries the SAME pinned tz as with_extractor:
+        # tests that run world.service first and with_extractor second must
+        # resolve dates in ONE zone (CI runs UTC; the runner's local zone
+        # must never leak into child-date identity — the immutability test
+        # caught this on CI).
+        EnrichmentService(repo, session, memory=memory, timezone="Asia/Jerusalem"),
+    )
     session.rollback()
     session.close()
     _wipe(session)
