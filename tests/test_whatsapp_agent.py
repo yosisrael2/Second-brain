@@ -365,7 +365,6 @@ class TestServiceWhatsappAgent:
 
 def _healthy_whatsapp(**overrides: object) -> dict[str, object]:
     raw: dict[str, object] = {
-        "configured": True,
         "interval_s": 30.0,
         "heartbeat_age_s": 5.0,
         "last_poll_age_s": 5.0,
@@ -409,26 +408,36 @@ class TestWhatsappHealthComponent:
         entry = body["components"]["whatsapp"]
         assert entry["status"] == "ok"
 
-    def test_unconfigured_is_disabled_not_down(self):
-        entry = self._payload({"configured": False})["components"]["whatsapp"]
+    def test_health_truth_is_the_poller_heartbeat_not_the_api_env(self):
+        """The poller is configured by run-whatsapp.sh, which the API process
+        cannot see — the heartbeat is the ground truth, NOT this process's
+        WHATSAPP_BRIDGE_DB (that inference reported 'disabled' for a RUNNING
+        poller in the live cockpit, 2026-10-23)."""
+        body = self._payload(
+            {"interval_s": 30.0, "heartbeat_age_s": 5.0, "last_poll_age_s": 5.0, "channels": 11}
+        )
+        assert body["components"]["whatsapp"]["status"] == "ok"
+
+    def test_no_heartbeat_ever_is_disabled(self):
+        entry = self._payload(_healthy_whatsapp(heartbeat_age_s=None, last_poll_age_s=None))[
+            "components"
+        ]["whatsapp"]
         assert entry["status"] == "disabled"
+        assert "never heartbeated" in entry["summary"]
+
+    def test_stale_heartbeat_is_degraded(self):
+        """Past 3x the interval the poll loop is presumed stuck: degraded. The
+        heartbeat fires every poll cycle, so a stale heartbeat means the loop
+        stopped — an operational state, not a config problem (not 'down')."""
+        entry = self._payload(_healthy_whatsapp(last_poll_age_s=300.0, heartbeat_age_s=300.0))[
+            "components"
+        ]["whatsapp"]
+        assert entry["status"] == "degraded"
 
     def test_within_three_intervals_is_ok(self):
         """The manager's rule: healthy = last poll within 3x the interval."""
         entry = self._payload(_healthy_whatsapp(last_poll_age_s=75.0, heartbeat_age_s=75.0))
         assert entry["components"]["whatsapp"]["status"] == "ok"
-
-    def test_stale_poll_is_down(self):
-        entry = self._payload(_healthy_whatsapp(last_poll_age_s=300.0, heartbeat_age_s=300.0))[
-            "components"
-        ]["whatsapp"]
-        assert entry["status"] == "down"
-
-    def test_no_heartbeat_is_down(self):
-        entry = self._payload(_healthy_whatsapp(heartbeat_age_s=None, last_poll_age_s=None))[
-            "components"
-        ]["whatsapp"]
-        assert entry["status"] == "down"
 
     def test_background_labels_cover_the_whatsapp_agent(self):
         assert "com.secondbrain.whatsapp" in ops_health.BACKGROUND_LABELS

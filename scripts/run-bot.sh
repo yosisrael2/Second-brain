@@ -24,6 +24,9 @@ BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
 # explicit opt-in — the bot IS the real service, so opt in here (same
 # contract as run-server.sh).
 export BRAIN_ALLOW_LIVE=1
+# launchd log files must stream, not buffer in 4kB blocks (run-server.sh does
+# the same; without it the bot's log can read as empty while it runs fine).
+export PYTHONUNBUFFERED=1
 
 [ -x "$BRAIN" ] || {
   echo "run-bot: $BRAIN missing — provision the venv first" >&2
