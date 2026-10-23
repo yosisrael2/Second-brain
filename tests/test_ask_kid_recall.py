@@ -222,7 +222,9 @@ def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
     for n in range(20):
         repo.add(
             MemoryItem(
-                raw_text=f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' ברקת - הורים / מעין: הודעה מספר {n}"
+                raw_text=(
+                    f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' ברקת - הורים / מעין: הודעה מספר {n}"
+                )
             )
         )
     search = RecordingSearch([])
