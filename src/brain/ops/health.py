@@ -43,6 +43,7 @@ class HealthContext:
         docker: Callable[[], dict[str, Any]] | None = None,
         disk: Callable[[], dict[str, Any]] | None = None,
         background: Callable[[], dict[str, Any]] | None = None,
+        whatsapp: Callable[[], dict[str, Any]] | None = None,
         email: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
@@ -54,6 +55,7 @@ class HealthContext:
         self.docker = docker or _docker_check
         self.disk = disk or _disk_check
         self.background = background or _background_check
+        self.whatsapp = whatsapp or _whatsapp_check
         self.email = email or _email_check
 
 
@@ -99,9 +101,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", "collection missing — run brain reindex", raw)
         vectors, items = raw.get("vectors"), raw.get("items")
         if isinstance(vectors, int) and isinstance(items, int) and vectors != items:
-            return _entry(
-                "degraded", f"vectors {vectors}/{items} — run brain reindex", raw
-            )
+            return _entry("degraded", f"vectors {vectors}/{items} — run brain reindex", raw)
         if not raw.get("dims_ok", True):
             return _entry("degraded", "embedder dim != collection dim", raw)
         return _entry("ok", f"vectors {vectors}/{items}", raw)
@@ -131,9 +131,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", f"{provider} — last call failed", raw)
         if activity is not None:
             return _entry("ok", f"{provider} · answered {activity['kind']}", raw)
-        return _entry(
-            "not probed", f"{provider} configured — run a probe to verify", raw
-        )
+        return _entry("not probed", f"{provider} configured — run a probe to verify", raw)
     if component == "telegram":
         if not raw.get("token_set", False):
             return _entry("disabled", "TELEGRAM_BOT_TOKEN unset", raw)
@@ -147,6 +145,25 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         if age > 60:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"heartbeat {age:.0f}s ago", raw)
+    if component == "whatsapp":
+        if not raw.get("configured", False):
+            return _entry("disabled", "WHATSAPP_BRIDGE_DB unset — poller off", raw)
+        interval = raw.get("interval_s") or 30.0
+        if not isinstance(interval, (int, float)) or interval <= 0:
+            interval = 30.0
+        heartbeat_age = raw.get("heartbeat_age_s")
+        if heartbeat_age is None:
+            return _entry("down", "poller never heartbeated", raw)
+        if heartbeat_age > 3 * interval:
+            return _entry("down", f"heartbeat {heartbeat_age:.0f}s ago", raw)
+        last_poll_age = raw.get("last_poll_age_s")
+        if last_poll_age is None:
+            return _entry("degraded", "up but never polled", raw)
+        if last_poll_age > 3 * interval:
+            return _entry("degraded", f"last poll {last_poll_age:.0f}s ago", raw)
+        channels = raw.get("channels")
+        suffix = f" · {channels} channel(s)" if isinstance(channels, int) else ""
+        return _entry("ok", f"polled {last_poll_age:.0f}s ago{suffix}", raw)
     if component == "email":
         if not raw.get("label_set", False):
             return _entry("disabled", "GMAIL_LABEL_ID unset", raw)
@@ -206,12 +223,11 @@ def run_health_checks(
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
+        "whatsapp": _safe(context.whatsapp),
     }
     components = {name: _derive_status(name, data) for name, data in raw.items()}
     downs = [name for name, entry in components.items() if entry["status"] == "down"]
-    degradeds = [
-        name for name, entry in components.items() if entry["status"] == "degraded"
-    ]
+    degradeds = [name for name, entry in components.items() if entry["status"] == "degraded"]
     overall = "ok"
     if degradeds:
         overall = "degraded"
@@ -314,7 +330,8 @@ def _qdrant_check() -> dict[str, Any]:
 
     settings = get_settings()
     client = QdrantClient(
-        url=settings.qdrant_url, api_key=unwrap_secret(settings.qdrant_api_key),
+        url=settings.qdrant_url,
+        api_key=unwrap_secret(settings.qdrant_api_key),
         timeout=settings.qdrant_timeout_s,
     )
     try:
@@ -478,11 +495,52 @@ def _telegram_check() -> dict[str, Any]:
     return details
 
 
+def _whatsapp_check() -> dict[str, Any]:
+    """Cheap poller health: configured?, heartbeat + last poll ages, channels.
+
+    Healthy = last poll within 3x the poll interval AND a fresh heartbeat
+    (both signals come from the poller itself: heartbeat per cycle,
+    whatsapp_poll_state per channel).
+    """
+    try:
+        settings = get_settings()
+    except Exception:  # noqa: BLE001 — broken settings must not crash health
+        return {"configured": False}
+    configured = bool(settings.whatsapp_bridge_db.strip())
+    details: dict[str, Any] = {
+        "configured": configured,
+        "interval_s": settings.whatsapp_poll_interval_s,
+    }
+    if not configured:
+        return details
+    details["heartbeat_age_s"] = ops.heartbeat_age_seconds("whatsapp")
+    try:
+        from sqlalchemy import text  # noqa: PLC0415
+
+        from brain.db.session import engine  # noqa: PLC0415
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT max(last_poll_at), count(*) FROM whatsapp_poll_state")
+            ).one()
+    except Exception:  # noqa: BLE001 — table missing/poll never ran: ages stay None
+        return details
+    last_poll_at, channels = row[0], int(row[1])
+    details["channels"] = channels
+    if last_poll_at is not None:
+        details["last_poll_age_s"] = max(0.0, (datetime.now(UTC) - last_poll_at).total_seconds())
+        details["last_poll_at"] = _iso(last_poll_at)
+    return details
+
+
 def _docker_check() -> dict[str, Any]:
     try:
         out = subprocess.run(
             ["docker", "compose", "ps", "--format", "json", "--all"],
-            capture_output=True, text=True, timeout=3, check=False,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
         )
         if out.returncode != 0:
             return {"available": False}
@@ -511,8 +569,12 @@ def _compose_project() -> str | None:
     return os.environ.get("COMPOSE_PROJECT_NAME")
 
 
-# LaunchAgent labels managed by scripts/service.sh (the background-service pair).
-BACKGROUND_LABELS = ("com.secondbrain.api", "com.secondbrain.telegram")
+# LaunchAgent labels managed by scripts/service.sh (the background services).
+BACKGROUND_LABELS = (
+    "com.secondbrain.api",
+    "com.secondbrain.telegram",
+    "com.secondbrain.whatsapp",
+)
 
 
 def _background_check() -> dict[str, Any]:
@@ -529,7 +591,10 @@ def _background_check() -> dict[str, Any]:
         try:
             out = subprocess.run(
                 ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-                capture_output=True, text=True, timeout=3, check=False,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return {"available": False, "agents": {}}
@@ -568,9 +633,7 @@ def _derive_background(raw: dict[str, Any]) -> dict[str, Any]:
     agents: dict[str, Any] = raw.get("agents") or {}
     installed = {label: info for label, info in agents.items() if info}
     if not installed:
-        return _entry(
-            "disabled", "launchd agents not installed — scripts/service.sh install", raw
-        )
+        return _entry("disabled", "launchd agents not installed — scripts/service.sh install", raw)
     total = len(installed)
     running = [label for label, info in installed.items() if info.get("state") == "running"]
     stopped = [
@@ -583,9 +646,7 @@ def _derive_background(raw: dict[str, Any]) -> dict[str, Any]:
         return _entry("ok", f"{total}/{total} agents running", raw)
     if not running:
         return _entry("down", f"0/{total} agents running — {', '.join(stopped)}", raw)
-    return _entry(
-        "degraded", f"{len(running)}/{total} agents running — {', '.join(stopped)}", raw
-    )
+    return _entry("degraded", f"{len(running)}/{total} agents running — {', '.join(stopped)}", raw)
 
 
 def _disk_check() -> dict[str, Any]:
@@ -597,9 +658,12 @@ def _disk_check() -> dict[str, Any]:
     cache = Path.home() / ".cache" / "fastembed"
     if cache.exists():
         fastembed_free_gb = shutil.disk_usage(cache).free / 1e9
-    return {"free_gb": round(free_gb, 1), "fastembed_free_gb": (
-        round(fastembed_free_gb, 1) if fastembed_free_gb is not None else None
-    )}
+    return {
+        "free_gb": round(free_gb, 1),
+        "fastembed_free_gb": (
+            round(fastembed_free_gb, 1) if fastembed_free_gb is not None else None
+        ),
+    }
 
 
 # --- on-demand probes ---------------------------------------------------------
@@ -633,16 +697,29 @@ def run_probe(component: str, ctx: HealthContext | None = None) -> dict[str, Any
         latency = round((time.perf_counter() - started) * 1000, 1)
         # Record the probe so config-only components become "proven" (never raises).
         ops.record_event(
-            component, "probe", bool(result.get("ok", True)), latency_ms=latency,
-            detail={k: result[k] for k in ("summary", "dims", "model", "confidence")
-                    if result.get(k) is not None},
+            component,
+            "probe",
+            bool(result.get("ok", True)),
+            latency_ms=latency,
+            detail={
+                k: result[k]
+                for k in ("summary", "dims", "model", "confidence")
+                if result.get(k) is not None
+            },
         )
-        return {"component": component, "ok": result.get("ok", True),
-                "latency_ms": latency, **result, "checked_at": _now()}
+        return {
+            "component": component,
+            "ok": result.get("ok", True),
+            "latency_ms": latency,
+            **result,
+            "checked_at": _now(),
+        }
     except Exception as exc:  # noqa: BLE001  (probes report failures, never raise)
         return {
-            "component": component, "ok": False,
-            "error": f"{type(exc).__name__}: {exc!s}"[:200], "checked_at": _now(),
+            "component": component,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc!s}"[:200],
+            "checked_at": _now(),
         }
 
 
@@ -656,8 +733,12 @@ def _probe_embedder() -> dict[str, Any]:
     started = time.perf_counter()
     vector = deps.get_embedder().embed(_PROBE_EMBED_TEXT)
     latency = round((time.perf_counter() - started) * 1000, 1)
-    return {"ok": True, "dims": len(vector), "latency_ms": latency,
-            "summary": f"embedded {len(vector)} dims"}
+    return {
+        "ok": True,
+        "dims": len(vector),
+        "latency_ms": latency,
+        "summary": f"embedded {len(vector)} dims",
+    }
 
 
 def _probe_jev() -> dict[str, Any]:
@@ -673,8 +754,7 @@ def _probe_jev() -> dict[str, Any]:
     return {
         "ok": result.get("confidence", 0) > 0,
         "labels": {
-            k: str(v) for k, v in result.items()
-            if k in {"type", "importance", "actionability"}
+            k: str(v) for k, v in result.items() if k in {"type", "importance", "actionability"}
         },
         "confidence": result.get("confidence"),
         "latency_ms": latency,

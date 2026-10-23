@@ -23,6 +23,7 @@ const state = {
   countdown: 5,
   health: null,
   flow: null,
+  whatsapp: null,
   events: { events: [], total: 0, offset: 0, limit: 25 },
   stats: null,
   traceHighlight: null,
@@ -99,6 +100,10 @@ async function refreshAll() {
       state.health = health;
       renderOverall();
       if (state.tab === "health") renderHealth();
+    }).catch(() => {}),
+    api("/ops/whatsapp").then((wa) => {
+      state.whatsapp = wa;
+      if (state.tab === "health") renderWhatsappCard();
     }).catch(() => {}),
     api("/ops/flow").then((flow) => {
       state.flow = flow;
@@ -453,6 +458,36 @@ function flowNodes(flow, pos) {
 // ---------- health tab ----------
 
 const PROBEABLE = ["postgres", "qdrant", "embedder", "jev", "llm", "telegram", "docker", "disk"];
+
+function renderWhatsappCard() {
+  // PR D1b: per-channel cursor/counts from GET /ops/whatsapp. The card hides
+  // itself when the poller was never configured (no state rows at all).
+  const card = $("whatsapp-card");
+  const wa = state.whatsapp;
+  if (!card || !wa) return;
+  const channels = wa.channels || [];
+  if (!channels.length) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const healthEntry = state.health?.components?.whatsapp;
+  const chip = $("whatsapp-chip");
+  if (healthEntry) {
+    chip.textContent = healthEntry.status;
+    chip.className = `chip ${healthEntry.status}`;
+  }
+  const lastPoll = wa.last_poll_at ? ago(wa.last_poll_at) : "never";
+  $("whatsapp-summary").textContent =
+    `last poll ${lastPoll} · ${channels.length} channel(s)`;
+  const lines = channels.map((channel) =>
+    `${channel.channel || channel.chat_jid}\t` +
+    `cursor ${channel.cursor_at ? ago(channel.cursor_at) : "—"}\t` +
+    `${channel.messages_seen} msgs · ${channel.conversations_created} new · ` +
+    `${channel.conversations_updated} updated`
+  );
+  $("whatsapp-channels").textContent = lines.join("\n");
+}
 
 function renderHealth() {
   const health = state.health;

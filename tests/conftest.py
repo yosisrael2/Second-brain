@@ -222,3 +222,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     except AssertionError as exc:
         print(f"\nERROR: {exc}")
         session.testsfailed = max(session.testsfailed or 0, 1)
+
+# F3: the attachments-core fixture (tests/test_attachments.py) shared with the
+# poller test modules. Module-level alias — pytest collects fixture objects by
+# value, so the same fixture instance is available as `svc_env` everywhere.
+from tests.test_attachments import svc_env_fixture as svc_env  # noqa: E402,F401

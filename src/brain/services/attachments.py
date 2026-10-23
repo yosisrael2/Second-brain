@@ -444,6 +444,28 @@ class AttachmentService:
     def queue_depth(self) -> int:
         return self._queue.qsize()
 
+    def submit(self, attachment_id: uuid.UUID) -> None:
+        """Queue one captured attachment for reading (budget-capped at drain)."""
+        self._queue.put_nowait(attachment_id)
+
+    def drain(self) -> int:
+        """Sync convenience for sync callers (pollers): drain the queue now.
+
+        Runs the async drain on a fresh event loop; the daily budget is
+        enforced inside ``process_pending`` exactly as elsewhere.
+        """
+        import asyncio  # noqa: PLC0415
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            raise RuntimeError(
+                "drain() is for sync callers; await process_pending() inside async code"
+            )
+        return asyncio.run(self.process_pending())
+
     async def process_pending(self) -> int:
         """Drain queued attachments while the daily budget allows."""
         processed = 0

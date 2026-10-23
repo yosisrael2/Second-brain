@@ -134,6 +134,9 @@ class Settings(BaseSettings):
     # into conversations (item 35); the overlap window (must stay smaller
     # than the gap) makes restarts idempotent.
     whatsapp_bridge_db: str = ""
+    # F3 (item 47): the bridge's local REST endpoint for media downloads
+    # (POST {url}/api/download). Read-only use only — never /api/send.
+    whatsapp_bridge_url: str = "http://127.0.0.1:8085"
     whatsapp_gap_minutes: int = 60
     whatsapp_overlap_minutes: int = 5
     whatsapp_poll_interval_s: float = 30.0
