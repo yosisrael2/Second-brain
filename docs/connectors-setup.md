@@ -102,11 +102,13 @@ BRAIN_GTASKS_LISTS=""
 GMAIL_CREDENTIALS_PATH=~/.config/second-brain/gmail-client-secret.json
 ```
 
-Note: the Calendar/Drive/Tasks connectors and their settings ship in their own
-PRs (C2/C3/C4); this file's branch carries the framework + the Gmail
-connector, so on that branch alone only `BRAIN_CONNECTORS` resolves. Every
-setting name above exists in code — see the PR description for the file:line
-grep proof per branch.
+Note: the framework lands in PR #53 (connectors base) — it registers no Google
+connector by itself, so on that branch alone only `BRAIN_CONNECTORS` resolves.
+Each connector ships in its own PR: Gmail (C5, worker_6), Calendar (C2,
+worker_9), Drive (C3, worker_10), Tasks (C4, worker_11) — together with the
+per-connector settings below. Every setting name in this file exists in code
+on the branch that ships it — the PR description carries the file:line grep
+proof per branch.
 
 ## First run (order matters)
 
@@ -142,10 +144,8 @@ is replaced, no other source needs separate setup.
 Sources report deletions (a cancelled event, a trashed file, a deleted task).
 Second Brain **never hard-deletes**:
 
-- the item stays in the database, its meta gains `source_deleted: true`, and
-  it is hidden from lists, search and ask exactly like superseded items
-  (`superseded_by` set to itself — the PR B mechanism);
-- if the source un-deletes the record later, the item is un-hidden
+- the item stays in the database and is hidden from lists, search and ask;
+- if the source un-deletes the record later, the item re-appears
   automatically;
 - items YOU deleted in Second Brain are never re-captured on the next sync;
 - records that were already deleted upstream are never created in the first
