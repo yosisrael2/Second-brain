@@ -666,7 +666,11 @@ class TestServiceEmailAgent:
         assert not (tmp_path / "LaunchAgents" / "com.secondbrain.email.plist").exists()
 
     def test_restart_kickstarts_the_email_agent(self, tmp_path):
-        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=_service_env(tmp_path))
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.email.plist").write_text("<plist/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         assert any("kickstart" in c and "com.secondbrain.email" in c for c in _calls(tmp_path))
 
