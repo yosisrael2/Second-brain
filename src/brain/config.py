@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8
+    # Attachments (design delta items 43-45): original files are stored OUTSIDE
+    # the repo and the DB, content-addressed by sha256, exact duplicates stored
+    # once. The dir must not live inside the checkout.
+    files_dir: Path = Path.home() / ".second-brain-files"
+    # Daily reading budget (Claude reads + text-layer extractions), item 44.
+    attachment_daily_budget: int = 50
     # Candidates fetched for the reranker before truncating to ask_top_k.
     # Reranking is cheap relative to the LLM call, and the reranker can only
     # surface what reaches it: a Hebrew email corpus scores an English
@@ -96,6 +102,11 @@ class Settings(BaseSettings):
     # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
     # ~4x documents.
     ask_recall_pool: int = 32
+    # Kid-recall leg of /ask (PR 0d): when a question names a confirmed kid,
+    # items from that kid's channels/class join the recall pool before the
+    # rerank. This caps how many extra candidates that leg may fetch —
+    # a ceiling, never a floor (fewer matches -> fewer candidates).
+    ask_kid_recall_limit: int = 16
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
@@ -150,8 +161,7 @@ class Settings(BaseSettings):
             part = part.strip()
             if part and not part.lstrip("+").isdigit():
                 raise ValueError(
-                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
-                    f"got {value!r}"
+                    f"TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, got {value!r}"
                 )
         return value
 

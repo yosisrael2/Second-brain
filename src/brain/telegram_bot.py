@@ -300,6 +300,7 @@ class BotServices:
     search: Any  # SearchService
     ask: Any  # AskService
     memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
+    attachments: Any = None  # AttachmentService (F1; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -343,6 +344,8 @@ def _live_services_factory() -> ServicesFactory:
                     search,
                     deps.get_llm_client(),
                     memory_block=memory.compact_block,
+                    memory=memory,
+                    items_repo=repo,
                 ),
                 memory=memory,
             )
@@ -480,6 +483,47 @@ class TelegramBot:
         reply = self._save_parsed(parsed)
         record_event("telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")})
         return Reply(text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard)
+
+    def capture_attachment_parent(self, text: str) -> Any:
+        """Capture the caption as an attachment's parent item (item 45).
+
+        The caption is the parent's text; on an exact-duplicate caption the
+        EXISTING item is the parent (ingest dedupe returns its snapshot).
+        """
+        parsed = parse_paste(text, tz=self._timezone)
+        with self._services_factory() as services:
+            items = services.ingest.capture_parsed(parsed, extra_meta={"channel": "telegram"})
+        return items[0]
+
+    def read_attachment(self, attachment_id: Any) -> Any:
+        """Run one attachment read through the (shared) attachment service."""
+        with self._services_factory() as services:
+            if services.attachments is None:
+                return "unsupported"
+            return services.attachments.process(attachment_id)
+
+    def attachment_summary(self, attachment_id: Any, status: str) -> Reply:
+        """Short follow-up for a finished (or failed) attachment read."""
+        with self._services_factory() as services:
+            att = services.attachments.get(attachment_id) if services.attachments else None
+        if att is None:
+            return Reply(text="📎 attachment saved")
+        name = _esc(att.filename)
+        if status == "done":
+            with self._services_factory() as services:
+                own = services.attachments.own_item(attachment_id)
+            description = (own.meta or {}).get("description", "") if own else ""
+            if description:
+                return Reply(text=f"📎 {name}\n{description}")
+            head = (att.text or "").strip().splitlines()
+            preview = head[0][:160] if head else ""
+            return Reply(text=f"📎 {name}\n{preview}" if preview else f"📎 {name}")
+        if status == "unsupported":
+            return Reply(text=f"📎 {name} — saved (searchable by filename only)")
+        if status == "too_large":
+            return Reply(text=f"📎 {name} — too large to read (over 20 MB), not stored")
+        # failed or queued
+        return Reply(text=f"📎 {name} — ⚠️ reading failed; recorded in ops")
 
     def _save_parsed(self, parsed: Any, *, forward: dict[str, Any] | None = None) -> Reply:
         extra_meta: dict[str, Any] = {"channel": "telegram"}
@@ -1591,6 +1635,12 @@ async def _download_text(tg: Any, document: Any) -> str:
     return bytes(file.download_as_bytearray()).decode("utf-8", errors="replace")
 
 
+async def _download_bytes(tg: Any, file_id: str) -> bytes:
+    """Download a file's raw bytes (attachments keep them verbatim)."""
+    file = await tg.get_file(file_id=file_id)
+    return bytes(file.download_as_bytearray())
+
+
 async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: str) -> Reply:
     """Run the (blocking) ask in a thread, sending TYPING every 4 seconds."""
     stop = asyncio.Event()
@@ -1612,6 +1662,49 @@ async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: s
     finally:
         stop.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def _handle_attachment(
+    tg: Any,
+    chat_id: int,
+    core: TelegramBot,
+    message: Any,
+    *,
+    filename: str,
+    mime: str | None,
+    file_id: str,
+) -> None:
+    """Item 45: save the attachment + caption-parent, reply, read, report."""
+    with core._services_factory() as services:
+        if services.attachments is None:  # feature not wired (older factory)
+            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            return
+        caption = getattr(message, "caption", None) or f"[attachment: {filename}]"
+        content = await _download_bytes(tg, file_id)
+        parent = core.capture_attachment_parent(caption)
+        att = services.attachments.capture(
+            parent.id,
+            content,
+            filename,
+            mime,
+            "telegram",
+            str(getattr(message, "message_id", "") or ""),
+        )
+        await _send(tg, chat_id, Reply(text="📎 saved, reading…"))
+        attachment_id = att.id
+    task = asyncio.create_task(_read_and_report(tg, chat_id, core, attachment_id))
+    logger.info("telegram: attachment %s reading in background", attachment_id)
+    del task  # fire and forget; failures are recorded on the row
+
+
+async def _read_and_report(tg: Any, chat_id: int, core: TelegramBot, attachment_id: Any) -> None:
+    """Read the attachment (budget/queue aware) and send a short summary."""
+    try:
+        status = await core.read_attachment(attachment_id)
+        await _send(tg, chat_id, core.attachment_summary(attachment_id, status))
+    except Exception as exc:  # noqa: BLE001 — never crash the bot on a follow-up
+        logger.error("telegram: attachment follow-up failed: %s", exc, exc_info=True)
+        record_event("telegram", "attachment_report", ok=False, detail={"error": str(exc)})
 
 
 async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
@@ -1653,14 +1746,31 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
             text = await _download_text(tg, document)
             await _send(tg, chat_id, core.capture_document(file_name, text))
         else:
-            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            await _handle_attachment(
+                tg,
+                chat_id,
+                core,
+                message,
+                filename=file_name,
+                mime=getattr(document, "mime_type", None),
+                file_id=document.file_id,
+            )
         return
-    if (
-        getattr(message, "photo", None)
-        or getattr(message, "voice", None)
-        or getattr(message, "video_note", None)
-    ):
-        await _send(tg, chat_id, core.unsupported("Photos, voice and video"))
+    photo = getattr(message, "photo", None)
+    if photo:
+        largest = photo[-1]  # Telegram lists sizes ascending; take the largest
+        await _handle_attachment(
+            tg,
+            chat_id,
+            core,
+            message,
+            filename="photo.jpg",
+            mime="image/jpeg",
+            file_id=largest.file_id,
+        )
+        return
+    if getattr(message, "voice", None) or getattr(message, "video_note", None):
+        await _send(tg, chat_id, core.unsupported("Voice and video"))
         return
     if message.text:
         if core.is_question(message.text):

@@ -19,11 +19,17 @@ from brain.ai.jev import JevClient
 from brain.ai.rerank import JevReranker
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.config import get_settings, unwrap_secret
-from brain.db.session import get_db
+from brain.db.session import SessionLocal, get_db
 from brain.factories import build_embedder, build_llm_client
 from brain.repositories.items import ItemsRepository
 from brain.repositories.memory import MemoryRepository
 from brain.services.ask import AskService
+from brain.services.attachments import (
+    AttachmentFileStore,
+    AttachmentService,
+    ClaudeFileReader,
+    PdfTextLayerReader,
+)
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsService
@@ -145,6 +151,25 @@ def get_memory_repository(db: Session = Depends(get_db)) -> MemoryRepository:
     return MemoryRepository(db)
 
 
+@lru_cache
+def _attachment_service() -> "AttachmentService":
+    """Process-wide attachment service — the reading queue must outlive one update."""
+    settings = get_settings()
+    return AttachmentService(
+        store=AttachmentFileStore(root=settings.files_dir),
+        pdf_reader=PdfTextLayerReader(),
+        claude_reader=ClaudeFileReader(),
+        indexer=get_item_indexer(),
+        session_factory=SessionLocal,
+        daily_budget=settings.attachment_daily_budget,
+    )
+
+
+def get_attachment_service() -> "AttachmentService":
+    """Provide the shared attachment service (one queue/budget per process)."""
+    return _attachment_service()
+
+
 def get_memory_service(
     repo: MemoryRepository = Depends(get_memory_repository),
 ) -> MemoryService:
@@ -165,6 +190,8 @@ def get_search_service(
 def build_ask_service(
     search: SearchService,
     llm: LLMClient,
+    memory: MemoryService | None = None,
+    items_repo: ItemsRepository | None = None,
     memory_block: Callable[[], str] | None = None,
 ) -> AskService:
     """Build the AskService from settings — THE single builder.
@@ -175,6 +202,9 @@ def build_ask_service(
     ``AskService(search, llm)`` silently runs on UTC with default sizes.
     ``memory_block`` matches AskService: a callable returning the confirmed
     memory block ('' when empty) or None — NOT a string (AskService calls it).
+    Passing ``memory`` + ``items_repo`` enables the PR 0d kid-recall leg
+    (capped by ``ask_kid_recall_limit``); omitting either keeps /ask
+    byte-identical to the pre-0d pipeline.
     """
     settings = get_settings()
     return AskService(
@@ -184,6 +214,9 @@ def build_ask_service(
         recall_pool=settings.ask_recall_pool,
         tz=ZoneInfo(settings.timezone),
         memory_block=memory_block,
+        memory=memory,
+        items_repo=items_repo,
+        kid_recall_limit=settings.ask_kid_recall_limit,
     )
 
 
@@ -191,6 +224,13 @@ def get_ask_service(
     search: SearchService = Depends(get_search_service),
     llm: LLMClient = Depends(get_llm_client),
     memory: MemoryService = Depends(get_memory_service),
+    repo: ItemsRepository = Depends(get_items_repository),
 ) -> AskService:
     """Provide an AskService wired to search, the shared LLM client and memory."""
-    return build_ask_service(search, llm, memory_block=memory.compact_block)
+    return build_ask_service(
+        search,
+        llm,
+        memory=memory,
+        items_repo=repo,
+        memory_block=memory.compact_block,
+    )
