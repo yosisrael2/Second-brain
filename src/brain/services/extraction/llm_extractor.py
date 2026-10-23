@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Versioned prompt (recorded in extraction_meta for every child it produces;
 # iterating the prompt bumps this version, so eval runs are comparable).
-EXTRACTION_PROMPT_VERSION = "v5"
+EXTRACTION_PROMPT_VERSION = "v6"
 
 # Injection defense: the source text is DATA (docs/ai-layer.md rationale).
 _PROMPT_TEMPLATE = """You extract structured children from one message.
@@ -54,12 +54,17 @@ Rules (labeling rules from the design spec, plain words):
     for one date ("send an art smock on Sunday", "bring a ruler") or
     RECURRING ("a water bottle every day", "the library book stays in the
     bag"). A recurring bring/wear item is ONE reminder child, never one
-    per day.
+    per day. A bring/wear item is a reminder only when the item
+    TRAVELS WITH THE CHILD (worn, carried in the bag, handed to the
+    teacher by the child).
   * task = an action asked of the PARENT with a deadline (sign, pay, reply,
     register, volunteer, send a document, update a detail) —
     due=true, when_raw = the deadline. A task stays a task even when
     phrased gently ("please ...", "we ask that ...", "we recommend ...")
-    — what matters is that the action is the parent's to do.
+    — what matters is that the action is the parent's to do. When the
+    PARENT must send / submit / return / upload something (a signed
+    form, a photo, a confirmation), it is a task for the reader — never
+    a reminder — even when the message uses the word "send".
   * event = a one-time happening at a date/time/place (a trip, a
     ceremony, a meeting, a party).
   * fact = standing information that asks nobody to act and marks no

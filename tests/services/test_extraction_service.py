@@ -1060,6 +1060,103 @@ def test_within_pass_duplicate_removed_counted(world: World):
     assert "להגיע עם כובע לטיול" in titles and "להביא כובע לטיול" not in titles
 
 
+def test_within_pass_duplicate_merges_quotes(world: World):
+    """v6 Lever A: the dedupe pass keeps ONE child and merges the dropped
+    duplicate's verbatim quote into extraction_meta['extra_quotes'] — the
+    evidence is never discarded."""
+    body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם כובע לטיול",
+            quote="הגיעו עם כובע לטיול ביום חמישי 22.10",
+            when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="reminder", title="להביא כובע לטיול",  # near-duplicate (0.8)
+            quote="יש להצטייד בכובע",  # a DIFFERENT verbatim span
+            when_raw="יום חמישי 22.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.deduped_removed == 1
+    assert report.children_created == 1  # only the reminder + ... just it
+    child = _children(world.session)[0]
+    extras = child.extraction_meta.get("extra_quotes") or []
+    assert "יש להצטייד בכובע" in extras  # the dropped child's quote survives
+    assert child.extraction_meta["when_raw"] == "יום חמישי 22.10"
+
+
+def test_dedupe_threshold_keeps_similar_but_distinct_things(world: World):
+    """v6 Lever A threshold pin (synthetic text only): same kind + same day
+    with title similarity BELOW the 0.7 identity threshold = two DIFFERENT
+    things — both stay children."""
+    from brain.services.textnorm import title_similarity
+
+    t1, t2 = "להביא ספר קריאה לכיתה", "להביא מחברת חשבון לשיעור"
+    assert title_similarity(t1, t2) < 0.7  # the gate does NOT fire here
+    body = "יש להביא ספר קריאה לכיתה, ולהביא מחברת חשבון לשיעור ביום חמישי 22.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title=t1, quote="יש להביא ספר קריאה לכיתה",
+            when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="reminder", title=t2, quote="ולהביא מחברת חשבון לשיעור",
+            when_raw="יום חמישי 22.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.deduped_removed == 0
+    assert report.children_created == 2
+
+
+def test_eval_runner_emits_one_row_per_child(world: World, tmp_path):
+    """v6 Lever A: the eval runner groups by child — a child carrying merged
+    quotes still yields exactly ONE pred row, quoting the kept link."""
+    import json as _json
+    from pathlib import Path as _Path
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    from brain.services.extraction.eval_runner import run_extraction_eval
+
+    body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
+    emails = tmp_path / "emails.txt"
+    emails.write_text(
+        "From: Morah Rinat <rinat@example.org>\n"
+        "Date: Mon, 19 Oct 2026 09:00\n"
+        f"\n{body}\n",
+        encoding="utf-8",
+    )
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם כובע לטיול",
+            quote="הגיעו עם כובע לטיול ביום חמישי 22.10",
+            when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="reminder", title="להביא כובע לטיול",
+            quote="יש להצטייד בכובע",
+            when_raw="יום חמישי 22.10",
+        ),
+    ]
+    out = tmp_path / "pred.jsonl"
+    rows = run_extraction_eval(
+        emails, out, world.session, CountingExtractor(candidates),
+        tz=_ZoneInfo("Asia/Jerusalem"),
+    )
+    written = [_json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1 and len(written) == 1  # ONE row for ONE child
+    assert written[0]["type"] == "reminder"
+    assert written[0]["source_quote"] == "הגיעו עם כובע לטיול ביום חמישי 22.10"
+    assert written[0]["child_id"].startswith("E01-")
+
+
 # --- v4 backstop: a clock time the model dropped from when_raw, taken from
 # --- the child's own verbatim quote (deterministic, never guessed)
 
@@ -1226,3 +1323,18 @@ def test_v5_prompt_pins(world: World):
     assert "6.10" not in prompt
     assert "12:55" not in prompt
     assert "starts in November" not in prompt
+
+
+def test_v6_prompt_pins(world: World):
+    """v6 Lever B: a bring/wear item is a reminder only when the item
+    TRAVELS WITH THE CHILD; a parent-submit item is a TASK for the reader
+    even when the message says 'send'. Generic examples only."""
+    from brain.services.extraction.llm_extractor import LLMExtractor
+
+    llm = FakeLLM([GOOD_REPLY])
+    extractor = LLMExtractor(llm)
+    source = _capture(world.repo, "מייל כלשהו לבניית הפרומפט", source="email")
+    extractor.extract(source, memory_context="Confirmed memory:")
+    prompt = llm.prompts[0]
+    assert "TRAVELS WITH THE CHILD" in prompt
+    assert "it is a task for the reader" in prompt

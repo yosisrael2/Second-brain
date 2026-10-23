@@ -383,6 +383,16 @@ class EnrichmentService:
                     break
             if dup:
                 removed += 1
+                # v6 Lever A: the dropped duplicate's verbatim quote is
+                # EVIDENCE — merge it into the kept child instead of
+                # discarding it (stored as an extra quote; one link per
+                # (child, source) — see the UNIQUE constraint comment).
+                quote = child.candidate.quote
+                if quote and quote != prior.candidate.quote:
+                    extras = list(prior.meta.get("extra_quotes") or [])
+                    if quote not in extras:
+                        extras.append(quote)
+                    prior.meta["extra_quotes"] = extras
                 continue
             kept.append(child)
         if removed:

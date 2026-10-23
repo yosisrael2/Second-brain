@@ -89,8 +89,19 @@ def _child_rows(
         ),
         {"sid": str(source.id)},
     ).all()
+    # v6 Lever A: ONE row per CHILD, not per link — a child carrying merged
+    # duplicate quotes (extraction_meta['extra_quotes']) must still yield a
+    # single pred row (the schema requires a unique child_id per file). The
+    # quote is the kept link's (first in creation order, i.e. candidate order).
+    first_quote: dict[Any, str] = {}
+    child_order: list[Any] = []
+    for child_id, quote in links:
+        if child_id not in first_quote:
+            first_quote[child_id] = quote
+            child_order.append(child_id)
     rows: list[dict[str, Any]] = []
-    for number, (child_id, quote) in enumerate(links):
+    for number, child_id in enumerate(child_order):
+        quote = first_quote[child_id]
         child = session.get(MemoryItem, child_id)
         assert child is not None
         meta = child.extraction_meta or {}
@@ -112,7 +123,7 @@ def _child_rows(
         row["source_quote"] = quote
         if meta.get("derived_from") is not None:
             # relation to the derived-from child, by pred child_id (item 22);
-            # the extractor's index refers to candidate order == link order
+            # the extractor's index refers to candidate order == child order
             target_number = int(meta["derived_from"]) + 1
             row["relation"] = {
                 "kind": "derived_from",
