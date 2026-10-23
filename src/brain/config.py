@@ -164,6 +164,11 @@ class Settings(BaseSettings):
     # ids to sync (allowlist, order preserved). 'primary' is the authenticated
     # user's main calendar; an empty value syncs nothing.
     brain_gcal_calendars: str = "primary"
+    # How far back the first gcal full sync reaches (instances that ENDED more
+    # than this many days ago are never fetched; the cutoff is frozen at the
+    # first sync and persisted in the connector cursor). There is NO future
+    # cap: a dropped future instance would never be re-delivered.
+    brain_gcal_past_days: int = 60
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod

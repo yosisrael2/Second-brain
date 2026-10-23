@@ -1,32 +1,45 @@
 """Google Calendar connector (source name ``gcal``, scope ``calendar.readonly``).
 
-Incremental sync uses the Calendar API's native ``syncToken`` mechanism
-(``events.list``): the cursor is a JSON object mapping calendar id ->
-nextSyncToken for every allowlisted calendar (``BRAIN_GCAL_CALENDARS``,
-default ``"primary"``). A cursor carries ONE token per calendar; when a
-calendar's token is rejected (HTTP 410 — expired), that calendar is fully
-re-listed without a token and the batch reports ``reset=True``.
+RECURRING EVENTS — instance-per-record (manager decision, connectors/gcal-review):
+``events.list`` runs with ``singleEvents=true`` + ``showDeleted=true`` on every
+call, so records are single one-off events and INSTANCES — the KB gets one
+item per occurrence and temporal questions ("what is on Wednesday?") work
+natively. Rationale and consequences:
 
-RECURRING EVENTS — expansion decision (connectors contract requires an
-explicit pick): one record per SERIES, the raw recurrence rules surfaced in
-``text`` ("Repeats: RRULE:...") and ``meta["recurrence"]``. NOT
-``singleEvents=True`` instance expansion, because:
+- The sync guide's own paginated-incremental example uses
+  ``singleEvents=true&syncToken=...``; the parameters that may NOT ride with
+  ``syncToken`` (iCalUID, orderBy, privateExtendedProperty, q,
+  sharedExtendedProperty, timeMin, timeMax, updatedMin) exclude singleEvents
+  and showDeleted. The SAME parameter set is used on full and incremental
+  calls (the guide's consistency rule), minus the banned ones.
+- A deleted whole series arrives as one cancelled record per instance
+  (showDeleted+singleEvents doc), so every instance item is correctly marked
+  ``deleted=True``. Series masters never appear (singleEvents=true excludes
+  them) — no double representation. Instances carry no ``recurrence`` field;
+  if one ever appears in a payload it is kept in ``meta`` only, never in
+  ``text``.
+- Instance ids (``<seriesId>_<start>``) are the external_ids; a moved
+  occurrence arrives as a cancelled old-id record + a new-id record, which
+  the runner applies as mark-deleted + create.
 
-1. ``syncToken``-based incremental sync never expands recurrences (the API
-   returns the series master with its ``recurrence``, and only individually
-   touched instances as instance-id events) — instance records produced on a
-   full sync would have no incremental counterpart, and external_ids would
-   flip between series-form and instance-form across sync modes, breaking
-   the runner's stable-``external_id`` idempotency.
-2. Expansion needs a bounded window, but open-ended RRULEs have no safe
-   horizon: occurrences past the window would silently vanish, and every
-   full resync would re-materialize the whole (unbounded) occurrence set.
+PAST CUTOFF (``BRAIN_GCAL_PAST_DAYS``, default 60): the initial full sync
+adds ``timeMin = now - past_days`` (legal on a full sync; banned with
+``syncToken``), and a client-side filter drops instances that ENDED before
+that cutoff from every batch (incremental syncs can still deliver changes
+for old instances because timeMin cannot ride along). The cutoff is frozen
+at the first sync and persisted inside the cursor.
 
-Cost of the pick: a single cancelled OCCURRENCE arrives as a ``cancelled``
-instance record (id ``<seriesId>_<time>``) with no prior series-internal
-record; it is mapped to a ``deleted=True`` record per the contract, and the
-series record itself stays (the series still exists). The runner decides how
-unknown deleted ids are recorded — flagged in the PR for the runner owner.
+NO client-side FUTURE cap, ever: a future instance dropped today would never
+be re-delivered unless it changed again, so it would be silently lost when
+its date finally arrives. Only the past cutoff is safe, because the past
+never becomes relevant again.
+
+Cursor: JSON ``{"cutoff": "<iso instant>", "calendars": {calendarId:
+nextSyncToken}}`` — one token per allowlisted calendar (``BRAIN_GCAL_CALENDARS``,
+default ``"primary"``). When a calendar's token is rejected (HTTP 410 —
+expired), that calendar is fully re-listed without a token (``timeMin``
+re-applied from the frozen cutoff) and the batch reports ``reset=True``.
+A bad/absent cursor means full resync with a fresh cutoff.
 
 All-day events (``date``, no ``dateTime``) are interpreted in the app
 timezone and rendered date-only; ``meta["end"]`` keeps Google's exclusive
@@ -36,14 +49,16 @@ end date exactly as sent (RFC 5545 semantics, same as the ICS paste path).
 Text renders in the app timezone (``TIMEZONE``, Asia/Jerusalem in
 production) reusing the repo's existing calendar one-liner
 (``brain.services.paste._calendar_one_liner``, the same renderer the ICS
-paste path and ``brain normalize-calendar`` use), then adds the raw
-recurrence, description, organizer and attendee display names:
+paste path and ``brain normalize-calendar`` use), then adds description,
+organizer and attendee display names:
 
     <title> — Thu 29 Oct 17:00–18:30 @ <location>
-    Repeats: RRULE:FREQ=WEEKLY;BYDAY=TH
     <description>
     Organizer: <name>
     Attendees: <name>, <name>
+
+(The ICS paste path still stores a recurring series as one item dated at its
+start — known mismatch, backlog ticket; do not "fix" it here.)
 
 Events carry no byte attachments in this scope (event file attachments are
 Drive files; fetching them needs ``drive.readonly`` — out of this ticket).
@@ -53,7 +68,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
@@ -109,8 +124,21 @@ def _event_instant(value: dict[str, Any] | None, tz: ZoneInfo) -> tuple[datetime
     return None, False
 
 
+def _ends_before_cutoff(payload: dict[str, Any], tz: ZoneInfo, cutoff: datetime) -> bool:
+    """True when the instance definitely ended before the past cutoff.
+
+    Records without a parseable end (e.g. skeletal cancelled instances) are
+    ALWAYS kept: dropping them would silently lose deletions. See the module
+    docstring — the past cutoff is the only client-side filter; there is no
+    future cap (a dropped future instance would never come back).
+    """
+    end, _ = _event_instant(payload.get("end"), tz)
+    return end is not None and end <= cutoff
+
+
 def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
-    """Map one Calendar API event payload -> :class:`SourceRecord` (pure).
+    """Map one Calendar API event payload (one-off event or instance)
+    -> :class:`SourceRecord` (pure).
 
     Raises ValueError when the payload carries no event id — a record without
     a stable external id can never be synced idempotently, so it is refused
@@ -125,7 +153,6 @@ def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
     title = str(payload.get("summary") or "").strip() or _TITLE_FALLBACK
     location = str(payload.get("location") or "").strip()
     description = str(payload.get("description") or "").strip()
-    recurrence = [str(r).strip() for r in (payload.get("recurrence") or []) if str(r).strip()]
     version = str(payload.get("etag") or payload.get("updated") or "") or None
     url = str(payload.get("htmlLink") or "") or None
 
@@ -136,15 +163,18 @@ def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
         meta["end"] = end.isoformat()  # all-day: exclusive end date, as Google sends it
     if location:
         meta["location"] = location
+    # Instances never carry a recurrence field (recurring-events guide); if a
+    # payload ever has one, keep it for debugging — but out of the text.
+    recurrence = [str(r).strip() for r in (payload.get("recurrence") or []) if str(r).strip()]
     if recurrence:
         meta["recurrence"] = recurrence
+    if payload.get("recurringEventId"):
+        meta["recurring_event_id"] = str(payload["recurringEventId"])
     status = str(payload.get("status") or "").strip()
     if status:
         meta["status"] = status
 
     lines = [_calendar_one_liner(meta, tz, date_only=all_day)]
-    if recurrence:
-        lines.append("Repeats: " + "; ".join(recurrence))
     if description:
         lines.append(description)
     organizer = _person_name(payload.get("organizer"))
@@ -168,22 +198,38 @@ def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
     )
 
 
-def _parse_cursor(cursor: str | None) -> dict[str, str]:
-    """Decode the gcal cursor: JSON {calendarId: syncToken}. Bad cursor -> {}."""
+def _parse_cursor(cursor: str | None) -> tuple[datetime | None, dict[str, str]]:
+    """Decode the gcal cursor: (frozen cutoff, {calendarId: syncToken}).
+
+    A bad/absent cursor means full resync: (None, {}).
+    """
     if not cursor:
-        return {}
+        return None, {}
     try:
         decoded = json.loads(cursor)
     except ValueError:
-        return {}
+        return None, {}
     if not isinstance(decoded, dict):
-        return {}
-    return {str(k): str(v) for k, v in decoded.items() if str(v).strip()}
+        return None, {}
+    calendars = decoded.get("calendars")
+    if not isinstance(calendars, dict):
+        calendars = {}
+    tokens = {str(k): str(v) for k, v in calendars.items() if str(v).strip()}
+    cutoff: datetime | None = None
+    raw_cutoff = str(decoded.get("cutoff") or "").strip()
+    if raw_cutoff:
+        try:
+            parsed = datetime.fromisoformat(raw_cutoff)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.tzinfo is not None:
+            cutoff = parsed
+    return cutoff, tokens
 
 
 @register
 class GCalConnector(GoogleConnector):
-    """Google Calendar source: incremental ``events.list`` over the allowlist."""
+    """Google Calendar source: instance-per-record ``events.list`` sync."""
 
     name = "gcal"
 
@@ -193,7 +239,7 @@ class GCalConnector(GoogleConnector):
     SCOPES: ClassVar[tuple[str, ...]] = (GCAL_SCOPE,)
 
     def fetch(self, cursor: str | None, *, limit: int) -> FetchResult:
-        """Sync the allowlisted calendars incrementally.
+        """Sync the allowlisted calendars incrementally, instance-per-record.
 
         A ``limit=0`` call is a no-op that preserves the cursor (returning
         ``next_cursor=None`` here would silently downgrade the next sync to a
@@ -201,8 +247,12 @@ class GCalConnector(GoogleConnector):
         """
         if limit <= 0:
             return FetchResult(records=[], next_cursor=cursor, reset=False)
-        tokens = _parse_cursor(cursor)
+        frozen_cutoff, tokens = _parse_cursor(cursor)
         service = self._service()
+        zone = self._zone()
+        cutoff = frozen_cutoff or datetime.now(UTC) - timedelta(
+            days=self._settings().brain_gcal_past_days
+        )
         records: list[SourceRecord] = []
         next_tokens: dict[str, str] = {}
         reset = False
@@ -212,13 +262,18 @@ class GCalConnector(GoogleConnector):
             token = tokens.get(calendar_id)
             remaining = limit - len(records)
             try:
-                events, sync_token = self._sync_calendar(service, calendar_id, token, remaining)
+                events, sync_token = self._sync_calendar(
+                    service, calendar_id, token, cutoff, zone, remaining
+                )
             except _SyncTokenExpired:
                 # Token expired/invalid (410): drop it and fully re-list this
-                # calendar. Other calendars' tokens stay valid.
+                # calendar from the frozen cutoff. Other calendars' tokens
+                # stay valid.
                 reset = True
-                events, sync_token = self._sync_calendar(service, calendar_id, None, remaining)
-            records.extend(self._map_events(events, calendar_id))
+                events, sync_token = self._sync_calendar(
+                    service, calendar_id, None, cutoff, zone, remaining
+                )
+            records.extend(self._map_events(events, calendar_id, zone))
             if sync_token is not None:
                 next_tokens[calendar_id] = sync_token
             elif token is not None:
@@ -226,7 +281,9 @@ class GCalConnector(GoogleConnector):
                 # the next run re-lists from the last complete position
                 # (idempotent — the runner dedupes by external_id/version).
                 next_tokens[calendar_id] = token
-        next_cursor = json.dumps(next_tokens, sort_keys=True) if next_tokens else None
+        next_cursor = json.dumps(
+            {"cutoff": cutoff.isoformat(), "calendars": next_tokens}, sort_keys=True
+        )
         return FetchResult(records=records, next_cursor=next_cursor, reset=reset)
 
     # -- internals ---------------------------------------------------------
@@ -243,8 +300,9 @@ class GCalConnector(GoogleConnector):
     def _zone(self) -> ZoneInfo:
         return ZoneInfo(self._settings().timezone)
 
-    def _map_events(self, events: list[dict[str, Any]], calendar_id: str) -> list[SourceRecord]:
-        zone = self._zone()
+    def _map_events(
+        self, events: list[dict[str, Any]], calendar_id: str, zone: ZoneInfo
+    ) -> list[SourceRecord]:
         records: list[SourceRecord] = []
         for payload in events:
             record = record_from_event(payload, zone)
@@ -252,9 +310,22 @@ class GCalConnector(GoogleConnector):
         return records
 
     def _sync_calendar(
-        self, service: Any, calendar_id: str, sync_token: str | None, budget: int
+        self,
+        service: Any,
+        calendar_id: str,
+        sync_token: str | None,
+        cutoff: datetime,
+        zone: ZoneInfo,
+        budget: int,
     ) -> tuple[list[dict[str, Any]], str | None]:
-        """Walk one calendar's events; returns (events, nextSyncToken).
+        """Walk one calendar's instances; returns (events, nextSyncToken).
+
+        ``singleEvents=true`` + ``showDeleted=true`` always (instance-per-
+        record; parameter set identical on full and incremental calls per the
+        sync guide). The full sync bounds the past server-side with
+        ``timeMin`` (banned only WITH a syncToken); the client-side cutoff
+        filter covers incremental deliveries of old instances. Dropped
+        records do not consume budget.
 
         ``nextSyncToken`` is None when the walk stopped at ``budget`` before
         the source signaled a complete sync — the caller then keeps the old
@@ -266,10 +337,16 @@ class GCalConnector(GoogleConnector):
             params: dict[str, Any] = {
                 "calendarId": calendar_id,
                 "showDeleted": True,  # cancellations must surface as deleted records
+                "singleEvents": True,  # instance-per-record (see module docstring)
                 "maxResults": min(budget, _MAX_PAGE_RESULTS),
             }
             if sync_token is not None:
                 params["syncToken"] = sync_token
+            else:
+                # Full sync: bound the past server-side (timeMin = exclusive
+                # lower bound on the event END). Illegal with a syncToken —
+                # the frozen client-side cutoff covers incremental calls.
+                params["timeMin"] = cutoff.isoformat()
             if page_token:
                 params["pageToken"] = page_token
             return service.events().list(**params)
@@ -277,7 +354,9 @@ class GCalConnector(GoogleConnector):
         last_sync_token: str | None = None
         try:
             for page in self.iter_pages(build_request):
-                events.extend(page.get("items") or [])
+                for payload in page.get("items") or []:
+                    if not _ends_before_cutoff(payload, zone, cutoff):
+                        events.append(payload)
                 if page.get("nextSyncToken"):
                     last_sync_token = str(page["nextSyncToken"])
                 if len(events) >= budget and page.get("nextPageToken"):
