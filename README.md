@@ -586,6 +586,24 @@ Behavior worth knowing:
   Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store. To run
   `dev-start.sh` against the real store you opt in explicitly with
   `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
+- **Live-store construction guard** — the lifespan guard cannot catch code
+  that never goes through an app start (a `TestClient(create_app())` without
+  a `with` block, an ad-hoc script, a lru_cache'd factory that outlived an
+  env change). The SAME refusal therefore also runs at CONSTRUCTION: the
+  SQLAlchemy engine factory (`brain.db.session.create_engine_from_settings`)
+  refuses the live database URL, and the Qdrant vector store's `__init__`
+  refuses the live collection name when it builds a real client (stores with
+  an injected client — the tests' in-memory qdrant — are never the live
+  server and are not gated). Consequence for the CLI: every `brain`
+  subcommand that touches the live store (`reindex`, `enrich`, `whatsapp`,
+  `gmail-poll`, `memory seed-*`, `telegram`) now refuses unless the operator
+  sets `BRAIN_ALLOW_LIVE=1` for that one command — e.g.
+  `BRAIN_ALLOW_LIVE=1 brain reindex`. `scripts/run-bot.sh` exports the flag
+  itself (the bot is the real service), as does `scripts/run-server.sh`.
+  The test suite additionally runs a session-level tripwire
+  (`tests/live_guard.py`): it snapshots the LIVE collection's point count
+  before and after the run (one read-only REST GET each) and fails loudly if
+  it changed — a future leak turns red instead of surfacing days later.
 
 ## Setup
 

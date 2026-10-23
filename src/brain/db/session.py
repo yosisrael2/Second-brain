@@ -6,12 +6,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from brain.config import get_settings
+from brain.config import assert_not_live_database, get_settings
 
 
 def create_engine_from_settings() -> Engine:
-    """Build a SQLAlchemy engine from settings."""
-    return create_engine(get_settings().database_url, pool_pre_ping=True)
+    """Build a SQLAlchemy engine from settings (refuses the LIVE database).
+
+    Construction-time guard: the engine is the chokepoint every consumer
+    (app, bot, CLI) builds on — checking here means a live URL without
+    BRAIN_ALLOW_LIVE=1 fails at import/build time, not only at app start.
+    """
+    database_url = get_settings().database_url
+    assert_not_live_database(database_url)
+    return create_engine(database_url, pool_pre_ping=True)
 
 
 engine = create_engine_from_settings()

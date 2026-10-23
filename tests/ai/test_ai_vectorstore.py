@@ -89,8 +89,10 @@ def test_negative_integer_ids_are_rejected(store):
 def test_missing_url_and_client_raises_clear_error(monkeypatch):
     monkeypatch.delenv("QDRANT_URL", raising=False)
 
+    # a *_test collection: the live-collection construction guard (PR #43)
+    # must not mask the missing-URL error this test is about
     with pytest.raises(VectorStoreError, match="QDRANT_URL"):
-        QdrantVectorStore()
+        QdrantVectorStore(collection="brain_items_test")
 
 
 def test_satisfies_vector_store_protocol():
