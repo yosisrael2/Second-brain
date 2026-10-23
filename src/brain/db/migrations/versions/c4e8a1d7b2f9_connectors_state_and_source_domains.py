@@ -27,7 +27,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c4e8a1d7b2f9"
-down_revision: str | None = "c9d2e7f4a1b8"  # was b8c4f2a6e9d1: #49's triage migration landed while this branch was in flight; re-pointed per the merge-order rule (single head)
+down_revision: str | None = "c9d2e7f4a1b8"  # was b8c4f2a6e9d1: #49's triage migration
+# landed while this branch was in flight; re-pointed per the merge-order rule.
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
