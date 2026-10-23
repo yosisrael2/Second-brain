@@ -201,6 +201,35 @@ def test_sync_runs_the_runner_end_to_end_with_a_registered_connector(
     assert cursor == "c1"
 
 
+def test_sync_drain_loops_until_no_cursor_movement(settings_env, database, capsys, monkeypatch):
+    """--drain keeps fetching batches while the cursor moves (a first sync of
+    a large source); a batch that leaves the cursor unchanged ends the drain."""
+    from sqlalchemy import text as sql_text
+
+    from brain.db.session import SessionLocal
+
+    connector = _StubGcal(
+        batches=[
+            FetchResult(
+                records=[make_record(external_id="f1", text="body f1")], next_cursor="c1"
+            ),
+            FetchResult(
+                records=[make_record(external_id="f2", text="body f2")], next_cursor="c2"
+            ),
+            FetchResult(records=[], next_cursor="c2"),  # drained: cursor stops
+        ]
+    )
+    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+
+    assert cli.main(["connectors", "sync", "gcal", "--drain"]) == 0
+    out = capsys.readouterr().out
+    assert "created=2" in out  # both batches applied in one invocation
+    assert connector.cursors == [None, "c1", "c2"]  # three fetches, then stop
+    with SessionLocal() as session:
+        count = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
+    assert count == 2
+
+
 def test_auth_google_requires_enabled_connectors(settings_env, monkeypatch, capsys):
     monkeypatch.setenv("BRAIN_CONNECTORS", "")
     get_settings.cache_clear()

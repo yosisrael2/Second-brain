@@ -220,6 +220,162 @@ def test_user_deleted_item_is_never_recaptured(runner_db):
     assert h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0) == []
 
 
+def test_deletion_touches_only_the_marks_not_the_content(runner_db):
+    """Review bug 1: a deleted record's payload carries no content (Drive's
+    deleted record has text=''; a cancelled event only id+status). The
+    deletion must change ONLY the marks + ledger version — never wipe the
+    text, re-index empty content, re-enqueue, or touch occurred_at."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            # the delete payload: same id, NO useful content
+            _batch(make_record(version="v2", text="", occurred_at=None, deleted=True)),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    text_before = item.raw_text
+    when_before = item.occurred_at
+    enqueued_before = len(h.enrichment.enqueued)
+    indexed_before = len(h.indexer.indexed)
+
+    summary = runner.run()
+
+    assert summary.deleted == 1
+    item = h.item("r1")
+    assert item is not None
+    assert item.raw_text == text_before  # content NOT wiped
+    assert item.occurred_at == when_before
+    assert item.meta["source_deleted"] is True
+    assert len(h.enrichment.enqueued) == enqueued_before  # nothing re-enqueued
+    assert len(h.indexer.indexed) == indexed_before  # nothing re-indexed
+
+
+def test_user_edited_item_is_still_hidden_when_source_deletes(runner_db):
+    """Review bug 2: deletion applies regardless of who owns the text."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[_batch(make_record()), _batch(make_record(deleted=True))]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    item.raw_text = "USER edited this"
+    h.repo.commit()
+
+    summary = runner.run()
+
+    assert summary.deleted == 1
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["source_deleted"] is True
+    assert item.superseded_by == item.id
+    assert h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0) == []
+
+
+def test_relation_strike_survives_source_delete_and_undelete(runner_db):
+    """Review bug 3: a REAL PR-B strike (superseded_by = a newer item) must
+    survive both the source delete and the un-delete — the runner only ever
+    sets/clears its OWN self-strike."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", deleted=True)),
+            _batch(make_record(version="v3", text="body of r1, back")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    newer = MemoryItem(raw_text="newer version of the fact", source="manual")
+    h.repo.add(newer)
+    h.repo.commit()
+    item.superseded_by = newer.id  # a real supersedes relation struck this item
+    h.repo.commit()
+
+    runner.run()  # delete
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["source_deleted"] is True
+    assert item.superseded_by == newer.id  # NOT overwritten with self
+
+    runner.run()  # un-delete (v3, not deleted)
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta.get("source_deleted") is None
+    assert item.superseded_by == newer.id  # relation's strike still intact
+
+
+def _link_child(h: Harness, parent: MemoryItem, title: str, state: str) -> MemoryItem:
+    """Create an extraction child (state) quoting the parent via item_sources."""
+    from brain.db.models import ItemSource
+
+    child = MemoryItem(
+        raw_text=title,
+        source=parent.source,
+        child_state=state,
+        extraction_meta={"run_id": "r-test"},
+    )
+    h.repo.add(child)
+    h.repo.commit()
+    h.session.add(ItemSource(child_id=child.id, source_id=parent.id, quote="q"))
+    h.session.commit()
+    return child
+
+
+def test_children_of_a_deleted_parent_hidden_or_flagged(runner_db):
+    """Review bug 4: a trashed source must not leave its proposed children
+    askable. Proposed children hide with the same mechanism; kept children
+    (the user acted) stay visible but flagged; un-delete reverses exactly."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", deleted=True)),
+            _batch(make_record(version="v3", text="body of r1, back")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    parent = h.item("r1")
+    assert parent is not None
+    proposed = _link_child(h, parent, "Dentist Tuesday", "proposed")
+    kept = _link_child(h, parent, "Dentist (confirmed)", "kept")
+
+    runner.run()  # delete
+    proposed = h.repo.get(proposed.id)
+    kept = h.repo.get(kept.id)
+    assert proposed is not None and proposed.superseded_by == proposed.id
+    assert kept is not None and kept.superseded_by is None  # user acted: visible
+    assert kept.meta.get("parent_source_deleted") is True
+
+    runner.run()  # un-delete
+    proposed = h.repo.get(proposed.id)
+    kept = h.repo.get(kept.id)
+    assert proposed is not None and proposed.superseded_by is None
+    assert kept is not None and kept.meta.get("parent_source_deleted") is None
+
+
+def test_connector_text_sha_detects_user_edits_without_duplicating_text(runner_db):
+    """Review finding 5: the framework stores a sha256 of its last-written
+    text (NOT the full text) in meta, and the update path compares hashes."""
+    import hashlib
+
+    h = Harness(runner_db)
+    connector = FakeConnector(batches=[_batch(make_record())])
+    h.runner(connector).run()
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["connector_text_sha"] == hashlib.sha256(b"body of r1").hexdigest()
+    assert "connector_text" not in item.meta  # no full-text duplicate in JSONB
+
+
 def test_new_version_updates_item_in_place_and_reindexes(runner_db):
     h = Harness(runner_db)
     connector = FakeConnector(

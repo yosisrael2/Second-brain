@@ -10,16 +10,17 @@ SEMANTICS (the connectors contract; adapters depend on these verbatim):
 - known id, same version -> skip (idempotent; re-running never duplicates).
 - known id, new version  -> update the item in place (text, occurred_at,
                             meta), recompute the fingerprint, re-index,
-                            re-enqueue enrichment. The user's own fields
-                            (status, project, importance, ...) are never
-                            touched — only what the source owns.
-- deleted=True           -> NEVER hard-delete. The item stays, meta gains
-                            ``source_deleted=true`` and it is hidden from
-                            retrieval exactly like PR-B-superseded items:
-                            ``superseded_by`` is set to the item's own id,
-                            which every list/search/occurrence path already
-                            filters. If the source un-deletes it later, the
-                            marks are cleared.
+                            re-enqueue enrichment — unless the USER edited the
+                            text since the framework wrote it (detected via
+                            the stored ``connector_text_sha``): their edit
+                            survives; only the version marker moves.
+- deleted=True           -> NEVER hard-delete and NEVER write content: only
+                            the marks move (meta ``source_deleted=true``;
+                            hidden via the PR-B self-supersede mechanism, set
+                            only when no real relation strike exists; proposed
+                            extraction children hide with the parent, kept
+                            children are flagged). If the source un-deletes
+                            later, exactly those marks are reversed.
 - cursor                 -> persisted ONLY after the whole batch succeeded.
                             Any record failure leaves the cursor untouched,
                             so the next run re-fetches the window and skips
@@ -43,8 +44,9 @@ SEMANTICS (the connectors contract; adapters depend on these verbatim):
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -67,6 +69,11 @@ _BACKOFF_CAP_S = 600.0
 # Attachments larger than the core's cap are recorded and skipped (the same
 # policy as the email poller) — never a record failure.
 from brain.services.attachments import MAX_FILE_BYTES  # noqa: E402
+
+
+def _text_sha(text: str) -> str:
+    """sha256 of the framework-written text (user-edit marker; NOT the text)."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def backoff_seconds(
@@ -103,6 +110,8 @@ class _ItemsRepoProto(Protocol):
     def commit(self) -> None: ...
 
     def refresh(self, item: MemoryItem) -> None: ...
+
+    def children_of(self, item_id: Any) -> Sequence[MemoryItem]: ...
 
 
 class _StateRepoProto(Protocol):
@@ -263,53 +272,120 @@ class ConnectorRunner:
         if record.version == row.version and record.deleted == already_deleted:
             return "skipped"
 
-        # Changed (or un-deleted): update what the source owns, in place —
-        # unless the USER edited the text since the framework wrote it.
-        # Detection: the framework stores its last-written text in meta under
-        # 'connector_text'; a mismatch means the user owns the text now (same
-        # rule as the extraction re-run: user-acted items are never
-        # overwritten). Only the version marker moves, so this bump is not
-        # re-reported on every later sync.
-        if item.raw_text != stored_meta.get("connector_text"):
-            item.meta = {**stored_meta, **self._framework_meta(record)}
-            self._repo.commit()
-            self._records.put(name, record.external_id, record.version, item.id)
+        stored_meta = dict(item.meta or {})
+        already_deleted = bool(stored_meta.get("source_deleted"))
+        if record.version == row.version and record.deleted == already_deleted:
             return "skipped"
-        item.raw_text = record.text
-        item.occurred_at = record.occurred_at
-        item.meta = {**stored_meta, **self._framework_meta(record)}
-        item.fingerprint = content_fingerprint(item.raw_text, item.occurred_at, item.source)
-        if record.deleted and not already_deleted:
-            item.meta = {**item.meta, "source_deleted": True}
-            # PR B mechanism: self-supersede hides the item from every default
-            # listing/search/occurrence path (repositories/items.py) and from
-            # the semantic leg (services/search.py _load_items).
-            item.superseded_by = item.id
-        elif not record.deleted and already_deleted:
-            item.meta = {k: v for k, v in item.meta.items() if k != "source_deleted"}
-            item.superseded_by = None
+
+        if record.deleted:
+            # DELETION touches ONLY the marks + ledger version. Delete
+            # payloads carry no content (Drive: text=''; cancelled events:
+            # id+status) — writing them would wipe the user's item, re-index
+            # empty text and burn an enrichment slot on a hidden item.
+            if already_deleted:
+                self._records.put(name, record.external_id, record.version, item.id)
+                return "skipped"
+            return self._apply_deletion(record, item, row)
+
+        # Content change or un-delete: update what the source owns, in place
+        # — unless the USER edited the text since the framework wrote it.
+        # Detection: the framework stores a sha256 of its last-written text;
+        # a hash mismatch means the user owns the text now (same rule as the
+        # extraction re-run: user-acted items are never overwritten). Only
+        # the version marker moves, so this bump is not re-reported forever.
+        user_edited = stored_meta.get("connector_text_sha") != _text_sha(item.raw_text)
+        new_meta = {**stored_meta, **self._framework_meta(record)}
+        if already_deleted:
+            # Source un-deleted: reversal applies regardless of who owns the
+            # text — a hidden item the source restored must be visible again.
+            new_meta = {k: v for k, v in new_meta.items() if k != "source_deleted"}
+            self._reverse_deleted_marks(item)
+        item.meta = new_meta
+        if not user_edited:
+            item.raw_text = record.text
+            item.occurred_at = record.occurred_at
+            item.fingerprint = content_fingerprint(
+                item.raw_text, item.occurred_at, item.source
+            )
         self._repo.commit()
         self._repo.refresh(item)
         self._records.put(name, record.external_id, record.version, item.id)
-        if self._indexer is not None:
+        if not user_edited:
+            # The content actually changed: re-index + re-enqueue. A user-
+            # edited item only got a marker refresh — nothing to index.
             self._index(item)
-        if self._enrichment is not None:
             self._enqueue(item)
-        return "deleted" if record.deleted else "updated"
+            return "updated"
+        return "skipped"
+
+    def _apply_deletion(
+        self, record: SourceRecord, item: MemoryItem, row: Any
+    ) -> str:
+        """Mark ONE record deleted: meta mark + hide + ledger version. Nothing
+        else — no content write, no re-index, no enrichment.
+
+        Hiding reuses the PR-B mechanism (superseded_by): every default
+        listing/search/occurrence path and the semantic leg (services/search.py
+        _load_items) already filter it. The self-strike is set ONLY when the
+        item is not already struck by a REAL relation (superseded_by = a newer
+        item) — overwriting it would break relation undo; on un-delete only
+        the framework's own self-strike is cleared.
+
+        Children (review bug 4): the parent's PROPOSED extraction children
+        hide with the same mechanism; KEPT children stay visible (the user
+        acted) but get meta parent_source_deleted=true. Un-delete reverses
+        exactly that.
+        """
+        item.meta = {
+            **dict(item.meta or {}),
+            "version": record.version,
+            "source_deleted": True,
+        }
+        if item.superseded_by is None:
+            item.superseded_by = item.id
+        for child in self._repo.children_of(item.id):
+            if child.child_state == "dropped":
+                continue  # never askable anyway
+            child_meta = dict(child.meta or {})
+            if child.child_state == "proposed":
+                if child.superseded_by is None:
+                    child.superseded_by = child.id
+            child_meta["parent_source_deleted"] = True
+            child.meta = child_meta
+        self._repo.commit()
+        self._repo.refresh(item)
+        self._records.put(self._connector.name, record.external_id, record.version, item.id)
+        return "deleted"
+
+    def _reverse_deleted_marks(self, item: MemoryItem) -> None:
+        """Undo exactly what :meth:`_apply_deletion` did to ``item`` and its
+        children — only the framework's OWN marks (a real relation's strike
+        and the user's actions are never touched)."""
+        if item.superseded_by == item.id:
+            item.superseded_by = None
+        for child in self._repo.children_of(item.id):
+            child_meta = dict(child.meta or {})
+            if "parent_source_deleted" not in child_meta:
+                continue  # we never touched this child
+            child_meta.pop("parent_source_deleted")
+            if child.child_state == "proposed" and child.superseded_by == child.id:
+                child.superseded_by = None
+            child.meta = child_meta
 
     def _framework_meta(self, record: SourceRecord) -> dict[str, Any]:
         """The one place item meta is built (SIMPLIFY target: single site).
 
-        ``connector_text`` is the last text the framework wrote — the update
-        path compares against it to detect a USER edit and then never
-        overwrites the item's text again.
+        ``connector_text_sha`` is the sha256 of the last text the framework
+        wrote — the update path compares hashes to detect a USER edit (never
+        overwrite the item's text again) without duplicating the full text
+        into JSONB.
         """
         meta: dict[str, Any] = {
             "connector": self._connector.name,
             "external_id": record.external_id,
             "version": record.version,
             "url": record.url,
-            "connector_text": record.text,
+            "connector_text_sha": _text_sha(record.text),
         }
         meta.update(record.meta)  # the record's own keys win
         return meta
