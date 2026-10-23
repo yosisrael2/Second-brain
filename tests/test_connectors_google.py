@@ -9,6 +9,7 @@ they only need ``.resp.status`` (googleapiclient HttpError) or a type name
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -19,7 +20,7 @@ from brain.connectors.base import (
     ConnectorRetryableError,
     FetchResult,
 )
-from brain.connectors.google.base import GoogleConnector, scopes_for
+from brain.connectors.google.base import GoogleConnector, is_rate_limited, scopes_for
 
 
 class _HttpErrorLike(Exception):
@@ -160,3 +161,37 @@ def test_translate_error_preserves_the_status_for_cursor_invalidation():
     translated = _StubGoogleConnector._translate_error(_HttpErrorLike(410))
     assert isinstance(translated, ConnectorRetryableError)
     assert translated.status == 410  # adapters catch this and return reset=True
+
+
+class _RateLimitedHttpError(_HttpErrorLike):
+    """403 with Google's quota body (see is_rate_limited's docstring)."""
+
+    def __init__(self, reason: str = "rateLimitExceeded") -> None:
+        super().__init__(403)
+        self.content = json.dumps(
+            {
+                "error": {
+                    "code": 403,
+                    "errors": [{"reason": reason}],
+                    "message": "Rate limit exceeded",
+                }
+            }
+        ).encode()
+
+
+def test_403_with_rate_limit_reason_is_retryable_not_auth():
+    for reason in ("rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"):
+        translated = _StubGoogleConnector._translate_error(_RateLimitedHttpError(reason))
+        assert type(translated) is ConnectorRetryableError, reason
+        assert translated.status == 403
+
+
+def test_plain_403_is_still_auth():
+    translated = _StubGoogleConnector._translate_error(_HttpErrorLike(403))
+    assert type(translated) is ConnectorAuthError
+
+
+def test_is_rate_limited_is_the_one_shared_check():
+    assert is_rate_limited(_RateLimitedHttpError())
+    assert not is_rate_limited(_HttpErrorLike(403))  # permission denied -> not throttling
+    assert not is_rate_limited(_HttpErrorLike(429))  # status handles 429 already

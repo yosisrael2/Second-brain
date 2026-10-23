@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, ClassVar
 
@@ -110,6 +111,55 @@ def default_service_factory(refresh_token: str, scopes: list[str]) -> Any:
     return discovery.build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
 
+_RATE_LIMIT_REASONS = frozenset(
+    {"rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"}
+)
+
+
+def _error_reason(exc: Exception) -> str:
+    """The Google error reason carried by a duck-typed HttpError, or ''.
+
+    googleapiclient's HttpError exposes the raw JSON as ``.content``
+    (bytes/str) and optionally parsed ``.error_details``; the body looks like
+    {"error": {"errors": [{"reason": "rateLimitExceeded"}], ...}}.
+    Parsing is duck-typed and defensive: tests pass hand-built fakes and the
+    real client classes both carry one of the two attributes.
+    """
+    details = getattr(exc, "error_details", None)
+    if isinstance(details, list):
+        for entry in details:
+            reason = entry.get("reason") if isinstance(entry, dict) else None
+            if reason:
+                return str(reason)
+    content = getattr(exc, "content", b"") or b""
+    text = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
+    if not text:
+        return ""
+    try:
+        body = json.loads(text)
+        errors = body.get("error", {}).get("errors", []) or []
+        for entry in errors:
+            reason = entry.get("reason")
+            if reason:
+                return str(reason)
+    except (ValueError, AttributeError):
+        return ""
+    return ""
+
+
+def is_rate_limited(exc: Exception) -> bool:
+    """True when the duck-typed Google error is a THROTTLING error.
+
+    Google APIs signal quota/rate limits with HTTP 403 (not only 429) carrying
+    the reasons rateLimitExceeded / userRateLimitExceeded / dailyLimitExceeded
+    (https://developers.google.com/drive/v3/web/handle-errors and the per-API
+    equivalents). Those are transient -> retryable; ANY other 403 (permission
+    denied, forbidden) means re-consent or config, not a retry. The one check
+    adapters share (e.g. Drive export 403s).
+    """
+    return _error_reason(exc) in _RATE_LIMIT_REASONS
+
+
 class GoogleConnector(Connector):
     """Shared base for Google data sources (gmail/gcal/gdrive/gtasks adapters).
 
@@ -201,7 +251,13 @@ class GoogleConnector(Connector):
         resp = getattr(exc, "resp", None)
         status = getattr(resp, "status", None)
         if status is not None:
-            if status in (401, 403):
+            if status == 403:
+                # 403 is dual-natured (see is_rate_limited): throttling is
+                # transient, everything else means re-consent/config.
+                if is_rate_limited(exc):
+                    return ConnectorRetryableError("google http 403 (rate limited)", status=403)
+                return ConnectorAuthError("google http 403", status=403)
+            if status in (401,):
                 return ConnectorAuthError(f"google http {status}", status=status)
             if status == 410:  # Gone: incremental cursor expired -> full resync
                 return ConnectorRetryableError(
