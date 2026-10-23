@@ -47,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -59,6 +59,7 @@ from brain.connectors.base import (
     ConnectorRetryableError,
     SourceRecord,
 )
+from brain.connectors.state import QUARANTINE_AFTER
 from brain.db.models import MemoryItem
 from brain.services.dedupe import content_fingerprint
 
@@ -129,6 +130,12 @@ class _RecordRepoProto(Protocol):
 
     def put(self, source: str, external_id: str, version: str | None, item_id: Any) -> None: ...
 
+    def mark_failure(
+        self, source: str, external_id: str, version: str | None, error: str
+    ) -> bool: ...
+
+    def clear_failure(self, source: str, external_id: str) -> None: ...
+
 
 class _IndexerProto(Protocol):
     def index(self, item: MemoryItem) -> None: ...
@@ -185,23 +192,46 @@ class ConnectorRunner:
             try:
                 outcome = self._handle(record)
             except Exception as exc:  # noqa: BLE001 — one bad record holds the cursor
-                errors += 1
-                logger.warning(
-                    "connectors: %s record %s failed: %s",
-                    name,
-                    record.external_id,
-                    exc,
-                    exc_info=True,
-                )
-                ops.record_event(
-                    f"connector:{name}",
-                    "record",
-                    ok=False,
-                    detail={
-                        "external_id": record.external_id,
-                        "error": f"{type(exc).__name__}: {exc}"[:200],
-                    },
-                )
+                detail = f"{type(exc).__name__}: {exc}"[:200]
+                if self._records.mark_failure(
+                    name, record.external_id, record.version, detail
+                ):
+                    # 3rd consecutive failure: QUARANTINED. Not an error any
+                    # more — the batch's cursor may advance past it; the
+                    # record stays in the ledger until the version bumps.
+                    skipped += 1
+                    ops.record_event(
+                        f"connector:{name}",
+                        "quarantine",
+                        ok=False,
+                        detail={
+                            "external_id": record.external_id,
+                            "error": detail,
+                            "fail_count": QUARANTINE_AFTER,
+                        },
+                    )
+                    logger.warning(
+                        "connectors: %s record %s quarantined after %d failures: %s",
+                        name,
+                        record.external_id,
+                        QUARANTINE_AFTER,
+                        detail,
+                    )
+                else:
+                    errors += 1
+                    ops.record_event(
+                        f"connector:{name}",
+                        "record",
+                        ok=False,
+                        detail={"external_id": record.external_id, "error": detail},
+                    )
+                    logger.warning(
+                        "connectors: %s record %s failed: %s",
+                        name,
+                        record.external_id,
+                        exc,
+                        exc_info=True,
+                    )
                 continue
             if outcome == "created":
                 created += 1
@@ -243,11 +273,26 @@ class ConnectorRunner:
         name = self._connector.name
         row = self._records.get(name, record.external_id)
         item = self._repo.get(row.item_id) if row is not None and row.item_id else None
-        if row is not None and row.item_id is None:
+        if row is not None and row.item_id is None and row.fail_count == 0:
             # USER-DELETED: the item was deleted out-of-band and the ledger's
             # SET NULL kept the row. Deleting is a user decision — never
-            # re-capture this record.
+            # re-capture this record. (A poison record also has item_id NULL
+            # but fail_count > 0 — it falls through to the retry below.)
             return "skipped"
+
+        if row is not None and row.status == "failed":
+            # QUARANTINED: not attempted, not an error — the cursor advances.
+            if record.version == row.version:
+                return "skipped"
+            # The source bumped the version: one more chance.
+            self._records.clear_failure(name, record.external_id)
+            row = self._records.get(name, record.external_id)
+
+        # ONE clamp site: ItemCreate rejects text longer than the core's
+        # raw_text limit, so a long record would fail ingest, hold the cursor
+        # and retry forever. Both the create and the update path use the
+        # clamped text from here on.
+        record, truncated_from = self._clamp_text(record)
 
         if row is None or item is None:
             # Unknown record — or a race (the item vanished between the two
@@ -260,17 +305,12 @@ class ConnectorRunner:
                     raw_text=record.text,
                     source=name,
                     occurred_at=record.occurred_at,
-                    meta=self._framework_meta(record),
+                    meta=self._framework_meta(record, truncated_from=truncated_from),
                 )
             )
             self._capture_attachments(record, item)
             self._records.put(name, record.external_id, record.version, item.id)
             return "created"
-
-        stored_meta = dict(item.meta or {})
-        already_deleted = bool(stored_meta.get("source_deleted"))
-        if record.version == row.version and record.deleted == already_deleted:
-            return "skipped"
 
         stored_meta = dict(item.meta or {})
         already_deleted = bool(stored_meta.get("source_deleted"))
@@ -294,7 +334,10 @@ class ConnectorRunner:
         # extraction re-run: user-acted items are never overwritten). Only
         # the version marker moves, so this bump is not re-reported forever.
         user_edited = stored_meta.get("connector_text_sha") != _text_sha(item.raw_text)
-        new_meta = {**stored_meta, **self._framework_meta(record)}
+        new_meta = {
+            **stored_meta,
+            **self._framework_meta(record, truncated_from=truncated_from),
+        }
         if already_deleted:
             # Source un-deleted: reversal applies regardless of who owns the
             # text — a hidden item the source restored must be visible again.
@@ -372,7 +415,22 @@ class ConnectorRunner:
                 child.superseded_by = None
             child.meta = child_meta
 
-    def _framework_meta(self, record: SourceRecord) -> dict[str, Any]:
+    def _clamp_text(self, record: SourceRecord) -> tuple[SourceRecord, int | None]:
+        """Clamp record.text to the core's raw_text limit (the ONE clamp site).
+
+        Returns the (possibly replaced) record and the original length when
+        truncation happened (None otherwise). The sha marker is computed on
+        the CLAMPED text by _framework_meta, so a long item does not look
+        user-edited on every later sync.
+        """
+        limit = schemas.RAW_TEXT_MAX_LENGTH
+        if len(record.text) <= limit:
+            return record, None
+        return replace(record, text=record.text[:limit]), len(record.text)
+
+    def _framework_meta(
+        self, record: SourceRecord, truncated_from: int | None = None
+    ) -> dict[str, Any]:
         """The one place item meta is built (SIMPLIFY target: single site).
 
         ``connector_text_sha`` is the sha256 of the last text the framework
@@ -387,6 +445,9 @@ class ConnectorRunner:
             "url": record.url,
             "connector_text_sha": _text_sha(record.text),
         }
+        if truncated_from is not None:
+            meta["text_truncated"] = True
+            meta["original_length"] = truncated_from
         meta.update(record.meta)  # the record's own keys win
         return meta
 

@@ -2,6 +2,7 @@
 auth google (fake flow + fake keychain — no network, no real keychain).
 """
 
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -129,6 +130,25 @@ def test_list_shows_persisted_state(settings_env, database, capsys):
         with SessionLocal() as session:
             session.execute(sql_text("DELETE FROM connector_state"))
             session.commit()
+
+
+def test_list_shows_quarantined_count(settings_env, database, capsys):
+    """Review round 2 A: quarantined poison records are visible per source."""
+    from brain.connectors.state import ConnectorRecordRepo
+    from brain.db.session import SessionLocal
+
+    with SessionLocal() as session:
+        for _ in range(3):  # three strikes -> quarantined
+            ConnectorRecordRepo(session).mark_failure(
+                "gcal", "bad-1", "v9", "RuntimeError: poison"
+            )
+
+    assert cli.main(["connectors", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "quarantined" in out
+    # the gcal row carries the quarantined count
+    gcal_row = next(line for line in out.splitlines() if line.startswith("gcal"))
+    assert re.search(r"\b1\b", gcal_row)
 
 
 def test_sync_refuses_unknown_disabled_and_unavailable(settings_env, capsys):
