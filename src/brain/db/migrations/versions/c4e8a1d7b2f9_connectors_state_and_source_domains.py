@@ -27,8 +27,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c4e8a1d7b2f9"
-down_revision: str | None = "c9d2e7f4a1b8"  # was b8c4f2a6e9d1: #49's triage migration
-# landed while this branch was in flight; re-pointed per the merge-order rule.
+down_revision: str | None = "c9d2e7f4a1b8"  # re-pointed: #49 (triage) merged first
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -85,6 +84,12 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        # Poison-record quarantine: 3 consecutive record-level failures put
+        # the row in status 'failed'; the runner then skips it (cursor can
+        # advance) until the source bumps the version.
+        sa.Column("status", sa.String(16), nullable=False, server_default="synced"),
+        sa.Column("fail_count", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("last_error", sa.Text(), nullable=True),
     )
     op.create_index(
         op.f("ix_connector_records_item_id"), "connector_records", ["item_id"], unique=False

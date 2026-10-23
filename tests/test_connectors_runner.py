@@ -92,7 +92,9 @@ class Harness:
 
     def item(self, external_id: str) -> MemoryItem | None:
         row = self.records.get("gcal", external_id)
-        return None if row is None else self.repo.get(row.item_id)
+        if row is None or row.item_id is None:
+            return None  # unknown record, or a poison/tombstone ledger row
+        return self.repo.get(row.item_id)
 
 
 class _InMemoryIndexer:
@@ -218,6 +220,333 @@ def test_user_deleted_item_is_never_recaptured(runner_db):
     row = h.records.get("gcal", "r1")
     assert row is not None and row.item_id is None  # tombstone remains
     assert h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0) == []
+
+
+def test_deletion_touches_only_the_marks_not_the_content(runner_db):
+    """Review bug 1: a deleted record's payload carries no content (Drive's
+    deleted record has text=''; a cancelled event only id+status). The
+    deletion must change ONLY the marks + ledger version — never wipe the
+    text, re-index empty content, re-enqueue, or touch occurred_at."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            # the delete payload: same id, NO useful content
+            _batch(make_record(version="v2", text="", occurred_at=None, deleted=True)),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    text_before = item.raw_text
+    when_before = item.occurred_at
+    enqueued_before = len(h.enrichment.enqueued)
+    indexed_before = len(h.indexer.indexed)
+
+    summary = runner.run()
+
+    assert summary.deleted == 1
+    item = h.item("r1")
+    assert item is not None
+    assert item.raw_text == text_before  # content NOT wiped
+    assert item.occurred_at == when_before
+    assert item.meta["source_deleted"] is True
+    assert len(h.enrichment.enqueued) == enqueued_before  # nothing re-enqueued
+    assert len(h.indexer.indexed) == indexed_before  # nothing re-indexed
+
+
+def test_user_edited_item_is_still_hidden_when_source_deletes(runner_db):
+    """Review bug 2: deletion applies regardless of who owns the text."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[_batch(make_record()), _batch(make_record(deleted=True))]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    item.raw_text = "USER edited this"
+    h.repo.commit()
+
+    summary = runner.run()
+
+    assert summary.deleted == 1
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["source_deleted"] is True
+    assert item.superseded_by == item.id
+    assert h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0) == []
+
+
+def test_relation_strike_survives_source_delete_and_undelete(runner_db):
+    """Review bug 3: a REAL PR-B strike (superseded_by = a newer item) must
+    survive both the source delete and the un-delete — the runner only ever
+    sets/clears its OWN self-strike."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", deleted=True)),
+            _batch(make_record(version="v3", text="body of r1, back")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    item = h.item("r1")
+    assert item is not None
+    newer = MemoryItem(raw_text="newer version of the fact", source="manual")
+    h.repo.add(newer)
+    h.repo.commit()
+    item.superseded_by = newer.id  # a real supersedes relation struck this item
+    h.repo.commit()
+
+    runner.run()  # delete
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["source_deleted"] is True
+    assert item.superseded_by == newer.id  # NOT overwritten with self
+
+    runner.run()  # un-delete (v3, not deleted)
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta.get("source_deleted") is None
+    assert item.superseded_by == newer.id  # relation's strike still intact
+
+
+def _link_child(h: Harness, parent: MemoryItem, title: str, state: str) -> MemoryItem:
+    """Create an extraction child (state) quoting the parent via item_sources."""
+    from brain.db.models import ItemSource
+
+    child = MemoryItem(
+        raw_text=title,
+        source=parent.source,
+        child_state=state,
+        extraction_meta={"run_id": "r-test"},
+    )
+    h.repo.add(child)
+    h.repo.commit()
+    h.session.add(ItemSource(child_id=child.id, source_id=parent.id, quote="q"))
+    h.session.commit()
+    return child
+
+
+def test_children_of_a_deleted_parent_hidden_or_flagged(runner_db):
+    """Review bug 4: a trashed source must not leave its proposed children
+    askable. Proposed children hide with the same mechanism; kept children
+    (the user acted) stay visible but flagged; un-delete reverses exactly."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", deleted=True)),
+            _batch(make_record(version="v3", text="body of r1, back")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    parent = h.item("r1")
+    assert parent is not None
+    proposed = _link_child(h, parent, "Dentist Tuesday", "proposed")
+    kept = _link_child(h, parent, "Dentist (confirmed)", "kept")
+
+    runner.run()  # delete
+    proposed = h.repo.get(proposed.id)
+    kept = h.repo.get(kept.id)
+    assert proposed is not None and proposed.superseded_by == proposed.id
+    assert kept is not None and kept.superseded_by is None  # user acted: visible
+    assert kept.meta.get("parent_source_deleted") is True
+
+    runner.run()  # un-delete
+    proposed = h.repo.get(proposed.id)
+    kept = h.repo.get(kept.id)
+    assert proposed is not None and proposed.superseded_by is None
+    assert kept is not None and kept.meta.get("parent_source_deleted") is None
+
+
+def test_connector_text_sha_detects_user_edits_without_duplicating_text(runner_db):
+    """Review finding 5: the framework stores a sha256 of its last-written
+    text (NOT the full text) in meta, and the update path compares hashes."""
+    import hashlib
+
+    h = Harness(runner_db)
+    connector = FakeConnector(batches=[_batch(make_record())])
+    h.runner(connector).run()
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta["connector_text_sha"] == hashlib.sha256(b"body of r1").hexdigest()
+    assert "connector_text" not in item.meta  # no full-text duplicate in JSONB
+
+
+def test_long_text_record_is_clamped_not_fatal(runner_db):
+    """Review round 2 A: ItemCreate rejects raw_text > RAW_TEXT_MAX_LENGTH
+    (10_000), so a 12k-char record would fail ingest every run and hold the
+    cursor forever. The runner clamps in ONE place and flags it in meta."""
+    import hashlib
+
+    from brain import schemas
+
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[_batch(make_record(text="x" * 12_345))],
+    )
+    h.runner(connector).run()
+    item = h.item("r1")
+    assert item is not None  # created, NOT failed
+    assert len(item.raw_text) == schemas.RAW_TEXT_MAX_LENGTH
+    assert item.meta["text_truncated"] is True
+    assert item.meta["original_length"] == 12_345
+    # the marker is the sha of the CLAMPED text, or every long item would
+    # look user-edited forever
+    assert item.meta["connector_text_sha"] == hashlib.sha256(
+        item.raw_text.encode("utf-8")
+    ).hexdigest()
+
+
+def test_long_text_update_clamps_too(runner_db):
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),
+            _batch(make_record(version="v2", text="y" * 11_111)),
+        ]
+    )
+    h.runner(connector).run()
+    item = h.item("r1")
+    assert item is not None
+
+    summary = h.runner(connector).run()  # second batch: the long update
+
+    assert summary.updated == 1
+    item = h.item("r1")
+    assert item is not None
+    assert len(item.raw_text) == 10_000
+    assert item.meta["text_truncated"] is True
+    assert item.meta["original_length"] == 11_111
+
+
+def test_poison_record_quarantines_and_releases_cursor(runner_db):
+    """Review round 2 A part 2: a record whose create always raises must not
+    wedge the source. Failures 1-2 hold the cursor; on the 3rd the record is
+    quarantined in the ledger (status failed + last error), the batch counts
+    it as skipped and the cursor advances. Later runs skip it unattempted."""
+    from sqlalchemy import text as sql_text
+
+    from brain.db.session import SessionLocal
+
+    h = Harness(runner_db)
+    real_create = h.ingest.create
+
+    def flaky_create(payload: Any) -> Any:
+        if payload.raw_text == "poison body":
+            raise RuntimeError("simulated ingest failure")
+        return real_create(payload)
+
+    h.ingest.create = flaky_create
+    poison_batch = [
+        make_record(external_id="good", text="good one"),
+        make_record(external_id="bad", text="poison body"),
+    ]
+    connector = FakeConnector(
+        batches=[
+            _batch(*poison_batch),
+            _batch(*poison_batch),
+            _batch(*poison_batch),
+            _batch(*poison_batch),  # source still re-offers it after quarantine
+        ]
+    )
+    runner = h.runner(connector)
+
+    s1 = runner.run()
+    assert s1.errors == 1 and s1.cursor_saved is False
+    s2 = runner.run()
+    assert s2.errors == 1 and s2.cursor_saved is False
+
+    s3 = runner.run()  # 3rd failure: quarantine, not an error -> cursor moves
+    assert s3.errors == 0
+    assert s3.cursor_saved is True
+    row = h.records.get("gcal", "bad")
+    assert row is not None
+    assert row.status == "failed"
+    assert row.fail_count == 3
+    assert row.last_error is not None and "simulated ingest failure" in row.last_error
+    with SessionLocal() as session:
+        quarantined_events = session.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component = 'connector:gcal' AND kind = 'quarantine'"
+            )
+        ).scalar()
+    assert quarantined_events and quarantined_events >= 1
+
+    s4 = runner.run()  # quarantined: skipped unattempted, still no error
+    assert s4.errors == 0
+    assert s4.skipped >= 1
+    assert h.item("bad") is None  # never captured
+
+
+def test_quarantined_record_retries_on_version_bump(runner_db):
+    """A later version bump gives a quarantined record another chance; a
+    success resets the quarantine bookkeeping."""
+    h = Harness(runner_db)
+    real_create = h.ingest.create
+
+    def flaky_create(payload: Any) -> Any:
+        if payload.raw_text == "poison body":
+            raise RuntimeError("simulated ingest failure")
+        return real_create(payload)
+
+    h.ingest.create = flaky_create
+    poison = make_record(external_id="bad", text="poison body")
+    connector = FakeConnector(
+        batches=[
+            _batch(poison),
+            _batch(poison),
+            _batch(poison),
+            _batch(make_record(external_id="bad", version="v2", text="fixed body")),
+        ]
+    )
+    runner = h.runner(connector)
+    for _ in range(3):
+        runner.run()
+    row = h.records.get("gcal", "bad")
+    assert row is not None and row.status == "failed"
+
+    summary = runner.run()  # v2: retried and it works now
+
+    assert summary.created == 1
+    item = h.item("bad")
+    assert item is not None and item.raw_text == "fixed body"
+    row = h.records.get("gcal", "bad")
+    assert row is not None
+    assert row.status == "synced"
+    assert row.fail_count == 0
+    assert row.last_error is None
+
+
+def test_unhide_without_version_bump_reverses_marks(runner_db):
+    """Review round 2 C (pins the semantics): the skip condition is version
+    equal AND deleted-state equal, so a source un-delete WITHOUT a version
+    bump gets through and reverses the marks."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record()),  # v1 created
+            _batch(make_record(deleted=True)),  # v1 deleted — SAME version
+            _batch(make_record()),  # v1 restored — SAME version
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()
+    runner.run()
+    assert (h.item("r1") is not None) and (h.item("r1").meta.get("source_deleted") is True)  # type: ignore[union-attr]
+
+    runner.run()  # un-delete, no version bump
+
+    item = h.item("r1")
+    assert item is not None
+    assert item.meta.get("source_deleted") is None
+    assert item.superseded_by is None
 
 
 def test_new_version_updates_item_in_place_and_reindexes(runner_db):

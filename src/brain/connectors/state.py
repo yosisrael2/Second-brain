@@ -24,6 +24,11 @@ from brain.db.models import ConnectorRecord, ConnectorState
 _LAST_ERROR_MAX = 2000  # keep the column small; errors are truncated
 
 
+# Consecutive record-level failures before a record is quarantined: the
+# cursor must never be wedged by one poison record forever.
+QUARANTINE_AFTER = 3
+
+
 class ConnectorStateRepo:
     """Cursor + health per connector (the ``connector_state`` table)."""
 
@@ -92,14 +97,68 @@ class ConnectorRecordRepo:
         return self._session.scalars(stmt).first()
 
     def put(self, source: str, external_id: str, version: str | None, item_id: object) -> None:
-        """Insert or update the ledger row for one synced record."""
+        """Insert or update the ledger row for one synced record.
+
+        A successful sync also resets the poison-record bookkeeping: the
+        record is back in the runner's good graces.
+        """
         row = self.get(source, external_id)
         if row is None:
             row = ConnectorRecord(source=source, external_id=external_id)
             self._session.add(row)
         row.version = version
         row.item_id = item_id  # type: ignore[assignment]
+        row.status = "synced"
+        row.fail_count = 0
+        row.last_error = None
         self._session.commit()
+
+    def mark_failure(
+        self, source: str, external_id: str, version: str | None, error: str
+    ) -> bool:
+        """Count one more consecutive failure for this record.
+
+        After QUARANTINE_AFTER failures in a row the record is quarantined:
+        status 'failed' + the failing version recorded — the runner stops
+        retrying it, so the batch's cursor can advance. Returns True iff the
+        record is NOW quarantined. A later version bump clears it (the
+        runner calls :meth:`clear_failure`). The version is only written on
+        quarantining — an in-flight failing record keeps its old version so
+        the runner's version-equality skip never bypasses the retry.
+        """
+        row = self.get(source, external_id)
+        if row is None:
+            row = ConnectorRecord(source=source, external_id=external_id)
+            self._session.add(row)
+        row.fail_count = (row.fail_count or 0) + 1
+        row.last_error = error
+        quarantined = row.fail_count >= QUARANTINE_AFTER
+        if quarantined:
+            row.status = "failed"
+            row.version = version
+        self._session.commit()
+        return quarantined
+
+    def clear_failure(self, source: str, external_id: str) -> None:
+        """Release a quarantined record (the source bumped its version)."""
+        row = self.get(source, external_id)
+        if row is not None and row.status == "failed":
+            row.status = "synced"
+            row.fail_count = 0
+            row.last_error = None
+            self._session.commit()
+
+    def quarantined_counts(self) -> dict[str, int]:
+        """Quarantined (status 'failed') rows per source (CLI listing)."""
+        rows = self._session.execute(
+            select(ConnectorRecord.source, ConnectorRecord.external_id).where(
+                ConnectorRecord.status == "failed"
+            )
+        ).all()
+        counts: dict[str, int] = {}
+        for source, _external_id in rows:
+            counts[source] = counts.get(source, 0) + 1
+        return counts
 
     def counts(self) -> dict[str, int]:
         """Rows per source (CLI listing)."""
