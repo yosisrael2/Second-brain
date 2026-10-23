@@ -665,7 +665,9 @@ Previously every suite silently pinned the same `brain_items_test`, and
 concurrent runs polluted each other's vectors (a real incident). Run two
 suites side by side by pointing each at its own `DATABASE_URL` and letting
 the collection follow, e.g. `DATABASE_URL=.../brain_w5_test pytest`;
-CI's `brain_test` keeps the classic `brain_items_test`.
+CI's `brain_test` keeps the classic `brain_items_test`. If your shell
+exports `QDRANT_COLLECTION` explicitly, unset it — an explicit value
+bypasses the derivation.
 
 CI runs the same commands on every PR and push to main (GitHub Actions,
 `.github/workflows/ci.yml`): ruff, mypy, shellcheck, and pytest against

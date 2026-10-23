@@ -5,9 +5,11 @@ the kid's class name) join the recall pool BEFORE the Jev rerank. Offline:
 real MemoryService + real ItemsRepository over brain_w5_test, search stubbed.
 """
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import text as sql_text
 from tests.conftest import assert_test_database
 
@@ -55,14 +57,22 @@ def _wipe_items() -> None:
         conn.execute(sql_text("DELETE FROM memory_items"))
 
 
-def _world() -> tuple[MemoryService, ItemsRepository]:
-    """Real memory + items repositories over the test DB, wiped clean."""
+@pytest.fixture(name="world")
+def world_fixture(clean_memory, memory_db) -> Iterator[tuple[MemoryService, ItemsRepository]]:
+    """Real memory + items repositories over the test DB, wiped clean.
+
+    The session is closed on teardown — the AskService holds it in a cycle
+    (service -> repo -> session), so without an explicit close CPython's GC
+    may leave an idle-in-transaction connection parked in the pool, which
+    deadlocks the migration test's ALTER/DROP TABLE later in the suite.
+    """
     _wipe_items()
     session = SessionLocal()
     memory = MemoryService(MemoryRepository(session))
     for entity in memory.overview(status="confirmed", q=None):
         memory.delete_entity(entity["id"])
-    return memory, ItemsRepository(session)
+    yield memory, ItemsRepository(session)
+    session.close()
 
 
 def _seed_itamar_world(memory: MemoryService, repo: ItemsRepository) -> MemoryItem:
@@ -106,8 +116,8 @@ def _service(
     )
 
 
-def test_kid_question_recalls_channel_item_without_kid_name(clean_items, memory_db) -> None:
-    memory, repo = _world()
+def test_kid_question_recalls_channel_item_without_kid_name(clean_items, world) -> None:
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     search = RecordingSearch([])  # semantic leg finds nothing (the failure mode)
     service = _service(memory, repo, search)
@@ -123,8 +133,8 @@ def test_kid_question_recalls_channel_item_without_kid_name(clean_items, memory_
     ), "the recalled item must not contain the kid's name"
 
 
-def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
-    memory, repo = _world()
+def test_family_channel_recalled_for_named_kid(clean_items, world) -> None:
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     family_item = repo.add(MemoryItem(
         raw_text="[20/10/2026, 09:00] כל המשפחה / אבא: קמפינג בערב הבחירות בהר עגול",
@@ -140,8 +150,8 @@ def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
     assert str(family_item.id) in [str(hit.item.id) for hit in result.sources]
 
 
-def test_no_kid_named_leaves_pool_unchanged(clean_items, memory_db) -> None:
-    memory, repo = _world()
+def test_no_kid_named_leaves_pool_unchanged(clean_items, world) -> None:
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     semantic_hit = repo.add(MemoryItem(raw_text="הקמפינג של כיתת ב' ברקת בהר עגול"))
     search = RecordingSearch([SearchHit(item=semantic_hit, score=0.9)])
@@ -159,8 +169,8 @@ def test_no_kid_named_leaves_pool_unchanged(clean_items, memory_db) -> None:
     ]
 
 
-def test_other_kids_channels_never_leak(clean_items, memory_db) -> None:
-    memory, repo = _world()
+def test_other_kids_channels_never_leak(clean_items, world) -> None:
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     rona_item = repo.add(MemoryItem(
         raw_text="[19/10/2026, 17:00] רונה כדורגל / המאמנת: אימון רביעי 15:15 באשכולות",
@@ -176,8 +186,8 @@ def test_other_kids_channels_never_leak(clean_items, memory_db) -> None:
     assert str(rona_item.id) not in [str(hit.item.id) for hit in result.sources]
 
 
-def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
-    memory, repo = _world()
+def test_kid_recall_cap_respected(clean_items, world) -> None:
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     for n in range(20):
         repo.add(MemoryItem(
@@ -191,13 +201,13 @@ def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
     assert len(search.seen_extra[0]) == 16, "the extra leg must respect its cap"
 
 
-def test_kid_name_matches_word_boundaries_only(clean_items, memory_db) -> None:
+def test_kid_name_matches_word_boundaries_only(clean_items, world) -> None:
     """'May' inside 'mayor' (or 'שחר' inside 'שחרור') must NOT name a kid.
 
     Substring matching is too loose: a kid whose name appears as a proper
     sub-word of another word in the question must not widen the pool.
     """
-    memory, repo = _world()
+    memory, repo = world
     _seed_itamar_world(memory, repo)  # unrelated world so only May can fire
     memory.add_entity("person", "May")
     memory.set_kid("May", gender="girl", school="בראשית", grade="3", class_="ג' שקד")
@@ -221,10 +231,43 @@ def test_kid_name_matches_word_boundaries_only(clean_items, memory_db) -> None:
     assert search.seen_extra[-1], "the real name as a whole word still fires"
 
 
-def test_by_text_any_excludes_dropped_children(clean_items, memory_db) -> None:
+def test_hebrew_prefixes_still_name_a_kid(clean_items, world) -> None:
+    """Hebrew glues prefixes onto words: 'לאיתמר'/'ואיתמר'/'שלאיתמר' are all
+    questions that NAME Itamar, so the prefix run [והבכלמש]{0,3} must be
+    allowed before the name — while 'שחר' inside 'שחרור' still must not fire
+    (the word continues with a letter, the name does not end there).
+    """
+    memory, repo = world
+    _seed_itamar_world(memory, repo)
+    memory.add_entity("person", "Shachar", aliases=["שחר"])
+    memory.set_kid("Shachar", gender="boy", school="בראשית", grade="4", class_="ד' נוף")
+    memory.set_channel("שחר חוג כדורסל", kind="club", applies_to="Shachar")
+    repo.add(MemoryItem(
+        raw_text="[21/10/2026, 18:30] שחר חוג כדורסל / המאמן: מחר מתאמנים בדווקא בבוקר",
+        occurred_at=datetime(2026, 10, 21, 15, 30, tzinfo=UTC),
+    ))
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    for question in (
+        "מה צריך לאיתמר מחר?",       # single prefix ל
+        "ואיתמר, מה הוא צריך?",       # single prefix ו
+        "האם שלאיתמר יש מחר משהו?",   # prefix combo של
+    ):
+        service.ask(question, now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+        assert search.seen_extra[-1], f"'{question}' must fire the kid leg"
+
+    service.ask("מה חדש עם השחרור הזה?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert not search.seen_extra[-1], "prefixes must not resurrect the שחרור false positive"
+
+    service.ask("מה עם שחר בחוג מחר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert search.seen_extra[-1], "the bare alias as a whole word still fires"
+
+
+def test_by_text_any_excludes_dropped_children(clean_items, world) -> None:
     """Repo contract (design item 19): dropped extracted children are never
     recalled; ordinary captures, proposed and kept children are."""
-    memory, repo = _world()
+    memory, repo = world
     _seed_itamar_world(memory, repo)
     for state in [None, "proposed", "kept", "dropped"]:
         repo.add(MemoryItem(
