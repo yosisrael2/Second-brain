@@ -12,6 +12,7 @@ import json
 from urllib.error import URLError
 
 import pytest
+from sqlalchemy import text
 from tests.live_guard import assert_points_stable, live_point_count
 
 from brain.ai.vectorstore import QdrantVectorStore
@@ -128,6 +129,114 @@ class TestSessionTripwire:
     def test_tripwire_passes_when_stable_or_unknown(self) -> None:
         assert_points_stable(before=50, after=50)
         assert_points_stable(before=None, after=51)  # qdrant was unreachable
+
+
+class TestLazyEngine:
+    """The guard fires when the live DB would actually be used — not on import."""
+
+    def test_from_import_does_not_build_the_engine(self, monkeypatch) -> None:
+        import brain.db.session as db_session
+
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        engine_before = db_session.engine  # from-import style: binds the proxy
+        assert db_session._engine is None, "attribute access on the proxy must not build"
+        assert engine_before is db_session.engine
+
+    def test_first_use_builds_and_guards(self, monkeypatch) -> None:
+        import brain.db.session as db_session
+
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        with db_session.SessionLocal() as session:
+            session.execute(text("SELECT 1"))
+        assert db_session._engine is not None
+
+    def test_live_url_refuses_on_first_use_without_a_flag(self, monkeypatch) -> None:
+        import brain.db.session as db_session
+
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        monkeypatch.setenv("DATABASE_URL", LIVE_DB_URL)
+        monkeypatch.delenv("BRAIN_ALLOW_LIVE", raising=False)
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="LIVE"):
+                db_session.SessionLocal()
+            assert db_session._engine is None, "nothing built when refused"
+        finally:
+            get_settings.cache_clear()
+
+
+class TestCLIDoesNotNeedTheFlagWhenHarmless:
+    """A guard firing where nothing dangerous happens trains reflexive opt-ins."""
+
+    def test_cli_help_never_builds_the_engine(self, monkeypatch, capsys) -> None:
+        import brain.db.session as db_session
+        from brain import cli
+
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        monkeypatch.setenv("DATABASE_URL", LIVE_DB_URL)
+        monkeypatch.delenv("BRAIN_ALLOW_LIVE", raising=False)
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(["--help"])
+            assert exc_info.value.code in (None, 0)
+        finally:
+            get_settings.cache_clear()
+            capsys.readouterr()
+        assert db_session._engine is None
+
+    def test_eval_extraction_aggregate_only_runs_without_the_flag(
+        self, monkeypatch, tmp_path, capsys
+    ) -> None:
+        import brain.db.session as db_session
+        from brain import cli
+
+        gold = tmp_path / "gold.jsonl"
+        pred = tmp_path / "pred.jsonl"
+        gold.write_text("")
+        pred.write_text("")
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        monkeypatch.setenv("DATABASE_URL", LIVE_DB_URL)
+        monkeypatch.delenv("BRAIN_ALLOW_LIVE", raising=False)
+        get_settings.cache_clear()
+        try:
+            assert cli.main([
+                "eval-extraction", "--gold", str(gold), "--pred", str(pred),
+                "--aggregate-only",
+            ]) == 0
+        finally:
+            get_settings.cache_clear()
+            capsys.readouterr()
+        assert db_session._engine is None, "eval-extraction must never touch the DB"
+
+    def test_db_using_command_refuses_without_the_flag(self, monkeypatch) -> None:
+        import brain.db.session as db_session
+        from brain import cli
+
+        monkeypatch.setattr(db_session, "_engine", None)
+        monkeypatch.setattr(db_session, "_session_factory", None)
+        monkeypatch.setenv("DATABASE_URL", LIVE_DB_URL)
+        monkeypatch.delenv("BRAIN_ALLOW_LIVE", raising=False)
+        get_settings.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="LIVE"):
+                cli.main([
+                    "memory", "seed-kid", "--name", "x", "--gender", "girl",
+                    "--school", "s", "--grade", "1", "--class", "c", "--teacher", "t",
+                ])
+        finally:
+            get_settings.cache_clear()
+
+    def test_alembic_env_does_not_import_db_session(self) -> None:
+        # migrations build their own engine from the URL; they must keep
+        # needing only the explicit flag, not this module's shared engine
+        env_py = open("src/brain/db/migrations/env.py").read()
+        assert "db.session" not in env_py and "SessionLocal" not in env_py
 
 
 class TestNarrowGuards:
