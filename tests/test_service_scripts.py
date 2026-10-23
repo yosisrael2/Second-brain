@@ -525,7 +525,8 @@ class TestServiceOtherCommands:
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         bootstraps = [c for c in _calls(tmp_path) if "bootstrap" in c]
-        assert len(bootstraps) == 4
+        # Email is opt-in and unset here: api, telegram, whatsapp bootstrap.
+        assert len(bootstraps) == 3
 
     def test_side_process_scripts_log_unbuffered(self):
         """launchd log files must stream: PYTHONUNBUFFERED=1 everywhere
@@ -628,13 +629,41 @@ class TestRunEmailExitContract:
         assert "ALLOW: 1" in result.stdout
         assert "COMPOSE: second-brain" in result.stdout
 
+    def test_sources_lib_and_loads_the_env_file(self, tmp_path):
+        """run-email.sh must source lib.sh BEFORE calling load_env_file: with
+        the source missing, every start printed 'load_env_file: command not
+        found' and .env was silently skipped (review of #43 @ 5564e09).
+        BRAIN_ENV_FILE is the test seam: the env file the launcher loads
+        (production default: $ROOT/.env)."""
+        env_file = tmp_path / "email.env"
+        env_file.write_text("GMAIL_LABEL_ID=Label_from_env_file\n")
+        fake_bin = tmp_path / "bin-email3"
+        fake_bin.mkdir()
+        fake_brain = fake_bin / "brain"
+        fake_brain.write_text('echo "LABEL: ${GMAIL_LABEL_ID-unset}"\n')
+        fake_brain.chmod(0o755)
+        result = _run(
+            [str(SCRIPTS / "run-email.sh")],
+            env={
+                "BRAIN_BIN": str(fake_brain),
+                "BRAIN_ENV_FILE": str(env_file),
+                "GMAIL_LABEL_ID": "",  # neutralize any inherited value
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "command not found" not in result.stderr, result.stderr
+        assert "LABEL: Label_from_env_file" in result.stdout, result.stdout + result.stderr
+
 
 class TestServiceEmailAgent:
-    """service.sh manages FOUR agents: api, telegram, email, whatsapp."""
+    """service.sh manages FOUR agents: api, telegram, email, whatsapp —
+    but email is OPT-IN: install writes/bootstraps it only when
+    GMAIL_LABEL_ID is set (env or .env); otherwise the agent is skipped
+    and no stale plist is left behind."""
 
     @need_venv
     def test_install_writes_and_bootstraps_four_labels(self, tmp_path):
-        env = _service_env(tmp_path)
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         email_plist = tmp_path / "LaunchAgents" / "com.secondbrain.email.plist"
@@ -649,7 +678,7 @@ class TestServiceEmailAgent:
 
     @need_venv
     def test_install_precreates_email_log_files_0600(self, tmp_path):
-        env = _service_env(tmp_path)
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         log_dir = tmp_path / "Logs"
@@ -659,11 +688,46 @@ class TestServiceEmailAgent:
             assert log.stat().st_mode & 0o777 == 0o600, f"{name} not 0600"
 
     def test_uninstall_removes_the_email_plist(self, tmp_path):
-        env = _service_env(tmp_path)
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
         _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         result = _run([str(SCRIPTS / "service.sh"), "uninstall"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         assert not (tmp_path / "LaunchAgents" / "com.secondbrain.email.plist").exists()
+
+    def test_install_skips_email_when_gmail_label_id_unset(self, tmp_path):
+        """Email is OPT-IN: without GMAIL_LABEL_ID (env or .env) install must
+        NOT write or bootstrap the email agent, must remove any stale email
+        plist (a leftover agent would start, exit 78->0 and read as a
+        permanently-down background service), and must say so (review of
+        #43 @ 5564e09)."""
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": ""})
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.email.plist").write_text("<stale/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (plist_dir / "com.secondbrain.email.plist").exists(), result.stdout
+        assert "skipped" in result.stdout and "GMAIL_LABEL_ID" in result.stdout
+        calls = _calls(tmp_path)
+        assert not any("bootstrap" in c and "com.secondbrain.email" in c for c in calls)
+
+    def test_install_installs_email_when_gmail_label_id_set(self, tmp_path):
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        plist_dir = tmp_path / "LaunchAgents"
+        assert (plist_dir / "com.secondbrain.email.plist").exists()
+        assert any("bootstrap" in c and "com.secondbrain.email" in c for c in _calls(tmp_path))
+        assert "GMAIL_LABEL_ID not set" not in result.stdout
+
+    def test_status_skips_email_when_not_configured_without_failing(self, tmp_path):
+        """'status' must not report the opt-out email agent as down: without
+        GMAIL_LABEL_ID the email line says skipped and api/tg/whatsapp alone
+        decide the exit code."""
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": ""})
+        result = _run([str(SCRIPTS / "service.sh"), "status"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "GMAIL_LABEL_ID not set" in result.stdout
 
     def test_restart_kickstarts_the_email_agent(self, tmp_path):
         env = _service_env(tmp_path)

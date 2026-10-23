@@ -54,11 +54,21 @@ GUI_DOMAIN="gui/$(id -u)"
 # shims (docker), then the system. The cockpit docker check needs `docker`.
 SERVICE_PATH="/opt/homebrew/bin:$HOME/.rd/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+email_configured() {
+  # Email is OPT-IN: the agent is installed only when a Gmail label id is
+  # configured (real environment wins over .env). Without it the poller
+  # would start, exit 78->0 and stay down — reading as a permanently-dead
+  # background service in the cockpit. Install skips it instead.
+  load_env_file
+  [ -n "${GMAIL_LABEL_ID:-}" ]
+}
+
 usage() {
   cat <<EOF
 Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|whatsapp]
 
 install    stop our manual instances, write the plists, bootstrap them
+           (email is opt-in: only installed when GMAIL_LABEL_ID is set)
 uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
 restart    kickstart -k all installed agents (skips the rest)
@@ -272,27 +282,48 @@ install() {
   sleep_check
 
   say "install: writing plists to $PLIST_DIR"
+  local install_email=0
+  if email_configured; then
+    install_email=1
+  fi
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
-  write_plist "$LABEL_EMAIL" "$RUN_EMAIL" "email"
+  if [ "$install_email" -eq 1 ]; then
+    write_plist "$LABEL_EMAIL" "$RUN_EMAIL" "email"
+  else
+    # Opt-out must leave no stale agent: an old plist would keep running (or
+    # bootstrap and exit 78->0) — a permanently-down background service.
+    bootout_label "$LABEL_EMAIL"
+    rm -f "$PLIST_DIR/${LABEL_EMAIL}.plist"
+    say "email: skipped (GMAIL_LABEL_ID not set)"
+  fi
   THROTTLE=30 write_plist "$LABEL_WA" "$RUN_WHATSAPP" "whatsapp"
 
   # Pre-create the log files mode 600: launchd writes into the existing inode
   # (preserving the mode) instead of creating them with the default umask.
-  for f in api api.err telegram telegram.err email email.err whatsapp whatsapp.err; do
+  for f in api api.err telegram telegram.err whatsapp whatsapp.err; do
     touch "$LOG_DIR/$f.log" 2>/dev/null || true
   done
+  if [ "$install_email" -eq 1 ]; then
+    for f in email email.err; do
+      touch "$LOG_DIR/$f.log" 2>/dev/null || true
+    done
+  fi
   chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
 
   say "install: bootstrapping agents"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
-  bootout_label "$LABEL_EMAIL"
+  if [ "$install_email" -eq 1 ]; then
+    bootout_label "$LABEL_EMAIL"
+  fi
   bootout_label "$LABEL_WA"
   local failed=0
   bootstrap_label "$LABEL_API" || failed=1
   bootstrap_label "$LABEL_TG" || failed=1
-  bootstrap_label "$LABEL_EMAIL" || failed=1
+  if [ "$install_email" -eq 1 ]; then
+    bootstrap_label "$LABEL_EMAIL" || failed=1
+  fi
   bootstrap_label "$LABEL_WA" || failed=1
   if [ "$failed" -ne 0 ]; then
     die "install: one or more agents failed to bootstrap (see above); re-run scripts/service.sh install"
@@ -336,7 +367,11 @@ status() {
   local ok=0
   print_label_status "$LABEL_API" || ok=1
   print_label_status "$LABEL_TG" || ok=1
-  print_label_status "$LABEL_EMAIL" || ok=1
+  if email_configured; then
+    print_label_status "$LABEL_EMAIL" || ok=1
+  else
+    printf '  %-28s skipped (GMAIL_LABEL_ID not set)\n' "$LABEL_EMAIL"
+  fi
   print_label_status "$LABEL_WA" || ok=1
   sleep_check
   docker_check

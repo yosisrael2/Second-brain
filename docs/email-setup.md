@@ -108,7 +108,9 @@ poller pauses 5 minutes between attempts and everything else keeps working.
 ## Run it 24/7 (launchd agent)
 
 A third launchd agent keeps the poller alive across logins, same model as
-the API and Telegram agents:
+the API and Telegram agents — installed only when `GMAIL_LABEL_ID` is set
+(opt-in; without consent there is nothing for the agent to poll, and an
+always-down agent would sit in the cockpit):
 
 | Agent | Runs | Restart behaviour |
 | --- | --- | --- |
@@ -129,9 +131,13 @@ while you are at the console:
    the token later without a prompt nobody will see.
 2. `brain gmail-poll --once` — verifies label id + token + capture end to
    end, and warms the same keychain grant.
-3. `scripts/service.sh install` — writes and bootstraps all three agents
-   (the email agent runs `scripts/run-email.sh`, which exports
-   `BRAIN_ALLOW_LIVE=1` and pins `COMPOSE_PROJECT_NAME=second-brain`).
+3. `scripts/service.sh install` — writes and bootstraps the agents. The
+   email agent is OPT-IN: it is installed only when `GMAIL_LABEL_ID` is
+   already set (in the environment or in `.env`); otherwise install prints
+   `email: skipped (GMAIL_LABEL_ID not set)` and removes any stale email
+   plist, and `service.sh status` shows the email agent as skipped instead
+   of down. The email agent runs `scripts/run-email.sh`, which exports
+   `BRAIN_ALLOW_LIVE=1` and pins `COMPOSE_PROJECT_NAME=second-brain`.
    Logs: `~/Library/Logs/second-brain/email.log` (poll ids and counts
    only — never message bodies, sender addresses, or tokens).
 

@@ -29,7 +29,10 @@ BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
   exit 0  # EX_CONFIG-shaped, but as 0: a missing venv is permanent; never restart-loop
 }
 
-load_env_file  # fills unset vars from .env (DATABASE_URL, GMAIL_*); real env wins
+# shellcheck source=lib.sh
+# shellcheck disable=SC1091  # dynamic path: lib.sh sits next to this script
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+load_env_file "${BRAIN_ENV_FILE:-$ROOT/.env}"  # fills unset vars (DATABASE_URL, GMAIL_*); real env wins
 # The launchd path IS the real service: opt in to the live-store startup guard
 # (brain.config.assert_not_live_store refuses bare worktree uvicorns otherwise).
 export BRAIN_ALLOW_LIVE=1
