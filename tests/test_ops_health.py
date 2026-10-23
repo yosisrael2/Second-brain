@@ -315,6 +315,25 @@ class TestBackgroundComponent:
         assert node["status"] == "ok"
         assert node["summary"] == "2/2 agents running"
 
+    def test_email_opt_out_never_degrades_the_background_node(self):
+        """The email agent is OPT-IN (service.sh installs it only when
+        GMAIL_LABEL_ID is set). A skipped email agent has NO plist, so
+        launchctl print fails and its info is empty — it must not count as
+        installed, and api/tg/whatsapp running alone must read 'ok' (review
+        of #43 @ 5564e09)."""
+        ops_health.reset_cache()
+        agents = {
+            "com.secondbrain.api": {"state": "running", "pid": 100},
+            "com.secondbrain.telegram": {"state": "running", "pid": 101},
+            "com.secondbrain.whatsapp": {"state": "running", "pid": 102},
+            "com.secondbrain.email": {},  # not installed -> launchctl print failed
+        }
+        raw = lambda: {"available": True, "agents": agents}  # noqa: E731
+        body = ops_health.run_health_checks(self._ctx(raw))
+        node = body["components"]["background"]
+        assert node["status"] == "ok", node["summary"]
+        assert node["summary"] == "3/3 agents running"
+
     def test_degraded_when_one_agent_dead_with_exit_code(self):
         ops_health.reset_cache()
         agents = {
