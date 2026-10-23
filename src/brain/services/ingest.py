@@ -192,6 +192,7 @@ class IngestService:
                 status=None,
                 limit=batch_size,
                 offset=offset,
+                include_noise=True,  # D2a: noise stays stored AND searchable
             )
             if not batch:
                 return indexed
