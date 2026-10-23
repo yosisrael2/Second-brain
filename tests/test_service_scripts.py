@@ -234,7 +234,11 @@ class _LaunchctlStub:
             '    touch "$STATE/gone-$label"\n'
             "    exit 0;;\n"
             "  bootstrap)\n"
-            '    label="${2##*/}"\n'
+            '    case "$2" in\n'
+            '      gui/[0-9]*) ;;  # launchctl bootstrap takes a DOMAIN target only\n'
+            '      *) echo "bootstrap: $2 is not a domain target (gui/<uid>)" >&2; exit 1;;\n'
+            '    esac\n'
+            '    label="${3##*/}"\n'
             '    n=$(cat "$STATE/bfail-$label" 2>/dev/null || echo 0)\n'
             f'    if [ "$n" -lt {bootstrap_failures} ]; then\n'
             '      echo $((n + 1)) > "$STATE/bfail-$label"\n'
@@ -444,6 +448,21 @@ class TestServiceOtherCommands:
         result = _run([str(SCRIPTS / "service.sh"), "bogus"], env=_service_env(tmp_path))
         assert result.returncode != 0
         assert "unknown command" in result.stderr
+
+    def test_bootstrap_target_is_the_domain_not_the_service(self, tmp_path):
+        """launchctl bootstrap takes a DOMAIN (gui/<uid>) plus the plist path —
+        NOT a service target (gui/<uid>/<label>, which is for bootout/print/
+        kickstart). A service target here makes every bootstrap fail, i.e. the
+        next install would boot out all agents and start none. The stub is
+        strict about the argv shape so this stays caught."""
+        env = _service_env(tmp_path)
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        for call in _calls(tmp_path):
+            if "bootstrap" not in call:
+                continue
+            target = call.split()[1]
+            assert target.count("/") == 1 and target.startswith("gui/"), call
 
     def test_install_retries_bootstrap_after_the_launchd_race(self, tmp_path):
         """'Bootstrap failed: 5: Input/output error' is the classic bootout→

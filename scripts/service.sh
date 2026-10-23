@@ -239,8 +239,7 @@ bootstrap_label() {
   # error'); retry ONLY that error, up to 3 tries, then report failure.
   local label="$1" attempt=1 out
   while :; do
-    if out="$(launchctl bootstrap "${GUI_DOMAIN}/${label}" \
-      "$PLIST_DIR/${label}.plist" 2>&1)"; then
+    if out="$(launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${label}.plist" 2>&1)"; then
       printf '  %-28s bootstrapped\n' "$label"
       return 0
     fi
