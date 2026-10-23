@@ -56,7 +56,7 @@ Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|wh
 install    stop our manual instances, write the three plists, bootstrap them
 uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
-restart    kickstart -k all agents
+restart    kickstart -k all installed agents (skips the rest)
 logs [c]   tail the last ${LINES:-50} lines (component: api, telegram,
            whatsapp, or all)
 
@@ -308,13 +308,17 @@ status() {
 }
 
 restart() {
-  say "restart: kickstart -k all agents"
+  say "restart: kickstart -k installed agents (labels with no plist are skipped)"
   local failed=0 label
   for label in "$LABEL_API" "$LABEL_TG" "$LABEL_WA"; do
+    if [ ! -f "$PLIST_DIR/${label}.plist" ]; then
+      printf '  %-28s skipped (not installed)\n' "$label"
+      continue
+    fi
     if launchctl kickstart -k "${GUI_DOMAIN}/${label}" 2>/dev/null; then
       printf '  %-28s kicked\n' "$label"
     else
-      printf '  %-28s FAILED (installed?)\n' "$label" >&2
+      printf '  %-28s FAILED\n' "$label" >&2
       failed=1
     fi
   done
