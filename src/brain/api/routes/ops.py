@@ -54,6 +54,19 @@ def post_ops_probe(component: str) -> dict[str, Any]:
     return ops_health.run_probe(component)
 
 
+@router.get("/ops/attachments")
+def get_ops_attachments() -> dict[str, Any]:
+    """Attachment queue depth + today's reading budget (design item 43/44)."""
+    from brain.api.deps import _attachment_service  # noqa: PLC0415 (deferred)
+
+    svc = _attachment_service()
+    return {
+        "queue_depth": svc.queue_depth(),
+        "read_today": svc.read_today(),
+        "daily_budget": svc.daily_budget,
+    }
+
+
 @router.get("/ops/flow")
 def get_ops_flow() -> dict[str, Any]:
     """Flow-diagram payload: nodes/edges with live status + hop stats."""
@@ -132,7 +145,9 @@ def get_ops_events(
         rows = conn.execute(
             text(
                 "SELECT id, ts, component, kind, ok, latency_ms, edge, detail "
-                + base + where + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
+                + base
+                + where
+                + " ORDER BY ts DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).mappings()
@@ -232,6 +247,38 @@ def _item_events(item_id: str) -> list[dict[str, Any]]:
         event["ts"] = _iso(event["ts"])
         events.append(event)
     return events
+
+
+@router.get("/ops/whatsapp")
+def get_ops_whatsapp() -> dict[str, Any]:
+    """WhatsApp poller ops: last poll time + per-channel cursor and counts (PR D1)."""
+    with engine.connect() as conn:
+        rows = (
+            conn.execute(
+                text(
+                    "SELECT chat_jid, channel_name, cursor_utc, last_poll_at, last_message_at, "
+                    "messages_seen, conversations_created, conversations_updated "
+                    "FROM whatsapp_poll_state ORDER BY channel_name, chat_jid"
+                )
+            )
+            .mappings()
+            .all()
+        )
+    channels = [
+        {
+            "channel": row["channel_name"],
+            "chat_jid": row["chat_jid"],
+            "cursor_at": _iso(row["cursor_utc"]) if row["cursor_utc"] else None,
+            "last_poll_at": _iso(row["last_poll_at"]) if row["last_poll_at"] else None,
+            "last_message_at": _iso(row["last_message_at"]) if row["last_message_at"] else None,
+            "messages_seen": int(row["messages_seen"]),
+            "conversations_created": int(row["conversations_created"]),
+            "conversations_updated": int(row["conversations_updated"]),
+        }
+        for row in rows
+    ]
+    polls = [row["last_poll_at"] for row in rows if row["last_poll_at"] is not None]
+    return {"last_poll_at": _iso(max(polls)) if polls else None, "channels": channels}
 
 
 @router.get("/ops/stats")

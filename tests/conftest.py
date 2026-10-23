@@ -7,6 +7,8 @@ fast, and the destructive fixtures double-check the engine URL before deleting.
 
 import os
 
+from brain.config import test_collection_for
+
 _TEST_DB_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain_test"
 
 # The env var wins over .env in pydantic-settings, so this pins the suite to
@@ -22,14 +24,21 @@ os.environ.setdefault("DATABASE_URL", _TEST_DB_URL)
 # Qdrant gets the same treatment as Postgres: the suite must never write to a
 # developer's real collection. The default collection name is the LIVE one
 # ('brain_items'), so ambient .env files would silently point e2e tests at it.
-# Pin a *_test collection; refuse non-test collections outright.
+# Pin a *_test collection; refuse non-test collections outright. When the
+# caller did not pick one explicitly, DERIVE it from the test database name
+# (brain_w5_test -> brain_items_w5_test): concurrent suites from different
+# workers then never share a collection — vector pollution between suites
+# was a real incident (see README "Running the tests").
 _env_collection = os.environ.get("QDRANT_COLLECTION")
 if _env_collection is not None and not _env_collection.endswith("_test"):
     raise RuntimeError(
         "refusing to run tests against non-test qdrant collection "
         f"{_env_collection!r}; point QDRANT_COLLECTION at a *_test collection"
     )
-os.environ.setdefault("QDRANT_COLLECTION", "brain_items_test")
+if _env_collection is None:
+    _db_name = os.environ["DATABASE_URL"].rsplit("/", 1)[-1].split("?")[0]
+    assert _db_name.endswith("_test"), f"test database {_db_name!r} must end in _test"
+    os.environ["QDRANT_COLLECTION"] = test_collection_for(_db_name)
 
 from collections.abc import Iterator  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -186,3 +195,9 @@ def _drop_test_database() -> None:
             (db_name,),
         )
         conn.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+
+
+# F3: the attachments-core fixture (tests/test_attachments.py) shared with the
+# poller test modules. Module-level alias — pytest collects fixture objects by
+# value, so the same fixture instance is available as `svc_env` everywhere.
+from tests.test_attachments import svc_env_fixture as svc_env  # noqa: E402,F401

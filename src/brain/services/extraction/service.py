@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -80,6 +81,18 @@ def qualifies(item: MemoryItem) -> bool:
     return _dateish_expressions(item.raw_text) >= _MIN_DATE_EXPRESSIONS
 
 
+@dataclass(frozen=True)
+class SourceOutcome:
+    """One source's enrichment result in a run (the completion hook's payload).
+
+    The proposal-card layer (PR C) turns these into one bot card per source.
+    """
+
+    source: MemoryItem
+    created: int
+    updated: int
+
+
 @dataclass
 class RunReport:
     """What one run_once pass did (also the cockpit/ops payload's core)."""
@@ -117,12 +130,19 @@ class EnrichmentService:
         indexer: Any | None = None,
         daily_cap: int = 100,
         timezone: str | None = None,
+        on_children_changed: Callable[[list[SourceOutcome]], None] | None = None,
     ) -> None:
         """``session`` is the runner's DB session (same one behind ``repo``).
 
         ``indexer`` is optional (Strategy, like ItemsService): new children
         are indexed best-effort; failures are logged and picked up by the
         next ``brain reindex``.
+
+        ``on_children_changed`` is the PR C completion hook: after a
+        ``run_once`` pass it receives one :class:`SourceOutcome` per source
+        whose children were created/updated (never per quiet source). A
+        raising hook is logged and swallowed — a notification must never
+        break the run.
         """
         self._repo = repo
         self._session = session
@@ -130,6 +150,7 @@ class EnrichmentService:
         self._memory = memory
         self._indexer = indexer
         self._daily_cap = daily_cap
+        self.on_children_changed = on_children_changed
         if timezone is None:
             from brain.config import get_settings  # noqa: PLC0415 (cheap, local)
 
@@ -202,6 +223,7 @@ class EnrichmentService:
         """
         report = RunReport()
         budget = "backfill" if backfill else "daily"
+        job_outcomes: list[SourceOutcome] = []
         while report.processed < limit:
             job = self._next_due_job(now, budget)
             if job is None:
@@ -212,10 +234,20 @@ class EnrichmentService:
                 self._session.commit()
                 report.deferred_over_cap += 1
                 break
-            report.add(self._process_job(job, now))
+            report.add(self._process_job(job, now, job_outcomes))
+        self._fire_children_changed(job_outcomes)
         return report
 
     # --- internals ---------------------------------------------------------
+
+    def _fire_children_changed(self, outcomes: list[SourceOutcome]) -> None:
+        """The PR C completion hook (never raises into the runner)."""
+        if not outcomes or self.on_children_changed is None:
+            return
+        try:
+            self.on_children_changed(outcomes)
+        except Exception:  # noqa: BLE001 — a notification must never break a run
+            logger.exception("enrichment: on_children_changed hook failed")
 
     @property
     def _tz(self):  # type: ignore[no-untyped-def]
@@ -241,7 +273,9 @@ class EnrichmentService:
         tomorrow = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return tomorrow
 
-    def _process_job(self, job: EnrichmentJob, now: datetime) -> RunReport:
+    def _process_job(
+        self, job: EnrichmentJob, now: datetime, outcomes: list[SourceOutcome]
+    ) -> RunReport:
         report = RunReport(processed=1)
         source = self._repo.get(job.item_id)
         if source is None:
@@ -281,6 +315,15 @@ class EnrichmentService:
                 report.children_created += 1
             elif outcome == "updated":
                 report.children_updated += 1
+        if report.children_created or report.children_updated:
+            # the completion hook only hears about sources whose children CHANGED
+            outcomes.append(
+                SourceOutcome(
+                    source=source,
+                    created=report.children_created,
+                    updated=report.children_updated,
+                )
+            )
         job.state = "done"
         job.llm_used = True  # the pass consumed an extraction (A2: a real LLM call)
         job.finished_at = now
@@ -564,4 +607,3 @@ class _ResolvedChild:
     applies_to: list[str]
     date_conflict: bool
     meta: dict[str, Any]
-

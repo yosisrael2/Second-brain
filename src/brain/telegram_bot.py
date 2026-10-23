@@ -55,6 +55,7 @@ import uuid as uuid_mod
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -65,6 +66,22 @@ from brain.services.ask import AskResult
 from brain.services.ingest import IngestService
 from brain.services.memory import MemoryError
 from brain.services.paste import parse as parse_paste
+from brain.services.proposals import (
+    CB_PROPOSED_DROP,
+    CB_PROPOSED_FIX,
+    CB_PROPOSED_KEEP,
+    CB_PROPOSED_KEEP_ALL,
+    FixError,
+    apply_drop,
+    apply_fix,
+    apply_keep,
+    due_proposed_children,
+    mark_pinged,
+    ping_line,
+    proposal_keyboard,
+    proposed_children_of,
+    render_source_card,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +262,9 @@ class Pending:
 
     ids: tuple[uuid_mod.UUID, ...] = ()  # target items for the action
     text: str | None = None  # WhatsApp paste waiting for the join/split choice
+    # PR C proposal cards: what the token refers to + the fix-flow step
+    kind: str = "capture"  # "capture" | "proposal" | "fix"
+    step: str | None = None  # fix flow: "title" | "date"
 
 
 class PendingRegistry:
@@ -280,6 +300,7 @@ class BotServices:
     search: Any  # SearchService
     ask: Any  # AskService
     memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
+    attachments: Any = None  # AttachmentService (F1; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -323,6 +344,8 @@ def _live_services_factory() -> ServicesFactory:
                     search,
                     deps.get_llm_client(),
                     memory_block=memory.compact_block,
+                    memory=memory,
+                    items_repo=repo,
                 ),
                 memory=memory,
             )
@@ -343,6 +366,7 @@ def _one_line(text: str, limit: int) -> str:
     if len(flat) > limit:
         flat = flat[:limit].rstrip() + "…"
     return _esc(flat)
+
 
 _SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
@@ -382,6 +406,11 @@ class TelegramBot:
         self._allowed_ids = allowed_ids
         self._timezone = timezone
         self.registry = registry or PendingRegistry()
+        # PR C proposal cards: user -> fix-flow token; outbound card queue;
+        # 48h-ping throttle
+        self._fix_flow: dict[int, str] = {}
+        self._outbound: list[tuple[int, Reply]] = []
+        self._last_ping_check = 0.0
 
     def is_allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self._allowed_ids
@@ -398,11 +427,11 @@ class TelegramBot:
         stripped = text.strip()
         return bool(stripped) and not stripped.startswith("/") and stripped.endswith("?")
 
-    def route(
-        self, text: str, user_id: int, *, forward: dict[str, Any] | None = None
-    ) -> Reply:
+    def route(self, text: str, user_id: int, *, forward: dict[str, Any] | None = None) -> Reply:
         """Dispatch one allowed text message; returns the reply."""
         stripped = text.strip()
+        if user_id in self._fix_flow:  # PR C: an active Fix flow captures the input
+            return self._fix_input(user_id, stripped)
         if not stripped.startswith("/"):
             if self.is_question(stripped):
                 return self.ask(stripped)
@@ -439,8 +468,7 @@ class TelegramBot:
             count = self._message_count(parsed)
             return Reply(
                 text=(
-                    f"💬 WhatsApp thread with {count} messages — save as "
-                    "one item or separately?"
+                    f"💬 WhatsApp thread with {count} messages — save as one item or separately?"
                 ),
                 keyboard=[
                     [("Save as 1 item", f"{CB_WA_JOIN}:{token}")],
@@ -453,12 +481,49 @@ class TelegramBot:
         """Capture an .ics document's contents as a calendar item."""
         parsed = parse_paste(text or "", kind_hint="calendar", tz=self._timezone)
         reply = self._save_parsed(parsed)
-        record_event(
-            "telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")}
-        )
-        return Reply(
-            text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard
-        )
+        record_event("telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")})
+        return Reply(text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard)
+
+    def capture_attachment_parent(self, text: str) -> Any:
+        """Capture the caption as an attachment's parent item (item 45).
+
+        The caption is the parent's text; on an exact-duplicate caption the
+        EXISTING item is the parent (ingest dedupe returns its snapshot).
+        """
+        parsed = parse_paste(text, tz=self._timezone)
+        with self._services_factory() as services:
+            items = services.ingest.capture_parsed(parsed, extra_meta={"channel": "telegram"})
+        return items[0]
+
+    def read_attachment(self, attachment_id: Any) -> Any:
+        """Run one attachment read through the (shared) attachment service."""
+        with self._services_factory() as services:
+            if services.attachments is None:
+                return "unsupported"
+            return services.attachments.process(attachment_id)
+
+    def attachment_summary(self, attachment_id: Any, status: str) -> Reply:
+        """Short follow-up for a finished (or failed) attachment read."""
+        with self._services_factory() as services:
+            att = services.attachments.get(attachment_id) if services.attachments else None
+        if att is None:
+            return Reply(text="📎 attachment saved")
+        name = _esc(att.filename)
+        if status == "done":
+            with self._services_factory() as services:
+                own = services.attachments.own_item(attachment_id)
+            description = (own.meta or {}).get("description", "") if own else ""
+            if description:
+                return Reply(text=f"📎 {name}\n{description}")
+            head = (att.text or "").strip().splitlines()
+            preview = head[0][:160] if head else ""
+            return Reply(text=f"📎 {name}\n{preview}" if preview else f"📎 {name}")
+        if status == "unsupported":
+            return Reply(text=f"📎 {name} — saved (searchable by filename only)")
+        if status == "too_large":
+            return Reply(text=f"📎 {name} — too large to read (over 20 MB), not stored")
+        # failed or queued
+        return Reply(text=f"📎 {name} — ⚠️ reading failed; recorded in ops")
 
     def _save_parsed(self, parsed: Any, *, forward: dict[str, Any] | None = None) -> Reply:
         extra_meta: dict[str, Any] = {"channel": "telegram"}
@@ -499,9 +564,7 @@ class TelegramBot:
         """
         token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
         filed = bool(items) and all(item.status == "filed" for item in items)
-        deduped = bool(items) and all(
-            getattr(item, "deduplicated", False) for item in items
-        )
+        deduped = bool(items) and all(getattr(item, "deduplicated", False) for item in items)
         row: list[tuple[str, str]] = []
         if not filed:
             row.append(("✅ File", f"{CB_FILE}:{token}"))
@@ -764,9 +827,7 @@ class TelegramBot:
                 return Reply("Memory layer is not installed yet.")
             # MemoryService.overview returns a LIST of entity dicts
             entities = memory.overview(status="confirmed", q=None)
-        persons = [
-            e for e in entities if e.get("kind") == "person" and e.get("facts")
-        ]
+        persons = [e for e in entities if e.get("kind") == "person" and e.get("facts")]
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
         lines = ["👤 <b>Profile</b>"]
@@ -816,13 +877,8 @@ class TelegramBot:
 
     def _memory_remove_buttons(self, fact_ids: list[str]) -> list[list[tuple[str, str]]]:
         """Numbered ✖ buttons (rows of 4), numbered like the profile lines."""
-        token = self.registry.put(
-            Pending(ids=tuple(uuid_mod.UUID(fid) for fid in fact_ids))
-        )
-        buttons = [
-            (f"✖ {n}", f"{CB_MEM_DEL}:{token}:{n - 1}")
-            for n in range(1, len(fact_ids) + 1)
-        ]
+        token = self.registry.put(Pending(ids=tuple(uuid_mod.UUID(fid) for fid in fact_ids)))
+        buttons = [(f"✖ {n}", f"{CB_MEM_DEL}:{token}:{n - 1}") for n in range(1, len(fact_ids) + 1)]
         return [buttons[i : i + 4] for i in range(0, len(buttons), 4)]
 
     def _remove_profile_fact(self, pending: Pending, index: int) -> Reply:
@@ -908,21 +964,266 @@ class TelegramBot:
     def unsupported(self, what: str) -> Reply:
         return Reply(f"😕 {_esc(what)} are not supported yet — paste the text instead.")
 
+    # -- proposal cards (PR C: delta items 19/20/D2/D4/D7) -----------------------
+
+    def proposals_changed(self, outcomes: list) -> None:
+        """The EnrichmentService completion hook: queue one card per changed
+        source for every allowed chat (flushed by the poll loop)."""
+        for outcome in outcomes:
+            reply = self._proposal_reply_for(outcome.source)
+            if reply is None:
+                continue
+            for chat_id in sorted(self._allowed_ids):
+                self._outbound.append((chat_id, reply))
+
+    def drain_outbound(self) -> list[tuple[int, Reply]]:
+        """Cards queued by the completion hook, oldest first."""
+        queued = self._outbound
+        self._outbound = []
+        return queued
+
+    def _proposal_reply_for(self, source) -> Reply | None:
+        """Render the source's proposal card (None when nothing is proposed)."""
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        session = SessionLocal()
+        try:
+            children = proposed_children_of(session, source.id)
+            if not children:
+                return None
+            token = self.registry.put(
+                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
+            )
+            text = render_source_card(source, children, self._timezone.key)
+            return Reply(text=text, keyboard=proposal_keyboard(token, children))
+        finally:
+            session.close()
+
+    def _proposal_child_ids(self, pending: Pending) -> list:
+        """The child ids a card token refers to (ids[1:])."""
+        return list(pending.ids[1:])
+
+    def _proposal_keep(self, pending: Pending, index: int) -> Reply:
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        ids = self._proposal_child_ids(pending)
+        if not 0 <= index < len(ids):
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        with SessionLocal() as session:
+            child = session.get(MemoryItem, ids[index])
+            if child is None or child.child_state != "proposed":
+                return Reply("⌛ That button expired — the card moved on.", edit=True)
+            title = child.raw_text[:40]
+            apply_keep(_repo_of(session), child)
+        return self._proposal_card_reply(pending, notice=f"✅ Kept: {title}")
+
+    def _proposal_drop(self, pending: Pending, index: int) -> Reply:
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        ids = self._proposal_child_ids(pending)
+        if not 0 <= index < len(ids):
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        with SessionLocal() as session:
+            child = session.get(MemoryItem, ids[index])
+            if child is None or child.child_state != "proposed":
+                return Reply("⌛ That button expired — the card moved on.", edit=True)
+            title = child.raw_text[:40]
+            apply_drop(_repo_of(session), child)
+        return self._proposal_card_reply(pending, notice=f"🗑 Dropped (never returns): {title}")
+
+    def _proposal_keep_all(self, pending: Pending) -> Reply:
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        changed = 0
+        with SessionLocal() as session:
+            repo = _repo_of(session)
+            for child_id in self._proposal_child_ids(pending):
+                child = session.get(MemoryItem, child_id)
+                if child is not None and child.child_state == "proposed":
+                    child.child_state = "kept"
+                    changed += 1
+            if changed:
+                repo.commit()
+        return self._proposal_card_reply(pending, notice=f"✅ Kept {changed} item(s).")
+
+    def _proposal_card_reply(self, pending: Pending, *, notice: str) -> Reply:
+        """Re-render the source card after an action (edit-in-place)."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        session = SessionLocal()
+        try:
+            source = session.get(MemoryItem, pending.ids[0]) if pending.ids else None
+            children = [
+                row
+                for row in (session.get(MemoryItem, cid) for cid in pending.ids[1:])
+                if row is not None and row.child_state == "proposed"
+            ]
+        finally:
+            session.close()
+        if source is None or not children:
+            return Reply(f"{notice}\n ✓ all done here.", edit=True)
+        token = self.registry.put(
+            Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
+        )
+        text = f"{notice}\n" + render_source_card(source, children, self._timezone.key)
+        return Reply(text=text, keyboard=proposal_keyboard(token, children), edit=True)
+
+    def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        ids = self._proposal_child_ids(pending)
+        if not 0 <= index < len(ids):
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        with SessionLocal() as session:
+            child = session.get(MemoryItem, ids[index])
+        if child is None or child.child_state != "proposed":
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        if user_id is None:
+            return Reply("Unknown user — cannot start an edit.", edit=True)
+        token = self.registry.put(Pending(ids=(child.id,), kind="fix", step="title"))
+        self._fix_flow[user_id] = token
+        return Reply(
+            f"✏️ New title for: {_esc(child.raw_text[:60])}\nType the new title (or 'cancel')."
+        )
+
+    def _fix_input(self, user_id: int, text: str) -> Reply:
+        """One step of the Fix flow (title, then date)."""
+        token = self._fix_flow.get(user_id)
+        pending = self.registry.get(token) if token else None
+        if pending is None or pending.kind != "fix":
+            self._fix_flow.pop(user_id, None)
+            return self.capture(text)
+        if text.lower() == "cancel":
+            self._fix_flow.pop(user_id, None)
+            return Reply("✏️ Fix cancelled — nothing changed.")
+        if pending.step == "title":
+            self._fix_flow[user_id] = self.registry.put(
+                Pending(ids=pending.ids, text=text, kind="fix", step="date")
+            )
+            return Reply(
+                f"✏️ Title will be: {_esc(text[:60])}\n"
+                "Now the date: dd.mm / 'יום חמישי 29.10 13:00' / 'keep' to leave it "
+                "unchanged ('cancel' aborts)."
+            )
+        # step == "date"
+        title_pending = self.registry.get(token)
+        title = (title_pending.text if title_pending else "") or ""
+        child_id = pending.ids[0]
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        with SessionLocal() as session:
+            from brain.db.models import MemoryItem  # noqa: PLC0415
+
+            child = session.get(MemoryItem, child_id)
+            if child is None:
+                self._fix_flow.pop(user_id, None)
+                return Reply("⌛ That item is gone — fix aborted.")
+            source = self._proposal_source_of(child, session)
+            try:
+                if text.lower() in ("keep", "-"):
+                    fixed = child
+                    fixed.raw_text = title
+                    fixed.child_state = "kept"
+                    fixed.extraction_meta = {**(fixed.extraction_meta or {}), "user_edited": True}
+                    _repo_of(session).commit()
+                else:
+                    fixed = apply_fix(
+                        _repo_of(session),
+                        child,
+                        title=title,
+                        when_raw=text,
+                        source=source,
+                        tz_name=self._timezone.key,
+                    )
+            except FixError as exc:
+                return Reply(f"✏️ {_esc(str(exc))}\nTry again (or 'cancel').")
+            self._fix_flow.pop(user_id, None)
+            return Reply(
+                f"✏️ Fixed: {_esc(fixed.raw_text[:60])}\n"
+                "Your edit is locked — extraction will not overwrite it."
+            )
+
+    def _proposal_source_of(self, child, session):
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from brain.db.models import ItemSource, MemoryItem  # noqa: PLC0415
+
+        row = session.execute(
+            select(MemoryItem)
+            .join(ItemSource, ItemSource.source_id == MemoryItem.id)
+            .where(ItemSource.child_id == child.id)
+            .order_by(ItemSource.created_at.asc())
+            .limit(1)
+        ).scalar_one_or_none()
+        return row
+
+    def due_pings(self, now: datetime | None = None) -> list[tuple[int, Reply]]:
+        """The 48h ping (D7): one Keep/Drop ping per due proposed task."""
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        moment = now or datetime.now(tz=UTC)
+        session = SessionLocal()
+        try:
+            children = due_proposed_children(session, moment, self._timezone.key)
+            if not children:
+                return []
+            mark_pinged(children, moment)
+            session.commit()
+            pings: list[tuple[int, Reply]] = []
+            for child in children:
+                token = self.registry.put(Pending(ids=(child.id,), kind="proposal"))
+                reply = Reply(
+                    text=ping_line(child, self._timezone.key),
+                    keyboard=[
+                        [("✅ Keep", f"{CB_PROPOSED_KEEP}:{token}:0")],
+                        [("🗑 Drop", f"{CB_PROPOSED_DROP}:{token}:0")],
+                    ],
+                )
+                for chat_id in sorted(self._allowed_ids):
+                    pings.append((chat_id, reply))
+            return pings
+        finally:
+            session.close()
+
     # -- callbacks -----------------------------------------------------------------
 
-    def handle_callback(self, data: str) -> Reply:
-        """Dispatch an inline-button press; stale/unknown → graceful reply."""
+    def handle_callback(self, data: str, user_id: int | None = None) -> Reply:
+        """Dispatch an inline-button press; stale/unknown → graceful reply.
+
+        ``user_id`` is optional (PR C): the Fix button opens a per-user edit
+        flow, so the callback needs to know who pressed it.
+        """
         prefix, _, rest = data.partition(":")
         try:
             if prefix == CB_NEXT:
                 return self.review(int(rest))
-            if prefix in (CB_TYPE_APPLY, CB_OPEN, CB_MEM_DEL):
+            if prefix in (
+                CB_TYPE_APPLY,
+                CB_OPEN,
+                CB_MEM_DEL,
+                CB_PROPOSED_KEEP,
+                CB_PROPOSED_FIX,
+                CB_PROPOSED_DROP,
+            ):
                 token, _, arg = rest.partition(":")
-            elif prefix in (CB_UNDO, CB_FILE, CB_DELETE, CB_TYPE, CB_WA_JOIN, CB_WA_SPLIT):
+            elif prefix in (
+                CB_UNDO,
+                CB_FILE,
+                CB_DELETE,
+                CB_TYPE,
+                CB_WA_JOIN,
+                CB_WA_SPLIT,
+                CB_PROPOSED_KEEP_ALL,
+            ):
                 token, arg = rest, ""
             else:
                 return Reply("Unknown action — the button is stale or invalid.")
-            if prefix in (CB_OPEN, CB_MEM_DEL):
+            if prefix in (CB_OPEN, CB_MEM_DEL, CB_PROPOSED_KEEP, CB_PROPOSED_FIX, CB_PROPOSED_DROP):
                 index = int(arg)
         except ValueError:
             return Reply("Unknown action — the button is stale or invalid.")
@@ -946,6 +1247,14 @@ class TelegramBot:
             return self._open_card(pending, index)
         if prefix == CB_MEM_DEL:
             return self._remove_profile_fact(pending, index)
+        if prefix == CB_PROPOSED_KEEP:
+            return self._proposal_keep(pending, index)
+        if prefix == CB_PROPOSED_DROP:
+            return self._proposal_drop(pending, index)
+        if prefix == CB_PROPOSED_FIX:
+            return self._proposal_fix_start(user_id, pending, index)
+        if prefix == CB_PROPOSED_KEEP_ALL:
+            return self._proposal_keep_all(pending)
         if prefix == CB_UNDO:
             return self._delete_items(pending, undo=True)
         return self._delete_items(pending, undo=False)  # CB_DELETE
@@ -963,8 +1272,10 @@ class TelegramBot:
                     continue
         if not items:
             return Reply("🗑 Deleted", edit=True)
-        text = self._card_header(items, notice=notice) + "\n" + "\n".join(
-            self._item_card(item) for item in items
+        text = (
+            self._card_header(items, notice=notice)
+            + "\n"
+            + "\n".join(self._item_card(item) for item in items)
         )
         return Reply(text=text, keyboard=self._capture_buttons(items), edit=True)
 
@@ -1078,6 +1389,11 @@ async def poll_loop(
     backoff = conflict_backoff_s
     try:
         while True:
+            # Liveness on the poll path: the long-poll itself can occupy the
+            # whole timeout window, so the heartbeat must start FRESH before
+            # each attempt (previously only successful polls heartbeated, and
+            # a quiet chat pushed the age past health's threshold).
+            heartbeat("telegram", {"phase": "polling", "last_update_id": last_update_id})
             try:
                 updates = await tg.get_updates(offset=offset, timeout=poll_timeout_s)
             except Conflict as exc:
@@ -1116,6 +1432,9 @@ async def poll_loop(
                     backoff,
                     exc,
                 )
+                # Liveness on the retry path: the backoff sleep can outlast the
+                # poll timeout (doubling up to 60s) — prove the loop is alive.
+                heartbeat("telegram", {"phase": "backoff", "last_update_id": last_update_id})
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
@@ -1130,6 +1449,8 @@ async def poll_loop(
                 raise
             except NetworkError as exc:
                 logger.warning("telegram: network error, retrying (%s)", type(exc).__name__)
+                # Liveness on the retry path (see the conflict branch).
+                heartbeat("telegram", {"phase": "backoff", "last_update_id": last_update_id})
                 await asyncio.sleep(3)
                 continue
             # A successful poll means the other poller is gone: fresh window.
@@ -1156,10 +1477,45 @@ async def poll_loop(
                         detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
                     )
                     logger.exception("telegram: update handling failed")
+            await _flush_bot_jobs(tg, core)
     finally:
         shutdown = getattr(tg, "shutdown", None)
         if shutdown is not None:
             await shutdown()
+
+
+def _item_indexer():
+    """The shared vector indexer (app-lifetime singleton), or None in tests."""
+    try:
+        from brain.api import deps  # noqa: PLC0415
+
+        return deps.get_item_indexer()
+    except Exception:  # noqa: BLE001 — no app context: skip re-indexing
+        return None
+
+
+def _repo_of(session):
+    """An ItemsRepository bound to an existing session (proposal actions)."""
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+
+    return ItemsRepository(session)
+
+
+async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
+    """Send queued proposal cards + the throttled 48h pings; never stops the loop."""
+    import time as _time  # noqa: PLC0415
+
+    try:
+        for chat_id, reply in core.drain_outbound():
+            await _send(tg, chat_id, reply)
+        now = _time.monotonic()
+        if now - core._last_ping_check >= 60.0:  # noqa: SLF001 (same module)
+            core._last_ping_check = now
+            for chat_id, reply in core.due_pings():
+                await _send(tg, chat_id, reply)
+    except Exception:  # noqa: BLE001 — background jobs must never kill polling
+        record_event("telegram", EVENT_ERROR, ok=False, detail={"error": "proposal flush failed"})
+        logger.exception("telegram: proposal flush failed")
 
 
 def _inline_keyboard(rows: list[list[tuple[str, str]]] | None) -> Any:
@@ -1190,19 +1546,27 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
         if edit_message is not None:
             try:
                 await edit_message(
-                    chat_id=chat_id, message_id=message_id, text=text,
-                    parse_mode="HTML", reply_markup=markup,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
                 )
                 return
             except Exception as exc:  # noqa: BLE001
                 if _is_parse_entity_error(exc):
                     record_event(
-                        "telegram", EVENT_ERROR, ok=False,
+                        "telegram",
+                        EVENT_ERROR,
+                        ok=False,
                         detail={"error": f"edit fallback: {type(exc).__name__}: {exc!s}"[:200]},
                     )
                     await edit_message(
-                        chat_id=chat_id, message_id=message_id,
-                        text=_strip_html(text), parse_mode=None, reply_markup=markup,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=_strip_html(text),
+                        parse_mode=None,
+                        reply_markup=markup,
                     )
                     return
                 logger.debug("telegram: edit_message_text failed, sending new (%s)", exc)
@@ -1281,6 +1645,12 @@ async def _download_text(tg: Any, document: Any) -> str:
     return bytes(file.download_as_bytearray()).decode("utf-8", errors="replace")
 
 
+async def _download_bytes(tg: Any, file_id: str) -> bytes:
+    """Download a file's raw bytes (attachments keep them verbatim)."""
+    file = await tg.get_file(file_id=file_id)
+    return bytes(file.download_as_bytearray())
+
+
 async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: str) -> Reply:
     """Run the (blocking) ask in a thread, sending TYPING every 4 seconds."""
     stop = asyncio.Event()
@@ -1304,6 +1674,49 @@ async def _ask_with_typing(tg: Any, chat_id: int, core: TelegramBot, question: s
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def _handle_attachment(
+    tg: Any,
+    chat_id: int,
+    core: TelegramBot,
+    message: Any,
+    *,
+    filename: str,
+    mime: str | None,
+    file_id: str,
+) -> None:
+    """Item 45: save the attachment + caption-parent, reply, read, report."""
+    with core._services_factory() as services:
+        if services.attachments is None:  # feature not wired (older factory)
+            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            return
+        caption = getattr(message, "caption", None) or f"[attachment: {filename}]"
+        content = await _download_bytes(tg, file_id)
+        parent = core.capture_attachment_parent(caption)
+        att = services.attachments.capture(
+            parent.id,
+            content,
+            filename,
+            mime,
+            "telegram",
+            str(getattr(message, "message_id", "") or ""),
+        )
+        await _send(tg, chat_id, Reply(text="📎 saved, reading…"))
+        attachment_id = att.id
+    task = asyncio.create_task(_read_and_report(tg, chat_id, core, attachment_id))
+    logger.info("telegram: attachment %s reading in background", attachment_id)
+    del task  # fire and forget; failures are recorded on the row
+
+
+async def _read_and_report(tg: Any, chat_id: int, core: TelegramBot, attachment_id: Any) -> None:
+    """Read the attachment (budget/queue aware) and send a short summary."""
+    try:
+        status = await core.read_attachment(attachment_id)
+        await _send(tg, chat_id, core.attachment_summary(attachment_id, status))
+    except Exception as exc:  # noqa: BLE001 — never crash the bot on a follow-up
+        logger.error("telegram: attachment follow-up failed: %s", exc, exc_info=True)
+        record_event("telegram", "attachment_report", ok=False, detail={"error": str(exc)})
+
+
 async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
     """Allowlist-check and dispatch one Telegram update."""
     user = update.effective_user
@@ -1321,7 +1734,7 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
         answer = getattr(query, "answer", None)
         if answer is not None:
             await answer()
-        reply = core.handle_callback(query.data or "")
+        reply = core.handle_callback(query.data or "", user.id)
         record_event("telegram", EVENT_CALLBACK, ok=True, detail={})
         message = getattr(query, "message", None)
         chat_id = getattr(message, "chat_id", None)
@@ -1335,19 +1748,39 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
     document = getattr(message, "document", None)
     if document is not None:
         file_name = document.file_name or "document"
-        is_ics = file_name.lower().endswith(".ics") or getattr(document, "mime_type", "") == "text/calendar"  # noqa: E501
+        is_ics = (
+            file_name.lower().endswith(".ics")
+            or getattr(document, "mime_type", "") == "text/calendar"
+        )  # noqa: E501
         if is_ics:
             text = await _download_text(tg, document)
             await _send(tg, chat_id, core.capture_document(file_name, text))
         else:
-            await _send(tg, chat_id, core.unsupported("Files other than .ics"))
+            await _handle_attachment(
+                tg,
+                chat_id,
+                core,
+                message,
+                filename=file_name,
+                mime=getattr(document, "mime_type", None),
+                file_id=document.file_id,
+            )
         return
-    if (
-        getattr(message, "photo", None)
-        or getattr(message, "voice", None)
-        or getattr(message, "video_note", None)
-    ):
-        await _send(tg, chat_id, core.unsupported("Photos, voice and video"))
+    photo = getattr(message, "photo", None)
+    if photo:
+        largest = photo[-1]  # Telegram lists sizes ascending; take the largest
+        await _handle_attachment(
+            tg,
+            chat_id,
+            core,
+            message,
+            filename="photo.jpg",
+            mime="image/jpeg",
+            file_id=largest.file_id,
+        )
+        return
+    if getattr(message, "voice", None) or getattr(message, "video_note", None):
+        await _send(tg, chat_id, core.unsupported("Voice and video"))
         return
     if message.text:
         if core.is_question(message.text):
@@ -1488,7 +1921,7 @@ def run(settings: Settings) -> int:
         core, tg = build_bot(settings)
         logger.info("telegram: long polling started")
         try:
-            asyncio.run(poll_loop(tg, core))
+            asyncio.run(poll_loop(tg, core, poll_timeout_s=settings.telegram_poll_timeout_s))
         except KeyboardInterrupt:
             logger.info("telegram: stopped")
             return EXIT_DISABLED
@@ -1503,8 +1936,7 @@ def run(settings: Settings) -> int:
             return EXIT_TRANSIENT
     except ImportError:
         print(
-            "telegram: python-telegram-bot is not installed — run "
-            "`pip install -e '.[telegram]'`",
+            "telegram: python-telegram-bot is not installed — run `pip install -e '.[telegram]'`",
             file=sys.stderr,
         )
         return EXIT_CONFIG

@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8
+    # Attachments (design delta items 43-45): original files are stored OUTSIDE
+    # the repo and the DB, content-addressed by sha256, exact duplicates stored
+    # once. The dir must not live inside the checkout.
+    files_dir: Path = Path.home() / ".second-brain-files"
+    # Daily reading budget (Claude reads + text-layer extractions), item 44.
+    attachment_daily_budget: int = 50
     # Candidates fetched for the reranker before truncating to ask_top_k.
     # Reranking is cheap relative to the LLM call, and the reranker can only
     # surface what reaches it: a Hebrew email corpus scores an English
@@ -96,6 +102,11 @@ class Settings(BaseSettings):
     # invisible at pool 8, rank 4 of 32 after rerank). One rerank call,
     # ~4x documents.
     ask_recall_pool: int = 32
+    # Kid-recall leg of /ask (PR 0d): when a question names a confirmed kid,
+    # items from that kid's channels/class join the recall pool before the
+    # rerank. This caps how many extra candidates that leg may fetch —
+    # a ceiling, never a floor (fewer matches -> fewer candidates).
+    ask_kid_recall_limit: int = 16
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
@@ -118,10 +129,36 @@ class Settings(BaseSettings):
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
 
+    # WhatsApp bridge (PR D1). The poller reads the bridge's messages.db
+    # READ-ONLY; an empty path disables the poller. The gap groups messages
+    # into conversations (item 35); the overlap window (must stay smaller
+    # than the gap) makes restarts idempotent.
+    whatsapp_bridge_db: str = ""
+    # F3 (item 47): the bridge's local REST endpoint for media downloads
+    # (POST {url}/api/download). Read-only use only — never /api/send.
+    whatsapp_bridge_url: str = "http://127.0.0.1:8085"
+    whatsapp_gap_minutes: int = 60
+    whatsapp_overlap_minutes: int = 5
+    whatsapp_poll_interval_s: float = 30.0
+
     # Telegram bot (mobile capture channel). The token is a secret; the
     # allowlist is REQUIRED with a token — the bot never answers strangers.
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
+    # The bot's getUpdates long-poll timeout (seconds). ONE source of truth:
+    # the poll loop uses it, and /ops/health derives the telegram heartbeat
+    # threshold from it (timeout + margin) so a quiet poll never flaps.
+    telegram_poll_timeout_s: int = 50
+
+    # Email source (F2): a read-only Gmail label poller. The label ID is an
+    # immutable Gmail label id (never its display name); the OAuth refresh
+    # token lives in the macOS login keychain (never here, never in .env).
+    # credentials_path points at the Desktop-client secret JSON OUTSIDE the
+    # repo (the gmail-auth helper needs it; the poller does not).
+    gmail_label_id: str = ""
+    gmail_query: str = ""
+    gmail_poll_interval_s: int = 60
+    gmail_credentials_path: str = ""
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod
@@ -131,8 +168,7 @@ class Settings(BaseSettings):
             part = part.strip()
             if part and not part.lstrip("+").isdigit():
                 raise ValueError(
-                    "TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, "
-                    f"got {value!r}"
+                    f"TELEGRAM_ALLOWED_USER_IDS must be comma-separated integers, got {value!r}"
                 )
         return value
 
@@ -178,6 +214,22 @@ def get_settings() -> Settings:
 # refuses to start against the live store unless explicitly allowed.
 LIVE_DATABASE_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain"
 LIVE_QDRANT_COLLECTION = DEFAULT_QDRANT_COLLECTION  # 'brain_items'
+
+
+def test_collection_for(database_name: str) -> str:
+    """The Qdrant collection name for a test database (per-worker isolation).
+
+    Derives the test collection from the test database name so two workers
+    running suites against different test databases (brain_w5_test,
+    brain_test, ...) never share one Qdrant collection — concurrent suites
+    polluting each other's vectors was a real incident. 'brain_w5_test' ->
+    'brain_items_w5_test', 'brain_test' -> 'brain_items_test'. Callers keep
+    the ``*_test``-suffix guard: this function is only ever fed names that
+    already end in ``_test`` (conftest enforces that before calling).
+    """
+    if database_name.startswith("brain_"):
+        database_name = database_name[len("brain_") :]
+    return f"brain_items_{database_name}"
 
 
 def _is_live_database_url(url: str) -> bool:

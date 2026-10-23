@@ -61,16 +61,16 @@ linked to its section or doc.
 
 - Meaning extraction PR A1: data model + async enrichment of captured items
 - Memory-aware recall for kid questions (PR 0d)
-- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp
-- Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user
+- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp. PR F3 wires email + WhatsApp IN: the Gmail poller fetches stored attachment references (`users.messages.attachments.get`, still read-only) and WhatsApp downloads media for allowlisted channels via the bridge's local `/api/download` — both captured as their own attachment item (20 MB / daily-budget / sandbox respected), replacing the "not read yet" markers
+- Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user (setup: docs/email-setup.md)
 - WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
 - Bot timezone fix
+- Bot proposal cards (PR C): Keep / Fix / Drop on one card per source + 48h pings — built; fires only when the enrichment worker is switched on (worker stays OFF for now)
 
 **Planned**
 
 - PR A2: LLM extraction scored against the frozen gold set + held-out data
 - PR B: relations between items + duplicate handling
-- PR C: bot proposal cards (Keep / Fix / Drop) for classification review
 - PR D: WhatsApp triage, reconciliation, media
 - Then: actions — approved items become Google Calendar events / tasks
 
@@ -323,6 +323,20 @@ Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 | POST   | `/ops/trace/capture`  | Capture dry-run — never writes                                   |
 | GET    | `/ops/trace/search?q=`| Search pipeline trace (before/after rerank, fallback decision)  |
 | POST   | `/ops/trace/ask`      | Ask trace — runs the real LLM (user-initiated)                  |
+
+Diagnostics note: live checks that exercise the ask path with a FAKE LLM must
+call `AskService.ask(..., record_ops=False)` — that skips the `ask→search` /
+`ask→llm` spans and the kid_recall event, so `/ops/health`'s llm component is
+not marked "last call failed" until the next real call. Real requests keep
+the default (`record_ops=True`); nothing else changes.
+
+Health components `attachments` (queue depth, read today / daily budget, last
+error) and `enrichment` (queue depth, cap used / limit, worker on/off — off is
+the designed inert state) mirror `GET /ops/attachments` and `GET
+/ops/enrichment`; the cockpit renders their cards automatically. The telegram
+heartbeat threshold follows the bot's actual long-poll timeout
+(`telegram_poll_timeout_s` + margin), and the poll loop heartbeats on the
+conflict/network retry paths too — a quiet chat no longer flaps "degraded".
 
 Privacy contract: the ops layer never records secrets (tokens appear only as
 `set`/`unset` + last 4 chars) and never note bodies — events/traces carry
@@ -655,6 +669,19 @@ refuses to run at all against a non-`*_test` URL, and the destructive
 `clean_items` teardown double-checks the engine URL in use before deleting.
 `tests/test_db_isolation.py` proves the point: it seeds a marker row in the
 dev database, runs the DB-backed suite, and asserts the marker survives.
+
+**Per-worker Qdrant collections.** The suite also refuses non-`*_test`
+Qdrant collections — and when you leave `QDRANT_COLLECTION` unset, it DERIVES
+the collection from the test database name (`brain_w5_test` ->
+`brain_items_w5_test`, `brain_test` -> `brain_items_test`), so two workers
+testing against different test databases never share one vector collection.
+Previously every suite silently pinned the same `brain_items_test`, and
+concurrent runs polluted each other's vectors (a real incident). Run two
+suites side by side by pointing each at its own `DATABASE_URL` and letting
+the collection follow, e.g. `DATABASE_URL=.../brain_w5_test pytest`;
+CI's `brain_test` keeps the classic `brain_items_test`. If your shell
+exports `QDRANT_COLLECTION` explicitly, unset it — an explicit value
+bypasses the derivation.
 
 CI runs the same commands on every PR and push to main (GitHub Actions,
 `.github/workflows/ci.yml`): ruff, mypy, shellcheck, and pytest against

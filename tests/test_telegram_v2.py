@@ -101,9 +101,15 @@ class TestCaptureKeyboards:
         assert submenu.keyboard is not None
         type_labels = [label for row in submenu.keyboard for label, _ in row]
         assert set(type_labels) == {
-            "✔️ Task", "⚖️ Decision", "📝 Note", "📅 Event",
-            "🏷 reminder", "🏷 fact",  # extraction child kinds (PR A1)
-            "🔗 Reference", "💡 Idea", "« Back",
+            "✔️ Task",
+            "⚖️ Decision",
+            "📝 Note",
+            "📅 Event",
+            "🏷 reminder",
+            "🏷 fact",  # extraction child kinds (PR A1)
+            "🔗 Reference",
+            "💡 Idea",
+            "« Back",
         }
 
         item_id = next(iter(repo.items))
@@ -365,7 +371,14 @@ class TestRecentAndCommands:
 
         names = [c.command for c in (tg.commands or [])]
         assert names == [
-            "ask", "search", "review", "recent", "profile", "remember", "status", "help",
+            "ask",
+            "search",
+            "review",
+            "recent",
+            "profile",
+            "remember",
+            "status",
+            "help",
         ]
 
 
@@ -422,9 +435,7 @@ class TestDocuments:
         core, repo = make_core()
         ics = b"BEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Standup\nEND:VEVENT\nEND:VCALENDAR"
         tg = _AdapterTG(file_bytes=ics)
-        document = SimpleNamespace(
-            file_name="invite.ics", mime_type="text/calendar", file_id="f1"
-        )
+        document = SimpleNamespace(file_name="invite.ics", mime_type="text/calendar", file_id="f1")
         update = _fake_update(text=None, document=document)
 
         _handle(update, core, tg)
@@ -486,8 +497,7 @@ class TestCardFormat:
         assert "status:" not in reply.text  # no debug labels
 
         cal = core.route(
-            "TUESDAY, October 21, 2026\n9:00 – 12:30pm\nStandup\n"
-            "Location: Haifa office",
+            "TUESDAY, October 21, 2026\n9:00 – 12:30pm\nStandup\nLocation: Haifa office",
             111,
         )
         assert "Where: Haifa office" in cal.text  # location (calendar kind)
@@ -518,9 +528,9 @@ class TestExitCodes:
 
         real_poll_loop = telegram_bot.poll_loop
 
-        def _fast(tg, core):
+        def _fast(tg, core, **kwargs):
             return real_poll_loop(
-                tg, core, conflict_window_s=0.05, conflict_backoff_s=0.01
+                tg, core, conflict_window_s=0.05, conflict_backoff_s=0.01, **kwargs
             )
 
         monkeypatch.setattr(telegram_bot, "poll_loop", _fast)
@@ -631,16 +641,20 @@ class TestGoldenFormat:
 
         reply = core.route("When is the TLS cert due?", 111)
 
-        assert reply.text == (
-            "🧠 <b>Answer</b>\n"
-            "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
-            "\n"
-            "📚 <b>Sources</b>\n"
-            "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
-            "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
-            "\n"
-            "<i>claude-sonnet-5-5 · "
-        ) or True  # seconds vary: assert prefix exactly, footer tail loosely
+        assert (
+            reply.text
+            == (
+                "🧠 <b>Answer</b>\n"
+                "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
+                "\n"
+                "📚 <b>Sources</b>\n"
+                "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
+                "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
+                "\n"
+                "<i>claude-sonnet-5-5 · "
+            )
+            or True
+        )  # seconds vary: assert prefix exactly, footer tail loosely
         assert reply.text.startswith(
             "🧠 <b>Answer</b>\n"
             "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
@@ -687,7 +701,9 @@ class TestGoldenFormat:
         assert len(lines) == 6  # no status line: born filed, not needs_review
         # one action row, File hidden (born filed at 0.95 confidence)
         assert [label for row in reply.keyboard for label, _ in row] == [
-            "🏷 Type", "🗑 Delete", "↩️ Undo",
+            "🏷 Type",
+            "🗑 Delete",
+            "↩️ Undo",
         ]
 
     def test_capture_whatsapp_card_golden(self, monkeypatch):
@@ -721,20 +737,28 @@ class TestGoldenFormat:
 
         core, repo = make_core_with_repo()
         i1 = MemoryItem(
-            id=uuid.uuid4(), raw_text="Found the meeting notes", source="note",
+            id=uuid.uuid4(),
+            raw_text="Found the meeting notes",
+            source="note",
             created_at=datetime(2026, 10, 22, 9, 0, tzinfo=UTC),
         )
         i2 = MemoryItem(
-            id=uuid.uuid4(), raw_text="Meeting agenda draft", source="whatsapp",
+            id=uuid.uuid4(),
+            raw_text="Meeting agenda draft",
+            source="whatsapp",
             occurred_at=datetime(2026, 10, 21, 9, 0, tzinfo=UTC),
         )
         repo.add(i2)
         repo.add(i1)
         from tests.test_telegram_bot import _core as _make_core
 
-        core = _make_core(repo=repo, search_hits=[
-            SearchHit(item=i1, score=0.9), SearchHit(item=i2, score=0.8),
-        ])[0]
+        core = _make_core(
+            repo=repo,
+            search_hits=[
+                SearchHit(item=i1, score=0.9),
+                SearchHit(item=i2, score=0.8),
+            ],
+        )[0]
 
         reply = core.route("/search meeting", 111)
 
@@ -758,32 +782,29 @@ class TestGoldenFormat:
         core, _ = make_core(inbox=[item])
         reply = core.route("/review", 111)
 
-        assert reply.text == (
-            "📥 Inbox (1/1)\n"
-            "inbox candidate\n"
-            "⭐⭐ · —"
-        )
+        assert reply.text == ("📥 Inbox (1/1)\ninbox candidate\n⭐⭐ · —")
         labels = [label for row in reply.keyboard for label, _ in row]
         assert labels == ["✅ File", "🏷 Type", "🗑 Delete"]
 
     def test_status_golden(self, monkeypatch):
         from brain.ops import health as ops_health
 
-        monkeypatch.setattr(ops_health, "run_health_checks", lambda: {
-            "components": {
-                "api": {"status": "ok", "summary": "pid 7"},
-                "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
-                "telegram": {"status": "disabled", "summary": "no token"},
-            }
-        })
+        monkeypatch.setattr(
+            ops_health,
+            "run_health_checks",
+            lambda: {
+                "components": {
+                    "api": {"status": "ok", "summary": "pid 7"},
+                    "qdrant": {"status": "degraded", "summary": "vectors 6/6"},
+                    "telegram": {"status": "disabled", "summary": "no token"},
+                }
+            },
+        )
         core, _ = make_core()
         reply = core.route("/status", 111)
 
         assert reply.text == (
-            "🟠 brain: degraded\n"
-            "🟢 api: pid 7\n"
-            "🟡 qdrant: vectors 6/6\n"
-            "⚪ telegram: no token"
+            "🟠 brain: degraded\n🟢 api: pid 7\n🟡 qdrant: vectors 6/6\n⚪ telegram: no token"
         )
 
 
@@ -825,6 +846,8 @@ class TestEditInPlace:
         _handle(self._callback_update(core, data), core, tg)
 
         assert not tg.edits and len(tg.sent) == 1  # Open is a new card, not an edit
+
+
 # --- 9. hotfix: no reply may carry raw HTML (BadRequest parse-entities) --------
 
 
@@ -913,11 +936,15 @@ class TestReviewFixes:
     def test_when_line_survives_the_october_dst_change(self):
         core, repo = make_core()
         before = MemoryItem(
-            id=uuid.uuid4(), raw_text="IDT event", source="calendar",
+            id=uuid.uuid4(),
+            raw_text="IDT event",
+            source="calendar",
             occurred_at=datetime(2026, 10, 24, 13, 0, tzinfo=UTC),  # +03:00
         )
         after = MemoryItem(
-            id=uuid.uuid4(), raw_text="IST meeting", source="calendar",
+            id=uuid.uuid4(),
+            raw_text="IST meeting",
+            source="calendar",
             occurred_at=datetime(2026, 10, 26, 13, 0, tzinfo=UTC),  # +02:00
         )
         core, repo = make_core(inbox=[before])
