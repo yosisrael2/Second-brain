@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from brain.db.models import MemoryItem
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
-from brain.services.relations import RelationsService
+from brain.services.relations import RelationsError, RelationsService
 from brain.services.relations_view import (
     CB_REL_CONFIRM,
     CB_REL_KEEP_BOTH,
@@ -257,3 +257,93 @@ class _PendingIds:
         self.kind = "relation"
         self.text = ""
         self.step = 0
+
+
+class TestStateGuards:
+    """Review round 1: transitions must check provenance.state in the service."""
+
+    def test_stale_keep_both_after_confirm_is_refused(self, world):
+        repo, session = world
+        old = _capture(repo, "pool party at Dana's")
+        new = _capture(repo, "pool party moved to Friday")
+        rel = RelationsService().propose_supersede(new_id=new.id, old_id=old.id)
+        RelationsService().confirm_supersede(rel.id)  # confirmed from another card/API
+        session.expire_all()
+
+        bot, _ = _bot(world)
+        token = bot.registry.put(_PendingIds(ids=(new.id, rel.id)))
+        reply = bot.handle_callback(f"{CB_REL_KEEP_BOTH}:{token}:0", 7)
+
+        # nothing deleted, the strike stays, and the message is honest
+        session.expire_all()
+        assert RelationsService().get(rel.id) is not None
+        assert session.get(MemoryItem, old.id).superseded_by == new.id
+        assert "already applied" in reply.text
+
+    def test_discard_proposal_refuses_an_applied_relation(self, world):
+        repo, _ = world
+        old = _capture(repo, "pool party at Dana's")
+        new = _capture(repo, "pool party moved to Friday")
+        rel = RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+        with pytest.raises(RelationsError, match="already applied"):
+            RelationsService().discard_proposal(rel.id)
+        assert RelationsService().get(rel.id) is not None
+
+    def test_discard_proposal_deletes_only_a_proposed_row(self, world):
+        repo, _ = world
+        old = _capture(repo, "pool party at Dana's")
+        new = _capture(repo, "pool party moved to Friday")
+        rel = RelationsService().propose_supersede(new_id=new.id, old_id=old.id)
+        RelationsService().discard_proposal(rel.id)
+        assert RelationsService().get(rel.id) is None
+
+    def test_double_confirm_is_a_noop(self, world):
+        repo, _ = world
+        old = _capture(repo, "old")
+        new = _capture(repo, "new")
+        rel = RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+        again = RelationsService().confirm_supersede(rel.id)
+        assert again.provenance["state"] == "applied"
+
+    def test_undo_of_an_applied_relation_then_double_undo_no_ops(self, world):
+        repo, session = world
+        old = _capture(repo, "old")
+        new = _capture(repo, "new")
+        rel = RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+        RelationsService().undo_supersede(rel.id)
+        again = RelationsService().undo_supersede(rel.id)  # already undone
+        assert again.provenance["state"] == "undone"
+        session.expire_all()
+        assert session.get(MemoryItem, old.id).superseded_by is None
+
+    def test_confirm_refuses_an_undone_relation(self, world):
+        repo, _ = world
+        old = _capture(repo, "old")
+        new = _capture(repo, "new")
+        rel = RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+        RelationsService().undo_supersede(rel.id)
+        with pytest.raises(RelationsError, match="undone"):
+            RelationsService().confirm_supersede(rel.id)
+
+    def test_error_text_is_escaped_in_the_reply(self, world, monkeypatch):
+        import html
+
+        from brain.services import relations as rel_module
+
+        repo, _ = world
+        old = _capture(repo, "old")
+        new = _capture(repo, "new")
+        rel = RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+
+        real_error = rel_module.RelationsError
+
+        class _Boom(rel_module.RelationsService):
+            def discard_proposal(self, relation_id):  # noqa: ANN001
+                raise real_error("bad <b>&")
+
+        bot, _ = _bot(world)
+        token = bot.registry.put(_PendingIds(ids=(new.id, rel.id)))
+        monkeypatch.setattr(rel_module, "RelationsService", _Boom)
+        reply = bot.handle_callback(f"{CB_REL_KEEP_BOTH}:{token}:0", 7)
+        assert "<b>&" not in reply.text
+        assert html.escape("bad <b>&", quote=False) in reply.text

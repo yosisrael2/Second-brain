@@ -102,6 +102,25 @@ class RelationsService:
                 session.expunge(rel)
             return rel
 
+    def discard_proposal(self, relation_id: uuid.UUID) -> None:
+        """✖ Keep-both: delete a PROPOSED supersede, and ONLY that.
+
+        Review round 1 state guard: a stale card's keep-both must never
+        delete an APPLIED relation (that would leave the old item struck
+        with no relation pointing at it — unfindable by Restore/Undo).
+        One transaction; anything not 'proposed' is refused.
+        """
+        with self._sessions() as session:
+            rel = session.get(ItemRelation, relation_id)
+            if rel is None:
+                raise RelationsError(f"no such relation: {relation_id}")
+            if rel.kind != "supersedes":
+                raise RelationsError(f"not a supersedes relation: {relation_id}")
+            if (rel.provenance or {}).get("state") != "proposed":
+                raise RelationsError("already applied — use Undo")
+            session.delete(rel)
+            session.commit()
+
     def remove(self, relation_id: uuid.UUID) -> None:
         """Delete a plain link (derived_from/same_as corrections).
 
@@ -207,6 +226,21 @@ class RelationsService:
             rel = session.get(ItemRelation, relation_id)
             if rel is None or rel.kind != "supersedes":
                 raise RelationsError(f"not a supersedes relation: {relation_id}")
+            # Review round 1 state guards: confirm only proposed -> applied;
+            # undo only applied -> undone. Repeats are honest no-ops.
+            state = (rel.provenance or {}).get("state")
+            if to_state == "applied":
+                if state == "applied":
+                    session.expunge(rel)
+                    return rel  # double confirm: no-op
+                if state == "undone":
+                    raise RelationsError("relation was undone — apply the supersede again instead")
+            else:  # undo
+                if state == "undone":
+                    session.expunge(rel)
+                    return rel  # double undo: no-op, already restored
+                if state != "applied":
+                    raise RelationsError("not applied yet — discard the proposal instead")
             rel.provenance = {**rel.provenance, "state": to_state}
             if strike:
                 self._strike(rel.to_id, by=rel.from_id, session=session)

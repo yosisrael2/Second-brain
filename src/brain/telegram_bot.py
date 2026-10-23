@@ -1106,10 +1106,10 @@ class TelegramBot:
                 service.confirm_supersede(rel_ids[index])
                 notice = "✅ Confirmed — the old version is struck through (undo anytime)."
             else:  # CB_REL_KEEP_BOTH
-                service.remove(rel_ids[index])
+                service.discard_proposal(rel_ids[index])
                 notice = "✖ Keeping both — proposal discarded."
         except RelationsError as exc:
-            return Reply(f"⌛ {exc}", edit=True)
+            return Reply(f"⌛ {_esc(str(exc))}", edit=True)
         return self._card_reply(pending, notice=notice)
 
     def _relation_restore(self, pending: Pending) -> Reply:
@@ -1129,7 +1129,7 @@ class TelegramBot:
         try:
             RelationsService().undo_supersede(rel.id)
         except RelationsError as exc:
-            return Reply(f"⌛ {exc}", edit=True)
+            return Reply(f"⌛ {_esc(str(exc))}", edit=True)
         return self._card_reply(pending, notice="♻️ Restored — back in /recent.")
 
     def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
