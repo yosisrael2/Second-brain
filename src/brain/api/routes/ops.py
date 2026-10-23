@@ -15,9 +15,10 @@ GET  /cockpit/              the dashboard (static, vanilla JS, no CDN)
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -249,9 +250,28 @@ def _item_events(item_id: str) -> list[dict[str, Any]]:
     return events
 
 
+def _now_utc() -> datetime:
+    """The endpoint clock — module-level so tests can pin it (monkeypatch)."""
+    return datetime.now(UTC)
+
+
+def _local_day_start(now_utc: datetime, zone_name: str) -> datetime:
+    """Start of the LOCAL day named by ``zone_name`` as an absolute instant
+    (tz-aware); safe for Jerusalem where DST flips at 02:00 local, so local
+    midnight always exists."""
+    local = now_utc.astimezone(ZoneInfo(zone_name))
+    return local.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 @router.get("/ops/whatsapp")
 def get_ops_whatsapp() -> dict[str, Any]:
-    """WhatsApp poller ops: last poll time + per-channel cursor and counts (PR D1)."""
+    """WhatsApp poller ops: last poll + per-channel cursor, counts and media
+    stats (PR D1; today/media fields feed the cockpit Sources panel)."""
+    # 'today' is the user's LOCAL day (settings.timezone), never the DB's UTC
+    # day: between 00:00 and ~03:00 local the UTC date is still yesterday.
+    # The local day start is computed here and bound as a param, so both the
+    # clock and the zone are pinnable in tests.
+    day_start = _local_day_start(_now_utc(), get_settings().timezone)
     with engine.connect() as conn:
         rows = (
             conn.execute(
@@ -264,6 +284,40 @@ def get_ops_whatsapp() -> dict[str, Any]:
             .mappings()
             .all()
         )
+        # One scan over the poller's own conversation items; every per-channel
+        # stat (conv today/total, media read/not-read) aggregates from these rows.
+        conv_rows = (
+            conn.execute(
+                text(
+                    "SELECT meta->>'chat_jid' AS jid, "
+                    "(created_at >= :day_start) AS is_today, "
+                    "meta->'messages' AS messages "
+                    "FROM memory_items "
+                    "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL"
+                ),
+                {"day_start": day_start},
+            )
+            .mappings()
+            .all()
+        )
+    conv: dict[str, dict[str, int]] = {}
+    media: dict[str, dict[str, int]] = {}
+    for row in conv_rows:
+        agg = conv.setdefault(row["jid"], {"today": 0, "total": 0})
+        agg["total"] += 1
+        if row["is_today"]:
+            agg["today"] += 1
+        bucket = media.setdefault(row["jid"], {"read": 0, "not_read": 0})
+        for entry in row["messages"] or []:
+            media_entry = entry.get("media") if isinstance(entry, dict) else None
+            if not isinstance(media_entry, dict):
+                continue
+            # meta only ever carries "saved" or "not read yet" — there is no
+            # failed state recorded here, so the honest split is read/not-read.
+            if media_entry.get("status") == "saved":
+                bucket["read"] += 1
+            else:
+                bucket["not_read"] += 1
     channels = [
         {
             "channel": row["channel_name"],
@@ -274,6 +328,10 @@ def get_ops_whatsapp() -> dict[str, Any]:
             "messages_seen": int(row["messages_seen"]),
             "conversations_created": int(row["conversations_created"]),
             "conversations_updated": int(row["conversations_updated"]),
+            "conversations_today": conv.get(row["chat_jid"], {}).get("today", 0),
+            "conversations_total": conv.get(row["chat_jid"], {}).get("total", 0),
+            "media_read": media.get(row["chat_jid"], {}).get("read", 0),
+            "media_not_read": media.get(row["chat_jid"], {}).get("not_read", 0),
         }
         for row in rows
     ]

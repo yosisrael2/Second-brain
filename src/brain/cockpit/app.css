@@ -492,6 +492,21 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
   max-height: 200px; overflow-y: auto; font-size: 13px;
 }
 
+/* PR B views: superseded versions are struck through, not hidden (the item
+   detail keeps the history visible but clearly marked). */
+.inspector .itext.superseded {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+.inspector .superseded-banner {
+  background: var(--bg-page);
+  border: 1px solid var(--border); border-radius: var(--radius-btn);
+  padding: 8px 10px; margin: 10px 0 0;
+  font-size: 12px; color: var(--text-muted);
+}
+.inspector .irelations { margin: 10px 0; display: grid; gap: 6px; }
+.inspector .rel-row { align-items: center; }
+
 /* ---------- toast ---------- */
 
 .toast {
