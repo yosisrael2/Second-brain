@@ -100,7 +100,6 @@ class MemoryItem(Base):
     # saved". Plain class attribute — SQLAlchemy does not map it.
     deduplicated = False
 
-
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(
@@ -121,9 +120,7 @@ class MemoryItem(Base):
     # times are interpreted in the TIMEZONE setting and stored as aware UTC;
     # explicit offsets (Outlook +0300, ICS TZID/Z) are honored as given. The
     # original raw strings stay in meta for audit.
-    occurred_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Exact-duplicate guard: sha256 over (normalized text, occurred_at UTC
     # minute, source kind); computed by brain.services.dedupe at ingest and
     # backfilled by the fingerprint migration. Nullable: rows created before
@@ -145,6 +142,29 @@ class MemoryItem(Base):
     # extraction_meta: provenance for extracted children (item 7): model,
     # prompt_version, run_id, extracted_at, date-resolution notes.
     extraction_meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # --- WhatsApp relevance triage (D2a; design delta item 36) ------------
+    # triage_label: 'relevant' | 'noise' for conversation items (source
+    # 'whatsapp'); NULL = not triaged yet (always listed). Columns, not
+    # meta: the /recent filter is a WHERE on every listing (indexable,
+    # same style as the A1 child_state columns) and re-triage overwrites
+    # typed values instead of parsing JSON. Noise stays stored and
+    # searchable but is hidden from default listings and never enqueued
+    # for enrichment; triage never deletes anything.
+    triage_label: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    triage_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # triage_method: 'jev' | 'llm' | 'kid_named' — the deterministic kid
+    # override first (v3), Jev's typed choice next, the LLM only below the
+    # confidence band; triage_version pins the prompt version.
+    triage_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    triage_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # PR B (item 20/D4): when this item is superseded by a newer version
+    # (relation kind 'supersedes'/'corrects', applied), it stays in the DB
+    # with strike-through semantics: hidden by default from /recent, /review
+    # and search, restorable by clearing this column (undo/restore). NULL =
+    # current version. Self-FK; deleting the newer item un-strikes (SET NULL).
+    superseded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="SET NULL"), nullable=True
+    )
     # Format-specific extraction result (email headers, WhatsApp messages,
     # event fields). Always a JSON object; empty for plain notes.
     meta: Mapped[dict[str, Any]] = mapped_column(
@@ -250,9 +270,7 @@ class Entity(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -303,9 +321,7 @@ class MemoryFact(Base):
         Index("ix_memory_facts_status", "status"),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     subject_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("entities.id", ondelete="CASCADE"), nullable=False
     )
@@ -407,7 +423,6 @@ class Attachment(Base):
     )
 
 
-
 class ItemSource(Base):
     """A quote linking an extracted child item to its source item (item 7).
 
@@ -453,9 +468,7 @@ class EnrichmentJob(Base):
 
     __tablename__ = "enrichment_jobs"
     __table_args__ = (
-        CheckConstraint(
-            "state IN ('queued', 'running', 'done', 'failed')", name="state"
-        ),
+        CheckConstraint("state IN ('queued', 'running', 'done', 'failed')", name="state"),
         CheckConstraint("budget IN ('daily', 'backfill')", name="budget"),
         UniqueConstraint("item_id"),
         Index("ix_enrichment_jobs_state_not_before", "state", "not_before"),
@@ -478,3 +491,42 @@ class EnrichmentJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ItemRelation(Base):
+    """A directed link between two memory items (PR B; design items 7, 20, 22).
+
+    ``from`` is the NEWER item, ``to`` the older one: supersedes/corrects run
+    new -> old, derived_from runs derived child -> the fact it was derived
+    from, same_as is canonicalised newer -> older. ``provenance`` records HOW
+    the link was made (how: same_thread | llm_match | user | migration) and
+    its lifecycle state for supersedes (applied | proposed | undone) — item
+    20's two tiers. UNIQUE(from_id, to_id, kind): one link per triple; undo
+    never deletes the row (audit), it marks provenance.state = 'undone'.
+    """
+
+    __tablename__ = "item_relations"
+    __table_args__ = (
+        UniqueConstraint("from_id", "to_id", "kind", name="uq_item_relations_triple"),
+        CheckConstraint(
+            "kind IN ('supersedes', 'corrects', 'derived_from', 'same_as')",
+            name="ck_item_relations_kind",
+        ),
+        Index("ix_item_relations_from_id", "from_id"),
+        Index("ix_item_relations_to_id", "to_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    from_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    to_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

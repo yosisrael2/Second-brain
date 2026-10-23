@@ -24,6 +24,7 @@ import sqlite3
 import uuid as uuid_mod
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -225,13 +226,14 @@ def _poller(
     bridge: BridgeStore,
     *,
     gap: int = DEFAULT_GAP_MINUTES,
+    indexer: Any | None = None,
 ) -> WhatsAppPoller:
     return WhatsAppPoller(
         bridge=bridge,
         state=world.state,
         items=world.items,
         memory=world.memory_repo,
-        indexer=FakeIndexer(),
+        indexer=indexer if indexer is not None else FakeIndexer(),
         zone_name=ZONE,
         gap_minutes=gap,
         commit=True,
@@ -472,6 +474,54 @@ def test_new_message_after_live_edge_is_ingested(tmp_path: Path, world: SimpleWo
     assert "old" not in item.raw_text
 
 
+class _BoomIndexer:
+    """An indexer whose vector store is down: index() always raises."""
+
+    def index(self, item: MemoryItem) -> bool:
+        raise RuntimeError("qdrant down")
+
+
+def test_poll_indexes_created_and_updated_conversations(tmp_path: Path, world: SimpleWorld):
+    """The poller indexes every conversation it creates AND every update in
+    place — otherwise polled conversations stay invisible to semantic search
+    until someone happens to run 'brain reindex'."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="hello")],
+    )
+    fake = FakeIndexer()
+    poller = _poller(world, BridgeStore(path), indexer=fake)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init at the live edge
+    _add_row(path, _bridge_row("m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC), content="fresh"))
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # creates the conversation
+    _add_row(path, _bridge_row("m3", datetime(2026, 10, 22, 13, 30, tzinfo=UTC), content="more"))
+    poller.poll(now=datetime(2026, 10, 22, 14, 0, tzinfo=UTC))  # appends: update in place
+    assert world.item_count() == 1
+    item = world.session.query(MemoryItem).one()
+    assert [str(i.id) for i in fake.indexed] == [str(item.id), str(item.id)]
+
+
+def test_indexer_failure_never_blocks_the_poll(tmp_path: Path, world: SimpleWorld):
+    """Same best-effort policy as capture: a down vector store degrades to
+    'indexed by the next brain reindex', the poll still completes."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="hello")],
+    )
+    poller = _poller(world, BridgeStore(path), indexer=_BoomIndexer())
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init
+    _add_row(path, _bridge_row("m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC), content="fresh"))
+    result = poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # must not raise
+    assert sum(r.created for r in result) == 1
+    assert world.item_count() == 1
+
+
 def test_cursor_idempotent_across_restarts(tmp_path: Path, world: SimpleWorld):
     """A fresh poller instance (restart) with the same messages creates nothing new."""
     world.seed_channel("Chat A")
@@ -673,3 +723,82 @@ def test_ops_endpoint_reports_cursor_and_counts(tmp_path: Path, world: SimpleWor
     assert channel["messages_seen"] == 1
     assert channel["conversations_created"] == 1
     assert channel["conversations_updated"] == 0
+
+
+def test_ops_endpoint_today_follows_the_local_day(
+    tmp_path: Path, world: SimpleWorld, monkeypatch: pytest.MonkeyPatch
+):
+    """'today' follows the user's LOCAL day (settings.timezone), not the DB's
+    UTC day: an item created 23:30Z on day D (= 02:30 local on D+1, Israel is
+    UTC+3 until the 25 Oct 2026 DST end) counts as today when the pinned 'now'
+    is 00:30Z on D+1 (= 03:30 local D+1). A UTC day-trunc counts it as
+    yesterday — exactly the 00:00–03:00 local window the review flagged."""
+    import brain.api.routes.ops as ops_routes
+
+    pinned_now = datetime(2026, 10, 23, 0, 30, tzinfo=UTC)
+    monkeypatch.setattr(ops_routes, "_now_utc", lambda: pinned_now)
+    monkeypatch.setattr(
+        ops_routes, "get_settings", lambda: SimpleNamespace(timezone="Asia/Jerusalem")
+    )
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("z0", datetime(2026, 10, 22, 20, 0, tzinfo=UTC))],
+    )
+    poller = _poller(world, BridgeStore(path))
+    poller.poll(now=datetime(2026, 10, 22, 20, 1, tzinfo=UTC))  # live edge
+    _add_row(path, _bridge_row("a1", datetime(2026, 10, 22, 23, 30, tzinfo=UTC)))
+    poller.poll(now=datetime(2026, 10, 22, 23, 31, tzinfo=UTC))
+    world.session.commit()
+    item = world.session.query(MemoryItem).one()
+    item.created_at = datetime(2026, 10, 22, 23, 30, tzinfo=UTC)
+    world.session.commit()
+
+    client = TestClient(create_app())
+    channel = client.get("/ops/whatsapp").json()["channels"][0]
+    assert channel["conversations_today"] == 1  # 02:30 local Oct 23 — today
+    assert channel["conversations_total"] == 1
+
+
+def test_ops_endpoint_reports_today_and_media_counts(tmp_path: Path, world: SimpleWorld):
+    """Per-channel conversations today/total + media read/not-read: the cockpit
+    Sources panel's data (read-only aggregation over the poller's own rows)."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC))],
+    )
+    poller = _poller(world, BridgeStore(path))
+    poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))  # live edge
+    _add_row(path, _bridge_row("a1", datetime(2026, 10, 22, 10, 0, tzinfo=UTC)))
+    poller.poll(now=datetime(2026, 10, 22, 10, 2, tzinfo=UTC))
+    world.session.commit()
+    # One media entry read (status saved) + one still "not read yet".
+    item = world.session.query(MemoryItem).one()
+    meta = dict(item.meta)
+    messages = [dict(m) for m in meta["messages"]]
+    messages.append(
+        {"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}}
+    )
+    messages.append(
+        {"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}}
+    )
+    meta["messages"] = messages
+    item.meta = meta
+    world.session.commit()
+
+    get_settings.cache_clear()
+    try:
+        client = TestClient(create_app())
+        payload = client.get("/ops/whatsapp").json()
+    finally:
+        get_settings.cache_clear()
+    channel = payload["channels"][0]
+    assert channel["conversations_today"] == 1  # created_at is now -> today
+    assert channel["conversations_total"] == 1
+    assert channel["media_read"] == 1
+    assert channel["media_not_read"] == 1

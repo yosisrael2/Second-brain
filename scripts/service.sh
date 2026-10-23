@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # service.sh — install/uninstall/status/restart/logs for the launchd agents.
 #
-# Installs two per-user LaunchAgents that keep the stack up across logins:
+# Installs per-user LaunchAgents that keep the stack up across logins:
 #   com.secondbrain.api       scripts/run-server.sh   (foreground uvicorn)
 #   com.secondbrain.telegram  scripts/run-bot.sh      (long-poll bot; exit-code
 #                             contract: 0/78 -> no restart, 1 -> restart)
+#   com.secondbrain.email     scripts/run-email.sh    (Gmail label poller; same
+#                             contract; needs re-auth pauses INSIDE the poller)
+#   com.secondbrain.whatsapp  scripts/run-whatsapp.sh (WhatsApp poller)
 #
-# Both agents get COMPOSE_PROJECT_NAME=second-brain so compose-scoped checks
+# All agents get COMPOSE_PROJECT_NAME=second-brain so compose-scoped checks
 # (the cockpit docker panel) always look at the service project, never at the
 # dev one (second-brain-dev). Secrets stay OUT of the plists: the app reads
 # .env itself via Settings(env_file=".env") with WorkingDirectory at the repo
@@ -18,7 +21,7 @@
 # both) and any manual WhatsApp poller (.dev/whatsapp.pid + orphans; a
 # second poller races the shared cursor table) BEFORE bootstrapping.
 #
-# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|whatsapp]
+# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|whatsapp]
 #
 # Test seams (never needed interactively): PLIST_DIR, LOG_DIR, PORT, LINES,
 # BRAIN_BIN, UVICORN_BIN — overridable so tests never touch the real
@@ -33,6 +36,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LABEL_API="com.secondbrain.api"
 LABEL_TG="com.secondbrain.telegram"
+LABEL_EMAIL="com.secondbrain.email"
 LABEL_WA="com.secondbrain.whatsapp"
 PLIST_DIR="${PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${LOG_DIR:-$HOME/Library/Logs/second-brain}"
@@ -41,6 +45,7 @@ BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
 UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 RUN_SERVER="$ROOT/scripts/run-server.sh"
 RUN_BOT="$ROOT/scripts/run-bot.sh"
+RUN_EMAIL="$ROOT/scripts/run-email.sh"
 RUN_WHATSAPP="$ROOT/scripts/run-whatsapp.sh"
 TG_PID_FILE="$ROOT/.dev/telegram.pid"
 WA_PID_FILE="$ROOT/.dev/whatsapp.pid"
@@ -49,18 +54,28 @@ GUI_DOMAIN="gui/$(id -u)"
 # shims (docker), then the system. The cockpit docker check needs `docker`.
 SERVICE_PATH="/opt/homebrew/bin:$HOME/.rd/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+email_configured() {
+  # Email is OPT-IN: the agent is installed only when a Gmail label id is
+  # configured (real environment wins over .env). Without it the poller
+  # would start, exit 78->0 and stay down — reading as a permanently-dead
+  # background service in the cockpit. Install skips it instead.
+  load_env_file
+  [ -n "${GMAIL_LABEL_ID:-}" ]
+}
+
 usage() {
   cat <<EOF
-Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|whatsapp]
+Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|whatsapp]
 
-install    stop our manual instances, write the three plists, bootstrap them
+install    stop our manual instances, write the plists, bootstrap them
+           (email is opt-in: only installed when GMAIL_LABEL_ID is set)
 uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
-restart    kickstart -k all agents
+restart    kickstart -k all installed agents (skips the rest)
 logs [c]   tail the last ${LINES:-50} lines (component: api, telegram,
-           whatsapp, or all)
+           email, whatsapp, or all)
 
-Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_WA}
+Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_EMAIL}, ${LABEL_WA}
 Plists: ${PLIST_DIR}   Logs: ${LOG_DIR}
 EOF
 }
@@ -224,13 +239,40 @@ EOF
 
 bootout_label() {
   launchctl bootout "${GUI_DOMAIN}/$1" 2>/dev/null || true
+  # Wait (bounded) for launchd to actually drop the label: bootstrapping a
+  # label launchd still holds is the classic '5: Input/output error' race.
+  local i=0
+  while [ "$i" -lt "${BOOTOUT_WAIT_TRIES:-10}" ]; do
+    launchctl print "${GUI_DOMAIN}/$1" >/dev/null 2>&1 || return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+}
+
+bootstrap_label() {
+  # launchctl bootstrap races a just-finished bootout ('5: Input/output
+  # error'); retry ONLY that error, up to 3 tries, then report failure.
+  local label="$1" attempt=1 out
+  while :; do
+    if out="$(launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${label}.plist" 2>&1)"; then
+      printf '  %-28s bootstrapped\n' "$label"
+      return 0
+    fi
+    if [ "$attempt" -ge 3 ] || ! printf '%s' "$out" | grep -q "Input/output error"; then
+      printf '  %-28s FAILED: %s\n' "$label" "$out" >&2
+      return 1
+    fi
+    sleep 1.5
+    attempt=$((attempt + 1))
+  done
 }
 
 install() {
   [ -x "$BRAIN" ] || die "$BRAIN missing — provision the venv first (scripts/dev-start.sh does)"
   [ -x "$UVICORN" ] || die "$UVICORN missing — provision the venv first"
-  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] && [ -x "$RUN_WHATSAPP" ] || \
-    die "scripts/run-server.sh, run-bot.sh and run-whatsapp.sh must be executable"
+  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] && [ -x "$RUN_EMAIL" ] \
+    && [ -x "$RUN_WHATSAPP" ] || \
+    die "scripts/run-server.sh, run-bot.sh, run-email.sh and run-whatsapp.sh must be executable"
   [ -f "$ROOT/.env" ] || say "env: WARNING — no .env at $ROOT; services run on defaults (telegram disabled until a token exists)"
 
   say "takeover: stopping manual instances (no duplicate bots, no 409)"
@@ -240,8 +282,21 @@ install() {
   sleep_check
 
   say "install: writing plists to $PLIST_DIR"
+  local install_email=0
+  if email_configured; then
+    install_email=1
+  fi
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
+  if [ "$install_email" -eq 1 ]; then
+    write_plist "$LABEL_EMAIL" "$RUN_EMAIL" "email"
+  else
+    # Opt-out must leave no stale agent: an old plist would keep running (or
+    # bootstrap and exit 78->0) — a permanently-down background service.
+    bootout_label "$LABEL_EMAIL"
+    rm -f "$PLIST_DIR/${LABEL_EMAIL}.plist"
+    say "email: skipped (GMAIL_LABEL_ID not set)"
+  fi
   THROTTLE=30 write_plist "$LABEL_WA" "$RUN_WHATSAPP" "whatsapp"
 
   # Pre-create the log files mode 600: launchd writes into the existing inode
@@ -249,15 +304,30 @@ install() {
   for f in api api.err telegram telegram.err whatsapp whatsapp.err; do
     touch "$LOG_DIR/$f.log" 2>/dev/null || true
   done
+  if [ "$install_email" -eq 1 ]; then
+    for f in email email.err; do
+      touch "$LOG_DIR/$f.log" 2>/dev/null || true
+    done
+  fi
   chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
 
   say "install: bootstrapping agents"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
+  if [ "$install_email" -eq 1 ]; then
+    bootout_label "$LABEL_EMAIL"
+  fi
   bootout_label "$LABEL_WA"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_API}.plist"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_TG}.plist"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_WA}.plist"
+  local failed=0
+  bootstrap_label "$LABEL_API" || failed=1
+  bootstrap_label "$LABEL_TG" || failed=1
+  if [ "$install_email" -eq 1 ]; then
+    bootstrap_label "$LABEL_EMAIL" || failed=1
+  fi
+  bootstrap_label "$LABEL_WA" || failed=1
+  if [ "$failed" -ne 0 ]; then
+    die "install: one or more agents failed to bootstrap (see above); re-run scripts/service.sh install"
+  fi
 
   sleep 2
   say "install: done — agents are starting (RunAtLoad)"
@@ -270,9 +340,10 @@ uninstall() {
   say "uninstall: booting out agents (their processes get SIGTERM from launchd)"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
+  bootout_label "$LABEL_EMAIL"
   bootout_label "$LABEL_WA"
   rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist" \
-    "$PLIST_DIR/${LABEL_WA}.plist"
+    "$PLIST_DIR/${LABEL_EMAIL}.plist" "$PLIST_DIR/${LABEL_WA}.plist"
   say "uninstall: plists removed; logs remain in $LOG_DIR"
 }
 
@@ -296,6 +367,11 @@ status() {
   local ok=0
   print_label_status "$LABEL_API" || ok=1
   print_label_status "$LABEL_TG" || ok=1
+  if email_configured; then
+    print_label_status "$LABEL_EMAIL" || ok=1
+  else
+    printf '  %-28s skipped (GMAIL_LABEL_ID not set)\n' "$LABEL_EMAIL"
+  fi
   print_label_status "$LABEL_WA" || ok=1
   sleep_check
   docker_check
@@ -308,13 +384,17 @@ status() {
 }
 
 restart() {
-  say "restart: kickstart -k all agents"
+  say "restart: kickstart -k installed agents (labels with no plist are skipped)"
   local failed=0 label
-  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_WA"; do
+  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_EMAIL" "$LABEL_WA"; do
+    if [ ! -f "$PLIST_DIR/${label}.plist" ]; then
+      printf '  %-28s skipped (not installed)\n' "$label"
+      continue
+    fi
     if launchctl kickstart -k "${GUI_DOMAIN}/${label}" 2>/dev/null; then
       printf '  %-28s kicked\n' "$label"
     else
-      printf '  %-28s FAILED (installed?)\n' "$label" >&2
+      printf '  %-28s FAILED\n' "$label" >&2
       failed=1
     fi
   done
@@ -326,9 +406,10 @@ logs() {
   case "$comp" in
     api) tail_log "api" ;;
     telegram) tail_log "telegram" ;;
+    email) tail_log "email" ;;
     whatsapp) tail_log "whatsapp" ;;
-    all) tail_log "api"; tail_log "telegram"; tail_log "whatsapp" ;;
-    *) usage >&2; die "unknown component '$comp' (api|telegram|whatsapp|all)" ;;
+    all) tail_log "api"; tail_log "telegram"; tail_log "email"; tail_log "whatsapp" ;;
+    *) usage >&2; die "unknown component '$comp' (api|telegram|email|whatsapp|all)" ;;
   esac
 }
 

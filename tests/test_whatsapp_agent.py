@@ -24,8 +24,9 @@ import os
 import sqlite3
 import subprocess
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -364,7 +365,6 @@ class TestServiceWhatsappAgent:
 
 def _healthy_whatsapp(**overrides: object) -> dict[str, object]:
     raw: dict[str, object] = {
-        "configured": True,
         "interval_s": 30.0,
         "heartbeat_age_s": 5.0,
         "last_poll_age_s": 5.0,
@@ -408,26 +408,147 @@ class TestWhatsappHealthComponent:
         entry = body["components"]["whatsapp"]
         assert entry["status"] == "ok"
 
-    def test_unconfigured_is_disabled_not_down(self):
-        entry = self._payload({"configured": False})["components"]["whatsapp"]
+    def test_health_truth_is_the_poller_heartbeat_not_the_api_env(self):
+        """The poller is configured by run-whatsapp.sh, which the API process
+        cannot see — the heartbeat is the ground truth, NOT this process's
+        WHATSAPP_BRIDGE_DB (that inference reported 'disabled' for a RUNNING
+        poller in the live cockpit, 2026-10-23)."""
+        body = self._payload(
+            {"interval_s": 30.0, "heartbeat_age_s": 5.0, "last_poll_age_s": 5.0, "channels": 11}
+        )
+        assert body["components"]["whatsapp"]["status"] == "ok"
+
+    def test_no_heartbeat_ever_is_disabled(self):
+        entry = self._payload(_healthy_whatsapp(heartbeat_age_s=None, last_poll_age_s=None))[
+            "components"
+        ]["whatsapp"]
         assert entry["status"] == "disabled"
+        assert "never heartbeated" in entry["summary"]
+
+    def test_stale_heartbeat_is_degraded(self):
+        """Past 3x the interval the poll loop is presumed stuck: degraded. The
+        heartbeat fires every poll cycle, so a stale heartbeat means the loop
+        stopped — an operational state, not a config problem (not 'down')."""
+        entry = self._payload(_healthy_whatsapp(last_poll_age_s=300.0, heartbeat_age_s=300.0))[
+            "components"
+        ]["whatsapp"]
+        assert entry["status"] == "degraded"
 
     def test_within_three_intervals_is_ok(self):
         """The manager's rule: healthy = last poll within 3x the interval."""
         entry = self._payload(_healthy_whatsapp(last_poll_age_s=75.0, heartbeat_age_s=75.0))
         assert entry["components"]["whatsapp"]["status"] == "ok"
 
-    def test_stale_poll_is_down(self):
-        entry = self._payload(_healthy_whatsapp(last_poll_age_s=300.0, heartbeat_age_s=300.0))[
-            "components"
-        ]["whatsapp"]
-        assert entry["status"] == "down"
-
-    def test_no_heartbeat_is_down(self):
-        entry = self._payload(_healthy_whatsapp(heartbeat_age_s=None, last_poll_age_s=None))[
-            "components"
-        ]["whatsapp"]
-        assert entry["status"] == "down"
-
     def test_background_labels_cover_the_whatsapp_agent(self):
         assert "com.secondbrain.whatsapp" in ops_health.BACKGROUND_LABELS
+
+
+class TestSideProcessIndexerWiring:
+    """'brain whatsapp' is a side process: it must poll with the REAL vector
+    indexer, not indexer=None (the D1b design bug — polled conversations were
+    invisible to semantic search until a manual 'brain reindex')."""
+
+    def test_side_process_indexer_returns_the_deps_indexer(self, monkeypatch):
+        import brain.cli as cli
+        from brain.api import deps
+
+        sentinel = object()
+        monkeypatch.setattr(deps, "get_item_indexer", lambda: sentinel)
+        assert cli._side_process_indexer() is sentinel
+
+    def test_side_process_indexer_returns_none_when_deps_unavailable(self, monkeypatch, caplog):
+        """The fallback stays, but it must never be SILENT: a warning with the
+        exception type+message AND an indexer_unavailable ops event, otherwise
+        the poller would ingest unsearchable conversations with no trace."""
+        import brain.cli as cli
+
+        def _boom():
+            raise RuntimeError("no embedder here")
+
+        monkeypatch.setattr("brain.api.deps.get_item_indexer", _boom)
+        with caplog.at_level("WARNING"):
+            assert cli._side_process_indexer() is None
+        assert "RuntimeError" in caplog.text
+        assert "no embedder here" in caplog.text
+        from brain.db.session import engine
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT detail FROM ops_events WHERE component = 'whatsapp'"
+                    " AND kind = 'indexer_unavailable'"
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0]["error"] == "RuntimeError"
+
+    def test_cli_attachment_service_forwards_the_indexer(self, monkeypatch):
+        """Attachment items captured by the poller path are indexed by the
+        attachments service itself — but only if the CLI hands it the indexer."""
+        import brain.cli as cli
+
+        captured: dict = {}
+
+        class _RecordingService:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("brain.services.attachments.AttachmentService", _RecordingService)
+        monkeypatch.setattr("brain.services.attachments.AttachmentFileStore", lambda root: None)
+        monkeypatch.setattr("brain.services.attachments.PdfTextLayerReader", lambda: None)
+        monkeypatch.setattr("brain.services.attachments.ClaudeFileReader", lambda: None)
+        cli._cli_attachment_service(
+            SimpleNamespace(files_dir=None, attachment_daily_budget=5), indexer="IDX"
+        )
+        assert captured["indexer"] == "IDX"
+
+    def test_whatsapp_cli_indexes_through_the_seam(self, tmp_path, database, monkeypatch):
+        """End to end, bounded: two --once cycles through cli.main with the
+        indexer seam stubbed — the created conversation reaches the indexer."""
+        import brain.cli as cli
+        from brain.config import get_settings
+        from brain.db.models import Entity
+        from brain.db.session import SessionLocal
+
+        class _RecordingIndexer:
+            def __init__(self):
+                self.indexed = []
+
+            def index(self, item):
+                self.indexed.append(item)
+                return True
+
+        fake = _RecordingIndexer()
+        monkeypatch.setattr(cli, "_side_process_indexer", lambda: fake)
+        with SessionLocal() as session:
+            session.execute(text("DELETE FROM whatsapp_poll_state"))
+            session.execute(text("DELETE FROM memory_items"))
+            session.execute(text("DELETE FROM entities"))
+            session.add(Entity(kind="channel", name="Chat A"))
+            session.commit()
+        bridge = _bridge(tmp_path)
+        monkeypatch.setenv("BRAIN_ALLOW_LIVE", "1")
+        monkeypatch.setenv("WHATSAPP_BRIDGE_DB", str(bridge))
+        get_settings.cache_clear()
+        try:
+            assert cli.main(["whatsapp", "--once"]) == 0  # init cycle
+            conn = sqlite3.connect(bridge)
+            try:
+                conn.execute(
+                    "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)"
+                    " VALUES ('m2', 'j1@g.us', 'Dana', 'fresh', ?, 0)",
+                    # strictly later than m1 (the fixture label drops microseconds)
+                    (
+                        (datetime.now(UTC) + timedelta(seconds=70)).strftime(
+                            "%Y-%m-%d %H:%M:%S+03:00"
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            assert cli.main(["whatsapp", "--once"]) == 0  # ingest cycle
+        finally:
+            get_settings.cache_clear()
+        assert len(fake.indexed) == 1
+        assert fake.indexed[0].source == "whatsapp"

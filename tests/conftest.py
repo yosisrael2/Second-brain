@@ -197,6 +197,32 @@ def _drop_test_database() -> None:
         conn.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
 
 
+# --- live-collection tripwire (session level) ---------------------------------
+# The PR #42 incident: a test vector landed in the LIVE qdrant collection and
+# nothing noticed. These two hooks snapshot the LIVE collection's point count
+# before and after the whole run and fail loudly on any change. Read-only
+# (one REST GET each); when qdrant is unreachable the tripwire stays silent.
+
+from tests.live_guard import assert_points_stable, live_point_count  # noqa: E402
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    session.config._live_points_before = live_point_count(  # type: ignore[attr-defined]
+        os.environ.get("QDRANT_URL", "http://localhost:27333")
+    )
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    before = getattr(session.config, "_live_points_before", None)
+    if before is None:
+        return
+    after = live_point_count(os.environ.get("QDRANT_URL", "http://localhost:27333"))
+    try:
+        assert_points_stable(before, after)
+    except AssertionError as exc:
+        print(f"\nERROR: {exc}")
+        session.testsfailed = max(session.testsfailed or 0, 1)
+
 # F3: the attachments-core fixture (tests/test_attachments.py) shared with the
 # poller test modules. Module-level alias — pytest collects fixture objects by
 # value, so the same fixture instance is available as `svc_env` everywhere.

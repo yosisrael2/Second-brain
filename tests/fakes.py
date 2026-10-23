@@ -50,6 +50,8 @@ class FakeRepository:
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_noise: bool = False,
+        include_superseded: bool = False,
     ) -> list[MemoryItem]:
         items = [
             item
@@ -63,13 +65,30 @@ class FakeRepository:
                 or item.child_state is None
                 or item.child_state == "kept"
             )
+            # D2a (item 36): triaged-noise WhatsApp conversations are
+            # unlisted by default; noise stays searchable either way
+            and (
+                include_noise
+                or item.source != "whatsapp"
+                or item.triage_label != "noise"
+            )
+            # PR B (item 20/D4): superseded items are unlisted by default
+            and (include_superseded or getattr(item, "superseded_by", None) is None)
         ]
         items.sort(key=lambda item: item.created_at, reverse=True)
         return items[offset : offset + limit]
 
-    def search(self, *, query: str, limit: int, offset: int) -> list[MemoryItem]:
+    def search(
+        self, *, query: str, limit: int, offset: int, include_superseded: bool = False
+    ) -> list[MemoryItem]:
         needle = query.lower()
-        matches = [item for item in self.items.values() if needle in item.raw_text.lower()]
+        matches = [
+            item
+            for item in self.items.values()
+            if needle in item.raw_text.lower()
+            # PR B (item 20/D4): superseded items are unlisted by default
+            and (include_superseded or getattr(item, "superseded_by", None) is None)
+        ]
         matches.sort(key=lambda item: item.created_at, reverse=True)
         return matches[offset : offset + limit]
 

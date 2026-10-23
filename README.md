@@ -12,34 +12,47 @@ Roadmap and known limitations: [Next steps](#next-steps).
 
 ## Features
 
-Everything below is merged and running on `main`. One line per capability,
-linked to its section or doc.
+Everything below is merged on `main`; items marked *(inactive)* are merged
+but switched off until a configuration step. One line per capability, linked
+to its section or doc.
 
 **Capture**
 - Telegram bot (long-polling, allowlist-only) and `POST /capture` API, both feeding the same paste parser — [Telegram bot](#telegram-bot), [Paste-aware capture](#memory-items-api)
 - Paste recognition: email, WhatsApp thread, calendar one-liner, or plain note; WhatsApp threads ask "save as one item or separately" first — `src/brain/services/paste.py`
 - Jev auto-classification (type / importance / actionability / confidence, routed at >= 0.9) with exact-duplicate guard (content fingerprint) — [Dogfood checklist](#dogfood-checklist-live-run-without-api-keys)
 - `.ics` calendar files captured as calendar items — [Telegram bot](#telegram-bot)
+- **WhatsApp ingestion (24/7):** the `com.secondbrain.whatsapp` agent reads the local WhatsApp bridge store read-only, only for channels registered in memory, groups messages into conversations by time gap (60 min) and stores one searchable item per conversation, indexed immediately — `src/brain/services/whatsapp.py`, `scripts/run-whatsapp.sh` (PRs #37, #40, #47, #50)
+- **Attachments:** photos and PDFs sent to the bot are stored once (sha256) outside the repo and read in the background — a PDF text layer locally, otherwise Claude in a single-file sandbox; 20 MB / 20 pages / 50 files per day; each attachment becomes its own searchable item. Email and WhatsApp attachment content is wired in the same pipeline — `src/brain/services/attachments.py` (PRs #38, #44)
+- **Gmail label source** *(inactive)*: read-only OAuth, one label, Message-ID dedupe, attachments via the attachment pipeline; activates after a one-time Google consent — [docs/email-setup.md](docs/email-setup.md) (PR #36)
 
 **Retrieval**
 - Multilingual embeddings (local `fastembed`, `minishlab/potion-multilingual-128M`, 256 dims — Hebrew + English), Postgres FTS over raw text, reciprocal-rank fusion of the two — [AI layer](#ai-layer-and-the-brain-cli)
 - Temporal retrieval: English + Hebrew weekday names, `dd.mm` dates, today/tomorrow/yesterday — `src/brain/services/temporal.py`
 - Ask recall pool: rerank over 32 candidates, top 8 in the prompt — [Memory items API](#memory-items-api)
+- Kid-aware recall: a question that names a kid (whole word, Hebrew one-letter prefixes allowed) also recalls items from that kid's channels and class — `src/brain/services/ask.py` (PRs #32, #42)
 
 **Ask**
 - Grounded answers with item-id citations; model visible in the reply (`claude-sonnet-5-5` default) — [Memory items API](#memory-items-api), [docs/ai-layer.md](docs/ai-layer.md)
 - Conflict rule: when two sources disagree about the same event, the answer opens with the conflict, quotes both versions with citations, and never claims "no conflict" — `src/brain/ai/ask.py` (PR #27)
+- API and bot build the answer service through one builder (same local timezone and retrieval sizes) — `brain.api.deps.build_ask_service` (PR #35)
 
 **Memory layer**
-- Entities (person / group / place / org + aliases) and versioned confirmed facts (`valid_from`/`valid_to`, `proposed -> confirmed -> rejected`, supersedes chain) — [Memory layer API](#memory-layer-api)
+- Entities (person / group / place / org / channel + aliases) and versioned confirmed facts (`valid_from`/`valid_to`, `proposed -> confirmed -> rejected`, supersedes chain) — [Memory layer API](#memory-layer-api)
 - Kid/class/teacher profiles, channel -> child mapping and `applies_to` resolution; memory block injected into ask answers — `src/brain/services/memory.py`
 - REST `/memory` API, cockpit Memory tab, bot `/profile` and `/remember`, seed CLI (`brain memory seed-kid`, `seed-channel`) — [Memory layer API](#memory-layer-api)
 
+**Meaning extraction and relations**
+- Extraction data model + durable enrichment queue (daily cap, backfill budget, grounded quotes, Hebrew-calendar dates, weekday/date conflict flag, re-run diffing) with a stub extractor — *(inactive: the enrichment worker is off)* (PR #33)
+- Bot proposal cards: one card per source with Keep / Fix / Drop and 48 h pings for due tasks and reminders — *(inactive until extraction runs)* (PR #41)
+- Relations between items (`supersedes`, `corrects`, `derived_from`, `same_as`): same-thread corrections applied visibly and undoably, cross-thread matches only proposed; superseded items are hidden from lists, search and ask but restorable; duplicate key never merges items for different people — `src/brain/services/relations.py` (PR #48)
+
 **Cockpit**
-- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone — [Cockpit](#cockpit-ops-dashboard)
+- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp (from the poller's heartbeat), attachments and extraction — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50)
 
 **Ops**
-- 24/7 launchd services (`scripts/service.sh`), single bot instance lock, live-store startup guard (`BRAIN_ALLOW_LIVE`), per-worker test databases, suite isolated from the live store — [Background services](#background-services-launchd-247), [Live-store startup guard](#live-store-startup-guard)
+- 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247)
+- Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; each test session fails loudly if the live collection changes — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45)
+- Tests isolated from live data: per-worker test databases and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42)
 
 **Evaluation**
 - `brain eval-extraction`: gold-set scorer for extraction candidates (per-type P/R/F1, date accuracy, applies_to, quote grounding, relations, `date_conflict` recall) — [docs/eval-extraction.md](docs/eval-extraction.md)
@@ -49,29 +62,31 @@ linked to its section or doc.
 | Area | Status | PRs |
 | --- | --- | --- |
 | Capture pipeline (items, paste parsing, Jev, dedupe) | **Done** | #1, #7, #17, #19 |
-| Retrieval (embeddings, FTS fusion, temporal, recall pool) | **Done** | #20, #21, #24 |
-| Ask (citations, model config, conflict rule) | **Done** | #6, #27 |
-| Memory layer (entities, versioned facts, ask block) | **Done** | #26, #28, #30 |
-| Telegram bot + launchd services | **Done** | #9-#12, #16, #18 |
-| Cockpit (ops dashboard + restyle) | **Done** | #13, #29 |
-| Ops safety (test isolation, live-store guard, dedicated ports) | **Done** | #10, #22, #23, #31 |
+| Retrieval (embeddings, FTS fusion, temporal, recall pool, kid-aware recall) | **Done** | #20, #21, #24, #32, #42 |
+| Ask (citations, model config, conflict rule, one builder) | **Done** | #6, #27, #35 |
+| Memory layer (entities, versioned facts, channels, ask block, API, UI) | **Done** | #26, #28, #30 |
+| WhatsApp ingestion (24/7 agent, conversations, indexing) | **Done, live** | #37, #40, #47, #50 |
+| Attachments (Telegram, email, WhatsApp media) | **Done** | #38, #44 |
+| Gmail label source | **Done, inactive** (needs Google consent) | #36 |
+| Extraction data model + queue, proposal cards | **Done, inactive** (worker off) | #33, #41 |
+| Relations + dedupe | **Done** | #48 |
+| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50 |
+| Cockpit (ops dashboard, restyle, health cards) | **Done** | #13, #29, #46 |
+| Ops safety (test isolation, live-store guards, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45 |
 | CI + extraction evaluation | **Done** | #4, #5, #25 |
 
-**In progress**
+**In progress** (paused 23 Oct 2026)
 
-- Meaning extraction PR A1: data model + async enrichment of captured items
-- Memory-aware recall for kid questions (PR 0d)
-- Attachments (PR F1): images/PDFs read by Claude (a PDF text layer is read locally first); Telegram first, then email and WhatsApp. PR F3 wires email + WhatsApp IN: the Gmail poller fetches stored attachment references (`users.messages.attachments.get`, still read-only) and WhatsApp downloads media for allowlisted channels via the bridge's local `/api/download` — both captured as their own attachment item (20 MB / daily-budget / sandbox respected), replacing the "not read yet" markers
-- Gmail source (PR F2): approved (read-only Gmail OAuth, one label); implementation in progress; needs a one-time Google consent by the user (setup: docs/email-setup.md)
-- WhatsApp ingestion (PR D1): automatic reading of allowlisted channels, grouped into conversations
-- Bot timezone fix
-- Bot proposal cards (PR C): Keep / Fix / Drop on one card per source + 48h pings — built; fires only when the enrichment worker is switched on (worker stays OFF for now)
+- LLM extraction (PR #39, draft): scored against the frozen gold set; run 2 reached quote grounding 1.00, audience accuracy 0.68 (no unknowns) and caught the dated conflict, but recall, precision and date accuracy are still below the merge bar
+- WhatsApp relevance triage (PR #49): chatter stays searchable but out of lists and extraction
+- Bot Undo / confirm-replace / Restore for relations (PR #51, ready)
+- Gmail always-on agent (PR #43)
+- Cockpit view of WhatsApp sources and item relations
 
 **Planned**
 
-- PR A2: LLM extraction scored against the frozen gold set + held-out data
-- PR B: relations between items + duplicate handling
-- PR D: WhatsApp triage, reconciliation, media
+- Activate Gmail (one-time Google consent) and switch extraction on after the held-out score
+- WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation
 - Then: actions — approved items become Google Calendar events / tasks
 
 **Quality check** (22-23 Oct 2026, real questions): calendar questions **10/10**,
@@ -195,6 +210,11 @@ the AI/integrations track).
 | GET    | `/items/{id}`      | Fetch one; 404 if missing                                        |
 | PATCH  | `/items/{id}`      | Partial update (absent fields unchanged); 404 if missing         |
 | DELETE | `/items/{id}`      | Delete; 204, or 404 if missing                                   |
+| POST   | `/items/{id}/relations` | Link to another item (`to_id`, `kind` supersedes\|corrects\|derived_from\|same_as, `provenance`). kind=supersedes auto-APPLIES (item 20a: old item struck-through, undoable); `propose: true` only PROPOSES (item 20b, cross-thread LLM match — old item stays visible until confirm) |
+| GET    | `/items/{id}/relations` | Every relation touching the item                                   |
+| GET    | `/items/{id}/current`   | Resolve the supersedes chain to the CURRENT version                |
+| POST   | `/items/relations/{rid}/confirm` | Confirm a proposed supersede (old item struck-through)    |
+| POST   | `/items/relations/{rid}/undo`    | Undo/restore (item 20a/D4: old item current again)        |
 | GET    | `/search?q=`       | Semantic search (embed -> Qdrant -> Jev rerank); falls back to keyword search (`score: null`) when embeddings/Qdrant are unavailable |
 | POST   | `/ask`             | Answer a question from top-k items with citations; 502 when the LLM is unconfigured/down |
 
@@ -600,6 +620,24 @@ Behavior worth knowing:
   Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store. To run
   `dev-start.sh` against the real store you opt in explicitly with
   `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
+- **Live-store construction guard** — the lifespan guard cannot catch code
+  that never goes through an app start (a `TestClient(create_app())` without
+  a `with` block, an ad-hoc script, a lru_cache'd factory that outlived an
+  env change). The SAME refusal therefore also runs at CONSTRUCTION: the
+  SQLAlchemy engine factory (`brain.db.session.create_engine_from_settings`)
+  refuses the live database URL, and the Qdrant vector store's `__init__`
+  refuses the live collection name when it builds a real client (stores with
+  an injected client — the tests' in-memory qdrant — are never the live
+  server and are not gated). Consequence for the CLI: every `brain`
+  subcommand that touches the live store (`reindex`, `enrich`, `whatsapp`,
+  `gmail-poll`, `memory seed-*`, `telegram`) now refuses unless the operator
+  sets `BRAIN_ALLOW_LIVE=1` for that one command — e.g.
+  `BRAIN_ALLOW_LIVE=1 brain reindex`. `scripts/run-bot.sh` exports the flag
+  itself (the bot is the real service), as does `scripts/run-server.sh`.
+  The test suite additionally runs a session-level tripwire
+  (`tests/live_guard.py`): it snapshots the LIVE collection's point count
+  before and after the run (one read-only REST GET each) and fails loudly if
+  it changed — a future leak turns red instead of surfacing days later.
 
 ## Setup
 

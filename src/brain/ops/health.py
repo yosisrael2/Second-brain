@@ -47,6 +47,7 @@ class HealthContext:
         email: Callable[[], dict[str, Any]] | None = None,
         attachments: Callable[[], dict[str, Any]] | None = None,
         enrichment: Callable[[], dict[str, Any]] | None = None,
+        triage: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -58,6 +59,7 @@ class HealthContext:
         self.disk = disk or _disk_check
         self.background = background or _background_check
         self.whatsapp = whatsapp or _whatsapp_check
+        self.triage = triage or _triage_check
         self.email = email or _email_check
         self.attachments = attachments or _attachments_check
         self.enrichment = enrichment or _enrichment_check
@@ -151,23 +153,19 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"heartbeat {age:.0f}s ago", raw)
     if component == "whatsapp":
-        if not raw.get("configured", False):
-            return _entry("disabled", "WHATSAPP_BRIDGE_DB unset — poller off", raw)
         interval = raw.get("interval_s") or 30.0
         if not isinstance(interval, (int, float)) or interval <= 0:
             interval = 30.0
         heartbeat_age = raw.get("heartbeat_age_s")
         if heartbeat_age is None:
-            return _entry("down", "poller never heartbeated", raw)
+            return _entry("disabled", "poller has never heartbeated", raw)
         if heartbeat_age > 3 * interval:
-            return _entry("down", f"heartbeat {heartbeat_age:.0f}s ago", raw)
+            return _entry("degraded", f"heartbeat {heartbeat_age:.0f}s ago", raw)
         last_poll_age = raw.get("last_poll_age_s")
-        if last_poll_age is None:
-            return _entry("degraded", "up but never polled", raw)
-        if last_poll_age > 3 * interval:
-            return _entry("degraded", f"last poll {last_poll_age:.0f}s ago", raw)
         channels = raw.get("channels")
         suffix = f" · {channels} channel(s)" if isinstance(channels, int) else ""
+        if last_poll_age is None:
+            return _entry("ok", f"heartbeat {heartbeat_age:.0f}s ago{suffix}", raw)
         return _entry("ok", f"polled {last_poll_age:.0f}s ago{suffix}", raw)
     if component == "email":
         if not raw.get("label_set", False):
@@ -208,6 +206,8 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             f"/{raw.get('cap_limit', '?')} · worker {'on' if worker else 'off (inert)'}"
         )
         return _entry("ok", summary, raw)
+    if component == "triage":
+        return _entry("ok", raw.get("summary", "no decisions today"), raw)
     if component == "docker":
         if not raw.get("available", False):
             return _entry("disabled", "docker unavailable", raw)
@@ -246,6 +246,7 @@ def run_health_checks(
         "email": _safe(context.email),
         "attachments": _safe(context.attachments),
         "enrichment": _safe(context.enrichment),
+        "triage": _safe(context.triage),
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
@@ -531,24 +532,22 @@ def _telegram_check() -> dict[str, Any]:
 
 
 def _whatsapp_check() -> dict[str, Any]:
-    """Cheap poller health: configured?, heartbeat + last poll ages, channels.
+    """Poller health from the poller's OWN telemetry — never this process's env.
 
-    Healthy = last poll within 3x the poll interval AND a fresh heartbeat
-    (both signals come from the poller itself: heartbeat per cycle,
-    whatsapp_poll_state per channel).
+    The poller is configured by scripts/run-whatsapp.sh (the sanctioned live
+    writer), which the API process cannot see; its heartbeat (ops) and the
+    whatsapp_poll_state rows are the ground truth. Inferring 'configured'
+    from this process's WHATSAPP_BRIDGE_DB reported 'disabled' for a RUNNING
+    poller in the live cockpit (2026-10-23).
     """
     try:
-        settings = get_settings()
+        interval = get_settings().whatsapp_poll_interval_s
     except Exception:  # noqa: BLE001 — broken settings must not crash health
-        return {"configured": False}
-    configured = bool(settings.whatsapp_bridge_db.strip())
+        interval = 30.0
     details: dict[str, Any] = {
-        "configured": configured,
-        "interval_s": settings.whatsapp_poll_interval_s,
+        "interval_s": interval,
+        "heartbeat_age_s": ops.heartbeat_age_seconds("whatsapp"),
     }
-    if not configured:
-        return details
-    details["heartbeat_age_s"] = ops.heartbeat_age_seconds("whatsapp")
     try:
         from sqlalchemy import text  # noqa: PLC0415
 
@@ -608,6 +607,7 @@ def _compose_project() -> str | None:
 BACKGROUND_LABELS = (
     "com.secondbrain.api",
     "com.secondbrain.telegram",
+    "com.secondbrain.email",
     "com.secondbrain.whatsapp",
 )
 
@@ -830,6 +830,37 @@ def _attachments_check() -> dict[str, Any]:
     if last_error:
         details["last_error"] = {"kind": last_error["kind"], "ts": _iso(last_error["ts"])}
     return details
+
+
+def _triage_check() -> dict[str, Any]:
+    """WhatsApp relevance triage (D2a): decisions recorded today by label.
+
+    Reads today's ops_events rows (component='triage', kind='decided') —
+    the same rows the triage service writes per decision. Counts only.
+    """
+    from datetime import UTC, datetime, time  # noqa: PLC0415
+
+    from sqlalchemy import text as sql_text  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    day_start = datetime.combine(datetime.now(UTC).date(), time.min, tzinfo=UTC)
+    with SessionLocal() as session:
+        rows = session.execute(
+            sql_text(
+                "SELECT detail->>'label' AS label, count(*) AS n FROM ops_events "
+                "WHERE component = 'triage' AND kind = 'decided' AND ok "
+                "AND ts >= :day GROUP BY label"
+            ),
+            {"day": day_start},
+        ).fetchall()
+    counts = {row.label: row.n for row in rows}
+    relevant = counts.get("relevant", 0)
+    return {
+        "relevant_today": relevant,
+        "noise_today": counts.get("noise", 0),
+        "summary": f"relevant {relevant} / noise {counts.get('noise', 0)} today",
+    }
 
 
 def _enrichment_check() -> dict[str, Any]:
