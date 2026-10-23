@@ -224,6 +224,33 @@ EOF
 
 bootout_label() {
   launchctl bootout "${GUI_DOMAIN}/$1" 2>/dev/null || true
+  # Wait (bounded) for launchd to actually drop the label: bootstrapping a
+  # label launchd still holds is the classic '5: Input/output error' race.
+  local i=0
+  while [ "$i" -lt "${BOOTOUT_WAIT_TRIES:-10}" ]; do
+    launchctl print "${GUI_DOMAIN}/$1" >/dev/null 2>&1 || return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+}
+
+bootstrap_label() {
+  # launchctl bootstrap races a just-finished bootout ('5: Input/output
+  # error'); retry ONLY that error, up to 3 tries, then report failure.
+  local label="$1" attempt=1 out
+  while :; do
+    if out="$(launchctl bootstrap "${GUI_DOMAIN}/${label}" \
+      "$PLIST_DIR/${label}.plist" 2>&1)"; then
+      printf '  %-28s bootstrapped\n' "$label"
+      return 0
+    fi
+    if [ "$attempt" -ge 3 ] || ! printf '%s' "$out" | grep -q "Input/output error"; then
+      printf '  %-28s FAILED: %s\n' "$label" "$out" >&2
+      return 1
+    fi
+    sleep 1.5
+    attempt=$((attempt + 1))
+  done
 }
 
 install() {
@@ -255,9 +282,13 @@ install() {
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
   bootout_label "$LABEL_WA"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_API}.plist"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_TG}.plist"
-  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_WA}.plist"
+  local failed=0
+  bootstrap_label "$LABEL_API" || failed=1
+  bootstrap_label "$LABEL_TG" || failed=1
+  bootstrap_label "$LABEL_WA" || failed=1
+  if [ "$failed" -ne 0 ]; then
+    die "install: one or more agents failed to bootstrap (see above); re-run scripts/service.sh install"
+  fi
 
   sleep 2
   say "install: done — agents are starting (RunAtLoad)"
