@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from brain.db.models import ConnectorRecord, ConnectorState
@@ -118,6 +118,15 @@ class ConnectorRecordRepo:
     ) -> bool:
         """Count one more consecutive failure for this record.
 
+        The failing record may have poisoned the SHARED session (a real DB
+        error — truncation, FK violation, bad JSONB — aborts the
+        transaction), so roll back FIRST: bookkeeping on a poisoned session
+        would raise PendingRollbackError inside the runner's except block
+        and abort run() with no quarantine and no cursor release. The
+        rollback only discards the failed record's partial writes — every
+        earlier record of the batch was already committed per record (each
+        _handle path commits before returning).
+
         After QUARANTINE_AFTER failures in a row the record is quarantined:
         status 'failed' + the failing version recorded — the runner stops
         retrying it, so the batch's cursor can advance. Returns True iff the
@@ -126,6 +135,7 @@ class ConnectorRecordRepo:
         quarantining — an in-flight failing record keeps its old version so
         the runner's version-equality skip never bypasses the retry.
         """
+        self._session.rollback()
         row = self.get(source, external_id)
         if row is None:
             row = ConnectorRecord(source=source, external_id=external_id)
@@ -151,14 +161,11 @@ class ConnectorRecordRepo:
     def quarantined_counts(self) -> dict[str, int]:
         """Quarantined (status 'failed') rows per source (CLI listing)."""
         rows = self._session.execute(
-            select(ConnectorRecord.source, ConnectorRecord.external_id).where(
-                ConnectorRecord.status == "failed"
-            )
+            select(ConnectorRecord.source, func.count())
+            .where(ConnectorRecord.status == "failed")
+            .group_by(ConnectorRecord.source)
         ).all()
-        counts: dict[str, int] = {}
-        for source, _external_id in rows:
-            counts[source] = counts.get(source, 0) + 1
-        return counts
+        return {source: n for source, n in rows}
 
     def counts(self) -> dict[str, int]:
         """Rows per source (CLI listing)."""
