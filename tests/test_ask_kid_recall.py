@@ -8,7 +8,9 @@ real MemoryService + real ItemsRepository over brain_w5_test, search stubbed.
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import text as sql_text
+from sqlalchemy.orm import Session
 from tests.conftest import assert_test_database
 
 from brain.ai.ask import FakeLLMClient
@@ -31,7 +33,11 @@ class RecordingSearch:
         self.seen_extra: list[list[MemoryItem]] = []
 
     def search(
-        self, query: str, *, limit: int, offset: int = 0,
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
         extra_items: list[MemoryItem] | None = None,
     ) -> list[SearchHit]:
         extra = list(extra_items or [])
@@ -55,10 +61,28 @@ def _wipe_items() -> None:
         conn.execute(sql_text("DELETE FROM memory_items"))
 
 
+# Sessions opened by _world(); closed after each test (see _close_leaked_sessions).
+_LEAKED: list[Session] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_leaked_sessions():
+    """Close _world()'s session after every test.
+
+    A leaked open transaction here used to hold locks that deadlocked the
+    alembic downgrade in test_datetime_serialization (flaky full-suite hang:
+    DROP TABLE waiting on an 'idle in transaction' pool connection).
+    """
+    yield
+    while _LEAKED:
+        _LEAKED.pop().close()
+
+
 def _world() -> tuple[MemoryService, ItemsRepository]:
     """Real memory + items repositories over the test DB, wiped clean."""
     _wipe_items()
     session = SessionLocal()
+    _LEAKED.append(session)
     memory = MemoryService(MemoryRepository(session))
     for entity in memory.overview(status="confirmed", q=None):
         memory.delete_entity(entity["id"])
@@ -70,8 +94,12 @@ def _seed_itamar_world(memory: MemoryService, repo: ItemsRepository) -> MemoryIt
     memory.add_entity("person", "Itamar", aliases=["איתמר"])
     memory.add_entity("person", "Rona")
     memory.set_kid(
-        "Itamar", gender="boy", school="בראשית", grade="2",
-        class_="ב' ברקת", teacher="Maayan",
+        "Itamar",
+        gender="boy",
+        school="בראשית",
+        grade="2",
+        class_="ב' ברקת",
+        teacher="Maayan",
     )
     memory.set_kid("Rona", gender="girl", school="בראשית", grade="5", class_="ה' ספיר")
     memory.set_channel("ב' ברקת - הורים", kind="parents", applies_to="Itamar")
@@ -79,15 +107,22 @@ def _seed_itamar_world(memory: MemoryService, repo: ItemsRepository) -> MemoryIt
     memory.set_channel("כל המשפחה", kind="committee", applies_to="family")
 
     # the item the semantic leg can NEVER find: no 'Itamar'/'איתמר' anywhere
-    class_item = repo.add(MemoryItem(
-        raw_text="[21/10/2026, 18:23] ב' ברקת - הורים / מעין: מחר חולצה לבנה וקלמר עם סרגל",
-        occurred_at=datetime(2026, 10, 21, 15, 23, tzinfo=UTC),
-        meta={"count": 1, "messages": [{
-            "sender": "ב' ברקת - הורים / מעין",
-            "at": "2026-10-21T15:23:00+00:00",
-            "at_raw": "21/10/2026, 18:23",
-        }]},
-    ))
+    class_item = repo.add(
+        MemoryItem(
+            raw_text="[21/10/2026, 18:23] ב' ברקת - הורים / מעין: מחר חולצה לבנה וקלמר עם סרגל",
+            occurred_at=datetime(2026, 10, 21, 15, 23, tzinfo=UTC),
+            meta={
+                "count": 1,
+                "messages": [
+                    {
+                        "sender": "ב' ברקת - הורים / מעין",
+                        "at": "2026-10-21T15:23:00+00:00",
+                        "at_raw": "21/10/2026, 18:23",
+                    }
+                ],
+            },
+        )
+    )
     return class_item
 
 
@@ -95,7 +130,8 @@ def _service(
     memory: MemoryService,
     repo: ItemsRepository,
     search: RecordingSearch,
-    *, kid_recall_limit: int = 16,
+    *,
+    kid_recall_limit: int = 16,
 ) -> AskService:
     return AskService(
         search,
@@ -126,10 +162,12 @@ def test_kid_question_recalls_channel_item_without_kid_name(clean_items, memory_
 def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
-    family_item = repo.add(MemoryItem(
-        raw_text="[20/10/2026, 09:00] כל המשפחה / אבא: קמפינג בערב הבחירות בהר עגול",
-        occurred_at=datetime(2026, 10, 20, 6, 0, tzinfo=UTC),
-    ))
+    family_item = repo.add(
+        MemoryItem(
+            raw_text="[20/10/2026, 09:00] כל המשפחה / אבא: קמפינג בערב הבחירות בהר עגול",
+            occurred_at=datetime(2026, 10, 20, 6, 0, tzinfo=UTC),
+        )
+    )
     search = RecordingSearch([])
     service = _service(memory, repo, search)
 
@@ -162,10 +200,12 @@ def test_no_kid_named_leaves_pool_unchanged(clean_items, memory_db) -> None:
 def test_other_kids_channels_never_leak(clean_items, memory_db) -> None:
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
-    rona_item = repo.add(MemoryItem(
-        raw_text="[19/10/2026, 17:00] רונה כדורגל / המאמנת: אימון רביעי 15:15 באשכולות",
-        occurred_at=datetime(2026, 10, 19, 14, 0, tzinfo=UTC),
-    ))
+    rona_item = repo.add(
+        MemoryItem(
+            raw_text="[19/10/2026, 17:00] רונה כדורגל / המאמנת: אימון רביעי 15:15 באשכולות",
+            occurred_at=datetime(2026, 10, 19, 14, 0, tzinfo=UTC),
+        )
+    )
     search = RecordingSearch([])
     service = _service(memory, repo, search)
 
@@ -180,9 +220,11 @@ def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
     for n in range(20):
-        repo.add(MemoryItem(
-            raw_text=f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' ברקת - הורים / מעין: הודעה מספר {n}"
-        ))
+        repo.add(
+            MemoryItem(
+                raw_text=f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' ברקת - הורים / מעין: הודעה מספר {n}"
+            )
+        )
     search = RecordingSearch([])
     service = _service(memory, repo, search, kid_recall_limit=16)
 

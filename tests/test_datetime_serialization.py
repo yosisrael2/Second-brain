@@ -39,8 +39,7 @@ def _assert_offsets(values: list, field: str = "occurred_at") -> None:
     for value in values:
         assert value is not None, f"{field} missing in response"
         assert value.endswith(("Z", "+00:00")), (
-            f"{field} serialized without an offset: {value!r} "
-            "(naive datetime in API response)"
+            f"{field} serialized without an offset: {value!r} (naive datetime in API response)"
         )
 
 
@@ -84,7 +83,11 @@ def test_migration_repairs_naive_occurred_at_and_backfills_fingerprint():
     cfg = _alembic_cfg()
     probe_id = None
     try:
-        # rewind to the previous head so the repair migration re-runs below
+        # Rewind to the previous head so the repair migration re-runs below.
+        # Dispose the pool FIRST: an idle-in-transaction pooled connection
+        # (a test session the GC has not reclaimed yet) holds locks that
+        # deadlock the downgrade's DDL — a flaky full-suite hang.
+        engine.dispose()
         command.downgrade(cfg, PREVIOUS_HEAD)
         with engine.begin() as conn:
             # reproduce the live drift exactly: naive column holding UTC wall-time
@@ -104,6 +107,7 @@ def test_migration_repairs_naive_occurred_at_and_backfills_fingerprint():
             )
             probe_id = probe_uuid
 
+        engine.dispose()  # same lock hygiene before the re-upgrade DDL
         command.upgrade(cfg, "head")  # runs d2f6a9c4e7b1 on top of the drifted state
 
         with engine.connect() as conn:
@@ -117,9 +121,7 @@ def test_migration_repairs_naive_occurred_at_and_backfills_fingerprint():
                 f"occurred_at still drifted after migration: {kind}"
             )
             value, fp = conn.execute(
-                text(
-                    "SELECT occurred_at, fingerprint FROM memory_items WHERE id = :i"
-                ),
+                text("SELECT occurred_at, fingerprint FROM memory_items WHERE id = :i"),
                 {"i": probe_id},
             ).fetchone()
             assert value is not None and value.utcoffset() is not None
@@ -129,9 +131,7 @@ def test_migration_repairs_naive_occurred_at_and_backfills_fingerprint():
         command.upgrade(cfg, "head")  # leave the shared test db at head, always
         with engine.begin() as conn:
             if probe_id is not None:
-                conn.execute(
-                    text("DELETE FROM memory_items WHERE id = :i"), {"i": probe_id}
-                )
+                conn.execute(text("DELETE FROM memory_items WHERE id = :i"), {"i": probe_id})
 
 
 def test_migration_round_trip_downgrade_upgrade():

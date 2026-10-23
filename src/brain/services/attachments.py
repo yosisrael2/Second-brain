@@ -205,9 +205,7 @@ class ClaudeFileReader:
                 async for message in self._query_fn(prompt=prompt, options=options):
                     if isinstance(message, AssistantMessage):
                         collected.extend(
-                            block.text
-                            for block in message.content
-                            if isinstance(block, TextBlock)
+                            block.text for block in message.content if isinstance(block, TextBlock)
                         )
                 return collected
 
