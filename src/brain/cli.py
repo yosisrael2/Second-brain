@@ -77,15 +77,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
     )
-    enrich = subparsers.add_parser("enrich", help="Drain the enrichment queue (extraction PR A1)")
+    enrich = subparsers.add_parser(
+        "enrich", help="Drain the enrichment queue (extraction PR A1)"
+    )
     enrich.add_argument(
         "--since",
         default=None,
         help="Backfill mode: enqueue every qualifying capture created since "
         "this ISO date (D6: its own budget, does not consume today's cap)",
     )
-    enrich.add_argument("--limit", type=int, default=20, help="Max parents to process this run")
-    enrich.add_argument("--budget", type=int, default=None, help="Override the cap for this run")
+    enrich.add_argument(
+        "--limit", type=int, default=20, help="Max parents to process this run"
+    )
+    enrich.add_argument(
+        "--budget", type=int, default=None, help="Override the cap for this run"
+    )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     seed_kid = memory_sub.add_parser(
@@ -198,7 +204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 teacher=args.teacher,
             )
         if args.memory_command == "seed-channel":
-            return _memory_seed_channel(name=args.name, kind=args.kind, applies_to=args.applies_to)
+            return _memory_seed_channel(
+                name=args.name, kind=args.kind, applies_to=args.applies_to
+            )
         parser.error(f"unknown memory command {args.memory_command!r}")
         return 2
     if args.command == "eval-extraction":
@@ -252,19 +260,17 @@ def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
             day = datetime.fromisoformat(since).replace(tzinfo=UTC)
             queued = 0
             for item in repo.list(
-                item_type=None,
-                project=None,
-                status=None,
-                limit=10_000,
-                offset=0,
-                include_children=False,
+                item_type=None, project=None, status=None,
+                limit=10_000, offset=0, include_children=False,
             ):
                 if item.created_at < day:
                     continue
                 if service.enqueue(item, budget="backfill") is not None:
                     queued += 1
             print(f"backfill: queued {queued} parent(s) since {since}")
-        report = service.run_once(datetime.now(tz=UTC), limit=limit, backfill=since is not None)
+        report = service.run_once(
+            datetime.now(tz=UTC), limit=limit, backfill=since is not None
+        )
         summary = " ".join(
             f"{name}={getattr(report, name)}"
             for name in (
@@ -572,7 +578,9 @@ def _normalize_calendar(
     normalized = 0
     offset = 0
     while True:
-        batch = repo.list(item_type=None, project=None, status=None, limit=_PAGE, offset=offset)
+        batch = repo.list(
+            item_type=None, project=None, status=None, limit=_PAGE, offset=offset
+        )
         if not batch:
             break
         for item in batch:
@@ -591,7 +599,9 @@ def _normalize_calendar(
                 meta["original_text"] = original
             item.raw_text = one_liner
             item.meta = meta  # reassign so SQLAlchemy sees the JSONB change
-            item.fingerprint = content_fingerprint(one_liner, item.occurred_at, item.source)
+            item.fingerprint = content_fingerprint(
+                one_liner, item.occurred_at, item.source
+            )
             normalized += 1
         offset += len(batch)
     repo.commit()
