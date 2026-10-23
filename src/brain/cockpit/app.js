@@ -24,6 +24,7 @@ const state = {
   health: null,
   flow: null,
   whatsapp: null,
+  connectors: null,
   events: { events: [], total: 0, offset: 0, limit: 25 },
   stats: null,
   traceHighlight: null,
@@ -104,6 +105,10 @@ async function refreshAll() {
     api("/ops/whatsapp").then((wa) => {
       state.whatsapp = wa;
       if (state.tab === "health") renderWhatsappCard();
+    }).catch(() => {}),
+    api("/ops/connectors").then((connectors) => {
+      state.connectors = connectors;
+      if (state.tab === "health") renderConnectorsCard();
     }).catch(() => {}),
     api("/ops/flow").then((flow) => {
       state.flow = flow;
@@ -492,6 +497,42 @@ function renderWhatsappCard() {
     );
   });
   $("whatsapp-channels").textContent = lines.join("\n\n");
+}
+
+function renderConnectorsCard() {
+  // C6 Sources panel: every registered connector + stale state rows, from
+  // GET /ops/connectors — last ok, cursor present, records, quarantined,
+  // last error. The card always renders (empty state when nothing is
+  // configured); rows are plain text (textContent), so last_error cannot
+  // inject HTML.
+  const card = $("connectors-card");
+  const payload = state.connectors;
+  if (!card || !payload) return;
+  const connectors = payload.connectors || [];
+  const chip = $("connectors-chip");
+  const errored = connectors.filter((entry) => entry.last_error);
+  if (!connectors.length) {
+    chip.textContent = "—";
+    chip.className = "chip disabled";
+    $("connectors-summary").textContent = "no connectors configured";
+    $("connectors-rows").textContent = "";
+    return;
+  }
+  chip.textContent = errored.length ? "error" : "ok";
+  chip.className = `chip ${errored.length ? "down" : "ok"}`;
+  $("connectors-summary").textContent =
+    `${connectors.length} connector(s) · ${errored.length} with last error`;
+  const lines = connectors.map((entry) => {
+    const lastOk = entry.last_ok_at ? ago(entry.last_ok_at) : "never";
+    const error = entry.last_error ? ` — ${String(entry.last_error).slice(0, 140)}` : "";
+    return (
+      `${entry.name}${entry.enabled ? "" : " (disabled)"}\n` +
+      `  last ok ${lastOk} · cursor ${entry.cursor_present ? "yes" : "no"} · ` +
+      `records ${entry.records ?? 0} · quarantined ${entry.quarantined ?? 0}` +
+      error
+    );
+  });
+  $("connectors-rows").textContent = lines.join("\n\n");
 }
 
 function renderHealth() {

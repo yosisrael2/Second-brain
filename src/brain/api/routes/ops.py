@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 from brain.config import get_settings, unwrap_secret
+from brain.connectors import all_names
 from brain.db.session import engine
 from brain.ops import flow as ops_flow
 from brain.ops import health as ops_health
@@ -337,6 +338,61 @@ def get_ops_whatsapp() -> dict[str, Any]:
     ]
     polls = [row["last_poll_at"] for row in rows if row["last_poll_at"] is not None]
     return {"last_poll_at": _iso(max(polls)) if polls else None, "channels": channels}
+
+
+@router.get("/ops/connectors")
+def get_ops_connectors() -> dict[str, Any]:
+    """Cockpit Sources panel feed (C6): every registered connector plus every
+    connector that has state rows — last ok / last error / cursor present /
+    records synced / quarantined. Read-only; the cursor token itself is
+    never exposed (it is an opaque OAuth page token), and ``last_error`` is
+    rendered by the cockpit as text (textContent), not HTML."""
+    enabled = set(get_settings().connectors_enabled)
+    registered = set(all_names())
+    with engine.connect() as conn:
+        state_rows = (
+            conn.execute(
+                text(
+                    "SELECT name, cursor, last_run_at, last_ok_at, last_error, counters "
+                    "FROM connector_state ORDER BY name"
+                )
+            )
+            .mappings()
+            .all()
+        )
+        counts = dict(
+            conn.execute(
+                text("SELECT source, count(*) FROM connector_records GROUP BY source")
+            ).all()
+        )
+    names = sorted(registered | {row["name"] for row in state_rows})
+    rows: dict[str, dict[str, Any]] = {
+        name: {
+            "name": name,
+            "enabled": name in enabled and name in registered,
+            "last_run_at": None,
+            "last_ok_at": None,
+            "last_error": None,
+            "cursor_present": False,
+            "records": int(counts.get(name, 0)),
+            "quarantined": 0,
+        }
+        for name in names
+    }
+    for row in state_rows:
+        entry = rows.get(row["name"])
+        if entry is None:  # pragma: no cover — the name seeded rows itself
+            continue
+        counters = row["counters"] or {}
+        entry["last_run_at"] = _iso(row["last_run_at"]) if row["last_run_at"] else None
+        entry["last_ok_at"] = _iso(row["last_ok_at"]) if row["last_ok_at"] else None
+        entry["last_error"] = row["last_error"]
+        entry["cursor_present"] = row["cursor"] is not None
+        # #53 is adding a per-connector quarantine count; until its shape
+        # lands, read it from the state counters (re-point at the column
+        # when the migration carries one).
+        entry["quarantined"] = int(counters.get("quarantined") or 0)
+    return {"connectors": list(rows.values())}
 
 
 @router.get("/ops/stats")
