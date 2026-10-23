@@ -722,3 +722,41 @@ def test_ops_endpoint_reports_cursor_and_counts(tmp_path: Path, world: SimpleWor
     assert channel["messages_seen"] == 1
     assert channel["conversations_created"] == 1
     assert channel["conversations_updated"] == 0
+
+
+def test_ops_endpoint_reports_today_and_media_counts(tmp_path: Path, world: SimpleWorld):
+    """Per-channel conversations today/total + media read/failed: the cockpit
+    Sources panel's data (read-only aggregation over the poller's own rows)."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC))],
+    )
+    poller = _poller(world, BridgeStore(path))
+    poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))  # live edge
+    _add_row(path, _bridge_row("a1", datetime(2026, 10, 22, 10, 0, tzinfo=UTC)))
+    poller.poll(now=datetime(2026, 10, 22, 10, 2, tzinfo=UTC))
+    world.session.commit()
+    # One media entry read (status saved) + one still "not read yet".
+    item = world.session.query(MemoryItem).one()
+    meta = dict(item.meta)
+    messages = [dict(m) for m in meta["messages"]]
+    messages.append({"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}})
+    messages.append({"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}})
+    meta["messages"] = messages
+    item.meta = meta
+    world.session.commit()
+
+    get_settings.cache_clear()
+    try:
+        client = TestClient(create_app())
+        payload = client.get("/ops/whatsapp").json()
+    finally:
+        get_settings.cache_clear()
+    channel = payload["channels"][0]
+    assert channel["conversations_today"] == 1  # created_at is now -> today
+    assert channel["conversations_total"] == 1
+    assert channel["media_read"] == 1
+    assert channel["media_not_read"] == 1

@@ -251,7 +251,8 @@ def _item_events(item_id: str) -> list[dict[str, Any]]:
 
 @router.get("/ops/whatsapp")
 def get_ops_whatsapp() -> dict[str, Any]:
-    """WhatsApp poller ops: last poll time + per-channel cursor and counts (PR D1)."""
+    """WhatsApp poller ops: last poll + per-channel cursor, counts and media
+    stats (PR D1; today/media fields feed the cockpit Sources panel)."""
     with engine.connect() as conn:
         rows = (
             conn.execute(
@@ -264,6 +265,40 @@ def get_ops_whatsapp() -> dict[str, Any]:
             .mappings()
             .all()
         )
+        conv = {
+            row["jid"]: {"today": int(row["today"]), "total": int(row["total"])}
+            for row in conn.execute(
+                text(
+                    "SELECT meta->>'chat_jid' AS jid, "
+                    "count(*) FILTER (WHERE created_at >= date_trunc('day', now())) AS today, "
+                    "count(*) AS total "
+                    "FROM memory_items "
+                    "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL GROUP BY 1"
+                )
+            )
+            .mappings()
+            .all()
+        }
+        media_rows = conn.execute(
+            text(
+                "SELECT meta->>'chat_jid' AS jid, meta->'messages' AS messages "
+                "FROM memory_items "
+                "WHERE source = 'whatsapp' AND meta->>'chat_jid' IS NOT NULL"
+            )
+        ).mappings().all()
+    media: dict[str, dict[str, int]] = {}
+    for row in media_rows:
+        bucket = media.setdefault(row["jid"], {"read": 0, "not_read": 0})
+        for entry in row["messages"] or []:
+            media_entry = entry.get("media") if isinstance(entry, dict) else None
+            if not isinstance(media_entry, dict):
+                continue
+            # meta only ever carries "saved" or "not read yet" — there is no
+            # failed state recorded here, so the honest split is read/not-read.
+            if media_entry.get("status") == "saved":
+                bucket["read"] += 1
+            else:
+                bucket["not_read"] += 1
     channels = [
         {
             "channel": row["channel_name"],
@@ -274,6 +309,10 @@ def get_ops_whatsapp() -> dict[str, Any]:
             "messages_seen": int(row["messages_seen"]),
             "conversations_created": int(row["conversations_created"]),
             "conversations_updated": int(row["conversations_updated"]),
+            "conversations_today": conv.get(row["chat_jid"], {}).get("today", 0),
+            "conversations_total": conv.get(row["chat_jid"], {}).get("total", 0),
+            "media_read": media.get(row["chat_jid"], {}).get("read", 0),
+            "media_not_read": media.get(row["chat_jid"], {}).get("not_read", 0),
         }
         for row in rows
     ]
