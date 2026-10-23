@@ -483,11 +483,18 @@ class EnrichmentService:
         due: datetime | None = None
         date_conflict = False
         conflict_note = None
+        meta_time_source: str | None = None
         if candidate.when_raw:
             sent_local = self._source_sent_local(source)
             resolved = xdates.resolve_when(candidate.when_raw, sent_local, self._tz)
             if resolved is not None:
                 clock = xdates.extract_clock(candidate.when_raw)
+                if clock is None:
+                    # v4 backstop: the model dropped the time from when_raw;
+                    # use the quote's adjacent clock time when unambiguous
+                    clock = xdates.quote_clock(candidate.quote, candidate.when_raw)
+                    if clock is not None:
+                        meta_time_source = "quote_time"
                 moment = xdates.combine_local(resolved.day, clock, self._tz)
                 date_conflict = resolved.date_conflict
                 conflict_note = resolved.conflict_note
@@ -500,9 +507,17 @@ class EnrichmentService:
             if self._memory is not None
             else ["unknown"]
         )
-        applies_to = self._narrow_audience(
-            self._source_default_audience(source), item_level
-        )
+        scope = candidate.audience.get("scope")
+        if scope in ("school", "community"):
+            # R3 (item 42): a WHOLE-SCHOOL/COMMUNITY event or break covers
+            # EVERY kid it names — the sender default (a class teacher's
+            # email) must NOT narrow an explicitly wide audience. This is
+            # the ONLY widening allowed past the source default.
+            applies_to = item_level
+        else:
+            applies_to = self._narrow_audience(
+                self._source_default_audience(source), item_level
+            )
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,
             "model": getattr(self._extractor, "name", "stub"),
@@ -521,6 +536,8 @@ class EnrichmentService:
             meta["derived_from"] = candidate.derived_from
         if conflict_note:
             meta["date_conflict_note"] = conflict_note  # both readings survive (item 2b)
+        if meta_time_source:
+            meta["time_source"] = meta_time_source
         return _ResolvedChild(
             candidate=candidate,
             start=start,

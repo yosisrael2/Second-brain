@@ -1055,3 +1055,140 @@ def test_within_pass_duplicate_removed_counted(world: World):
     assert report.children_created == 3
     titles = [row.raw_text for row in _children(world.session)]
     assert "להגיע עם כובע לטיול" in titles and "להביא כובע לטיול" not in titles
+
+
+# --- v4 backstop: a clock time the model dropped from when_raw, taken from
+# --- the child's own verbatim quote (deterministic, never guessed)
+
+
+def test_quote_time_backstop_rescues_a_dropped_time(world: World):
+    """when_raw lost the time; the quote has exactly one, adjacent -> timed."""
+    body = "הטיול יתקיים ביום שלישי 7.10 בשעה 12:55"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="event", title="טיול",
+            quote="הטיול יתקיים ביום שלישי 7.10 בשעה 12:55",
+            when_raw="יום שלישי 7.10",  # the model dropped 'בשעה 12:55'
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    assert child.occurred_at is not None
+    local = child.occurred_at.astimezone(_JLM)
+    assert (local.hour, local.minute) == (12, 55)  # timed via the quote
+    assert child.extraction_meta["time_source"] == "quote_time"
+
+
+def test_quote_time_backstop_refuses_to_guess(world: World):
+    """Two clock times near the date (or none adjacent) -> stays all-day."""
+    body = "הטיול ביום שלישי 7.10, יציאה 12:55 וחזרה 15:30"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="event", title="טיול",
+            quote="הטיול ביום שלישי 7.10, יציאה 12:55 וחזרה 15:30",
+            when_raw="יום שלישי 7.10",
+        ),
+        # a time FAR from the date expression is not 'adjacent' either
+        ChildCandidate(
+            kind="reminder", title="לשלם",
+            quote="יש לשלם עד 7.10. המזכירות פתוחה בימים א-ה 12:55.",
+            when_raw="7.10",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    rows = _children(world.session)
+    for row in rows:
+        local = row.occurred_at.astimezone(_JLM)
+        assert (local.hour, local.minute) == (0, 0)  # all-day, no guessing
+        assert "time_source" not in (row.extraction_meta or {})
+
+
+# --- v4: R3 scope widening + scope validation + prompt pins ---------------------
+
+
+def test_scope_school_overrides_the_sender_default(world: World):
+    """R3: a whole-school notice from a class teacher covers EVERY kid."""
+    _seed_teacher_memory(world.session)
+    source = _capture(world.repo, "החופשה מתחילה ביום חמישי 22.10", source="email")
+    source.meta = {**source.meta, "sender": "Rinat <rinat@bereshit.edu>"}
+    world.repo.commit()
+    candidates = [
+        ChildCandidate(
+            kind="event", title="חופשה",
+            quote="החופשה מתחילה ביום חמישי 22.10", when_raw="יום חמישי 22.10",
+            audience={"school": "בראשית", "scope": "school"},
+        ),
+        ChildCandidate(
+            kind="event", title="טיול הכיתה",  # class-scoped: default narrows
+            quote="החופשה מתחילה ביום חמישי 22.10", when_raw="יום חמישי 22.10",
+            audience={"scope": "class"},
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    rows = {row.raw_text: row for row in _children(world.session)}
+    assert rows["חופשה"].applies_to == ["Rona", "Itamar"]  # widened, not narrowed
+    assert rows["טיול הכיתה"].applies_to == ["Rona"]  # sender default applies
+
+
+def test_scope_community_overrides_the_sender_default(world: World):
+    _seed_teacher_memory(world.session)
+    source = _capture(world.repo, "אירוע קהילתי ביום שני 26.10", source="email")
+    source.meta = {**source.meta, "sender": "Maayan <maayan@bereshit.edu>"}
+    world.repo.commit()
+    candidates = [
+        ChildCandidate(
+            kind="event", title="אירוע קהילתי",
+            quote="אירוע קהילתי ביום שני 26.10", when_raw="יום שני 26.10",
+            audience={"scope": "community"},
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    assert _children(world.session)[0].applies_to == ["Rona", "Itamar"]
+
+
+def test_extractor_rejects_a_bad_scope(world: World):
+    from brain.services.extraction.llm_extractor import ExtractionError, LLMExtractor
+
+    llm = FakeLLM(
+        [
+            '{"candidates": [{"kind": "event", "title": "x", "quote": "y",'
+            ' "when_raw": "", "audience": {"scope": "universe"}}]}',
+            '{"candidates": [{"kind": "event", "title": "x", "quote": "y",'
+            ' "when_raw": "", "audience": {"scope": "universe"}}]}',
+        ]
+    )
+    extractor = LLMExtractor(llm)
+    source = _capture(world.repo, "טקסט", source="email")
+    try:
+        extractor.extract(source, memory_context="")
+        raise AssertionError("bad scope accepted")
+    except ExtractionError as exc:
+        assert "bad audience scope" in str(exc)
+
+
+def test_v4_prompt_pins(world: World):
+    """The v4 prompt states the scope rule, the precise kind rule and the
+    MUST time rule (pinned so a wording regression can't slip silently)."""
+    from brain.services.extraction.llm_extractor import LLMExtractor
+
+    llm = FakeLLM([GOOD_REPLY])
+    extractor = LLMExtractor(llm)
+    source = _capture(world.repo, "מייל כלשהו לבניית הפרומפט", source="email")
+    extractor.extract(source, memory_context="Confirmed memory:")
+    prompt = llm.prompts[0]
+    assert '"school"' in prompt and '"community"' in prompt and '"class"' in prompt
+    assert "school is closed for the holiday" in prompt  # generic scope example
+    assert "bring / wear / have" in prompt  # reminder = the CHILD's items
+    assert "sign, pay, reply" in prompt  # task = the PARENT's action
+    assert "Tuesday at 18:30" in prompt  # the MUST time example
+    assert "MUST" in prompt
