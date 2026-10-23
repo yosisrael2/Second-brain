@@ -182,6 +182,10 @@ class SearchService:
         by_id = {
             item.id: item
             for item in self._repo.get_many(_parse_uuids(ranked))
+            # PR B (item 20/D4): superseded (struck-through) items are hidden
+            # from search by default — the vector store still holds their
+            # points until reindexing, so filter here.
+            if item.superseded_by is None
         }
         hits: list[SearchHit] = []
         seen: set[uuid.UUID] = set()
