@@ -460,8 +460,9 @@ function flowNodes(flow, pos) {
 const PROBEABLE = ["postgres", "qdrant", "embedder", "jev", "llm", "telegram", "docker", "disk"];
 
 function renderWhatsappCard() {
-  // PR D1b: per-channel cursor/counts from GET /ops/whatsapp. The card hides
-  // itself when the poller was never configured (no state rows at all).
+  // PR D1b + cockpit-sources: per-channel stats from GET /ops/whatsapp —
+  // last message, conversations today/total, media read/not-read, cursor.
+  // The card hides itself when the poller was never configured (no state).
   const card = $("whatsapp-card");
   const wa = state.whatsapp;
   if (!card || !wa) return;
@@ -480,13 +481,17 @@ function renderWhatsappCard() {
   const lastPoll = wa.last_poll_at ? ago(wa.last_poll_at) : "never";
   $("whatsapp-summary").textContent =
     `last poll ${lastPoll} · ${channels.length} channel(s)`;
-  const lines = channels.map((channel) =>
-    `${channel.channel || channel.chat_jid}\t` +
-    `cursor ${channel.cursor_at ? ago(channel.cursor_at) : "—"}\t` +
-    `${channel.messages_seen} msgs · ${channel.conversations_created} new · ` +
-    `${channel.conversations_updated} updated`
-  );
-  $("whatsapp-channels").textContent = lines.join("\n");
+  const lines = channels.map((channel) => {
+    const lastMsg = channel.last_message_at ? ago(channel.last_message_at) : "—";
+    const cursor = channel.cursor_at ? ago(channel.cursor_at) : "—";
+    return (
+      `${channel.channel || channel.chat_jid}\n` +
+      `  last msg ${lastMsg} · cursor ${cursor}\n` +
+      `  conv ${channel.conversations_today ?? 0}/${channel.conversations_total ?? 0} today/total\n` +
+      `  media ${channel.media_read ?? 0} read / ${channel.media_not_read ?? 0} not read`
+    );
+  });
+  $("whatsapp-channels").textContent = lines.join("\n\n");
 }
 
 function renderHealth() {
@@ -680,9 +685,22 @@ async function openInspector(itemId) {
   const container = $("inspector-out");
   $("inspector-id").value = itemId;
   try {
-    const body = await api(`/ops/item/${itemId}`);
+    // PR B views: relations + the current-version chain render beside the row.
+    const [body, relations, current] = await Promise.all([
+      api(`/ops/item/${encodeURIComponent(itemId)}`),
+      api(`/items/${encodeURIComponent(itemId)}/relations`).catch(() => []),
+      api(`/items/${encodeURIComponent(itemId)}/current`).catch(() => null),
+    ]);
     const item = body.item;
+    const supersededById = current && current.id && current.id !== itemId ? current.id : null;
     const wrap = el("div", { class: "inspector" });
+    if (supersededById) {
+      const banner = el("div", { class: "superseded-banner" },
+        `superseded by `,
+        inspectorLink(supersededById),
+        " — this version is kept for history only");
+      wrap.append(banner);
+    }
     const meta = el("div");
     for (const key of ["id", "source", "type", "project", "importance", "actionability",
                        "confidence", "status", "occurred_at", "created_at"]) {
@@ -692,8 +710,9 @@ async function openInspector(itemId) {
       ));
     }
     wrap.append(
-      el("div", { class: "itext", text: item.raw_text ?? "" }),
+      el("div", { class: supersededById ? "itext superseded" : "itext", text: item.raw_text ?? "" }),
       meta,
+      renderRelations(itemId, relations),
       el("div", { class: "ifield" },
         el("span", { class: "ik", text: "vector" }),
         el("span", { class: "iv", text: body.vector?.exists
@@ -714,6 +733,43 @@ async function openInspector(itemId) {
   }
 }
 
+function inspectorLink(otherId) {
+  const link = el("button", {
+    class: "btn btn-ghost item-link", text: shortId(otherId),
+    title: "open in the Debug inspector",
+  });
+  link.addEventListener("click", () => openInspector(otherId));
+  return link;
+}
+
+// Directional labels per relation kind, from the viewed item's perspective.
+const RELATION_LABELS = {
+  supersedes: (outgoing) => (outgoing ? "replaces" : "replaced by"),
+  corrects: (outgoing) => (outgoing ? "corrects" : "corrected by"),
+  derived_from: (outgoing) => (outgoing ? "derived from" : "source of"),
+  same_as: () => "same as",
+};
+
+function renderRelations(itemId, relations) {
+  const wrap = el("div", { class: "irelations" });
+  wrap.append(el("div", { class: "ik", text: "relations" }));
+  const live = (relations || []).filter((r) => r.provenance?.state !== "undone");
+  if (!live.length) {
+    wrap.append(el("div", { class: "iv", text: "none" }));
+    return wrap;
+  }
+  for (const relation of live) {
+    const outgoing = relation.from_id === itemId;
+    const otherId = outgoing ? relation.to_id : relation.from_id;
+    const labeler = RELATION_LABELS[relation.kind];
+    const label = labeler ? labeler(outgoing) : relation.kind;
+    const proposed = relation.provenance?.state === "proposed" ? " (proposed)" : "";
+    wrap.append(el("div", { class: "ifield rel-row" },
+      el("span", { class: "ik", text: label + proposed }),
+      inspectorLink(otherId)));
+  }
+  return wrap;
+}
 // ---------- tabs + refresh loop ----------
 
 // Valid tabs come from the nav DOM (data-tab attrs), so a sixth tab (e.g.
@@ -789,6 +845,12 @@ function init() {
     };
     setTimeout(report, 300);
     setTimeout(report, 3000);
+  }
+  // Test hook: ?inspect=<item id> opens the Debug inspector for that item on
+  // load (screenshots + manual checks without typing a UUID).
+  if (params.get("inspect")) {
+    switchTab("debug");
+    openInspector(params.get("inspect"));
   }
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => switchTab(tab.dataset.tab));

@@ -525,13 +525,14 @@ class TestServiceOtherCommands:
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         bootstraps = [c for c in _calls(tmp_path) if "bootstrap" in c]
+        # Email is opt-in and unset here: api, telegram, whatsapp bootstrap.
         assert len(bootstraps) == 3
 
     def test_side_process_scripts_log_unbuffered(self):
         """launchd log files must stream: PYTHONUNBUFFERED=1 everywhere
         (run-server.sh already had it; the poller/bot logs buffered in 4kB
         blocks, which read as 'empty logs' while the agents were fine)."""
-        for script in ("run-server.sh", "run-bot.sh", "run-whatsapp.sh"):
+        for script in ("run-server.sh", "run-bot.sh", "run-email.sh", "run-whatsapp.sh"):
             text = (SCRIPTS / script).read_text()
             assert "export PYTHONUNBUFFERED=1" in text, script
 
@@ -576,3 +577,177 @@ class TestEnvironmentChecks:
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=_service_env(tmp_path))
         assert result.returncode == 0, result.stdout + result.stderr
         assert "docker: NOT reachable" in result.stderr
+
+
+class TestRunEmailExitContract:
+    """run-email.sh maps `brain gmail-poll` exit codes onto the KeepAlive
+    contract: 0 (clean) and 78 (EX_CONFIG: no label id / no keychain token)
+    become 0 (launchd: no restart); transient failures propagate (restart).
+    needs-re-auth/label-missing are NOT exits — the poller pauses internally;
+    they surface as 78 only when the agent cannot start at all."""
+
+    def _run_wrapper(self, tmp_path, poller_rc):
+        fake_bin = tmp_path / "bin-email"
+        fake_bin.mkdir(exist_ok=True)
+        fake_brain = fake_bin / "brain"
+        fake_brain.write_text(
+            f"#!/usr/bin/env bash\necho fake-gmail-poll rc={poller_rc}\nexit {poller_rc}\n"
+        )
+        fake_brain.chmod(0o755)
+        return _run([str(SCRIPTS / "run-email.sh")], env={"BRAIN_BIN": str(fake_brain)})
+
+    @pytest.mark.parametrize("poller_rc,expected", [(0, 0), (78, 0), (1, 1), (70, 70)])
+    def test_exit_code_mapping(self, tmp_path, poller_rc, expected):
+        result = self._run_wrapper(tmp_path, poller_rc)
+        assert result.returncode == expected, result.stdout + result.stderr
+
+    def test_wrapper_preserves_the_real_code_in_its_log_line(self, tmp_path):
+        result = self._run_wrapper(tmp_path, 78)
+        assert "exited 78" in result.stdout
+
+    def test_missing_venv_exits_0_no_restart_loop(self, tmp_path):
+        """A missing venv is permanent: exit 0, never restart-loop."""
+        result = _run(
+            [str(SCRIPTS / "run-email.sh")],
+            env={"BRAIN_BIN": str(tmp_path / "no-such-brain")},
+        )
+        assert result.returncode == 0
+        assert "missing" in result.stderr
+
+    def test_exports_allow_live_and_compose_project(self, tmp_path):
+        """The launchd email path is the real service: BRAIN_ALLOW_LIVE=1 (the
+        live-store guard would refuse otherwise) and COMPOSE_PROJECT_NAME=second-brain."""
+        fake_bin = tmp_path / "bin-email2"
+        fake_bin.mkdir()
+        fake_brain = fake_bin / "brain"
+        fake_brain.write_text(
+            'echo "ALLOW: ${BRAIN_ALLOW_LIVE-unset} COMPOSE: ${COMPOSE_PROJECT_NAME-unset}"\n'
+        )
+        fake_brain.chmod(0o755)
+        result = _run([str(SCRIPTS / "run-email.sh")], env={"BRAIN_BIN": str(fake_brain)})
+        assert result.returncode == 0, result.stderr
+        assert "ALLOW: 1" in result.stdout
+        assert "COMPOSE: second-brain" in result.stdout
+
+    def test_sources_lib_and_loads_the_env_file(self, tmp_path):
+        """run-email.sh must source lib.sh BEFORE calling load_env_file: with
+        the source missing, every start printed 'load_env_file: command not
+        found' and .env was silently skipped (review of #43 @ 5564e09).
+        BRAIN_ENV_FILE is the test seam: the env file the launcher loads
+        (production default: $ROOT/.env)."""
+        env_file = tmp_path / "email.env"
+        env_file.write_text("GMAIL_LABEL_ID=Label_from_env_file\n")
+        fake_bin = tmp_path / "bin-email3"
+        fake_bin.mkdir()
+        fake_brain = fake_bin / "brain"
+        fake_brain.write_text('echo "LABEL: ${GMAIL_LABEL_ID-unset}"\n')
+        fake_brain.chmod(0o755)
+        result = _run(
+            [str(SCRIPTS / "run-email.sh")],
+            env={
+                "BRAIN_BIN": str(fake_brain),
+                "BRAIN_ENV_FILE": str(env_file),
+                "GMAIL_LABEL_ID": "",  # neutralize any inherited value
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "command not found" not in result.stderr, result.stderr
+        assert "LABEL: Label_from_env_file" in result.stdout, result.stdout + result.stderr
+
+
+class TestServiceEmailAgent:
+    """service.sh manages FOUR agents: api, telegram, email, whatsapp —
+    but email is OPT-IN: install writes/bootstraps it only when
+    GMAIL_LABEL_ID is set (env or .env); otherwise the agent is skipped
+    and no stale plist is left behind."""
+
+    @need_venv
+    def test_install_writes_and_bootstraps_four_labels(self, tmp_path):
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        email_plist = tmp_path / "LaunchAgents" / "com.secondbrain.email.plist"
+        assert email_plist.exists(), result.stdout
+        text = email_plist.read_text()
+        assert "<string>com.secondbrain.email</string>" in text
+        assert str(SCRIPTS / "run-email.sh") in text
+        # Secrets stay out: the keychain token NEVER appears in the plist.
+        assert "GMAIL" not in text and "TOKEN" not in text
+        calls = _calls(tmp_path)
+        assert any("bootstrap" in c and "com.secondbrain.email" in c for c in calls)
+
+    @need_venv
+    def test_install_precreates_email_log_files_0600(self, tmp_path):
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        log_dir = tmp_path / "Logs"
+        for name in ("email.log", "email.err.log"):
+            log = log_dir / name
+            assert log.exists(), f"{name} not pre-created"
+            assert log.stat().st_mode & 0o777 == 0o600, f"{name} not 0600"
+
+    def test_uninstall_removes_the_email_plist(self, tmp_path):
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
+        _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        result = _run([str(SCRIPTS / "service.sh"), "uninstall"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (tmp_path / "LaunchAgents" / "com.secondbrain.email.plist").exists()
+
+    def test_install_skips_email_when_gmail_label_id_unset(self, tmp_path):
+        """Email is OPT-IN: without GMAIL_LABEL_ID (env or .env) install must
+        NOT write or bootstrap the email agent, must remove any stale email
+        plist (a leftover agent would start, exit 78->0 and read as a
+        permanently-down background service), and must say so (review of
+        #43 @ 5564e09)."""
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": ""})
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.email.plist").write_text("<stale/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (plist_dir / "com.secondbrain.email.plist").exists(), result.stdout
+        assert "skipped" in result.stdout and "GMAIL_LABEL_ID" in result.stdout
+        calls = _calls(tmp_path)
+        assert not any("bootstrap" in c and "com.secondbrain.email" in c for c in calls)
+
+    def test_install_installs_email_when_gmail_label_id_set(self, tmp_path):
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": "Label_test"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        plist_dir = tmp_path / "LaunchAgents"
+        assert (plist_dir / "com.secondbrain.email.plist").exists()
+        assert any("bootstrap" in c and "com.secondbrain.email" in c for c in _calls(tmp_path))
+        assert "GMAIL_LABEL_ID not set" not in result.stdout
+
+    def test_status_skips_email_when_not_configured_without_failing(self, tmp_path):
+        """'status' must not report the opt-out email agent as down: without
+        GMAIL_LABEL_ID the email line says skipped and api/tg/whatsapp alone
+        decide the exit code."""
+        env = _service_env(tmp_path, extra={"GMAIL_LABEL_ID": ""})
+        result = _run([str(SCRIPTS / "service.sh"), "status"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "GMAIL_LABEL_ID not set" in result.stdout
+
+    def test_restart_kickstarts_the_email_agent(self, tmp_path):
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.email.plist").write_text("<plist/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert any("kickstart" in c and "com.secondbrain.email" in c for c in _calls(tmp_path))
+
+    def test_status_covers_the_email_agent(self, tmp_path):
+        result = _run([str(SCRIPTS / "service.sh"), "status"], env=_service_env(tmp_path))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "com.secondbrain.email" in result.stdout
+
+    def test_logs_tails_the_email_component(self, tmp_path):
+        env = _service_env(tmp_path)
+        log_dir = tmp_path / "Logs"
+        log_dir.mkdir()
+        (log_dir / "email.log").write_text("email-poll-line\n")
+        result = _run([str(SCRIPTS / "service.sh"), "logs", "email"], env=env)
+        assert result.returncode == 0, result.stderr
+        assert "email-poll-line" in result.stdout

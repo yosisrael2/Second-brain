@@ -73,7 +73,14 @@ def _dateish_expressions(text: str) -> int:
 
 
 def qualifies(item: MemoryItem) -> bool:
-    """D1(b): which captures get the extraction pass."""
+    """D1(b): which captures get the extraction pass.
+
+    D2a (item 36): triaged-NOISE WhatsApp conversations are NEVER enqueued —
+    they are stored and searchable, but the daily extraction cap is not
+    spent on them. Untriaged items behave exactly as before.
+    """
+    if item.source == "whatsapp" and item.triage_label == "noise":
+        return False
     if item.source in _EMAIL_SOURCES:
         return True
     if len(item.raw_text) > _LONG_TEXT_CHARS:
