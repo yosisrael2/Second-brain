@@ -10,6 +10,7 @@ No network anywhere; the fake service is the only Google seam.
 from __future__ import annotations
 
 import copy
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -72,6 +73,88 @@ def _full_service() -> FakeTasksService:
     )
 
 
+def _stamp(minutes_after_midnight: int) -> str:
+    """A distinct RFC 3339 stamp: 2026-03-01T00:MM:00.000Z (UTC)."""
+    moment = datetime(2026, 3, 1, tzinfo=UTC) + timedelta(minutes=minutes_after_midnight)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def test_full_sync_truncation_ingests_everything_within_three_runs(runner_db):
+    # REGRESSION (review of a15bc56): records were emitted in API order (list
+    # position) while the cursor resumed at the earliest UNEMITTED 'updated'.
+    # When the oldest stamp sat among the unemitted tasks, every run re-fetched
+    # all 150 tasks and re-emitted the same first 100 — the cursor never moved
+    # and the last 50 were never ingested (livelock). The fixture below is in
+    # REVERSED updated order (position 0 = newest), so the oldest stamp is the
+    # LAST task and lands among the unemitted.
+    tasks = [
+        {
+            "id": f"t{position:03d}",
+            "title": f"task {position}",
+            "updated": _stamp(149 - position),  # reversed vs API order
+            "status": "needsAction",
+        }
+        for position in range(150)
+    ]
+    service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    h = GTasksHarness(runner_db)
+    connector = _connector(service)
+    runner = h.runner(connector)
+    first = runner.run(limit=100)
+    second_service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    connector._service = lambda: second_service  # type: ignore[method-assign]
+    second = runner.run(limit=100)
+    third_service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    connector._service = lambda: third_service  # type: ignore[method-assign]
+    third = runner.run(limit=100)
+
+    assert first.created == 100
+    # every task ingested within 2-3 fetches, and the loop terminates
+    assert second.created + third.created + first.created == 150
+    assert third.created == 0
+
+
+def test_tie_group_larger_than_limit_is_emitted_whole(runner_db):
+    # 120 tasks sharing ONE 'updated': resuming at that watermark (inclusive)
+    # re-yields the whole tie group, so it must be emitted past the limit in
+    # one batch — otherwise the cursor would resume at its own value forever.
+    tasks = [
+        {
+            "id": f"tie{position:03d}",
+            "title": f"tie {position}",
+            "updated": "2026-03-01T00:00:00.000Z",
+            "status": "needsAction",
+        }
+        for position in range(120)
+    ]
+    service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    h = GTasksHarness(runner_db)
+    connector = _connector(service)
+    first = h.runner(connector).run(limit=100)
+    second_service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    connector._service = lambda: second_service  # type: ignore[method-assign]
+    second = h.runner(connector).run(limit=100)
+
+    assert first.created == 120  # tie group extended past the limit
+    assert (second.created, second.errors) == (0, 0)
+    assert second.skipped == 120  # all re-delivered, all skipped by version
+
+
 def test_new_tasks_create_items_with_framework_meta(runner_db):
     h = GTasksHarness(runner_db)
     summary = h.runner(_connector(_full_service())).run()
@@ -108,7 +191,9 @@ def test_updatedmin_cursor_round_trips_and_rerun_is_idempotent(runner_db):
 
     assert first.created == 7
     assert (second.created, second.updated, second.errors) == (0, 0, 0)
-    assert second.skipped == 8  # 7 unchanged + the deleted-again unknown id
+    # The fake filters server-side like Google: only the task AT the watermark
+    # (inclusive) is re-delivered — and skipped by version. Idempotent.
+    assert (second.fetched, second.skipped) == (1, 1)
     # The saved cursor (max updated across lists) reached Google as updatedMin.
     incremental = [p for p in second_service.tasks_params if "updatedMin" in p]
     assert incremental, "second sync must be incremental"

@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
@@ -89,7 +89,8 @@ def record_from_task(
     ``tz`` is the local zone (Asia/Jerusalem in production) used to render
     times in ``text`` and to anchor the date-only due at local midnight.
     For subtasks the text carries the parent title when the caller resolved
-    one, else the raw parent id (meta always has the exact parent id).
+    one; when unresolvable the 'Part of' line is omitted (meta always keeps
+    the exact parent id).
     """
     task_id = str(task.get("id") or "")
     version = task.get("updated") or task.get("etag") or None
@@ -105,10 +106,6 @@ def record_from_task(
     parent_id = task.get("parent")
     if parent_id:
         meta["parent_external_id"] = str(parent_id)
-    # The manager contract: a subtask's text carries the parent title. When
-    # the caller could not resolve it (parent not in the fetched set) the raw
-    # parent id stands in — meta always has the exact id.
-    render_parent = parent_title or (str(parent_id) if parent_id else None)
     links = task.get("links") or []
     if links:
         meta["links"] = [
@@ -132,7 +129,7 @@ def record_from_task(
         text=_render_task_text(
             title,
             list_title=list_title,
-            parent_title=render_parent,
+            parent_title=parent_title,
             due=due,
             completed_at=completed_at,
             tz=tz,
@@ -251,28 +248,13 @@ def parse_cursor(cursor: str | None) -> tuple[str | None, tuple[str, ...] | None
     return updated_min, tuple(sorted(lists))
 
 
-def _newer_updated(current: str | None, candidate: str | None) -> str | None:
-    """The later of two RFC 3339 stamps (raw string kept verbatim)."""
-    if not candidate:
-        return current
-    if not current:
-        return candidate
-    dt_current, dt_candidate = parse_rfc3339(current), parse_rfc3339(candidate)
-    if dt_current and dt_candidate:
-        return candidate if dt_candidate > dt_current else current
-    return candidate if dt_candidate else current
-
-
-def _earlier_updated(current: str | None, candidate: str | None) -> str | None:
-    """The earlier of two stamps (watermark for a truncated batch)."""
-    if not candidate:
-        return current
-    if not current:
-        return candidate
-    dt_current, dt_candidate = parse_rfc3339(current), parse_rfc3339(candidate)
-    if dt_current and dt_candidate:
-        return candidate if dt_candidate < dt_current else current
-    return current
+def _stamp_order(value: str | None) -> datetime:
+    """Sort key for RFC 3339 stamps: parsed time, oldest first; missing or
+    unparseable stamps sort first (they carry no watermark)."""
+    parsed = parse_rfc3339(value)
+    if parsed is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _local_tz() -> ZoneInfo:
@@ -320,20 +302,19 @@ class GTasksConnector(GoogleConnector):
 
         selected = select_lists(self._fetch_lists(), allowlist)
         try:
-            records, all_max, earliest_pending = self._collect(selected, updated_min, limit)
+            records, last_emitted = self._collect(selected, updated_min, limit)
         except ConnectorError as exc:
             if updated_min is None or exc.status not in _CURSOR_INVALID_STATUSES:
                 raise  # a real error, or one a full resync cannot fix
             # The source rejected the watermark: full resync, tell the runner.
             updated_min, reset = None, True
-            records, all_max, earliest_pending = self._collect(selected, None, limit)
+            records, last_emitted = self._collect(selected, None, limit)
 
-        watermark = earliest_pending or all_max
-        # A truncated batch resumes from the EARLIEST unemitted stamp (never
-        # skips); otherwise the max updated seen. No new stamps + an existing
-        # cursor -> keep the previous watermark (inclusive boundary re-yields
-        # it; the runner skips unchanged versions — no churn).
-        next_updated = watermark
+        # The cursor is the LAST EMITTED record's 'updated' (sorted ascending,
+        # so everything older is emitted; updatedMin is inclusive, so the next
+        # fetch re-delivers at most the last tie group — skipped by version).
+        # No records -> keep the previous watermark (or none on a first sync).
+        next_updated = last_emitted
         if next_updated is None and not reset:
             next_updated = prev_updated
         return FetchResult(
@@ -382,18 +363,21 @@ class GTasksConnector(GoogleConnector):
 
     def _collect(
         self, selected: list[dict[str, Any]], updated_min: str | None, limit: int
-    ) -> tuple[list[SourceRecord], str | None, str | None]:
-        """Walk the selected lists, emitting up to ``limit`` records.
+    ) -> tuple[list[SourceRecord], str | None]:
+        """Fetch the selected lists, emit up to ``limit`` records, return them
+        with the cursor watermark (the last emitted record's ``updated``).
 
-        Returns (records, max updated seen, earliest unemitted updated). With
-        ``limit`` reached, the cursor must resume at the earliest unemitted
-        stamp so no record is ever skipped (at-least-once; re-delivered tasks
-        are idempotent by external_id + version).
+        Livelock-free truncation: tasks from ALL selected lists are sorted by
+        (updated, list_id, id) ASCENDING and emitted oldest-first, so the
+        resume watermark (updatedMin is inclusive) always moves forward no
+        matter what order the API returned. A tie group of equal ``updated``
+        is extended past ``limit`` — otherwise a group larger than the limit
+        would resume at its own watermark forever. Re-delivered unchanged
+        records are skipped by the runner (idempotent by external_id+version).
         """
         tz = _local_tz()
-        records: list[SourceRecord] = []
-        max_updated: str | None = None
-        earliest_pending: str | None = None
+        entries: list[tuple[tuple[datetime, str, str, str], dict[str, Any], str, str]] = []
+        titles_by_list: dict[str, dict[str, str]] = {}
         for lst in selected:
             list_id = str(lst.get("id") or "")
             list_title = str(lst.get("title") or "")
@@ -406,22 +390,65 @@ class GTasksConnector(GoogleConnector):
                 # the rest of the sync alive (logged, never silent in ops).
                 logger.warning("gtasks: task list %r unavailable, skipped: %s", list_id, exc)
                 continue
-            titles = {str(t.get("id") or ""): str(t.get("title") or "") for t in raw_tasks}
+            titles_by_list[list_id] = {
+                str(t.get("id") or ""): str(t.get("title") or "") for t in raw_tasks
+            }
             for task in raw_tasks:
                 updated = task.get("updated") or None
-                max_updated = _newer_updated(max_updated, updated)
-                if len(records) >= limit:
-                    earliest_pending = _earlier_updated(earliest_pending, updated)
-                    continue
-                parent_id = task.get("parent")
-                parent_title = titles.get(str(parent_id)) if parent_id else None
-                records.append(
-                    record_from_task(
-                        task,
-                        tz,
-                        list_id=list_id,
-                        list_title=list_title,
-                        parent_title=parent_title,
-                    )
+                key = (_stamp_order(updated), updated or "", list_id, str(task.get("id") or ""))
+                entries.append((key, task, list_id, list_title))
+        entries.sort(key=lambda entry: entry[0])
+
+        # One tasks().get per DISTINCT parent missing from the batch, shared
+        # by every record in this fetch.
+        missing_parents: dict[tuple[str, str], str | None] = {}
+        records: list[SourceRecord] = []
+        last_emitted: str | None = None
+        for _key, task, list_id, list_title in entries:
+            updated = task.get("updated") or None
+            if len(records) >= limit and (updated or "") != (last_emitted or ""):
+                break  # limit reached, past the last emitted tie group
+            parent_id = task.get("parent")
+            parent_title = None
+            if parent_id:
+                parent_title = self._resolve_parent_title(
+                    list_id,
+                    str(parent_id),
+                    titles_by_list.get(list_id, {}),
+                    missing_parents,
                 )
-        return records, max_updated, earliest_pending
+            records.append(
+                record_from_task(
+                    task,
+                    tz,
+                    list_id=list_id,
+                    list_title=list_title,
+                    parent_title=parent_title,
+                )
+            )
+            last_emitted = updated
+        return records, last_emitted
+
+    def _resolve_parent_title(
+        self,
+        list_id: str,
+        parent_id: str,
+        batch_titles: dict[str, str],
+        memo: dict[tuple[str, str], str | None],
+    ) -> str | None:
+        """The parent title for a subtask's 'Part of' line: from the same
+        batch when the parent is in it, else ONE ``tasks().get`` per distinct
+        missing parent (memoised per fetch). Unresolvable (deleted parent) ->
+        None: the line is omitted; meta keeps the exact parent id."""
+        if parent_id in batch_titles:
+            return batch_titles[parent_id] or None
+        key = (list_id, parent_id)
+        if key not in memo:
+            try:
+                raw = self._execute(self._service().tasks().get(tasklist=list_id, task=parent_id))
+            except ConnectorError as exc:
+                if exc.status != 404:
+                    raise
+                raw = {}  # parent deleted: render without the 'Part of' line
+            memo[key] = str(raw.get("title") or "") or None
+        return memo[key]

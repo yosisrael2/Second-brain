@@ -8,6 +8,7 @@ serves the hand-written fixtures under tests/fixtures/connectors/gtasks/
 
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +70,14 @@ class _FakeRequest:
                 raise FakeHttpError(self._svc.tasklists_error)
             pages = self._svc.tasklists_pages
             return pages.pop(0) if pages else {"items": []}
+        if "task" in self._params:  # tasks().get — one task resource
+            self._svc.tasks_get_calls.append((self._params["tasklist"], self._params["task"]))
+            resource = self._svc.tasks_get.get(self._params["tasklist"], {}).get(
+                self._params["task"]
+            )
+            if resource is None:
+                raise FakeHttpError(404, "task not found")
+            return copy.deepcopy(resource)
         self._svc.tasks_params.append(self._params)
         list_id = self._params["tasklist"]
         status = self._svc.tasks_errors.pop(list_id, None)
@@ -77,7 +86,19 @@ class _FakeRequest:
         pages = self._svc.tasks_pages.get(list_id)
         if pages is None:  # a list that no longer exists
             raise FakeHttpError(404, f"list {list_id} not found")
-        return pages.pop(0) if pages else {"items": []}
+        page = pages.pop(0) if pages else {"items": []}
+        updated_min = _parse_stamp(self._params.get("updatedMin"))  # type: ignore[arg-type]
+        if updated_min is not None:
+            # Google filters server-side: only tasks with updated >= updatedMin.
+            page = {
+                **page,
+                "items": [
+                    t
+                    for t in page.get("items", [])
+                    if (_parse_stamp(t.get("updated")) or datetime.min) >= updated_min
+                ],
+            }
+        return page
 
 
 class _FakeCollection:
@@ -88,9 +109,26 @@ class _FakeCollection:
     def list(self, **params: object) -> _FakeRequest:
         return _FakeRequest(self._svc, self._kind, params)
 
+    def get(self, **params: object) -> _FakeRequest:
+        return _FakeRequest(self._svc, self._kind, params)
+
+
+def _parse_stamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
 
 class FakeTasksService:
-    """Serves canned pages per call, recording list params for assertions."""
+    """Serves canned pages per call, recording list params for assertions.
+
+    Realistic where it matters: ``updatedMin`` filters server-side on Google
+    (tasks with ``updated >= updatedMin`` come back), and ``tasks().get``
+    serves single resources from ``tasks_get`` (404 when absent).
+    """
 
     def __init__(
         self,
@@ -99,13 +137,16 @@ class FakeTasksService:
         tasks_pages: dict[str, list[dict]] | None = None,
         tasklists_error: int | None = None,
         tasks_errors: dict[str, int] | None = None,
+        tasks_get: dict[str, dict[str, dict]] | None = None,
     ) -> None:
         self.tasklists_pages = list(tasklists_pages or [])
         self.tasks_pages = {k: list(v) for k, v in (tasks_pages or {}).items()}
         self.tasklists_error = tasklists_error
         self.tasks_errors = dict(tasks_errors or {})
+        self.tasks_get = {k: dict(v) for k, v in (tasks_get or {}).items()}
         self.tasklists_params: list[dict] = []
         self.tasks_params: list[dict] = []
+        self.tasks_get_calls: list[tuple[str, str]] = []
 
     def tasklists(self) -> _FakeCollection:
         return _FakeCollection(self, "tasklists")
@@ -219,11 +260,14 @@ def test_subtask_carries_parent_id_and_parent_title():
     assert "List: Personal" in record.text
 
 
-def test_subtask_with_unknown_parent_falls_back_to_id_in_text():
+def test_subtask_without_resolved_parent_omits_part_of_line():
+    # The pure mapping renders only what it is given: with no resolved parent
+    # title there is NO 'Part of' line (meta keeps the exact parent id). The
+    # connector resolves the title via tasks().get before mapping.
     task = _task("tasks_personal_page1.json", "task-sub-signup")
     record = record_from_task(task, TZ)
     assert record.meta["parent_external_id"] == "task-parent-school"
-    assert "Part of: task-parent-school" in record.text
+    assert "Part of" not in record.text
 
 
 def test_notes_and_links_rendered_and_in_meta():
@@ -331,6 +375,56 @@ def test_parse_cursor_garbage_returns_none_pair():
 # --- fetch -------------------------------------------------------------------
 
 
+def _child_only_service(tasks_get: dict[str, dict[str, dict]] | None = None) -> FakeTasksService:
+    """An incremental batch containing ONLY a changed subtask: its own updated
+    is fresh (that is why it is in the batch) while the unchanged parent is
+    absent. Realistic: Google returns exactly what changed since the watermark."""
+    child = dict(_task("tasks_personal_page1.json", "task-sub-signup"))
+    child["updated"] = "2026-03-10T12:00:00.000Z"  # changed after the last sync
+    return FakeTasksService(
+        tasklists_pages=_all_lists_pages(),
+        tasks_pages={PERSONAL: [{"kind": "tasks#tasks", "items": [child]}]},
+        tasks_get=tasks_get,
+    )
+
+
+def test_incremental_child_without_parent_fetches_parent_title():
+    # A changed subtask on an incremental sync must render the parent's TITLE,
+    # not the opaque id — via exactly ONE tasks().get for the missing parent.
+    parent = _task("tasks_personal_page1.json", "task-parent-school")
+    service = _child_only_service(tasks_get={PERSONAL: {"task-parent-school": parent}})
+    result = _connector(service).fetch(build_cursor("2026-03-09T00:00:00.000Z", ()), limit=100)
+    record = next(r for r in result.records if r.external_id == "task-sub-signup")
+    assert "Part of: School week prep" in record.text
+    assert service.tasks_get_calls == [(PERSONAL, "task-parent-school")]
+
+
+def test_unresolvable_parent_omits_part_of_line():
+    # The parent itself is gone (404 on tasks().get): no 'Part of' line, but
+    # meta keeps the exact parent id for the next full sync.
+    service = _child_only_service(tasks_get={})
+    result = _connector(service).fetch(build_cursor("2026-03-09T00:00:00.000Z", ()), limit=100)
+    record = next(r for r in result.records if r.external_id == "task-sub-signup")
+    assert "Part of" not in record.text
+    assert record.meta["parent_external_id"] == "task-parent-school"
+
+
+def test_two_children_sharing_one_missing_parent_call_get_once():
+    # One tasks().get per DISTINCT missing parent, memoised per fetch.
+    child_b = dict(_task("tasks_personal_page1.json", "task-sub-signup"))
+    child_b["id"] = "task-sub-second"
+    page = {"kind": "tasks#tasks", "items": [child_b, child_b | {"id": "task-sub-third"}]}
+    parent = _task("tasks_personal_page1.json", "task-parent-school")
+    service = FakeTasksService(
+        tasklists_pages=_all_lists_pages(),
+        tasks_pages={PERSONAL: [page]},
+        tasks_get={PERSONAL: {"task-parent-school": parent}},
+    )
+    result = _connector(service).fetch(None, limit=100)
+    assert len([r for r in result.records if r.meta.get("parent_external_id")]) == 2
+    assert service.tasks_get_calls == [(PERSONAL, "task-parent-school")]
+
+
 def test_first_fetch_walks_all_lists_and_pages():
     service = FakeTasksService(
         tasklists_pages=_all_lists_pages(),
@@ -340,12 +434,17 @@ def test_first_fetch_walks_all_lists_and_pages():
     # 5 + 1 tasks from Personal (2 pages) + 2 from Home = 8 records
     assert len(result.records) == 8
     assert result.reset is False
-    assert [r.external_id for r in result.records][:5] == [
-        "task-order-cake",
-        "task-gifts",
-        "task-parent-school",
-        "task-sub-signup",
-        "task-deleted-old",
+    # Emission order is (updated, list_id, id) ascending — NOT the API's
+    # list-position order (the truncation-livelock fix).
+    assert [r.external_id for r in result.records] == [
+        "task-home-shed",  # 2026-03-04T15:20 (Home)
+        "task-no-due",  # 2026-03-05T21:10 (Personal page 2)
+        "task-home-tap",  # 2026-03-06T06:30 (Home)
+        "task-deleted-old",  # 2026-03-07T12:00
+        "task-parent-school",  # 2026-03-08T07:00
+        "task-sub-signup",  # 2026-03-08T07:05
+        "task-gifts",  # 2026-03-09T18:45
+        "task-order-cake",  # 2026-03-10T09:30
     ]
     # every tasks.list call asked for the full window: completed, hidden, deleted
     assert service.tasks_params
@@ -406,10 +505,11 @@ def test_updatedmin_boundary_is_inclusive_runner_skips_unchanged():
     assert result.records[0].version == boundary  # exactly the stored version
 
 
-def test_limit_truncates_and_cursor_stays_safe():
-    # Three tasks with distinct updates; limit 2 emits the first two in walk
-    # order; the cursor falls back to the earliest unemitted 'updated' so the
-    # next run refetches everything not yet emitted (at-least-once safety).
+def test_limit_truncation_emits_oldest_first_and_cursor_is_last_emitted():
+    # Emission order is (updated, list_id, id) ascending; the cursor is the
+    # LAST EMITTED record's 'updated'. The next fetch resumes INCLUSIVELY at
+    # that stamp: the emitted tail is re-delivered (and skipped by the runner
+    # by version) plus everything newer — nothing is skipped forever.
     tasks = [
         {
             "id": "t1",
@@ -435,9 +535,17 @@ def test_limit_truncates_and_cursor_stays_safe():
         tasks_pages={PERSONAL: [{"items": tasks}]},
     )
     result = _connector(service).fetch(None, limit=2)
-    assert [r.external_id for r in result.records] == ["t1", "t2"]
+    assert [r.external_id for r in result.records] == ["t1", "t2"]  # oldest first
     updated, _lists = parse_cursor(result.next_cursor)
-    assert updated == "2026-03-03T00:00:00.000Z"  # earliest unemitted
+    assert updated == "2026-03-02T00:00:00.000Z"  # last emitted
+    # Resuming inclusively re-delivers t2 (unchanged; the runner skips it by
+    # version) and yields t3 — two fetches ingest everything.
+    second_service = FakeTasksService(
+        tasklists_pages=[_fixture("tasklists_page1.json")],
+        tasks_pages={PERSONAL: [{"items": tasks}]},
+    )
+    second = _connector(second_service).fetch(result.next_cursor, limit=2)
+    assert [r.external_id for r in second.records] == ["t2", "t3"]
 
 
 def test_allowlist_limits_lists_and_marks_cursor():
@@ -503,7 +611,8 @@ def test_invalid_updatedmin_resets_full_sync():
     cursor = build_cursor("2026-03-09T00:00:00.000Z", ())
     result = _connector(service).fetch(cursor, limit=100)
     assert result.reset is True
-    assert [r.external_id for r in result.records][:1] == ["task-order-cake"]
+    # the full retry walks everything, oldest updated first
+    assert [r.external_id for r in result.records][:1] == ["task-home-shed"]
     # the full retry did NOT send updatedMin — only the one rejected
     # incremental attempt ever carried it
     incremental_calls = [p for p in service.tasks_params if "updatedMin" in p]
