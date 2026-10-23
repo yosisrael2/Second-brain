@@ -1,24 +1,28 @@
 """WhatsApp relevance triage (D2a; design delta item 36).
 
 Conversations (source='whatsapp') are labelled ``relevant`` | ``noise``.
-Jev FIRST — one typed-choice call; the LLM only when Jev's confidence falls
-below the band (or Jev is unavailable), ONE call per conversation with a
-strict, versioned prompt. Noise stays stored and searchable but is hidden
-from the default listings and never enqueued for enrichment. Triage never
-deletes anything.
+Deterministic override FIRST: a conversation naming a confirmed kid is
+relevant, method 'kid_named' — never asked to the model. Otherwise Jev —
+one typed-choice call; the LLM only when Jev's confidence falls below the
+band (or Jev is unavailable), ONE call per conversation with a strict,
+versioned prompt. Noise stays stored and searchable but is hidden from the
+default listings and never enqueued for enrichment. Triage never deletes
+anything.
 
 Failures leave the item UNTRIAGED (never guessed) and are recorded as an ops
 event — best-effort by contract: the poll must never block on triage.
 """
 
 import json
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from brain import ops
 from brain.ai.jev import JevError
 
-TRIAGE_VERSION = "triage-v2"
+TRIAGE_VERSION = "triage-v3"
 # Below this Jev confidence the LLM gets the final say (item 36: LLM only
 # when Jev is unsure — a band keeps the cheap path dominant).
 JEV_CONFIDENT_BAND = 0.9
@@ -35,7 +39,9 @@ _TRIAGE_QUESTION = (
 _TRIAGE_CRITERIA: dict[str, str] = {
     "relevant": (
         "anything with a date/time/place change, a request to parents, a class "
-        "activity, a safety/health notice, or naming one of OUR kids"
+        "activity, a safety/health notice, staff changes/absences/illness in "
+        "our kids' class or school, new groups/registrations/sign-ups for a "
+        "school program, or naming one of OUR kids"
     ),
     "noise": (
         "pure reactions (thanks, emoji, 'how fun', '+1', 'told her'); media-only "
@@ -58,6 +64,10 @@ Label RELEVANT when the conversation carries any of:
 - a class or school activity description worth remembering
 - a safety or health notice
 - something about one of our kids by name
+- staff changes / absences / illness in our kids' class or school (an aide
+  or teacher out, substitutes, contact info for them)
+- new parents' groups, registrations or sign-ups opening for a school
+  program
 
 Label NOISE when the conversation is any of:
 - pure reactions: thanks, emoji-only, 'how fun', '+1', 'told her'
@@ -97,13 +107,64 @@ class TrierProto(Protocol):
     def __call__(self, item: Any) -> "TriageResult | None": ...
 
 
+_HEBREW_LETTER = "[\u05d0-\u05ea]"
+# Hebrew words glue one-letter prefixes onto the word itself ('לאיתמר',
+# 'ואיתמר', 'שלאיתמר') — up to 3 of them, directly before the name.
+_HEBREW_PREFIX_RUN = "[והבכלמש]{0,3}"
+
+
+def mentions_name(name: str, text: str) -> bool:
+    """Whole-word name match (THE one implementation — ask + triage share it).
+
+    'May' must not fire inside 'mayor', 'שחר' not inside 'שחרור': nothing
+    word-like may touch the name (\w is Unicode-aware, so Hebrew letters
+    count on both sides). For Hebrew-letter names an optional run of up to
+    3 Hebrew prefix letters is allowed right before the name, still with
+    nothing word-like before the run and after the name.
+    """
+    if not name:
+        return False
+    body = re.escape(name)
+    if re.search(_HEBREW_LETTER, name):
+        body = rf"{_HEBREW_PREFIX_RUN}{body}"
+    return re.search(rf"(?<!\w){body}(?!\w)", text, re.IGNORECASE) is not None
+
+
+def confirmed_kid_names(entities: Sequence[dict[str, Any]]) -> list[str]:
+    """Names + aliases of confirmed kids (kind 'person' with a grade fact).
+
+    The SAME kid definition the kid-recall leg uses (PR 0d); the triage
+    override and /ask must never disagree about who 'our kids' are.
+    """
+    names: list[str] = []
+    for entity in entities:
+        if entity.get("kind") != "person":
+            continue
+        if not any(
+            fact.get("predicate") == "grade" for fact in entity.get("facts", [])
+        ):
+            continue
+        names.append(entity.get("name", ""))
+        names.extend(entity.get("aliases") or [])
+    return [name for name in names if name]
+
+
 def triage_conversation(
     text: str,
     *,
     jev: Any,
     llm: Any,
+    kid_names: Sequence[str] | None = None,
 ) -> TriageResult | None:
     """Label one conversation. None means 'undecided' (ops event recorded)."""
+    # Deterministic override (v3): naming a confirmed kid is relevant —
+    # no model call, no confidence dance. The asymmetric safe side.
+    for name in kid_names or ():
+        if mentions_name(name, text):
+            return _record(TriageResult(
+                label="relevant", confidence=1.0, method="kid_named",
+                version=TRIAGE_VERSION,
+            ))
     choice = None
     try:
         choice = jev.choice(_TRIAGE_QUESTION, _TRIAGE_CRITERIA, text)

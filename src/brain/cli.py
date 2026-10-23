@@ -407,16 +407,26 @@ def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
     )
 
 
-def _build_trier():
-    """The real triage callable: Jev typed choice first, LLM fallback (D2a)."""
+def _build_trier(session):
+    """The real triage callable: kid override, then Jev, then the LLM (D2a)."""
     from brain.api import deps  # noqa: PLC0415
-    from brain.services.triage import triage_conversation  # noqa: PLC0415
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+    from brain.services.triage import (  # noqa: PLC0415
+        confirmed_kid_names,
+        triage_conversation,
+    )
 
     jev = deps.get_jev_client()
     llm = deps.get_llm_client()
+    kid_names = confirmed_kid_names(
+        MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
+    )
 
     def trier(item):
-        return triage_conversation(item.raw_text, jev=jev, llm=llm)
+        return triage_conversation(
+            item.raw_text, jev=jev, llm=llm, kid_names=kid_names
+        )
 
     return trier
 
@@ -440,10 +450,10 @@ def _whatsapp_triage(*, limit: int) -> int:
         settings.qdrant_collection,
         allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
     )
-    trier = _build_trier()
     decided = 0
     failed = 0
     with SessionLocal() as session:
+        trier = _build_trier(session)
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:
@@ -533,7 +543,7 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
             items=ItemsRepository(session),
             memory=MemoryRepository(session),
             indexer=indexer,  # side processes index like the API does (best-effort)
-            trier=_build_trier(),  # D2a: relevance triage on create + update
+            trier=_build_trier(session),  # D2a: relevance triage on create + update
             zone_name=settings.timezone,
             gap_minutes=settings.whatsapp_gap_minutes,
             overlap_minutes=settings.whatsapp_overlap_minutes,

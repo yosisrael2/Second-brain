@@ -100,6 +100,69 @@ def test_jev_confident_path_never_calls_the_llm() -> None:
     assert jev.calls == 1 and llm.prompts == [], "a confident Jev must not cost an LLM call"
 
 
+# --- the deterministic kid override (v3) ---------------------------------------
+
+
+def test_kid_named_override_is_relevant_without_any_model_call() -> None:
+    jev = FakeJev(JevError("jev down"))  # must never be reached
+    llm = FakeLLM(RuntimeError("llm down"))  # must never be reached
+
+    result = triage_conversation(
+        "[WhatsApp · ב' ברקת - הורים]\n[21/10/2026, 18:23] אמא של יואב: מי לוקח את איתמר היום?",
+        jev=jev,
+        llm=llm,
+        kid_names=["Itamar", "איתמר"],
+    )
+
+    assert result == TriageResult(
+        label="relevant", confidence=1.0, method="kid_named", version=TRIAGE_VERSION
+    )
+    assert jev.calls == 0 and llm.prompts == [], "the override never asks a model"
+
+
+def test_kid_override_uses_the_shared_matcher_rules() -> None:
+    jev = FakeJev(JevChoice(option="noise", confidence=0.99))
+
+    # 'לאיתמר' (glue prefix) fires the override...
+    fired = triage_conversation(
+        "מה צריך לאיתמר מחר?", jev=jev, llm=FakeLLM("unused"), kid_names=["איתמר"]
+    )
+    assert fired is not None and fired.method == "kid_named"
+
+    # ...but a sub-word never does ('שחר' inside 'שחרור')
+    jev2 = FakeJev(JevChoice(option="noise", confidence=0.99))
+    not_fired = triage_conversation(
+        "השחרור של הסרט החדש", jev=jev2, llm=FakeLLM("unused"), kid_names=["שחר"]
+    )
+    assert not_fired is not None and not_fired.method != "kid_named"
+
+
+def test_confirmed_kid_names_uses_the_ask_kid_definition() -> None:
+    from brain.services.triage import confirmed_kid_names
+
+    entities = [
+        {"kind": "person", "name": "Itamar", "aliases": ["איתמר"], "facts": [
+            {"predicate": "grade", "value": "2"},
+        ]},
+        {"kind": "person", "name": "NoGrade", "aliases": ["x"], "facts": []},
+        {"kind": "channel", "name": "ב' ברקת - הורים", "facts": []},
+    ]
+    assert confirmed_kid_names(entities) == ["Itamar", "איתמר"]
+
+
+def test_v3_prompt_carries_the_new_relevance_rules() -> None:
+    """The v3 additions (staff/health, new groups) are pinned in the prompt."""
+    from brain.services import triage
+
+    prompt = triage._PROMPT_TEMPLATE.format(text="x", version=triage.TRIAGE_VERSION)
+    assert "staff changes / absences / illness" in prompt
+    assert "new parents' groups, registrations or sign-ups" in prompt
+    assert triage.TRIAGE_VERSION == "triage-v3"
+    # v2's noise categories stay
+    assert "lost & found" in prompt and "media-only" in prompt
+    assert "other families" in prompt
+
+
 def test_llm_fallback_when_jev_confidence_is_low() -> None:
     jev = FakeJev(JevChoice(option="relevant", confidence=JEV_CONFIDENT_BAND - 0.01))
     llm = FakeLLM('{"label": "noise", "confidence": 0.91}')
@@ -358,7 +421,7 @@ def test_backfill_triages_untriaged_whatsapp_items_only(monkeypatch) -> None:
         label = "noise" if "תודה" in item.raw_text else "relevant"
         return TriageResult(label, 0.95, "jev", TRIAGE_VERSION)
 
-    monkeypatch.setattr("brain.cli._build_trier", lambda: fake_trier)
+    monkeypatch.setattr("brain.cli._build_trier", lambda session: fake_trier)
     rc = cli.main(["whatsapp-triage", "--limit", "100"])
     assert rc == 0
 
