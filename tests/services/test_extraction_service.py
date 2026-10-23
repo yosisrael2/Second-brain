@@ -955,3 +955,103 @@ def test_compound_weekday_date_when_raw_survives_to_a_conflict_flag(world: World
     assert whole.occurred_at is not None
     local = whole.occurred_at.astimezone(_JLM)
     assert local.date().isoformat() == "2026-10-07"
+
+
+# --- A2 run-#1 fixes: sender default (R1) + within-pass dedupe -----------------
+
+
+def _seed_teacher_memory(session: Session) -> None:
+    """Rona in ה' ספיר with teacher Rinat; Itamar ב' ברקת with Maayan."""
+    memory = MemoryService(MemoryRepository(session))
+    memory.set_kid(
+        "Rona", gender="girl", school="בראשית", grade="5",
+        class_="ה' ספיר", teacher="Rinat",
+    )
+    memory.set_kid(
+        "Itamar", gender="boy", school="בראשית", grade="2",
+        class_="ב' ברקת", teacher="Maayan",
+    )
+
+
+def test_narrow_audience_matrix():
+    """R1 semantics: the item level may only NARROW the source default."""
+    from brain.services.extraction.service import EnrichmentService
+
+    narrow = EnrichmentService._narrow_audience
+    assert narrow(None, ["unknown"]) == ["unknown"]  # no default -> item stands
+    assert narrow(["Rona"], ["unknown"]) == ["Rona"]  # unknown -> default
+    assert narrow(["Rona"], ["nobody"]) == ["nobody"]  # explicit exclusion stands
+    assert narrow(["Rona"], ["Rona"]) == ["Rona"]
+    assert narrow(["Rona", "Itamar"], ["Rona"]) == ["Rona"]  # subset narrows
+    assert narrow(["Rona"], ["Itamar"]) == ["nobody"]  # disjoint -> nobody
+    assert narrow(["Rona"], ["me"]) == ["me"]  # role-based 'me' compatible
+
+
+def test_sender_default_rescues_unknown_children(world: World):
+    """A class teacher's update with NO audience in the body -> her kid."""
+    _seed_teacher_memory(world.session)
+    source = _capture(world.repo, "מחר יום ספורט. מומלץ להגיע עם בגד ספורט.", source="email")
+    source.meta = {**source.meta, "sender": "Rinat <rinat@bereshit.edu>"}
+    world.repo.commit()
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם בגד ספורט",
+            quote="מומלץ להגיע עם בגד ספורט", when_raw="מחר",
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    assert child.applies_to == ["Rona"]  # was ['unknown'] before the sender default
+
+
+def test_item_level_audience_narrows_the_sender_default(world: World):
+    """Girls-only notice from a teacher whose kid is a BOY -> nobody."""
+    _seed_teacher_memory(world.session)
+    source = _capture(world.repo, "בנות בלבד: מבחן ביום ראשון", source="email")
+    source.meta = {**source.meta, "sender": "Maayan <maayan@bereshit.edu>"}
+    world.repo.commit()
+    candidates = [
+        ChildCandidate(
+            kind="event", title="מבחן בנות",
+            quote="בנות בלבד: מבחן ביום ראשון", when_raw="יום ראשון",
+            audience={"gender": "girls"},
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    service.run_once(NOW)
+    child = _children(world.session)[0]
+    assert child.applies_to == ["nobody"]  # narrowed: Itamar is a boy
+
+
+def test_within_pass_duplicate_removed_counted(world: World):
+    """The same thing extracted twice in one reply stores ONE child."""
+    body = "הגיעו עם כובע לטיול ביום חמישי 22.10"
+    source = _capture(world.repo, body, source="email")
+    candidates = [
+        ChildCandidate(
+            kind="reminder", title="להגיע עם כובע לטיול",
+            quote="הגיעו עם כובע לטיול", when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="reminder", title="להביא כובע לטיול",  # near-duplicate (0.8)
+            quote="הגיעו עם כובע לטיול", when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="event", title="טיול שנתי",  # same day, DIFFERENT kind -> kept
+            quote="לטיול ביום חמישי 22.10", when_raw="יום חמישי 22.10",
+        ),
+        ChildCandidate(
+            kind="task", title="לשלם עבור הטיול",  # dateless, different kind
+            quote="הגיעו עם כובע לטיול", when_raw="", due=True,
+        ),
+    ]
+    service = world.with_extractor(CountingExtractor(candidates))
+    service.enqueue(source)
+    report = service.run_once(NOW)
+    assert report.deduped_removed == 1  # the near-duplicate reminder
+    assert report.children_created == 3
+    titles = [row.raw_text for row in _children(world.session)]
+    assert "להגיע עם כובע לטיול" in titles and "להביא כובע לטיול" not in titles

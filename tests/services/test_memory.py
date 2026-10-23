@@ -533,3 +533,35 @@ def test_set_channel_rejects_invalid_kind(memory: MemoryService):
         memory.set_channel("ערוץ", kind="family", applies_to="me")
     # the valid set still works
     memory.set_channel("ערוץ", kind="teacher", applies_to="me")
+
+
+# -- A2 run-#1 fix 1: normalized label comparison -------------------------------
+
+
+def test_class_label_variants_all_match(memory: MemoryService):
+    """ה' ספיר (memory) == ה׳ ספיר / ה ספיר / כיתה ה' ספיר / ה-ספיר (text)."""
+    _seed_world(memory)
+    for variant in ("ה׳ ספיר", "ה ספיר", "כיתה ה' ספיר", "ה-ספיר", "ה' ספיר"):
+        assert memory.resolve_applies_to({"class": variant}) == ["Rona"], variant
+
+
+def test_school_label_variant_still_matches(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.resolve_applies_to({"school": "בָּרָאשִׁית"}) == ["Rona", "Itamar"]
+
+
+def test_different_class_still_incompatible(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.resolve_applies_to({"class": "ו' אלון"}) == ["nobody"]
+
+
+# -- A2 run-#1 fix 2: sender -> default audience (R1) ---------------------------
+
+
+def test_sender_matching_teacher_is_the_default_audience(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.default_audience_for_sender("Rinat <rinat@bereshit.edu>") == ["Rona"]
+    assert memory.default_audience_for_sender("Maayan") == ["Itamar"]
+    assert memory.default_audience_for_sender("דואר כללי <office@edu>") is None
+    assert memory.default_audience_for_sender(None) is None
+    assert memory.default_audience_for_sender("") is None

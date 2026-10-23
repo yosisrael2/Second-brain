@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Versioned prompt (recorded in extraction_meta for every child it produces;
 # iterating the prompt bumps this version, so eval runs are comparable).
-EXTRACTION_PROMPT_VERSION = "v2"
+EXTRACTION_PROMPT_VERSION = "v3"
 
 # Injection defense: the source text is DATA (docs/ai-layer.md rationale).
 _PROMPT_TEMPLATE = """You extract structured children from one message.

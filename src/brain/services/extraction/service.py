@@ -27,7 +27,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -100,6 +100,7 @@ class RunReport:
     processed: int = 0
     children_created: int = 0
     children_updated: int = 0
+    deduped_removed: int = 0
     dropped_ungrounded: int = 0
     deferred_over_cap: int = 0
     failed: int = 0
@@ -109,6 +110,7 @@ class RunReport:
             "processed",
             "children_created",
             "children_updated",
+            "deduped_removed",
             "dropped_ungrounded",
             "deferred_over_cap",
             "failed",
@@ -305,11 +307,16 @@ class EnrichmentService:
             return report
         run_id = uuid.uuid4()
         existing_children = self._children_of(source.id)
+        resolved_list: list[_ResolvedChild] = []
         for candidate in candidates:
             resolved = self._validate(candidate, source, now)
             if resolved is None:
                 report.dropped_ungrounded += 1
                 continue
+            resolved_list.append(resolved)
+        resolved_list, deduped = self._dedupe_pass(resolved_list, source)
+        report.deduped_removed += deduped
+        for resolved in resolved_list:
             outcome = self._store_child(resolved, source, existing_children, run_id, now)
             if outcome == "created":
                 report.children_created += 1
@@ -342,6 +349,98 @@ class EnrichmentService:
         return report
 
     # --- validation pipeline ---------------------------------------------
+
+    def _dedupe_pass(
+        self, resolved: list[_ResolvedChild], source: MemoryItem
+    ) -> tuple[list[_ResolvedChild], int]:
+        """Drop within-pass near-duplicates BEFORE storing (A2 run-#1 fix 4).
+
+        One real-world thing extracted twice in the same reply (e.g. once as
+        a reminder and once as an event) must not become two children. Uses
+        A1's identity logic INSIDE the pass: same kind + same resolved local
+        day (both dateless counts as the same day) + the SAME resolved
+        applies_to (one-per-class children are different things) +
+        title_similarity >= _CHILD_IDENTITY_THRESHOLD. The FIRST candidate
+        wins. Returns the kept list and how many were removed.
+        """
+        kept: list[_ResolvedChild] = []
+        removed = 0
+        for child in resolved:
+            day = self._local_day(child)
+            dup = False
+            for prior in kept:
+                if prior.candidate.kind != child.candidate.kind:
+                    continue
+                if prior.applies_to != child.applies_to:
+                    continue
+                if self._local_day(prior) != day:
+                    continue
+                if (
+                    title_similarity(prior.candidate.title, child.candidate.title)
+                    >= _CHILD_IDENTITY_THRESHOLD
+                ):
+                    dup = True
+                    break
+            if dup:
+                removed += 1
+                continue
+            kept.append(child)
+        if removed:
+            ops.record_event(
+                "enrichment",
+                "children_deduped",
+                ok=True,
+                detail={"item_id": str(source.id), "removed": removed},
+            )
+        return kept, removed
+
+    def _local_day(self, child: _ResolvedChild) -> date | None:
+        """The child's resolved LOCAL day (None when dateless)."""
+        moment = child.start or child.due
+        if moment is None:
+            return None
+        return moment.astimezone(self._tz).date()
+
+    def _source_default_audience(self, source: MemoryItem) -> list[str] | None:
+        """R1 source default: the sender's confirmed teacher->kid mapping."""
+        if self._memory is None:
+            return None
+        meta = source.meta if isinstance(source.meta, dict) else {}
+        sender = meta.get("sender")
+        try:
+            return self._memory.default_audience_for_sender(
+                sender if isinstance(sender, str) else None
+            )
+        except Exception:  # noqa: BLE001 — a memory hiccup must not break extraction
+            logger.exception("enrichment: sender default lookup failed")
+            return None
+
+    @staticmethod
+    def _narrow_audience(
+        default: list[str] | None, item_level: list[str]
+    ) -> list[str]:
+        """The item-level audience may only NARROW the source default (R1).
+
+        - no default (no sender / no teacher match): item resolution stands.
+        - item resolves to 'unknown': take the default when there is one.
+        - item resolves to 'nobody' (an explicit incompatibility, e.g.
+          girls-only in a boy's class): nobody — narrowing may exclude
+          everyone, it may never add anyone back.
+        - both kid sets: their intersection; empty -> nobody.
+        - item resolves only to 'me': me (role-based, compatible with any
+          kid-set default — the update is still about my kids).
+        """
+        if default is None:
+            return item_level
+        if item_level == ["unknown"]:
+            return list(default)
+        if item_level == ["nobody"]:
+            return ["nobody"]
+        item_kids = {name for name in item_level if name != "me"}
+        if not item_kids:
+            return item_level
+        overlap = item_kids & set(default)
+        return sorted(overlap) if overlap else ["nobody"]
 
     def _validate(
         self, candidate: ChildCandidate, source: MemoryItem, now: datetime
@@ -396,10 +495,13 @@ class EnrichmentService:
                     due = moment
                 else:
                     start = moment
-        applies_to = (
+        item_level = (
             self._memory.resolve_applies_to(dict(candidate.audience))
             if self._memory is not None
             else ["unknown"]
+        )
+        applies_to = self._narrow_audience(
+            self._source_default_audience(source), item_level
         )
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,

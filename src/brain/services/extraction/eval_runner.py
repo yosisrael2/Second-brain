@@ -39,16 +39,21 @@ def split_emails(raw: str) -> list[dict[str, str]]:
         if not body:
             continue
         sent_line = ""
+        from_line = ""
         text_lines: list[str] = []
         for line in body.splitlines():
             if line.startswith("Date:"):
                 sent_line = line[len("Date:") :].strip()
+                continue
+            if line.startswith("From:"):
+                from_line = line[len("From:") :].strip()
                 continue
             text_lines.append(line)
         emails.append(
             {
                 "email_id": f"E{len(emails) + 1:02d}",
                 "sent": sent_line,
+                "sender": from_line,
                 "text": "\n".join(text_lines).strip(),
             }
         )
@@ -151,7 +156,11 @@ def run_extraction_eval(
             raw_text=email["text"],
             source="email",
             occurred_at=_parse_sent(email["sent"]) if email["sent"] else None,
-            meta={"email_id": email["email_id"], "subject_kind": "school"},
+            meta={
+                "email_id": email["email_id"],
+                "subject_kind": "school",
+                "sender": email.get("sender", ""),
+            },
         )
         session.add(source)
         session.commit()
