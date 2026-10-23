@@ -51,8 +51,11 @@ class World:
     def with_extractor(
         self, extractor: CountingExtractor, *, daily_cap: int = 100
     ) -> EnrichmentService:
+        # tz pinned: clock-time assertions must not depend on the runner's
+        # local zone (CI runs UTC)
         return EnrichmentService(
-            self.repo, self.session, extractor=extractor, memory=self.memory, daily_cap=daily_cap
+            self.repo, self.session, extractor=extractor, memory=self.memory,
+            daily_cap=daily_cap, timezone="Asia/Jerusalem",
         )
 
 
