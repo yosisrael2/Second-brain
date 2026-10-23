@@ -105,9 +105,35 @@ Copy the id (not the name) into `GMAIL_LABEL_ID`.
 Both `needs re-auth` and `label missing` are DEGRADED, not crashes: the
 poller pauses 5 minutes between attempts and everything else keeps working.
 
-## Run it 24/7
+## Run it 24/7 (launchd agent)
 
-The launchd agent wiring (a third `com.secondbrain.email` agent in
-`scripts/service.sh`) is a deliberate follow-up; for now run
-`brain gmail-poll` in a terminal (or a tmux window). The poller is
-idempotent — stopping and restarting it never re-captures old mail.
+A third launchd agent keeps the poller alive across logins, same model as
+the API and Telegram agents:
+
+| Agent | Runs | Restart behaviour |
+| --- | --- | --- |
+| `com.secondbrain.api` | `scripts/run-server.sh` | 0/78 → no restart, else restart |
+| `com.secondbrain.telegram` | `scripts/run-bot.sh` | 0/78 → no restart, else restart |
+| `com.secondbrain.email` | `scripts/run-email.sh` | 0/78 → no restart, else restart |
+
+`needs re-auth` and `label missing` are NOT exits: the poller pauses
+internally (5 minutes) and the agent stays alive, so a revoked token never
+flaps the agent. Config errors that cannot start at all (no label id, no
+keychain token) exit 78 → no restart loop.
+
+**Install order matters** — do this from a normal Terminal session FIRST,
+while you are at the console:
+
+1. `brain gmail-auth` (browser consent) — the login keychain asks for
+   access once; click **Always Allow** so the background agent can read
+   the token later without a prompt nobody will see.
+2. `brain gmail-poll --once` — verifies label id + token + capture end to
+   end, and warms the same keychain grant.
+3. `scripts/service.sh install` — writes and bootstraps all three agents
+   (the email agent runs `scripts/run-email.sh`, which exports
+   `BRAIN_ALLOW_LIVE=1` and pins `COMPOSE_PROJECT_NAME=second-brain`).
+   Logs: `~/Library/Logs/second-brain/email.log` (poll ids and counts
+   only — never message bodies, sender addresses, or tokens).
+
+The poller is idempotent — stopping and restarting it never re-captures
+old mail (Message-ID + seen-ledger dedupe).

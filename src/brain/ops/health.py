@@ -511,8 +511,12 @@ def _compose_project() -> str | None:
     return os.environ.get("COMPOSE_PROJECT_NAME")
 
 
-# LaunchAgent labels managed by scripts/service.sh (the background-service pair).
-BACKGROUND_LABELS = ("com.secondbrain.api", "com.secondbrain.telegram")
+# LaunchAgent labels managed by scripts/service.sh (the background services).
+BACKGROUND_LABELS = (
+    "com.secondbrain.api",
+    "com.secondbrain.telegram",
+    "com.secondbrain.email",
+)
 
 
 def _background_check() -> dict[str, Any]:

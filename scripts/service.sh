@@ -5,6 +5,8 @@
 #   com.secondbrain.api       scripts/run-server.sh   (foreground uvicorn)
 #   com.secondbrain.telegram  scripts/run-bot.sh      (long-poll bot; exit-code
 #                             contract: 0/78 -> no restart, 1 -> restart)
+#   com.secondbrain.email     scripts/run-email.sh    (Gmail label poller; same
+#                             contract; needs re-auth pauses INSIDE the poller)
 #
 # Both agents get COMPOSE_PROJECT_NAME=second-brain so compose-scoped checks
 # (the cockpit docker panel) always look at the service project, never at the
@@ -32,6 +34,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LABEL_API="com.secondbrain.api"
 LABEL_TG="com.secondbrain.telegram"
+LABEL_EMAIL="com.secondbrain.email"
 PLIST_DIR="${PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${LOG_DIR:-$HOME/Library/Logs/second-brain}"
 PORT="${PORT:-27800}"
@@ -39,6 +42,7 @@ BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
 UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 RUN_SERVER="$ROOT/scripts/run-server.sh"
 RUN_BOT="$ROOT/scripts/run-bot.sh"
+RUN_EMAIL="$ROOT/scripts/run-email.sh"
 TG_PID_FILE="$ROOT/.dev/telegram.pid"
 GUI_DOMAIN="gui/$(id -u)"
 # PATH for the service environment: brew (both arches), Rancher Desktop's CLI
@@ -47,15 +51,15 @@ SERVICE_PATH="/opt/homebrew/bin:$HOME/.rd/bin:/usr/local/bin:/usr/bin:/bin:/usr/
 
 usage() {
   cat <<EOF
-Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram]
+Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email]
 
-install    stop our manual instances, write the two plists, bootstrap them
-uninstall  bootout both agents and remove the plists (logs are kept)
+install    stop our manual instances, write the three plists, bootstrap them
+uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
-restart    kickstart -k both agents
-logs [c]   tail the last ${LINES:-50} lines (component: api, telegram, or all)
+restart    kickstart -k all agents
+logs [c]   tail the last ${LINES:-50} lines (component: api, telegram, email, or all)
 
-Agents: ${LABEL_API}, ${LABEL_TG}
+Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_EMAIL}
 Plists: ${PLIST_DIR}   Logs: ${LOG_DIR}
 EOF
 }
@@ -186,7 +190,8 @@ bootout_label() {
 install() {
   [ -x "$BRAIN" ] || die "$BRAIN missing — provision the venv first (scripts/dev-start.sh does)"
   [ -x "$UVICORN" ] || die "$UVICORN missing — provision the venv first"
-  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] || die "scripts/run-server.sh and scripts/run-bot.sh must be executable"
+  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] && [ -x "$RUN_EMAIL" ] || \
+    die "scripts/run-server.sh, run-bot.sh and run-email.sh must be executable"
   [ -f "$ROOT/.env" ] || say "env: WARNING — no .env at $ROOT; services run on defaults (telegram disabled until a token exists)"
 
   say "takeover: stopping manual instances (no duplicate bots, no 409)"
@@ -198,10 +203,11 @@ install() {
   say "install: writing plists to $PLIST_DIR"
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
+  write_plist "$LABEL_EMAIL" "$RUN_EMAIL" "email"
 
   # Pre-create the log files mode 600: launchd writes into the existing inode
   # (preserving the mode) instead of creating them with the default umask.
-  for f in api api.err telegram telegram.err; do
+  for f in api api.err telegram telegram.err email email.err; do
     touch "$LOG_DIR/$f.log" 2>/dev/null || true
   done
   chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
@@ -209,8 +215,10 @@ install() {
   say "install: bootstrapping agents"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
+  bootout_label "$LABEL_EMAIL"
   launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_API}.plist"
   launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_TG}.plist"
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_EMAIL}.plist"
 
   sleep 2
   say "install: done — agents are starting (RunAtLoad)"
@@ -223,7 +231,9 @@ uninstall() {
   say "uninstall: booting out agents (their processes get SIGTERM from launchd)"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
-  rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist"
+  bootout_label "$LABEL_EMAIL"
+  rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist" \
+    "$PLIST_DIR/${LABEL_EMAIL}.plist"
   say "uninstall: plists removed; logs remain in $LOG_DIR"
 }
 
@@ -247,6 +257,7 @@ status() {
   local ok=0
   print_label_status "$LABEL_API" || ok=1
   print_label_status "$LABEL_TG" || ok=1
+  print_label_status "$LABEL_EMAIL" || ok=1
   sleep_check
   docker_check
   if [ "$ok" -eq 0 ]; then
@@ -260,7 +271,7 @@ status() {
 restart() {
   say "restart: kickstart -k both agents"
   local failed=0 label
-  for label in "$LABEL_API" "$LABEL_TG"; do
+  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_EMAIL"; do
     if launchctl kickstart -k "${GUI_DOMAIN}/${label}" 2>/dev/null; then
       printf '  %-28s kicked\n' "$label"
     else
@@ -276,8 +287,9 @@ logs() {
   case "$comp" in
     api) tail_log "api" ;;
     telegram) tail_log "telegram" ;;
-    all) tail_log "api"; tail_log "telegram" ;;
-    *) usage >&2; die "unknown component '$comp' (api|telegram|all)" ;;
+    email) tail_log "email" ;;
+    all) tail_log "api"; tail_log "telegram"; tail_log "email" ;;
+    *) usage >&2; die "unknown component '$comp' (api|telegram|email|all)" ;;
   esac
 }
 
