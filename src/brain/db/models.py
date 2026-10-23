@@ -41,6 +41,24 @@ _SOURCE_MAX_LENGTH = 64
 _PROJECT_MAX_LENGTH = 128
 _ENUM_MAX_LENGTH = 32
 
+# The closed domain of ``memory_items.source`` (CHECK ``source``): capture
+# paths that exist today (manual default, paste kinds, telegram bot, email
+# poller) + the connector names this ticket introduces. The migration adds
+# it NOT VALID (the live table predates the constraint; new inserts are
+# checked). New sources widen the domain in a migration — never silently.
+ITEM_SOURCE_DOMAIN = (
+    "manual",
+    "note",
+    "calendar",
+    "email",
+    "outlook",
+    "whatsapp",
+    "telegram",
+    "gcal",
+    "gdrive",
+    "gtasks",
+)
+
 
 def _in_domain(column: str, values: Iterable[str]) -> str:
     """Build a CHECK expression restricting a column to the given values."""
@@ -86,6 +104,10 @@ class MemoryItem(Base):
         CheckConstraint(
             f"confidence IS NULL OR confidence BETWEEN {CONFIDENCE_MIN} AND {CONFIDENCE_MAX}",
             name="confidence_range",
+        ),
+        CheckConstraint(
+            _in_domain("source", ITEM_SOURCE_DOMAIN),
+            name="source",
         ),
         Index(
             "ix_memory_items_search_vector",
@@ -369,7 +391,7 @@ class Attachment(Base):
     __tablename__ = "attachments"
     __table_args__ = (
         CheckConstraint(
-            _in_domain("source", ("telegram", "whatsapp", "email")),
+            _in_domain("source", ("telegram", "whatsapp", "email", "gcal", "gdrive", "gtasks")),
             name="source",
         ),
         CheckConstraint(
@@ -511,6 +533,53 @@ class ItemRelation(Base):
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     provenance: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# --- connectors (connectors ticket) -------------------------------------------
+
+
+class ConnectorState(Base):
+    """Per-connector sync cursor + health (written by ConnectorRunner)."""
+
+    __tablename__ = "connector_state"
+
+    name: Mapped[str] = mapped_column(String(_SOURCE_MAX_LENGTH), primary_key=True)
+    # Opaque next-batch cursor owned by the connector; persisted by the
+    # runner ONLY after the whole batch succeeded. NULL = never synced (or
+    # the source declared a full resync with no fresh cursor).
+    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Free-form counters JSON; the runner owns the ``attempt`` key (the
+    # consecutive-retryable-failure count that drives backoff).
+    counters: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+
+
+class ConnectorRecord(Base):
+    """One synced external record -> the item it produced (idempotency ledger).
+
+    The runner consults this before writing: unknown external_id -> create,
+    same version -> skip, new version -> update in place. ON DELETE CASCADE
+    on item_id: a user-deleted item makes the next sync re-capture it.
+    """
+
+    __tablename__ = "connector_records"
+    __table_args__ = (Index("ix_connector_records_item_id", "item_id"),)
+
+    source: Mapped[str] = mapped_column(String(_SOURCE_MAX_LENGTH), primary_key=True)
+    external_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("memory_items.id", ondelete="CASCADE"),
+        nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

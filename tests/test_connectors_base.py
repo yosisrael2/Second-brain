@@ -28,6 +28,10 @@ class _Dummy(Connector):
         raise AssertionError("not used in this test")
 
 
+# Registered once at import: the duplicate-registration guard needs it.
+register(_Dummy)
+
+
 def test_error_hierarchy():
     assert issubclass(ConnectorAuthError, ConnectorError)
     assert issubclass(ConnectorRetryableError, ConnectorError)
@@ -58,10 +62,10 @@ def test_connector_is_abstract():
 
 
 def test_register_get_alias():
+    assert get("dummy") is _Dummy  # registered at import (see _Dummy above)
     with pytest.raises(ValueError):
-        register(_Dummy)  # already registered via an earlier test in this module
+        register(_Dummy)  # duplicate name refused
 
-    assert get("dummy") is _Dummy
     alias("d", "dummy")
     assert get("d") is _Dummy
     assert "dummy" in all_names()
@@ -69,14 +73,10 @@ def test_register_get_alias():
         get("no-such-connector")
 
 
-def test_google_connector_stub_is_a_signature_stub():
+def test_google_connector_is_abstract():
+    """GoogleConnector carries the shared machinery; fetch() is the adapter's."""
     assert issubclass(GoogleConnector, Connector)
-    conn = object.__new__(GoogleConnector)
-    with pytest.raises(NotImplementedError):
-        conn.fetch(None, limit=10)
-    with pytest.raises(NotImplementedError):
-        GoogleConnector(token_loader=lambda: "", service_factory=lambda token, scopes: None)
-    with pytest.raises(NotImplementedError):
-        list(GoogleConnector.iter_pages(lambda token: {}))
-    with pytest.raises(NotImplementedError):
-        GoogleConnector._translate_error(Exception("x"))
+    with pytest.raises(TypeError):
+        GoogleConnector(  # type: ignore[abstract]
+            token_loader=lambda: "", service_factory=lambda token, scopes: None
+        )
