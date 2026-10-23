@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -67,9 +68,7 @@ class MemoryServiceProtocol(Protocol):
 class KidRecallRepoProto(Protocol):
     """What the kid-recall leg needs from the items repository."""
 
-    def by_text_any(
-        self, needles: Sequence[str], *, limit: int
-    ) -> Sequence[MemoryItem]: ...
+    def by_text_any(self, needles: Sequence[str], *, limit: int) -> Sequence[MemoryItem]: ...
 
 
 class AskService:
@@ -109,17 +108,26 @@ class AskService:
         self._items_repo = items_repo
         self._kid_recall_limit = kid_recall_limit
 
-    def ask(self, question: str, *, now: datetime | None = None) -> AskResult:
+    def ask(
+        self, question: str, *, now: datetime | None = None, record_ops: bool = True
+    ) -> AskResult:
         """Answer ``question`` from the top-k most relevant memory items.
 
         ``now`` anchors relative date expressions ("today", "this week");
         production passes nothing (real clock), tests pin it.
+
+        ``record_ops=False`` runs the whole path WITHOUT recording ops
+        spans/events (ask->search, ask->llm, kid_recall). DIAGNOSTICS ONLY:
+        live checks that exercise the ask path with a fake LLM must pass it,
+        otherwise /ops/health shows 'llm — last call failed' until the next
+        real call. Real requests keep the default (True) — no change.
         """
-        with ops.span("ask", "search", edge="ask->search") as span:
+        span_factory = ops.span if record_ops else _null_span
+        with span_factory("ask", "search", edge="ask->search") as span:
             # rerank sees the whole pool; only the top_k best reach the prompt.
             # No kid named -> the call is EXACTLY the pre-0d one (byte-identical
             # pool; also keeps third-party search fakes without the kwarg working).
-            kid_items = self._kid_recall_items(question)
+            kid_items = self._kid_recall_items(question, record_ops=record_ops)
             if kid_items:
                 pool = self._search.search(
                     question,
@@ -146,7 +154,7 @@ class AskService:
             }
             for hit in context_hits
         ]
-        with ops.span("ask", "llm", edge="ask->llm") as span:
+        with span_factory("ask", "llm", edge="ask->llm") as span:
             result = answer(
                 question,
                 context,
@@ -163,7 +171,7 @@ class AskService:
             model=result["model"],
         )
 
-    def _kid_recall_items(self, question: str) -> list[MemoryItem]:
+    def _kid_recall_items(self, question: str, *, record_ops: bool = True) -> list[MemoryItem]:
         """Extra candidates: items from a named kid's channels and class (PR 0d).
 
         The question is NEVER rewritten — this only widens recall. A kid is
@@ -177,10 +185,22 @@ class AskService:
         if self._memory is None or self._items_repo is None:
             return []
         entities = self._memory.overview(status="confirmed", q=None)
-        lowered = question.lower()
 
         def mentions(name: str) -> bool:
-            return bool(name) and name.lower() in lowered
+            if not name:
+                return False
+            # Whole-word match only: 'May' must not fire inside 'mayor',
+            # 'שחר' not inside 'שחרור'. \w is Unicode-aware, so Hebrew
+            # letters count as word characters on both sides. Hebrew words,
+            # though, glue one-letter prefixes onto the word itself ('לאיתמר',
+            # 'ואיתמר', 'שלאיתמר') — so for names written in Hebrew letters
+            # allow an optional run of up to 3 Hebrew prefix letters right
+            # before the name, still requiring that nothing word-like
+            # precedes the run and that nothing word-like follows the name.
+            body = re.escape(name)
+            if re.search(r"[\u05d0-\u05ea]", name):
+                body = rf"[והבכלמש]{{0,3}}{body}"
+            return re.search(rf"(?<!\w){body}(?!\w)", question, re.IGNORECASE) is not None
 
         kids: list[dict[str, Any]] = []
         channels: list[dict[str, Any]] = []
@@ -218,16 +238,17 @@ class AskService:
         needles = [needle for needle in dict.fromkeys(needles) if needle]
         if not needles:
             return []
-        items = list(
-            self._items_repo.by_text_any(needles, limit=self._kid_recall_limit)
-        )
-        ops.record_event(
-            "ask", "kid_recall", ok=True,
-            detail={
-                "needles": len(needles),
-                "fetched": len(items),
-            },
-        )
+        items = list(self._items_repo.by_text_any(needles, limit=self._kid_recall_limit))
+        if record_ops:
+            ops.record_event(
+                "ask",
+                "kid_recall",
+                ok=True,
+                detail={
+                    "needles": len(needles),
+                    "fetched": len(items),
+                },
+            )
         return items
 
     def _temporal_hits(self, question: str, now: datetime | None) -> list[SearchHit]:
@@ -266,3 +287,21 @@ class AskService:
         else:
             end_str = ""
         return f"{local:%a} {local.day} {local:%b} {local:%H:%M}{end_str}"
+
+
+class _NullSpan:
+    """Stand-in for ops.span when recording is off (diagnostics runs)."""
+
+    def __init__(self) -> None:
+        self.detail: dict[str, Any] = {}
+
+    def __enter__(self) -> _NullSpan:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _null_span(component: str, kind: str, edge: str | None = None) -> _NullSpan:
+    """Drop-in for ops.span that records nothing."""
+    return _NullSpan()

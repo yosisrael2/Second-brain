@@ -82,8 +82,14 @@ class TestLibShPhysicalRoot:
         # Fake server: real process whose command line matches our uvicorn
         # pattern, cwd = repo (physical).
         proc = subprocess.Popen(
-            ["python3", "-c", "import time; time.sleep(30)",
-             "uvicorn brain.main:app", "--port", "27800"],
+            [
+                "python3",
+                "-c",
+                "import time; time.sleep(30)",
+                "uvicorn brain.main:app",
+                "--port",
+                "27800",
+            ],
             cwd=repo,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -112,7 +118,7 @@ class TestLibShPhysicalRoot:
         shutil.copy(SCRIPTS / "lib.sh", repo / "scripts" / "lib.sh")
         alias = tmp_path / "alias2"
         alias.symlink_to(repo)
-        code = f"cd {alias} && source scripts/lib.sh && " 'printf "%s" "$LIB_ROOT"'
+        code = f'cd {alias} && source scripts/lib.sh && printf "%s" "$LIB_ROOT"'
         result = _bash_snippet(code)
         assert result.returncode == 0, result.stderr
         assert result.stdout == str(repo), (
@@ -195,20 +201,53 @@ class TestRunServer:
 
 
 class _LaunchctlStub:
-    """PATH shim for launchctl: records invocations, fakes `print` output."""
+    """PATH shim for launchctl: records invocations, fakes `print` output.
 
-    def __init__(self, tmp_path: Path, print_state: str = "running") -> None:
+    bootout marks the label gone (a later `print` for it fails, like the real
+    launchctl after a bootout); bootstrap can be told to fail N times with the
+    classic '5: Input/output error' before succeeding (the install race)."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        print_state: str = "running",
+        bootstrap_failures: int = 0,
+    ) -> None:
         self.bin = tmp_path / "stubbin"
         self.bin.mkdir(exist_ok=True)
+        self.state = tmp_path / "stubstate"
+        self.state.mkdir(exist_ok=True)
         self.log = tmp_path / "launchctl-calls.log"
         stub = self.bin / "launchctl"
         body = (
             "#!/usr/bin/env bash\n"
             f'echo "$@" >> {self.log}\n'
+            f"STATE={self.state}\n"
             'case "$1" in\n'
-            f'  print) printf "  state = {print_state}\\n  pid = 4242\\n'
+            "  print)\n"
+            '    label="${2##*/}"\n'
+            '    [ -f "$STATE/gone-$label" ] && exit 3\n'
+            f'    printf "  state = {print_state}\\n  pid = 4242\\n'
             f'  last exit code = 0\\n";;\n'
-            "  bootstrap|bootout|kickstart) exit 0;;\n"
+            "  bootout)\n"
+            '    label="${2##*/}"\n'
+            '    touch "$STATE/gone-$label"\n'
+            "    exit 0;;\n"
+            "  bootstrap)\n"
+            '    case "$2" in\n'
+            '      gui/[0-9]*) ;;  # launchctl bootstrap takes a DOMAIN target only\n'
+            '      *) echo "bootstrap: $2 is not a domain target (gui/<uid>)" >&2; exit 1;;\n'
+            '    esac\n'
+            '    label="${3##*/}"\n'
+            '    n=$(cat "$STATE/bfail-$label" 2>/dev/null || echo 0)\n'
+            f'    if [ "$n" -lt {bootstrap_failures} ]; then\n'
+            '      echo $((n + 1)) > "$STATE/bfail-$label"\n'
+            '      echo "Bootstrap failed: 5: Input/output error" >&2\n'
+            "      exit 5\n"
+            "    fi\n"
+            '    rm -f "$STATE/gone-$label"\n'
+            "    exit 0;;\n"
+            "  kickstart) exit 0;;\n"
             "  *) exit 0;;\n"
             "esac\n"
         )
@@ -364,13 +403,35 @@ class TestServiceOtherCommands:
         assert "not installed" in result.stdout
 
     def test_restart_kickstarts_both_labels(self, tmp_path):
-        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=_service_env(tmp_path))
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        for label in ("com.secondbrain.api", "com.secondbrain.telegram"):
+            (plist_dir / f"{label}.plist").write_text("<plist/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr
         calls = _calls(tmp_path)
         assert any("kickstart" in c and "-k" in c and "com.secondbrain.api" in c for c in calls)
         assert any(
             "kickstart" in c and "-k" in c and "com.secondbrain.telegram" in c for c in calls
         )
+
+    def test_restart_skips_labels_without_plists(self, tmp_path):
+        """'restart' must work BEFORE 'install': labels with no plist are
+        skipped with a note instead of failing the whole command."""
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / "com.secondbrain.api.plist").write_text("<plist/>\n")
+        # telegram + whatsapp deliberately not installed
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = _calls(tmp_path)
+        assert any("kickstart" in c and "com.secondbrain.api" in c for c in calls)
+        assert not any("com.secondbrain.telegram" in c for c in calls)
+        assert not any("com.secondbrain.whatsapp" in c for c in calls)
+        assert "skipped" in result.stdout
+        assert "com.secondbrain.whatsapp" in result.stdout
 
     def test_logs_tails_both_components(self, tmp_path):
         env = _service_env(tmp_path)
@@ -387,6 +448,92 @@ class TestServiceOtherCommands:
         result = _run([str(SCRIPTS / "service.sh"), "bogus"], env=_service_env(tmp_path))
         assert result.returncode != 0
         assert "unknown command" in result.stderr
+
+    def test_bootstrap_target_is_the_domain_not_the_service(self, tmp_path):
+        """launchctl bootstrap takes a DOMAIN (gui/<uid>) plus the plist path —
+        NOT a service target (gui/<uid>/<label>, which is for bootout/print/
+        kickstart). A service target here makes every bootstrap fail, i.e. the
+        next install would boot out all agents and start none. The stub is
+        strict about the argv shape so this stays caught."""
+        env = _service_env(tmp_path)
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        for call in _calls(tmp_path):
+            if "bootstrap" not in call:
+                continue
+            target = call.split()[1]
+            assert target.count("/") == 1 and target.startswith("gui/"), call
+
+    def test_install_retries_bootstrap_after_the_launchd_race(self, tmp_path):
+        """'Bootstrap failed: 5: Input/output error' is the classic bootout→
+        bootstrap race; install must retry (bounded) instead of dying with the
+        agents bootout'ed and nothing running (seen live 2026-10-23)."""
+        stub = _LaunchctlStub(tmp_path, bootstrap_failures=1)
+        env = stub.env()
+        env.update(
+            {
+                "PLIST_DIR": str(tmp_path / "LaunchAgents"),
+                "LOG_DIR": str(tmp_path / "Logs"),
+            }
+        )
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        bootstraps = [c for c in _calls(tmp_path) if "bootstrap" in c]
+        # EVERY label hit the race once and was retried (the stub counts per label).
+        for label in (
+            "com.secondbrain.api",
+            "com.secondbrain.telegram",
+            "com.secondbrain.whatsapp",
+        ):
+            assert len([c for c in bootstraps if label in c]) == 2, label
+
+    def test_install_fails_loudly_when_bootstrap_never_succeeds(self, tmp_path):
+        stub = _LaunchctlStub(tmp_path, bootstrap_failures=9)
+        env = stub.env()
+        env.update(
+            {
+                "PLIST_DIR": str(tmp_path / "LaunchAgents"),
+                "LOG_DIR": str(tmp_path / "Logs"),
+            }
+        )
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode != 0
+        assert "bootstrap" in (result.stdout + result.stderr).lower()
+        # One label's failure must not abandon the others: 3 attempts each
+        # (retry bound), then install reports failure.
+        bootstraps = [c for c in _calls(tmp_path) if "bootstrap" in c]
+        for label in (
+            "com.secondbrain.api",
+            "com.secondbrain.telegram",
+            "com.secondbrain.whatsapp",
+        ):
+            assert len([c for c in bootstraps if label in c]) == 3, label
+
+    def test_install_wait_for_bootout_is_bounded(self, tmp_path):
+        """If launchd still reports the label after bootout, install must not
+        hang: the wait is bounded (BOOTOUT_WAIT_TRIES) and bootstrap's retry
+        covers the rest of the race."""
+        stub = _LaunchctlStub(tmp_path, print_state="running")
+        env = stub.env()
+        env.update(
+            {
+                "PLIST_DIR": str(tmp_path / "LaunchAgents"),
+                "LOG_DIR": str(tmp_path / "Logs"),
+                "BOOTOUT_WAIT_TRIES": "1",
+            }
+        )
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        bootstraps = [c for c in _calls(tmp_path) if "bootstrap" in c]
+        assert len(bootstraps) == 4
+
+    def test_side_process_scripts_log_unbuffered(self):
+        """launchd log files must stream: PYTHONUNBUFFERED=1 everywhere
+        (run-server.sh already had it; the poller/bot logs buffered in 4kB
+        blocks, which read as 'empty logs' while the agents were fine)."""
+        for script in ("run-server.sh", "run-bot.sh", "run-email.sh", "run-whatsapp.sh"):
+            text = (SCRIPTS / script).read_text()
+            assert "export PYTHONUNBUFFERED=1" in text, script
 
 
 class TestEnvironmentChecks:
@@ -483,10 +630,10 @@ class TestRunEmailExitContract:
 
 
 class TestServiceEmailAgent:
-    """service.sh manages THREE agents: api, telegram, and the email poller."""
+    """service.sh manages FOUR agents: api, telegram, email, whatsapp."""
 
     @need_venv
-    def test_install_writes_and_bootstraps_three_labels(self, tmp_path):
+    def test_install_writes_and_bootstraps_four_labels(self, tmp_path):
         env = _service_env(tmp_path)
         result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
         assert result.returncode == 0, result.stdout + result.stderr

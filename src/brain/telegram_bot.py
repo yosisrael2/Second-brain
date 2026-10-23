@@ -1389,6 +1389,11 @@ async def poll_loop(
     backoff = conflict_backoff_s
     try:
         while True:
+            # Liveness on the poll path: the long-poll itself can occupy the
+            # whole timeout window, so the heartbeat must start FRESH before
+            # each attempt (previously only successful polls heartbeated, and
+            # a quiet chat pushed the age past health's threshold).
+            heartbeat("telegram", {"phase": "polling", "last_update_id": last_update_id})
             try:
                 updates = await tg.get_updates(offset=offset, timeout=poll_timeout_s)
             except Conflict as exc:
@@ -1427,6 +1432,9 @@ async def poll_loop(
                     backoff,
                     exc,
                 )
+                # Liveness on the retry path: the backoff sleep can outlast the
+                # poll timeout (doubling up to 60s) — prove the loop is alive.
+                heartbeat("telegram", {"phase": "backoff", "last_update_id": last_update_id})
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
                 continue
@@ -1441,6 +1449,8 @@ async def poll_loop(
                 raise
             except NetworkError as exc:
                 logger.warning("telegram: network error, retrying (%s)", type(exc).__name__)
+                # Liveness on the retry path (see the conflict branch).
+                heartbeat("telegram", {"phase": "backoff", "last_update_id": last_update_id})
                 await asyncio.sleep(3)
                 continue
             # A successful poll means the other poller is gone: fresh window.
@@ -1911,7 +1921,7 @@ def run(settings: Settings) -> int:
         core, tg = build_bot(settings)
         logger.info("telegram: long polling started")
         try:
-            asyncio.run(poll_loop(tg, core))
+            asyncio.run(poll_loop(tg, core, poll_timeout_s=settings.telegram_poll_timeout_s))
         except KeyboardInterrupt:
             logger.info("telegram: stopped")
             return EXIT_DISABLED

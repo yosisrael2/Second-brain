@@ -134,6 +134,9 @@ class Settings(BaseSettings):
     # into conversations (item 35); the overlap window (must stay smaller
     # than the gap) makes restarts idempotent.
     whatsapp_bridge_db: str = ""
+    # F3 (item 47): the bridge's local REST endpoint for media downloads
+    # (POST {url}/api/download). Read-only use only — never /api/send.
+    whatsapp_bridge_url: str = "http://127.0.0.1:8085"
     whatsapp_gap_minutes: int = 60
     whatsapp_overlap_minutes: int = 5
     whatsapp_poll_interval_s: float = 30.0
@@ -142,6 +145,10 @@ class Settings(BaseSettings):
     # allowlist is REQUIRED with a token — the bot never answers strangers.
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
+    # The bot's getUpdates long-poll timeout (seconds). ONE source of truth:
+    # the poll loop uses it, and /ops/health derives the telegram heartbeat
+    # threshold from it (timeout + margin) so a quiet poll never flaps.
+    telegram_poll_timeout_s: int = 50
 
     # Email source (F2): a read-only Gmail label poller. The label ID is an
     # immutable Gmail label id (never its display name); the OAuth refresh
@@ -209,6 +216,22 @@ LIVE_DATABASE_URL = "postgresql+psycopg://brain:brain@localhost:27432/brain"
 LIVE_QDRANT_COLLECTION = DEFAULT_QDRANT_COLLECTION  # 'brain_items'
 
 
+def test_collection_for(database_name: str) -> str:
+    """The Qdrant collection name for a test database (per-worker isolation).
+
+    Derives the test collection from the test database name so two workers
+    running suites against different test databases (brain_w5_test,
+    brain_test, ...) never share one Qdrant collection — concurrent suites
+    polluting each other's vectors was a real incident. 'brain_w5_test' ->
+    'brain_items_w5_test', 'brain_test' -> 'brain_items_test'. Callers keep
+    the ``*_test``-suffix guard: this function is only ever fed names that
+    already end in ``_test`` (conftest enforces that before calling).
+    """
+    if database_name.startswith("brain_"):
+        database_name = database_name[len("brain_") :]
+    return f"brain_items_{database_name}"
+
+
 def _is_live_database_url(url: str) -> bool:
     """True when `url` points at the live database.
 
@@ -228,17 +251,66 @@ def _is_live_database_url(url: str) -> bool:
     return name == "brain" and parsed.port == 27432 and host in {"localhost", "127.0.0.1", "::1"}
 
 
+def _allow_live(allow_live: str | None) -> bool:
+    """BRAIN_ALLOW_LIVE=1 opts in; an explicit argument wins over the env."""
+    if allow_live is not None:
+        return allow_live == "1"
+    import os  # noqa: PLC0415 — keep the module import surface unchanged
+
+    return os.environ.get("BRAIN_ALLOW_LIVE") == "1"
+
+
+def assert_not_live_database(database_url: str, allow_live: str | None = None) -> None:
+    """Refuse the LIVE database URL unless BRAIN_ALLOW_LIVE=1 (construction guard).
+
+    The narrow half of :func:`assert_not_live_store`: called from the
+    SQLAlchemy engine factory (brain.db.session) so every engine built from
+    settings is checked where it is created, not only when an app starts.
+    """
+    if _allow_live(allow_live):
+        return
+    if _is_live_database_url(url=database_url):
+        raise RuntimeError(
+            "refusing to start against the LIVE store; set DATABASE_URL/QDRANT_COLLECTION "
+            "for a test instance, or BRAIN_ALLOW_LIVE=1 for the real service ("
+            f"DATABASE_URL points at the live database ({database_url!r})"
+            ")"
+        )
+
+
+def assert_not_live_collection(
+    qdrant_collection: str, allow_live: str | None = None
+) -> None:
+    """Refuse the LIVE collection name unless BRAIN_ALLOW_LIVE=1 (construction guard).
+
+    The other narrow half: called from the Qdrant vector store's __init__
+    with the collection the store will ACTUALLY use (injected value, not
+    just the env), so a cached factory or a stray script cannot build a
+    live-pointing store unnoticed.
+    """
+    if _allow_live(allow_live):
+        return
+    if qdrant_collection == LIVE_QDRANT_COLLECTION:
+        raise RuntimeError(
+            "refusing to start against the LIVE store; set DATABASE_URL/QDRANT_COLLECTION "
+            "for a test instance, or BRAIN_ALLOW_LIVE=1 for the real service ("
+            f"QDRANT_COLLECTION is the live collection ({qdrant_collection!r})"
+            ")"
+        )
+
+
 def assert_not_live_store(
     database_url: str, qdrant_collection: str, allow_live: str | None = None
 ) -> None:
     """Refuse to start the app against the LIVE store unless explicitly allowed.
 
-    Wired into the app lifespan (src/brain/main.py). ``scripts/run-server.sh``
+    Wired into the app lifespan (src/brain/main.py) and composed from the
+    two narrow construction guards (engine factory, vector store). ``scripts/run-server.sh``
     — the launchd path — exports ``BRAIN_ALLOW_LIVE=1`` to opt in; anything
     else (a worktree without .env, a stray local instance) must point at an
     explicit test DATABASE_URL / QDRANT_COLLECTION or fail fast here.
     """
-    if allow_live == "1":
+    if _allow_live(allow_live):
         return
     reasons: list[str] = []
     if _is_live_database_url(url=database_url):
