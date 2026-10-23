@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 from brain.ai.gmail import GmailError, RestGmailClient
+
 pytest.importorskip("brain.services.whatsapp")
 from brain.services.whatsapp import WhatsAppMediaClient  # noqa: E402
 
@@ -117,8 +118,12 @@ class TestBridgeDownloadContract:
             ),
         )
         client.download("m1", "chat@g.us")
-        assert calls == [{"url": "http://127.0.0.1:8085/api/download",
-                          "json": {"message_id": "m1", "chat_jid": "chat@g.us"}}]
+        assert calls == [
+            {
+                "url": "http://127.0.0.1:8085/api/download",
+                "json": {"message_id": "m1", "chat_jid": "chat@g.us"},
+            }
+        ]
 
     def test_success_false_is_refused(self, tmp_path):
         store = tmp_path / "store"

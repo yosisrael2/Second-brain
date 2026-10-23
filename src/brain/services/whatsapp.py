@@ -344,9 +344,8 @@ class WhatsAppMediaClient:
                 # The real bridge answers failure as 500 + {success: false,
                 # message}; prefer its message over a bare HTTP error.
                 if not payload.get("success"):
-                    raise MediaDownloadError(
-                        f"bridge download failed: {str(payload.get('message') or 'unknown error')[:200]}"
-                    )
+                    message = str(payload.get("message") or "unknown error")
+                    raise MediaDownloadError(f"bridge download failed: {message[:200]}")
             elif response.is_error:
                 response.raise_for_status()  # non-JSON HTTP error
             else:
@@ -364,7 +363,9 @@ class WhatsAppMediaClient:
                     f"refusing path outside the bridge store root: {str(path)[:200]}"
                 )
             if not resolved.is_file():
-                raise MediaDownloadError(f"downloaded media is not a regular file: {str(path)[:200]}")
+                raise MediaDownloadError(
+                    f"downloaded media is not a regular file: {str(path)[:200]}"
+                )
             return resolved.read_bytes()
         finally:
             client.close()
