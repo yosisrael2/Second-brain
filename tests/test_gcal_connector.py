@@ -70,15 +70,24 @@ class _FakeHttpError(Exception):
 
 
 class _FakeCalendarService:
-    """Duck-typed googleapiclient service: per-calendar page queues + errors."""
+    """Duck-typed googleapiclient service: per-calendar page queues + errors.
+
+    ``queue`` serves pages FIFO; ``queue_page`` serves each page only for the
+    EXACT incoming pageToken that should produce it — so a resumed walk that
+    shows up with the wrong token fails loudly instead of silently passing.
+    """
 
     def __init__(self) -> None:
         self.pages: dict[str, list[dict[str, Any]]] = {}
+        self.pages_by_token: dict[tuple[str, str], dict[str, Any]] = {}
         self.errors: dict[str, Exception] = {}
         self.calls: list[dict[str, Any]] = []
 
     def queue(self, calendar_id: str, *pages: dict[str, Any]) -> None:
         self.pages[calendar_id] = list(pages)
+
+    def queue_page(self, calendar_id: str, incoming_token: str, page: dict[str, Any]) -> None:
+        self.pages_by_token[(calendar_id, incoming_token)] = page
 
     def fail_next(self, calendar_id: str, error: Exception) -> None:
         self.errors[calendar_id] = error
@@ -88,10 +97,14 @@ class _FakeCalendarService:
 
     def _take(self, params: dict[str, Any]) -> Any:
         self.calls.append(params)
-        error = self.errors.pop(str(params.get("calendarId")), None)
+        calendar_id = str(params.get("calendarId"))
+        error = self.errors.pop(calendar_id, None)
         if error is not None:
             return _FakeRequest(error)
-        queue = self.pages.get(str(params.get("calendarId"))) or []
+        key = (calendar_id, str(params.get("pageToken") or ""))
+        if key in self.pages_by_token:
+            return _FakeRequest(self.pages_by_token.pop(key))
+        queue = self.pages.get(calendar_id) or []
         return _FakeRequest(queue.pop(0) if queue else {"items": []})
 
 
@@ -128,9 +141,21 @@ def _instance2() -> dict[str, Any]:
 _FROZEN_CUTOVER = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
 
 
+def _state(sync_token: str | None = None, page_token: str | None = None) -> dict[str, Any]:
+    """One calendar's cursor state (mode derived from the sync token)."""
+    return {
+        "sync_token": sync_token,
+        "page_token": page_token,
+        "mode": "incr" if sync_token is not None else "full",
+    }
+
+
 def _frozen_cursor(*tokens: tuple[str, str]) -> str:
     return json.dumps(
-        {"cutoff": _FROZEN_CUTOVER.isoformat(), "calendars": dict(tokens)}
+        {
+            "cutoff": _FROZEN_CUTOVER.isoformat(),
+            "calendars": {cal: _state(tok) for cal, tok in tokens},
+        }
     )
 
 
@@ -373,7 +398,9 @@ def test_fetch_full_sync_requests_instances_bounded_by_time_min(
     assert abs((datetime.now(UTC) - time_min).days - 60) <= 1  # now - BRAIN_GCAL_PAST_DAYS
     # The fresh cutoff is frozen into the cursor for all later syncs.
     decoded = json.loads(result.next_cursor or "{}")
-    assert decoded["calendars"] == {"primary": "sync-1"}
+    assert decoded["calendars"] == {
+        "primary": {"sync_token": "sync-1", "page_token": None, "mode": "incr"}
+    }
     assert abs(
         (datetime.fromisoformat(decoded["cutoff"]) - time_min).total_seconds()
     ) < 1
@@ -399,7 +426,7 @@ def test_fetch_incremental_sends_saved_sync_tokens_without_time_min(
     # The frozen cutoff is reused, not recomputed.
     assert json.loads(result.next_cursor or "{}")["cutoff"] == _FROZEN_CUTOVER.isoformat()
     assert json.loads(result.next_cursor or "{}")["calendars"] == {
-        "primary": "sync-primary-2"
+        "primary": {"sync_token": "sync-primary-2", "page_token": None, "mode": "incr"}
     }
 
 
@@ -425,7 +452,9 @@ def test_fetch_410_resets_the_calendar_and_relists_from_the_frozen_cutoff(
     full_relist = fake.calls[1]
     assert "syncToken" not in full_relist
     assert datetime.fromisoformat(full_relist["timeMin"]) == _FROZEN_CUTOVER  # frozen
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {"primary": "fresh"}
+    assert json.loads(result.next_cursor or "{}")["calendars"] == {
+        "primary": {"sync_token": "fresh", "page_token": None, "mode": "incr"}
+    }
 
 
 def test_fetch_propagates_non_410_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -462,11 +491,15 @@ def test_fetch_walks_next_page_token_then_stores_next_sync_token(
     ]
     assert fake.calls[0].get("pageToken") is None
     assert fake.calls[1]["pageToken"] == "page-2"
-    assert fake.calls[1]["maxResults"] == 50  # budget respected, not the 250 page cap
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {"primary": "sync-end"}
+    assert fake.calls[1]["maxResults"] == 250  # fixed page size (consistency rule)
+    assert json.loads(result.next_cursor or "{}")["calendars"] == {
+        "primary": {"sync_token": "sync-end", "page_token": None, "mode": "incr"}
+    }
 
 
-def test_fetch_limit_truncates_and_keeps_the_old_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_stops_at_page_boundaries_and_stays_resumable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
@@ -479,10 +512,16 @@ def test_fetch_limit_truncates_and_keeps_the_old_token(monkeypatch: pytest.Monke
 
     result = conn.fetch(cursor, limit=1)
 
-    assert len(result.records) == 1
-    assert fake.calls[0]["maxResults"] == 1
-    # Truncated mid-walk: the OLD token stays current; the next run re-lists.
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {"primary": "old-token"}
+    # NEVER sliced: the whole page is returned (the batch may exceed the
+    # limit by up to one page); the walk stays resumable at the page token.
+    assert len(result.records) == 2
+    assert fake.calls[0]["maxResults"] == 250  # fixed page size (consistency rule)
+    decoded = json.loads(result.next_cursor or "{}")
+    assert decoded["calendars"]["primary"] == {
+        "sync_token": "old-token",  # incremental mode keeps its sync token
+        "page_token": "page-2",  # resume position
+        "mode": "incr",
+    }
 
 
 def test_fetch_limit_zero_is_a_no_op_that_preserves_the_cursor(
@@ -546,7 +585,9 @@ def test_fetch_drops_instances_that_ended_before_the_cutoff_but_keeps_the_token(
 
     # The stale September instance is filtered client-side; the token is kept.
     assert [r.external_id for r in result.records] == ["1q2w3e4r5t6y7u8i9o0p"]
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {"primary": "sync-1"}
+    assert json.loads(result.next_cursor or "{}")["calendars"] == {
+        "primary": {"sync_token": "sync-1", "page_token": None, "mode": "incr"}
+    }
 
 
 def test_fetch_never_drops_cancelled_records_without_an_end(
@@ -805,3 +846,140 @@ def test_cutoff_window_math() -> None:
     # documented behavior: cutoff = now - BRAIN_GCAL_PAST_DAYS, tz-aware UTC
     now = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
     assert now - timedelta(days=60) == datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+
+
+# ---- RED (review @ 5af092b): resumable walks, no livelock on big sources ---------
+
+
+def _instance_page(start_index: int, count: int) -> list[dict[str, Any]]:
+    """`count` synthetic instances, each with a DISTINCT day + title (distinct
+    fingerprint — the ingest dedupe would collapse identical records)."""
+    pages = []
+    base_day = datetime(2027, 1, 1, 17, 0, tzinfo=UTC)
+    for i in range(start_index, start_index + count):
+        start = base_day + timedelta(days=i)
+        end = start + timedelta(minutes=75)
+        payload = dict(_instance1())
+        payload["id"] = f"weekly-series-id-5678_{i:08d}T170000Z"
+        payload["etag"] = f'"page-{i}"'
+        payload["summary"] = f"חזרת תזמורת מס' {i}"
+        payload["start"] = {"dateTime": start.isoformat()}
+        payload["end"] = {"dateTime": end.isoformat()}
+        pages.append(payload)
+    return pages
+
+
+def test_walk_bigger_than_the_limit_terminates_with_a_sync_token(
+    runner_db, monkeypatch
+):
+    """RED (review of #55 @ 5af092b): a full sync of more than `limit`
+    instances must NOT livelock. 3 pages of 100 instances, limit 100:
+    successive runs through the REAL runner ingest all 300 and the connector
+    ends holding a syncToken within 3-4 runs."""
+    h = Harness(runner_db)
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", _OLD_ENOUGH)
+    get_settings.cache_clear()
+
+    def run_once() -> tuple[Any, str | None]:
+        fake = _FakeCalendarService()
+        fake.queue_page("primary", "", {"items": _instance_page(0, 100), "nextPageToken": "p2"})
+        fake.queue_page("primary", "p2", {"items": _instance_page(100, 100), "nextPageToken": "p3"})
+        fake.queue_page(
+            "primary", "p3", {"items": _instance_page(200, 100), "nextSyncToken": "S-final"}
+        )
+        summary = h.runner(_connector(fake)).run(limit=100)
+        state = h.state.get_or_create("gcal")
+        return summary, state.cursor
+
+    summaries = [run_once() for _ in range(4)]
+    created_per_run = [s.created for s, _ in summaries]
+    assert created_per_run == [100, 100, 100, 0], created_per_run
+    final_summary, final_cursor = summaries[-1]
+    assert final_summary.state == "ok"
+    assert final_cursor is not None
+    assert "S-final" in final_cursor  # the walk COMPLETED: a syncToken is held
+    items = h.repo.list(item_type=None, project=None, status=None, limit=500, offset=0)
+    assert len(items) == 300
+
+
+def test_incremental_walk_bigger_than_the_limit_resumes_without_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same resumability for an incremental batch spanning 2 pages: the
+    resumed call keeps the SAME syncToken + params and only the pageToken
+    advances (sync guide consistency rule); the held token survives."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue_page(
+        "primary", "", {"items": _instance_page(0, 100), "nextPageToken": "p2"}
+    )
+    fake.queue_page("primary", "p2", {"items": _instance_page(100, 100), "nextSyncToken": "S2"})
+    conn = _connector(fake)
+    cursor = _frozen_cursor(("primary", "T0"))
+
+    first = conn.fetch(cursor, limit=100)
+    assert len(first.records) == 100
+    state = json.loads(first.next_cursor or "{}")["calendars"]["primary"]
+    assert state == {"sync_token": "T0", "page_token": "p2", "mode": "incr"}
+
+    # resume: SAME sync token, page token advances; the walk completes.
+    second = conn.fetch(first.next_cursor, limit=100)
+    assert len(second.records) == 100
+    assert fake.calls[1]["syncToken"] == "T0"
+    assert fake.calls[1]["pageToken"] == "p2"
+    assert "timeMin" not in fake.calls[1]  # still an incremental call
+    final_state = json.loads(second.next_cursor or "{}")["calendars"]["primary"]
+    assert final_state == {"sync_token": "S2", "page_token": None, "mode": "incr"}
+
+
+def test_rejected_stored_page_token_restarts_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stored page_token that Google rejects (page tokens expire quickly,
+    HTTP 400) restarts that calendar's walk from page 1 with the SAME sync
+    token and reports reset=True — instead of erroring the sync or losing
+    the token."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue_page("primary", "", {"items": [_instance1()], "nextSyncToken": "S-fresh"})
+    fake.fail_next("primary", _FakeHttpError(400))  # the resumed call (stale token)
+    conn = _connector(fake)
+    cursor = json.dumps(
+        {
+            "cutoff": _FROZEN_CUTOVER.isoformat(),
+            "calendars": {"primary": _state("T0", "stale-page-token")},
+        }
+    )
+
+    result = conn.fetch(cursor, limit=100)
+
+    assert result.reset is True
+    assert fake.calls[0]["pageToken"] == "stale-page-token"
+    restart = fake.calls[1]
+    assert "pageToken" not in restart  # restart from page 1...
+    assert restart["syncToken"] == "T0"  # ...of the SAME incremental walk
+    assert [r.external_id for r in result.records] == ["weekly-series-id-5678_20261104T170000Z"]
+    final_state = json.loads(result.next_cursor or "{}")["calendars"]["primary"]
+    assert final_state == {"sync_token": "S-fresh", "page_token": None, "mode": "incr"}
+
+
+def test_walk_stopped_at_a_page_boundary_produces_no_gaps_or_repeats(
+    runner_db, monkeypatch
+):
+    """Termination property end-to-end: two runs over a 250-item page split
+    ingest every instance exactly once (no gaps from slicing, no re-runs)."""
+    h = Harness(runner_db)
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", _OLD_ENOUGH)
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue_page("primary", "", {"items": _instance_page(0, 250), "nextPageToken": "p2"})
+    fake.queue_page("primary", "p2", {"items": _instance_page(250, 50), "nextSyncToken": "S-end"})
+
+    first = h.runner(_connector(fake)).run(limit=100)  # boundary stop after page 1
+    second = h.runner(_connector(fake)).run(limit=100)  # resumes at p2, completes
+
+    assert (first.created, second.created) == (250, 50)
+    items = h.repo.list(item_type=None, project=None, status=None, limit=500, offset=0)
+    assert len(items) == 300  # every instance exactly once

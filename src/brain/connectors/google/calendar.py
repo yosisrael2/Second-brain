@@ -198,9 +198,14 @@ def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
     )
 
 
-def _parse_cursor(cursor: str | None) -> tuple[datetime | None, dict[str, str]]:
-    """Decode the gcal cursor: (frozen cutoff, {calendarId: syncToken}).
+def _parse_cursor(
+    cursor: str | None,
+) -> tuple[datetime | None, dict[str, dict[str, Any]]]:
+    """Decode the gcal cursor: (frozen cutoff, {calendarId: walk state}).
 
+    Per-calendar state: {"sync_token": str|None, "page_token": str|None,
+    "mode": "full"|"incr"}; ``mode`` is derived from ``sync_token`` presence
+    (``incr`` iff a sync token is held) and stored for the review-spec shape.
     A bad/absent cursor means full resync: (None, {}).
     """
     if not cursor:
@@ -214,7 +219,17 @@ def _parse_cursor(cursor: str | None) -> tuple[datetime | None, dict[str, str]]:
     calendars = decoded.get("calendars")
     if not isinstance(calendars, dict):
         calendars = {}
-    tokens = {str(k): str(v) for k, v in calendars.items() if str(v).strip()}
+    states: dict[str, dict[str, Any]] = {}
+    for key, value in calendars.items():
+        if not isinstance(value, dict):
+            continue  # unknown shape -> that calendar restarts from scratch
+        sync_token = str(value.get("sync_token") or "").strip() or None
+        page_token = str(value.get("page_token") or "").strip() or None
+        states[str(key)] = {
+            "sync_token": sync_token,
+            "page_token": page_token,
+            "mode": "incr" if sync_token is not None else "full",
+        }
     cutoff: datetime | None = None
     raw_cutoff = str(decoded.get("cutoff") or "").strip()
     if raw_cutoff:
@@ -224,7 +239,7 @@ def _parse_cursor(cursor: str | None) -> tuple[datetime | None, dict[str, str]]:
             parsed = None
         if parsed is not None and parsed.tzinfo is not None:
             cutoff = parsed
-    return cutoff, tokens
+    return cutoff, states
 
 
 @register
@@ -247,42 +262,49 @@ class GCalConnector(GoogleConnector):
         """
         if limit <= 0:
             return FetchResult(records=[], next_cursor=cursor, reset=False)
-        frozen_cutoff, tokens = _parse_cursor(cursor)
+        frozen_cutoff, calendar_states = _parse_cursor(cursor)
         service = self._service()
         zone = self._zone()
         cutoff = frozen_cutoff or datetime.now(UTC) - timedelta(
             days=self._settings().brain_gcal_past_days
         )
         records: list[SourceRecord] = []
-        next_tokens: dict[str, str] = {}
+        next_states: dict[str, dict[str, Any]] = {}
         reset = False
         for calendar_id in self._calendar_ids():
             if len(records) >= limit:
                 break
-            token = tokens.get(calendar_id)
+            state = calendar_states.get(calendar_id) or {}
+            sync_token = state.get("sync_token")
+            page_token = state.get("page_token")
             remaining = limit - len(records)
             try:
-                events, sync_token = self._sync_calendar(
-                    service, calendar_id, token, cutoff, zone, remaining
+                events, next_state = self._walk_calendar(
+                    service, calendar_id, sync_token, page_token, cutoff, zone, remaining
                 )
             except _SyncTokenExpired:
-                # Token expired/invalid (410): drop it and fully re-list this
-                # calendar from the frozen cutoff. Other calendars' tokens
-                # stay valid.
+                # SyncToken expired/invalid (410): drop it and fully re-list
+                # this calendar from the frozen cutoff. Other calendars'
+                # states stay valid.
                 reset = True
-                events, sync_token = self._sync_calendar(
-                    service, calendar_id, None, cutoff, zone, remaining
+                events, next_state = self._walk_calendar(
+                    service, calendar_id, None, None, cutoff, zone, remaining
+                )
+            except ConnectorError as exc:
+                if page_token is None or exc.status not in (400, 410):
+                    raise
+                # A STORED page_token was rejected (expired page token —
+                # pageTokens are short-lived): restart THIS calendar's walk
+                # from page 1 with the same mode/token (the sync guide's
+                # consistency rule) and tell the runner this is a resync.
+                reset = True
+                events, next_state = self._walk_calendar(
+                    service, calendar_id, sync_token, None, cutoff, zone, remaining
                 )
             records.extend(self._map_events(events, calendar_id, zone))
-            if sync_token is not None:
-                next_tokens[calendar_id] = sync_token
-            elif token is not None:
-                # The walk stopped at the limit mid-way: keep the OLD token so
-                # the next run re-lists from the last complete position
-                # (idempotent — the runner dedupes by external_id/version).
-                next_tokens[calendar_id] = token
+            next_states[calendar_id] = next_state
         next_cursor = json.dumps(
-            {"cutoff": cutoff.isoformat(), "calendars": next_tokens}, sort_keys=True
+            {"cutoff": cutoff.isoformat(), "calendars": next_states}, sort_keys=True
         )
         return FetchResult(records=records, next_cursor=next_cursor, reset=reset)
 
@@ -309,27 +331,31 @@ class GCalConnector(GoogleConnector):
             records.append(replace(record, meta={**record.meta, "calendar_id": calendar_id}))
         return records
 
-    def _sync_calendar(
+    def _walk_calendar(
         self,
         service: Any,
         calendar_id: str,
         sync_token: str | None,
+        resume_page_token: str | None,
         cutoff: datetime,
         zone: ZoneInfo,
         budget: int,
-    ) -> tuple[list[dict[str, Any]], str | None]:
-        """Walk one calendar's instances; returns (events, nextSyncToken).
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Walk one calendar's instances; returns (events, next walk state).
 
-        ``singleEvents=true`` + ``showDeleted=true`` always (instance-per-
-        record; parameter set identical on full and incremental calls per the
-        sync guide). The full sync bounds the past server-side with
-        ``timeMin`` (banned only WITH a syncToken); the client-side cutoff
-        filter covers incremental deliveries of old instances. Dropped
-        records do not consume budget.
+        The walk is RESUMABLE: request parameters are identical for every
+        page of a walk (the sync guide's consistency rule; fixed
+        ``maxResults``), only ``pageToken`` advances. The walk stops at PAGE
+        boundaries only — never slicing a page mid-way, so a batch may exceed
+        ``budget`` by up to one page — and the interrupted position is stored
+        (``page_token``) so the next run resumes instead of restarting.
 
-        ``nextSyncToken`` is None when the walk stopped at ``budget`` before
-        the source signaled a complete sync — the caller then keeps the old
-        token so nothing is marked consumed that was not fully read.
+        Returned state: ``{"sync_token": <held token>, "page_token":
+        <resume token or None>, "mode": "full"|"incr"}``. Only a walk whose
+        last page delivered ``nextSyncToken`` switches to a held sync token;
+        if the final page lacks one (should not happen per the API), the
+        PREVIOUS sync token is kept so nothing is marked consumed that was
+        not fully read.
         """
         events: list[dict[str, Any]] = []
 
@@ -338,7 +364,9 @@ class GCalConnector(GoogleConnector):
                 "calendarId": calendar_id,
                 "showDeleted": True,  # cancellations must surface as deleted records
                 "singleEvents": True,  # instance-per-record (see module docstring)
-                "maxResults": min(budget, _MAX_PAGE_RESULTS),
+                # FIXED page size for the whole walk (consistency rule); the
+                # batch may exceed the runner's limit by up to one page.
+                "maxResults": _MAX_PAGE_RESULTS,
             }
             if sync_token is not None:
                 params["syncToken"] = sync_token
@@ -347,11 +375,13 @@ class GCalConnector(GoogleConnector):
                 # lower bound on the event END). Illegal with a syncToken —
                 # the frozen client-side cutoff covers incremental calls.
                 params["timeMin"] = cutoff.isoformat()
-            if page_token:
-                params["pageToken"] = page_token
+            token = page_token or resume_page_token  # first call resumes the walk
+            if token:
+                params["pageToken"] = token
             return service.events().list(**params)
 
         last_sync_token: str | None = None
+        stop_at_page: str | None = None
         try:
             for page in self.iter_pages(build_request):
                 for payload in page.get("items") or []:
@@ -359,12 +389,13 @@ class GCalConnector(GoogleConnector):
                         events.append(payload)
                 if page.get("nextSyncToken"):
                     last_sync_token = str(page["nextSyncToken"])
-                if len(events) >= budget and page.get("nextPageToken"):
-                    # Budget reached with more pages pending: stop and cap the
-                    # batch; the caller keeps the OLD token so the un-read
-                    # remainder re-fetches next run (idempotent by
-                    # external_id/version at the runner).
-                    return events[:budget], None
+                next_page = page.get("nextPageToken")
+                if next_page and len(events) >= budget:
+                    # Budget reached at a PAGE boundary: store the position
+                    # and stop. The next run resumes from that page token —
+                    # nothing is re-fetched forever, nothing is dropped.
+                    stop_at_page = str(next_page)
+                    break
         except ConnectorRetryableError as exc:
             # The base translation marks an expired sync cursor as a retryable
             # with status 410 (the contract's cursor-invalidation signal);
@@ -372,4 +403,17 @@ class GCalConnector(GoogleConnector):
             if exc.status != 410:
                 raise
             raise _SyncTokenExpired(f"syncToken for {calendar_id!r} expired") from exc
-        return events, last_sync_token
+        if stop_at_page is not None:
+            return events, {
+                "sync_token": sync_token,
+                "page_token": stop_at_page,
+                "mode": "incr" if sync_token is not None else "full",
+            }
+        # Complete walk: hold the new sync token (fall back to the previous
+        # one if the last page surprisingly carried none — never advance to
+        # "no token", that would turn the next run into a full re-list).
+        return events, {
+            "sync_token": last_sync_token or sync_token,
+            "page_token": None,
+            "mode": "incr" if (last_sync_token or sync_token) is not None else "full",
+        }
