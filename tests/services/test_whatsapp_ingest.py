@@ -743,8 +743,12 @@ def test_ops_endpoint_reports_today_and_media_counts(tmp_path: Path, world: Simp
     item = world.session.query(MemoryItem).one()
     meta = dict(item.meta)
     messages = [dict(m) for m in meta["messages"]]
-    messages.append({"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}})
-    messages.append({"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}})
+    messages.append(
+        {"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}}
+    )
+    messages.append(
+        {"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}}
+    )
     meta["messages"] = messages
     item.meta = meta
     world.session.commit()

@@ -5,10 +5,10 @@ Never pointed at the live DB by the caller (worker_7 only).
 """
 
 import os
-import uuid
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import sys
+import uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -20,7 +20,7 @@ from brain.db.models import ItemRelation, MemoryItem, WhatsAppPollState  # noqa:
 DATABASE_URL = os.environ["DATABASE_URL"]
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
-now = datetime.now(timezone.utc)
+now = datetime.now(UTC)
 
 A = uuid.uuid4()
 B = uuid.uuid4()
@@ -84,15 +84,21 @@ with Session() as s:
     s.add_all(
         [
             ItemRelation(
-                from_id=B, to_id=A, kind="supersedes",
+                from_id=B,
+                to_id=A,
+                kind="supersedes",
                 provenance={"state": "applied", "how": "same_thread"},
             ),
             ItemRelation(
-                from_id=C, to_id=A, kind="supersedes",
+                from_id=C,
+                to_id=A,
+                kind="supersedes",
                 provenance={"state": "proposed", "how": "llm_match"},
             ),
             ItemRelation(
-                from_id=T, to_id=F, kind="derived_from",
+                from_id=T,
+                to_id=F,
+                kind="derived_from",
                 provenance={"state": "applied", "how": "llm_match"},
             ),
         ]
@@ -102,18 +108,24 @@ with Session() as s:
     s.add_all(
         [
             WhatsAppPollState(
-                chat_jid=FAMILY, channel_name="Family",
+                chat_jid=FAMILY,
+                channel_name="Family",
                 cursor_utc=now - timedelta(minutes=4),
                 last_poll_at=now - timedelta(minutes=1),
                 last_message_at=now - timedelta(minutes=9),
-                messages_seen=42, conversations_created=7, conversations_updated=3,
+                messages_seen=42,
+                conversations_created=7,
+                conversations_updated=3,
             ),
             WhatsAppPollState(
-                chat_jid=GROUP, channel_name="Project group",
+                chat_jid=GROUP,
+                channel_name="Project group",
                 cursor_utc=now - timedelta(hours=1, minutes=10),
                 last_poll_at=now - timedelta(minutes=1),
                 last_message_at=now - timedelta(days=2),
-                messages_seen=15, conversations_created=2, conversations_updated=1,
+                messages_seen=15,
+                conversations_created=2,
+                conversations_updated=1,
             ),
         ]
     )
@@ -129,17 +141,43 @@ with Session() as s:
         source="whatsapp",
         type="note",
         meta={
-            "kind": "whatsapp_conversation", "channel": "Family", "chat_jid": FAMILY,
+            "kind": "whatsapp_conversation",
+            "channel": "Family",
+            "chat_jid": FAMILY,
             "first_message_at": (now - timedelta(minutes=30)).isoformat(),
             "last_message_at": (now - timedelta(minutes=5)).isoformat(),
             "messages": [
-                msg("w1", "Ima", (now - timedelta(minutes=30)).isoformat(), "Don't forget the dentist tomorrow"),
-                msg("m-photo-1", "Aba", (now - timedelta(minutes=20)).isoformat(), "",
-                    {"media_type": "image", "filename": "ticket.jpg", "message_id": "m-photo-1",
-                     "status": "saved", "attachment_item_id": str(F)}),
-                msg("m-voice-1", "Ima", (now - timedelta(minutes=5)).isoformat(), "",
-                    {"media_type": "audio", "filename": "voice.ogg", "message_id": "m-voice-1",
-                     "status": "not read yet"}),
+                msg(
+                    "w1",
+                    "Ima",
+                    (now - timedelta(minutes=30)).isoformat(),
+                    "Don't forget the dentist tomorrow",
+                ),
+                msg(
+                    "m-photo-1",
+                    "Aba",
+                    (now - timedelta(minutes=20)).isoformat(),
+                    "",
+                    {
+                        "media_type": "image",
+                        "filename": "ticket.jpg",
+                        "message_id": "m-photo-1",
+                        "status": "saved",
+                        "attachment_item_id": str(F),
+                    },
+                ),
+                msg(
+                    "m-voice-1",
+                    "Ima",
+                    (now - timedelta(minutes=5)).isoformat(),
+                    "",
+                    {
+                        "media_type": "audio",
+                        "filename": "voice.ogg",
+                        "message_id": "m-voice-1",
+                        "status": "not read yet",
+                    },
+                ),
             ],
         },
         created_at=now - timedelta(hours=1),
@@ -150,7 +188,9 @@ with Session() as s:
         type="note",
         created_at=now - timedelta(days=1),
         meta={
-            "kind": "whatsapp_conversation", "channel": "Family", "chat_jid": FAMILY,
+            "kind": "whatsapp_conversation",
+            "channel": "Family",
+            "chat_jid": FAMILY,
             "messages": [
                 msg("y1", "Ima", (now - timedelta(days=1)).isoformat(), "Shabbat at ours, 19:00"),
             ],
@@ -167,15 +207,34 @@ with Session() as s:
         type="note",
         created_at=now - timedelta(hours=2),
         meta={
-            "kind": "whatsapp_conversation", "channel": "Project group", "chat_jid": GROUP,
+            "kind": "whatsapp_conversation",
+            "channel": "Project group",
+            "chat_jid": GROUP,
             "messages": [
-                msg("g1", "Dana", (now - timedelta(hours=2)).isoformat(), "The staging deploy is green again"),
-                msg("m-pdf-1", "Ran", (now - timedelta(hours=1)).isoformat(), "",
-                    {"media_type": "document", "filename": "incident-42.pdf",
-                     "message_id": "m-pdf-1", "status": "saved"}),
+                msg(
+                    "g1",
+                    "Dana",
+                    (now - timedelta(hours=2)).isoformat(),
+                    "The staging deploy is green again",
+                ),
+                msg(
+                    "m-pdf-1",
+                    "Ran",
+                    (now - timedelta(hours=1)).isoformat(),
+                    "",
+                    {
+                        "media_type": "document",
+                        "filename": "incident-42.pdf",
+                        "message_id": "m-pdf-1",
+                        "status": "saved",
+                    },
+                ),
             ],
         },
     )
     s.add_all([fam_today, fam_yesterday, grp_today])
     s.commit()
-    print("seeded:", {"family": str(FAMILY), "group": GROUP, "superseded_old": str(A), "current": str(B)})
+    print(
+        "seeded:",
+        {"family": str(FAMILY), "group": GROUP, "superseded_old": str(A), "current": str(B)},
+    )
