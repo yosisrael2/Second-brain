@@ -7,8 +7,9 @@ Tables (one migration, owned by the connectors ticket):
 ``connector_records`` is the runner's idempotency memory: it maps every
 synced external id to the item it produced and the version it saw, so
 re-running a sync never duplicates and version bumps update in place. The
-FK to memory_items is ON DELETE CASCADE: a user who deletes the item makes
-the runner re-capture the record on the next sync.
+FK to memory_items is ON DELETE SET NULL: a user who deletes the item has
+acted on it — the record stays (item_id NULL) and the runner never
+re-captures it.
 """
 
 from __future__ import annotations

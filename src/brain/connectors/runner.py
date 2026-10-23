@@ -233,17 +233,17 @@ class ConnectorRunner:
         """Apply one record; returns created|updated|deleted|skipped."""
         name = self._connector.name
         row = self._records.get(name, record.external_id)
-        item = self._repo.get(row.item_id) if row is not None else None
-        if row is not None and item is None:
-            # The item was deleted out-of-band (CASCADE removed the ledger
-            # row already; a stale in-session row is dropped here): re-sync
-            # treats this record as new.
-            row = None
+        item = self._repo.get(row.item_id) if row is not None and row.item_id else None
+        if row is not None and row.item_id is None:
+            # USER-DELETED: the item was deleted out-of-band and the ledger's
+            # SET NULL kept the row. Deleting is a user decision — never
+            # re-capture this record.
+            return "skipped"
 
         if row is None or item is None:
-            # Unknown record, or the item was deleted out-of-band (the
-            # ledger's CASCADE would normally have removed the row too): the
-            # sync treats it as new.
+            # Unknown record — or a race (the item vanished between the two
+            # reads): the sync treats it as new. The ledger put below upserts,
+            # so no duplicate row can appear.
             if record.deleted:
                 return "skipped"  # never create items for already-deleted records
             item = self._ingest.create(
@@ -263,7 +263,18 @@ class ConnectorRunner:
         if record.version == row.version and record.deleted == already_deleted:
             return "skipped"
 
-        # Changed (or un-deleted): update what the source owns, in place.
+        # Changed (or un-deleted): update what the source owns, in place —
+        # unless the USER edited the text since the framework wrote it.
+        # Detection: the framework stores its last-written text in meta under
+        # 'connector_text'; a mismatch means the user owns the text now (same
+        # rule as the extraction re-run: user-acted items are never
+        # overwritten). Only the version marker moves, so this bump is not
+        # re-reported on every later sync.
+        if item.raw_text != stored_meta.get("connector_text"):
+            item.meta = {**stored_meta, **self._framework_meta(record)}
+            self._repo.commit()
+            self._records.put(name, record.external_id, record.version, item.id)
+            return "skipped"
         item.raw_text = record.text
         item.occurred_at = record.occurred_at
         item.meta = {**stored_meta, **self._framework_meta(record)}
@@ -287,12 +298,18 @@ class ConnectorRunner:
         return "deleted" if record.deleted else "updated"
 
     def _framework_meta(self, record: SourceRecord) -> dict[str, Any]:
-        """The one place item meta is built (SIMPLIFY target: single site)."""
+        """The one place item meta is built (SIMPLIFY target: single site).
+
+        ``connector_text`` is the last text the framework wrote — the update
+        path compares against it to detect a USER edit and then never
+        overwrites the item's text again.
+        """
         meta: dict[str, Any] = {
             "connector": self._connector.name,
             "external_id": record.external_id,
             "version": record.version,
             "url": record.url,
+            "connector_text": record.text,
         }
         meta.update(record.meta)  # the record's own keys win
         return meta
