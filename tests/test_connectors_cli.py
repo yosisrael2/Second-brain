@@ -229,7 +229,9 @@ def test_auth_google_stores_only_the_refresh_token(
         "_build_connectors_oauth_flow",
         lambda path, scopes: flow.from_client_secret_file(path, scopes),
     )
-    monkeypatch.setattr(cli, "Keychain", lambda: FakeKeychain())
+    # The handler imports Keychain from the service module at call time, so
+    # the seam is the module attribute (CI has no `security` binary).
+    monkeypatch.setattr("brain.services.keychain.Keychain", lambda: FakeKeychain())
 
     assert cli.main(["connectors", "auth", "google", "--client-secret", str(secret)]) == 0
     out = capsys.readouterr().out
