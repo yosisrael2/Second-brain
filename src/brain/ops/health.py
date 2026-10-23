@@ -45,6 +45,8 @@ class HealthContext:
         background: Callable[[], dict[str, Any]] | None = None,
         whatsapp: Callable[[], dict[str, Any]] | None = None,
         email: Callable[[], dict[str, Any]] | None = None,
+        attachments: Callable[[], dict[str, Any]] | None = None,
+        enrichment: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -57,6 +59,8 @@ class HealthContext:
         self.background = background or _background_check
         self.whatsapp = whatsapp or _whatsapp_check
         self.email = email or _email_check
+        self.attachments = attachments or _attachments_check
+        self.enrichment = enrichment or _enrichment_check
 
 
 def reset_cache() -> None:
@@ -142,7 +146,8 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             return _entry("down", "bot never heartbeated", raw)
         if age > 1800:
             return _entry("down", f"heartbeat {age:.0f}s ago", raw)
-        if age > 60:
+        degraded_after = raw.get("degraded_after_s", 60)
+        if age > degraded_after:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"heartbeat {age:.0f}s ago", raw)
     if component == "whatsapp":
@@ -168,9 +173,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         if not raw.get("label_set", False):
             return _entry("disabled", "GMAIL_LABEL_ID unset", raw)
         if not raw.get("token_set", False):
-            return _entry(
-                "disabled", "no refresh token — run brain gmail-auth", raw
-            )
+            return _entry("disabled", "no refresh token — run brain gmail-auth", raw)
         state = raw.get("state")
         if state == "needs re-auth":
             return _entry("degraded", "needs re-auth", raw)
@@ -184,6 +187,27 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         if age > 150:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"poll ok · heartbeat {age:.0f}s ago", raw)
+    if component == "attachments":
+        last_error = raw.get("last_error")
+        if last_error:
+            return _entry(
+                "degraded",
+                f"queue {raw.get('queue_depth', 0)} · last error {last_error.get('kind')}",
+                raw,
+            )
+        return _entry(
+            "ok",
+            f"queue {raw.get('queue_depth', 0)} · read today {raw.get('read_today', 0)}"
+            f"/{raw.get('daily_budget', '?')}",
+            raw,
+        )
+    if component == "enrichment":
+        worker = raw.get("worker_enabled")
+        summary = (
+            f"queue {raw.get('queue_depth', 0)} · cap {raw.get('cap_used_today', 0)}"
+            f"/{raw.get('cap_limit', '?')} · worker {'on' if worker else 'off (inert)'}"
+        )
+        return _entry("ok", summary, raw)
     if component == "docker":
         if not raw.get("available", False):
             return _entry("disabled", "docker unavailable", raw)
@@ -220,6 +244,8 @@ def run_health_checks(
         "llm": _safe(context.llm),
         "telegram": _safe(context.telegram),
         "email": _safe(context.email),
+        "attachments": _safe(context.attachments),
+        "enrichment": _safe(context.enrichment),
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
@@ -427,6 +453,9 @@ def _llm_check() -> dict[str, Any]:
     return {"provider": settings.llm_provider, "model": model or None}
 
 
+TELEGRAM_HEARTBEAT_MARGIN_S = 30
+
+
 def _email_check() -> dict[str, Any]:
     """Raw email-poller facts: label + keychain token + last heartbeat state.
 
@@ -472,10 +501,16 @@ def _telegram_check() -> dict[str, Any]:
     token_set = settings.telegram_bot_token is not None
     allowlist_set = bool(settings.telegram_allowed_user_ids.strip())
     age = ops.heartbeat_age_seconds("telegram")
+    # The heartbeat threshold follows the bot's ACTUAL long-poll timeout: a
+    # quiet getUpdates can occupy the whole window, so anything up to
+    # timeout + margin is a healthy quiet poll, not a flap (ops polish).
+    poll_timeout_s = int(settings.telegram_poll_timeout_s)
     details: dict[str, Any] = {
         "token_set": token_set,
         "allowlist_set": allowlist_set,
         "heartbeat_age_s": age,
+        "poll_timeout_s": poll_timeout_s,
+        "degraded_after_s": poll_timeout_s + TELEGRAM_HEARTBEAT_MARGIN_S,
     }
     last_error = ops.latest_event("telegram", ok=False)
     if last_error:
@@ -775,3 +810,47 @@ def _probe_llm() -> dict[str, Any]:
         "latency_ms": latency,
         "summary": f"{completion.model or '?'} answered in {latency:.0f}ms",
     }
+
+
+def _attachments_check() -> dict[str, Any]:
+    """Attachment reading (F1): queue depth, budget usage, last error.
+
+    Mirrors GET /ops/attachments (same in-process service — the API process
+    owns the reading queue); read-only, never raises past _safe().
+    """
+    from brain.api.deps import _attachment_service  # noqa: PLC0415 (deferred: api cycle)
+
+    svc = _attachment_service()
+    details: dict[str, Any] = {
+        "queue_depth": svc.queue_depth(),
+        "read_today": svc.read_today(),
+        "daily_budget": svc.daily_budget,
+    }
+    last_error = ops.latest_event("attachments", ok=False)
+    if last_error:
+        details["last_error"] = {"kind": last_error["kind"], "ts": _iso(last_error["ts"])}
+    return details
+
+
+def _enrichment_check() -> dict[str, Any]:
+    """Extraction/enrichment (A1): queue depth, cap usage, worker on/off.
+
+    Mirrors GET /ops/enrichment. The worker being OFF is the designed inert
+    state (no children, no cards, no pings) — reported, never degraded.
+    """
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+
+    now = datetime.now(tz=UTC)
+    with SessionLocal() as session:
+        service = EnrichmentService(ItemsRepository(session), session)
+        details: dict[str, Any] = {
+            "worker_enabled": get_settings().enrichment_worker_enabled,
+            "queue_depth": service.queue_depth(),
+            "cap_used_today": service.cap_used_today(now),
+            "cap_limit": get_settings().enrichment_daily_cap,
+        }
+    return details

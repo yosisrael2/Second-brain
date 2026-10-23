@@ -145,6 +145,10 @@ class Settings(BaseSettings):
     # allowlist is REQUIRED with a token — the bot never answers strangers.
     telegram_bot_token: SecretStr | None = None
     telegram_allowed_user_ids: str = ""  # comma-separated Telegram user ids
+    # The bot's getUpdates long-poll timeout (seconds). ONE source of truth:
+    # the poll loop uses it, and /ops/health derives the telegram heartbeat
+    # threshold from it (timeout + margin) so a quiet poll never flaps.
+    telegram_poll_timeout_s: int = 50
 
     # Email source (F2): a read-only Gmail label poller. The label ID is an
     # immutable Gmail label id (never its display name); the OAuth refresh
@@ -224,7 +228,7 @@ def test_collection_for(database_name: str) -> str:
     already end in ``_test`` (conftest enforces that before calling).
     """
     if database_name.startswith("brain_"):
-        database_name = database_name[len("brain_"):]
+        database_name = database_name[len("brain_") :]
     return f"brain_items_{database_name}"
 
 
