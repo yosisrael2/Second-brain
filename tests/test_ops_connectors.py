@@ -48,12 +48,24 @@ def _state(session: Any, name: str, **fields: Any) -> None:
     session.commit()
 
 
-def _records(session: Any, source: str, external_ids: list[str]) -> None:
+def _records(
+    session: Any,
+    source: str,
+    external_ids: list[str],
+    *,
+    status: str = "synced",
+) -> None:
     from brain.db.models import ConnectorRecord
 
     for eid in external_ids:
         session.add(
-            ConnectorRecord(source=source, external_id=eid, version="v1", item_id=None)
+            ConnectorRecord(
+                source=source,
+                external_id=eid,
+                version="v1",
+                item_id=None,
+                status=status,
+            )
         )
     session.commit()
 
@@ -88,7 +100,6 @@ def test_one_ok_and_one_errored_with_last_error_and_counts(
         last_run_at=datetime(2026, 10, 23, 9, 0, tzinfo=UTC),
         last_ok_at=datetime(2026, 10, 23, 9, 0, tzinfo=UTC),
         last_error=None,
-        counters={"quarantined": 2},
     )
     _state(
         conn_db,
@@ -99,6 +110,7 @@ def test_one_ok_and_one_errored_with_last_error_and_counts(
         last_error="refresh token rejected: <invalid_grant> & more",
     )
     _records(conn_db, "email", ["m1", "m2", "m3"])
+    _records(conn_db, "email", ["m4"], status="failed")  # poisoned -> quarantined
     _records(conn_db, "gcal", ["e1"])
 
     payload = _get(monkeypatch, registered=["email", "gcal"], enabled="email")
@@ -108,8 +120,8 @@ def test_one_ok_and_one_errored_with_last_error_and_counts(
     email, gcal = rows["email"], rows["gcal"]
     assert email["enabled"] is True
     assert email["cursor_present"] is True
-    assert email["records"] == 3
-    assert email["quarantined"] == 2
+    assert email["records"] == 4  # every ledger row for the source
+    assert email["quarantined"] == 1  # the status='failed' poison record
     assert email["last_error"] is None
     assert email["last_ok_at"] == "2026-10-23T09:00:00+00:00"
     # The errored one: enabled=False (not in BRAIN_CONNECTORS) but LISTED

@@ -365,6 +365,17 @@ def get_ops_connectors() -> dict[str, Any]:
                 text("SELECT source, count(*) FROM connector_records GROUP BY source")
             ).all()
         )
+        # Quarantine (review round 2 of #53): poison records are ledger rows
+        # with status 'failed' — the same source of truth as
+        # ConnectorRecordRepo.quarantined_counts().
+        quarantined = dict(
+            conn.execute(
+                text(
+                    "SELECT source, count(*) FROM connector_records "
+                    "WHERE status = 'failed' GROUP BY source"
+                )
+            ).all()
+        )
     names = sorted(registered | {row["name"] for row in state_rows})
     rows: dict[str, dict[str, Any]] = {
         name: {
@@ -375,7 +386,7 @@ def get_ops_connectors() -> dict[str, Any]:
             "last_error": None,
             "cursor_present": False,
             "records": int(counts.get(name, 0)),
-            "quarantined": 0,
+            "quarantined": int(quarantined.get(name, 0)),
         }
         for name in names
     }
@@ -383,15 +394,10 @@ def get_ops_connectors() -> dict[str, Any]:
         entry = rows.get(row["name"])
         if entry is None:  # pragma: no cover — the name seeded rows itself
             continue
-        counters = row["counters"] or {}
         entry["last_run_at"] = _iso(row["last_run_at"]) if row["last_run_at"] else None
         entry["last_ok_at"] = _iso(row["last_ok_at"]) if row["last_ok_at"] else None
         entry["last_error"] = row["last_error"]
         entry["cursor_present"] = row["cursor"] is not None
-        # #53 is adding a per-connector quarantine count; until its shape
-        # lands, read it from the state counters (re-point at the column
-        # when the migration carries one).
-        entry["quarantined"] = int(counters.get("quarantined") or 0)
     return {"connectors": list(rows.values())}
 
 
