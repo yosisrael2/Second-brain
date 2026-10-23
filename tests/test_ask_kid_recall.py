@@ -86,8 +86,7 @@ def _world() -> tuple[MemoryService, ItemsRepository]:
     memory = MemoryService(MemoryRepository(session))
     for entity in memory.overview(status="confirmed", q=None):
         memory.delete_entity(entity["id"])
-    yield memory, ItemsRepository(session)
-    session.close()
+    return memory, ItemsRepository(session)
 
 
 def _seed_itamar_world(memory: MemoryService, repo: ItemsRepository) -> MemoryItem:
