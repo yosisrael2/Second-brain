@@ -22,11 +22,15 @@ passed since its last message), new messages UPDATE that same item in place:
 lines are appended and meta/fingerprint follow. After the gap, a new
 conversation (and item) starts.
 
-Media (item 47, deferred to PR D's second half after F1): a media message is
-kept inside its conversation as a recorded ``[<type>: <filename> — attachment
-not read yet]`` marker plus a stable media reference in meta (media_type,
-filename, file_length, message_id). D1 downloads NOTHING and never copies the
-private CDN url into our store.
+Media (item 47, wired in F3): when the attachments core and a media client
+are wired, every fresh media message in an ALLOWLISTED channel is downloaded
+via the bridge's local REST ``POST /api/download`` (read-only from our side:
+never ``/api/send``), captured as its own attachment item (source=
+'whatsapp', parent = the conversation item) and read through the daily
+budget. The conversation line's "attachment not read yet" marker is then
+replaced with a link to the attachment item. Without the wiring (or after a
+failed download) the marker stays — media is still recorded, just not read.
+Oversized files (> 20 MB) are skipped BEFORE any download.
 
 Timestamps (item 41): the bridge stores Go time.Time strings carrying the
 machine's local offset (+03:00/+02:00 across DST). Every timestamp is parsed
@@ -45,7 +49,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -287,6 +291,86 @@ class ItemIndexerProto(Protocol):
     def index(self, item: MemoryItem) -> bool: ...
 
 
+class MediaDownloadError(Exception):
+    """The bridge media download failed, returned a bad payload, or the
+    returned path is outside the bridge store root — refused, never stored."""
+
+
+class WhatsAppMediaClient:
+    """F3 (item 47): fetch media through the bridge's local REST download.
+
+    The REAL bridge contract (whatsapp-bridge/main.go ``/api/download``): it
+    downloads the media to its own store dir and responds application/json
+    ``DownloadMediaResponse {success, message, filename, path}`` — NEVER the
+    bytes (HTTP 500 + ``success:false`` on failure). This client parses that
+    JSON, requires ``success``, then VALIDATES the path: realpath must lie
+    inside the bridge store root (derived from ``WHATSAPP_BRIDGE_DB``'s
+    directory) and must be a regular file; symlinks resolving outside are
+    refused. Only then are the bytes read. Anything else raises
+    ``MediaDownloadError`` — refused, never stored.
+
+    Read-only from our side, structurally: the client exposes ONLY
+    ``download`` — there is no send capability on this class at all, and the
+    private CDN url / media keys from the store are never copied anywhere.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8085",
+        timeout_s: float = 30.0,
+        store_root: str | Path | None = None,
+        transport: Any | None = None,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+        self._store_root = Path(store_root).expanduser().resolve() if store_root else None
+        self._transport = transport
+
+    def download(self, message_id: str, chat_jid: str) -> bytes:
+        import httpx  # noqa: PLC0415
+
+        client = httpx.Client(transport=self._transport) if self._transport else httpx.Client()
+        try:
+            response = client.post(
+                f"{self._base_url}/api/download",
+                json={"message_id": message_id, "chat_jid": chat_jid},
+                timeout=self._timeout_s,
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                # The real bridge answers failure as 500 + {success: false,
+                # message}; prefer its message over a bare HTTP error.
+                if not payload.get("success"):
+                    message = str(payload.get("message") or "unknown error")
+                    raise MediaDownloadError(f"bridge download failed: {message[:200]}")
+            elif response.is_error:
+                response.raise_for_status()  # non-JSON HTTP error
+            else:
+                raise MediaDownloadError("bridge download returned non-JSON response")
+            path = payload.get("path")
+            if not path:
+                raise MediaDownloadError("bridge response carries no 'path'")
+            resolved = Path(str(path)).expanduser().resolve()
+            if self._store_root is None:
+                raise MediaDownloadError(
+                    "no bridge store root configured — refusing to read downloads"
+                )
+            if resolved != self._store_root and self._store_root not in resolved.parents:
+                raise MediaDownloadError(
+                    f"refusing path outside the bridge store root: {str(path)[:200]}"
+                )
+            if not resolved.is_file():
+                raise MediaDownloadError(
+                    f"downloaded media is not a regular file: {str(path)[:200]}"
+                )
+            return resolved.read_bytes()
+        finally:
+            client.close()
+
+
 # --- poller -----------------------------------------------------------------------
 
 
@@ -300,6 +384,8 @@ class ChannelPollResult:
     created: int
     updated: int
     cursor_utc: datetime | None
+    # F3: (message, parent conversation item id) for every fresh media message.
+    media: list[tuple[BridgeMessage, UUID]] = field(default_factory=list)
 
 
 class WhatsAppPoller:
@@ -330,6 +416,8 @@ class WhatsAppPoller:
         overlap_minutes: int = DEFAULT_OVERLAP_MINUTES,
         backfill_since: datetime | None = None,
         commit: bool = False,
+        attachments: Any | None = None,
+        media_client: Any | None = None,
     ) -> None:
         if overlap_minutes >= gap_minutes:
             raise PollerError(
@@ -351,6 +439,11 @@ class WhatsAppPoller:
         # persisted cursor takes over afterwards.
         self._backfill_since = backfill_since
         self._commit = commit
+        # F3 (item 47): optional attachments core + bridge media client. Both
+        # must be present for media downloads; without them media messages
+        # keep the plain "not read yet" marker (previous behaviour).
+        self._attachments = attachments
+        self._media = media_client
 
     def poll(self, *, now: datetime) -> list[ChannelPollResult]:
         """Poll every allowlisted channel once; per-channel failures are logged, not raised."""
@@ -382,6 +475,12 @@ class WhatsAppPoller:
             totals["updated"] += result.updated
         if self._commit:
             self._items.commit()
+        # F3 (item 47): media collection runs AFTER the conversation items are
+        # committed — the attachment row carries a real FK to its parent. Only
+        # allowlisted channels are in ``results`` by construction, so media in
+        # any other chat is never fetched.
+        if self._attachments is not None and self._media is not None:
+            self._collect_media(results)
         latency_ms = round((datetime.now(UTC) - started).total_seconds() * 1000, 1)
         ops.record_event(
             "whatsapp",
@@ -432,6 +531,7 @@ class WhatsAppPoller:
         cursor = state.cursor_utc
         open_id: UUID | None = state.open_item_id
         set_open = False
+        media_refs: list[tuple[BridgeMessage, UUID]] = []
         if fresh:
             cursor = fresh[-1].timestamp_utc
             # Leading messages whose chain of gaps stays within the limit
@@ -448,12 +548,16 @@ class WhatsAppPoller:
                 if idx:
                     self._append_to_conversation(open_item, fresh[:idx])
                     updated = 1
+                    media_refs.extend(
+                        (message, open_item.id) for message in fresh[:idx] if message.media_type
+                    )
             remaining = fresh[idx:]
             for group in group_conversations(remaining, gap_minutes=self._gap_minutes):
                 item = self._create_conversation(name, jid, group)
                 open_id = item.id
                 set_open = True
                 created += 1
+                media_refs.extend((message, item.id) for message in group if message.media_type)
         self._state.record_poll(
             state,
             now=now,
@@ -472,12 +576,120 @@ class WhatsAppPoller:
             created=created,
             updated=updated,
             cursor_utc=cursor,
+            media=media_refs,
         )
 
     def _open_item(self, state: WhatsAppPollState) -> MemoryItem | None:
         if state.open_item_id is None:
             return None
         return self._items.get(state.open_item_id)
+
+    # --- F3 media ------------------------------------------------------------
+
+    def _collect_media(self, results: list[ChannelPollResult]) -> None:
+        """Fetch, capture and link every fresh media message (item 47).
+
+        Per-message failures are recorded, never raised: a broken download
+        must not lose the conversation or stop the other channels.
+        """
+        touched: set[UUID] = set()
+        for result in results:
+            for message, parent_id in result.media:
+                attachment_item_id = self._handle_media(
+                    message, parent_id, self._attachments, self._media
+                )
+                if attachment_item_id is not None:
+                    touched.add(parent_id)
+                    self._replace_media_marker(parent_id, message, attachment_item_id)
+            if touched:
+                self._items.commit()
+                touched.clear()
+        try:
+            self._attachments.drain()
+        except Exception as exc:  # noqa: BLE001 — reading never fails the poll
+            ops.record_event(
+                "whatsapp",
+                "attachment_drain_error",
+                ok=False,
+                detail={"error": f"{type(exc).__name__}: {exc}"[:200]},
+            )
+
+    def _handle_media(
+        self, message: BridgeMessage, parent_id: UUID, attachments: Any, media: Any
+    ) -> UUID | None:
+        """Download + capture one media message; returns the attachment item id."""
+        from brain.services.attachments import MAX_FILE_BYTES
+
+        if message.file_length is not None and message.file_length > MAX_FILE_BYTES:
+            ops.record_event(
+                "whatsapp",
+                "media_skip_too_large",
+                ok=False,
+                detail={
+                    "message_id": message.id,
+                    "filename": message.filename,
+                    "size": message.file_length,
+                },
+            )
+            return None
+        try:
+            content = media.download(message.id, message.chat_jid)
+        except Exception as exc:  # noqa: BLE001 — recorded, never silent
+            ops.record_event(
+                "whatsapp",
+                "media_download_error",
+                ok=False,
+                detail={
+                    "message_id": message.id,
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                },
+            )
+            return None
+        try:
+            filename = message.filename or f"{message.media_type}-{message.id}"
+            att = attachments.capture(
+                parent_item_id=parent_id,
+                content=content,
+                filename=filename,
+                mime=_guess_mime(message.media_type, filename),
+                source="whatsapp",
+                source_ref=message.id,
+            )
+            attachments.submit(att.id)
+            return att.item_id
+        except Exception as exc:  # noqa: BLE001 — recorded, never silent
+            ops.record_event(
+                "whatsapp",
+                "media_capture_error",
+                ok=False,
+                detail={
+                    "message_id": message.id,
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                },
+            )
+            return None
+
+    def _replace_media_marker(
+        self, parent_id: UUID, message: BridgeMessage, attachment_item_id: UUID
+    ) -> None:
+        """Swap the "attachment not read yet" marker for the attachment link."""
+        item = self._items.get(parent_id)
+        if item is None:
+            return
+        needle = f"{message.media_type}: {message.filename}{_NOT_READ_YET}"
+        replacement = f"{message.media_type}: {message.filename} — attachment {attachment_item_id}"
+        if needle in item.raw_text:
+            item.raw_text = item.raw_text.replace(needle, replacement, 1)
+        meta = dict(item.meta or {})
+        messages = [dict(m) for m in meta.get("messages", [])]
+        for entry in messages:
+            media = entry.get("media")
+            if isinstance(media, dict) and media.get("message_id") == message.id:
+                media["status"] = "saved"
+                media["attachment_item_id"] = str(attachment_item_id)
+                entry["media"] = media
+        meta["messages"] = messages
+        item.meta = meta
 
     @staticmethod
     def _known_message_ids(item: MemoryItem | None) -> set[str]:
@@ -535,3 +747,21 @@ class WhatsAppPoller:
                 item.id,
                 exc,
             )
+
+
+_WHATSAPP_MIME: dict[str, str] = {
+    "image": "image/jpeg",
+    "video": "video/mp4",
+    "audio": "audio/ogg",
+}
+
+
+def _guess_mime(media_type: str | None, filename: str) -> str | None:
+    """A conservative mime from the bridge's media type + filename suffix."""
+    ext = Path(filename).suffix.lower()
+    if media_type == "document":
+        return "application/pdf" if ext == ".pdf" else None
+    mime = _WHATSAPP_MIME.get(media_type or "")
+    if mime == "image/jpeg" and ext in {".png", ".webp"}:
+        return f"image/{ext.lstrip('.')}"
+    return mime
