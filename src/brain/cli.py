@@ -12,12 +12,14 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from brain.ai.embedder import Embedder, EmbedderError
+from brain.ai.gmail import GMAIL_SCOPE, RestGmailClient
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
-from brain.config import get_settings, unwrap_secret
+from brain.config import Settings, get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
+from brain.services.email_poller import EmailPoller, heartbeat_email
 from brain.services.eval_extraction import (
     DEFAULT_TITLE_THRESHOLD,
     EvalError,
@@ -30,6 +32,7 @@ from brain.services.eval_extraction import (
 from brain.services.indexing import QdrantItemIndexer
 from brain.services.ingest import IngestService
 from brain.services.items import ItemsRepositoryProto
+from brain.services.keychain import GMAIL_ACCOUNT, Keychain
 from brain.services.paste import _calendar_one_liner
 
 logger = logging.getLogger(__name__)
@@ -107,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     seed_channel.add_argument(
         "--applies-to",
         required=True,
-        help="Rona | Itamar | me | family (values handed over at seed time)",
+        help="<kid name> | me | family (values handed over at seed time)",
     )
     eval_extraction = subparsers.add_parser(
         "eval-extraction",
@@ -146,6 +149,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Zone for converting offset-bearing start/due values "
         "(default: Settings.timezone from TIMEZONE)",
     )
+    gmail_auth = subparsers.add_parser(
+        "gmail-auth",
+        help="One-time Google OAuth consent; stores ONLY the refresh token "
+        "in the macOS login keychain (never in the repo or .env)",
+    )
+    gmail_auth.add_argument(
+        "--client-secret",
+        default=None,
+        help="Path to the Desktop-client secret JSON "
+        "(default: GMAIL_CREDENTIALS_PATH; keep it OUTSIDE the repo)",
+    )
+    gmail_auth.add_argument(
+        "--account",
+        default=GMAIL_ACCOUNT,
+        help=f"Keychain account name (default: {GMAIL_ACCOUNT})",
+    )
+    gmail_poll = subparsers.add_parser(
+        "gmail-poll",
+        help="Poll the configured Gmail label (GMAIL_LABEL_ID) and capture "
+        "new messages through the standard paste path",
+    )
+    gmail_poll.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one poll cycle and exit (also used by tests)",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "reindex":
@@ -174,6 +203,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.command == "eval-extraction":
         return _eval_extraction(args)
+    if args.command == "gmail-auth":
+        return _gmail_auth(args)
+    if args.command == "gmail-poll":
+        return _gmail_poll(args)
     parser.error(f"unknown command {args.command!r}")  # pragma: no cover - argparse guards
     return 2
 
@@ -564,6 +597,103 @@ def _normalize_calendar(
     repo.commit()
     print(f"normalized {normalized} calendar item(s) (run 'brain reindex' to re-embed)")
     return 0
+
+
+# --- gmail (email source, F2) -------------------------------------------------
+
+
+def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs google libs
+    """Build the installed-app OAuth flow (the ONLY google import in the CLI)."""
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise SystemExit(
+            "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
+        ) from exc
+    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=[GMAIL_SCOPE])
+
+
+def _gmail_auth(args: argparse.Namespace) -> int:
+    """One-time consent; stores ONLY the refresh token in the login keychain."""
+    settings: Settings = get_settings()
+    path = args.client_secret or settings.gmail_credentials_path
+    if not path:
+        print(
+            "gmail-auth: no client secret — pass --client-secret /path/to/secret.json "
+            "(or set GMAIL_CREDENTIALS_PATH). Keep the file OUTSIDE the repo.",
+            file=sys.stderr,
+        )
+        return 78
+    if not Path(path).exists():
+        print(f"gmail-auth: client secret file not found: {path}", file=sys.stderr)
+        return 78
+    flow = _build_oauth_flow(path)
+    print("gmail-auth: opening the browser for Google consent (read-only Gmail scope)…")
+    try:
+        creds = flow.run_local_server(port=0)
+    except KeyboardInterrupt:
+        print("gmail-auth: cancelled", file=sys.stderr)
+        return 130
+    token = creds.refresh_token
+    if not token:
+        print(
+            "gmail-auth: Google did not return a refresh token — revoke the app at "
+            "https://myaccount.google.com/permissions and re-run (prompt=consent).",
+            file=sys.stderr,
+        )
+        return 78
+    Keychain().store(args.account, token)
+    print(
+        f"gmail-auth: refresh token stored in the login keychain "
+        f"(service second-brain-gmail, account {args.account}). The token is never "
+        f"printed or written to disk.\n"
+        f"Next: set GMAIL_LABEL_ID to the immutable Gmail label id to poll "
+        f"(see docs/email-setup.md), then run `brain gmail-poll`."
+    )
+    return 0
+
+
+def _build_email_poller(settings: Settings) -> EmailPoller:
+    """Assemble the poller from the shared AI singletons (same path as the bot)."""
+    from brain.api import deps  # noqa: PLC0415  (deferred: shared client singletons)
+    from brain.repositories.email import EmailMessageRepository  # noqa: PLC0415
+
+    session = SessionLocal()
+    ingest = IngestService(
+        ItemsRepository(session),
+        deps.get_classifier(),
+        deps.get_item_indexer(),
+    )
+    return EmailPoller(
+        client=RestGmailClient(token_loader=lambda: Keychain().read(GMAIL_ACCOUNT) or ""),
+        ingest=ingest,
+        seen_repo=EmailMessageRepository(session),
+        settings=settings,
+    )
+
+
+def _gmail_poll(args: argparse.Namespace) -> int:
+    settings: Settings = get_settings()
+    if not settings.gmail_label_id:
+        print("gmail-poll: GMAIL_LABEL_ID unset — nothing to poll", file=sys.stderr)
+        return 78
+    token = Keychain().read(GMAIL_ACCOUNT)
+    if not token:
+        print(
+            "gmail-poll: no refresh token in the keychain — run `brain gmail-auth` first",
+            file=sys.stderr,
+        )
+        return 78
+    poller = _build_email_poller(settings)
+    if args.once:
+        summary = poller.poll_once()
+        heartbeat_email(summary)
+        print(
+            f"gmail-poll: state={summary.state} listed={summary.listed} new={summary.new} "
+            f"skipped={summary.skipped} errors={summary.errors}"
+        )
+        return 0
+    return poller.run_forever()
 
 
 if __name__ == "__main__":  # pragma: no cover

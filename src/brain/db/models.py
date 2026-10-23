@@ -330,6 +330,84 @@ class MemoryFact(Base):
     )
 
 
+class EmailMessage(Base):
+    """A processed Gmail message (the poller's seen-ledger, F2).
+
+    ``dedupe_id`` is unique: the RFC 5322 Message-ID, or ``fp:`` + sha256
+    over (sender, subject, internal minute) when the message has none —
+    the at-most-once guarantee for the email source.
+    """
+
+    __tablename__ = "email_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    dedupe_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    gmail_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    rfc_message_id: Mapped[str | None] = mapped_column(String(998), nullable=True)
+    item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="SET NULL"), nullable=True
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Attachment(Base):
+    """A file attached to a captured item (design delta item 43).
+
+    The attachment is ALSO its own searchable memory item (``item_id``) so
+    search, ask and PR A extraction treat filename + extracted text like any
+    other text; ``parent_item_id`` is the message/email that carried it.
+    """
+
+    __tablename__ = "attachments"
+    __table_args__ = (
+        CheckConstraint(
+            _in_domain("source", ("telegram", "whatsapp", "email")),
+            name="source",
+        ),
+        CheckConstraint(
+            _in_domain("status", ("pending", "done", "failed", "unsupported", "too_large")),
+            name="status",
+        ),
+        CheckConstraint(
+            _in_domain("text_method", ("pdf_text", "claude", "none")),
+            name="text_method",
+        ),
+        Index("ix_attachments_sha256", "sha256"),
+        Index("ix_attachments_parent_item_id", "parent_item_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    parent_item_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("memory_items.id", ondelete="CASCADE"), nullable=False
+    )
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    mime: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    pages: Mapped[int | None] = mapped_column(nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+
 class ItemSource(Base):
     """A quote linking an extracted child item to its source item (item 7).
 

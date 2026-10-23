@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from collections.abc import Mapping, Sequence
@@ -53,7 +54,14 @@ class SearchService:
         self._store = store
         self._reranker = reranker
 
-    def search(self, query: str, *, limit: int, offset: int = 0) -> list[SearchHit]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        extra_items: Sequence[MemoryItem] = (),
+    ) -> list[SearchHit]:
         """Return up to ``limit`` items best matching ``query``.
 
         Hybrid retrieval: semantic (vector) hits fused with full-text keyword
@@ -61,6 +69,11 @@ class SearchService:
         embedder may blur) pull their items up without abandoning semantics.
         Falls back to keyword-only when the embedder or vector store is
         unavailable, so search never hard-fails on infrastructure.
+
+        ``extra_items`` (memory-layer recall legs, e.g. PR 0d kid channels)
+        join the candidate pool BEFORE the rerank, so the reranker orders
+        them fairly against the semantic hits; empty extras keep the pool
+        byte-identical to the pre-0d behaviour.
         """
         try:
             with ops.span("search", "embed", edge="search->embedder"):
@@ -75,7 +88,18 @@ class SearchService:
                 "search", "keyword_fallback", ok=True,
                 detail={"reason": "semantic unavailable", "query_chars": len(query)},
             )
-            return self._keyword_fallback(query, limit=limit, offset=offset)
+            fallback = self._keyword_fallback(query, limit=limit, offset=offset)
+            if not extra_items:
+                return fallback
+            seen: set[uuid.UUID] = {hit.item.id for hit in fallback}
+            extras = [
+                SearchHit(item=item, score=None)
+                for item in extra_items
+                if item.id not in seen
+            ]
+            for hit in extras:
+                seen.add(hit.item.id)
+            return fallback + extras
         candidates = [
             {
                 "id": str(raw_hit["id"]),
@@ -84,7 +108,22 @@ class SearchService:
             }
             for raw_hit in raw_hits
         ]
-        with ops.span("search", "rerank", edge="search->rerank"):
+        if extra_items:
+            candidate_ids = {candidate["id"] for candidate in candidates}
+            for item in extra_items:
+                key = str(item.id)
+                if key not in candidate_ids:
+                    candidate_ids.add(key)
+                    candidates.append(
+                        {"id": key, "text": item.raw_text, "vector_score": None}
+                    )
+        with ops.span("search", "rerank", edge="search->rerank") as span:
+            pre_ids = [c["id"] for c in candidates]
+            span.detail = {
+                "extras_in": len(extra_items),
+                "pre_rerank_size": len(pre_ids),
+                "pre_rerank_hash": hashlib.sha1(",".join(pre_ids).encode()).hexdigest()[:12],
+            }
             ranked = self._reranker.rerank(query, candidates, top_n=limit + offset)
         fused = self._fuse_with_keywords(query, ranked, limit=limit + offset)
         return self._load_items(fused[offset : offset + limit])

@@ -44,6 +44,7 @@ class HealthContext:
         disk: Callable[[], dict[str, Any]] | None = None,
         background: Callable[[], dict[str, Any]] | None = None,
         whatsapp: Callable[[], dict[str, Any]] | None = None,
+        email: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.db = db or _db_check
         self.qdrant = qdrant or _qdrant_check
@@ -55,6 +56,7 @@ class HealthContext:
         self.disk = disk or _disk_check
         self.background = background or _background_check
         self.whatsapp = whatsapp or _whatsapp_check
+        self.email = email or _email_check
 
 
 def reset_cache() -> None:
@@ -162,6 +164,26 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         channels = raw.get("channels")
         suffix = f" · {channels} channel(s)" if isinstance(channels, int) else ""
         return _entry("ok", f"polled {last_poll_age:.0f}s ago{suffix}", raw)
+    if component == "email":
+        if not raw.get("label_set", False):
+            return _entry("disabled", "GMAIL_LABEL_ID unset", raw)
+        if not raw.get("token_set", False):
+            return _entry(
+                "disabled", "no refresh token — run brain gmail-auth", raw
+            )
+        state = raw.get("state")
+        if state == "needs re-auth":
+            return _entry("degraded", "needs re-auth", raw)
+        if state == "label missing":
+            return _entry("degraded", "label missing", raw)
+        age = raw.get("heartbeat_age_s")
+        if age is None:
+            return _entry("down", "poller never heartbeated", raw)
+        if age > 1800:
+            return _entry("down", f"heartbeat {age:.0f}s ago", raw)
+        if age > 150:
+            return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
+        return _entry("ok", f"poll ok · heartbeat {age:.0f}s ago", raw)
     if component == "docker":
         if not raw.get("available", False):
             return _entry("disabled", "docker unavailable", raw)
@@ -197,6 +219,7 @@ def run_health_checks(
         "jev": _safe(context.jev),
         "llm": _safe(context.llm),
         "telegram": _safe(context.telegram),
+        "email": _safe(context.email),
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
@@ -402,6 +425,43 @@ def _llm_check() -> dict[str, Any]:
         else settings.claude_sdk_model
     )
     return {"provider": settings.llm_provider, "model": model or None}
+
+
+def _email_check() -> dict[str, Any]:
+    """Raw email-poller facts: label + keychain token + last heartbeat state.
+
+    The token is only probed for PRESENCE (never read, never hinted — the
+    refresh token is a full credential, unlike the telegram token's last-4).
+    """
+    try:
+        settings = get_settings()
+    except Exception:  # noqa: BLE001  (config errors degrade the check)
+        return {"label_set": False, "token_set": False, "heartbeat_age_s": None}
+    label_set = bool(settings.gmail_label_id.strip())
+    token_set = False
+    if label_set:
+        try:
+            from brain.services.keychain import Keychain  # noqa: PLC0415
+
+            token_set = Keychain().read("default") is not None
+        except Exception:  # noqa: BLE001  (no keychain / denied: report, never raise)
+            token_set = False
+    age = ops.heartbeat_age_seconds("email")
+    details: dict[str, Any] = {
+        "label_set": label_set,
+        "token_set": token_set,
+        "heartbeat_age_s": age,
+        "poll_interval_s": settings.gmail_poll_interval_s,
+    }
+    hb = ops.heartbeat_detail("email")
+    if hb and hb.get("state"):
+        details["state"] = hb["state"]
+    elif label_set and token_set:
+        details["state"] = "ok"
+    last_error = ops.latest_event("email", ok=False)
+    if last_error and not details.get("state") == "ok":
+        details["last_error"] = {"kind": last_error["kind"], "ts": _iso(last_error["ts"])}
+    return details
 
 
 def _telegram_check() -> dict[str, Any]:
