@@ -324,6 +324,20 @@ Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 | GET    | `/ops/trace/search?q=`| Search pipeline trace (before/after rerank, fallback decision)  |
 | POST   | `/ops/trace/ask`      | Ask trace — runs the real LLM (user-initiated)                  |
 
+Diagnostics note: live checks that exercise the ask path with a FAKE LLM must
+call `AskService.ask(..., record_ops=False)` — that skips the `ask→search` /
+`ask→llm` spans and the kid_recall event, so `/ops/health`'s llm component is
+not marked "last call failed" until the next real call. Real requests keep
+the default (`record_ops=True`); nothing else changes.
+
+Health components `attachments` (queue depth, read today / daily budget, last
+error) and `enrichment` (queue depth, cap used / limit, worker on/off — off is
+the designed inert state) mirror `GET /ops/attachments` and `GET
+/ops/enrichment`; the cockpit renders their cards automatically. The telegram
+heartbeat threshold follows the bot's actual long-poll timeout
+(`telegram_poll_timeout_s` + margin), and the poll loop heartbeats on the
+conflict/network retry paths too — a quiet chat no longer flaps "degraded".
+
 Privacy contract: the ops layer never records secrets (tokens appear only as
 `set`/`unset` + last 4 chars) and never note bodies — events/traces carry
 item ids, lengths and error types; item text appears only in the inspector
@@ -586,6 +600,24 @@ Behavior worth knowing:
   Only the `BRAIN_ALLOW_LIVE=1` opt-in runs against the live store. To run
   `dev-start.sh` against the real store you opt in explicitly with
   `BRAIN_ALLOW_LIVE=1 scripts/dev-start.sh`.
+- **Live-store construction guard** — the lifespan guard cannot catch code
+  that never goes through an app start (a `TestClient(create_app())` without
+  a `with` block, an ad-hoc script, a lru_cache'd factory that outlived an
+  env change). The SAME refusal therefore also runs at CONSTRUCTION: the
+  SQLAlchemy engine factory (`brain.db.session.create_engine_from_settings`)
+  refuses the live database URL, and the Qdrant vector store's `__init__`
+  refuses the live collection name when it builds a real client (stores with
+  an injected client — the tests' in-memory qdrant — are never the live
+  server and are not gated). Consequence for the CLI: every `brain`
+  subcommand that touches the live store (`reindex`, `enrich`, `whatsapp`,
+  `gmail-poll`, `memory seed-*`, `telegram`) now refuses unless the operator
+  sets `BRAIN_ALLOW_LIVE=1` for that one command — e.g.
+  `BRAIN_ALLOW_LIVE=1 brain reindex`. `scripts/run-bot.sh` exports the flag
+  itself (the bot is the real service), as does `scripts/run-server.sh`.
+  The test suite additionally runs a session-level tripwire
+  (`tests/live_guard.py`): it snapshots the LIVE collection's point count
+  before and after the run (one read-only REST GET each) and fails loudly if
+  it changed — a future leak turns red instead of surfacing days later.
 
 ## Setup
 
