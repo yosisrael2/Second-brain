@@ -82,6 +82,16 @@ from brain.services.proposals import (
     proposed_children_of,
     render_source_card,
 )
+from brain.services.relations_view import (
+    CB_REL_CONFIRM,
+    CB_REL_KEEP_BOTH,
+    CB_REL_RESTORE,
+    CB_REL_UNDO,
+    correction_notice,
+    relations_keyboard,
+    replaced_by_notice,
+    strike,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -615,8 +625,14 @@ class TelegramBot:
         return f"{TYPE_EMOJI.get(item_type, '📝')} {KIND_NAME.get(item_type, 'Note')}"
 
     def _item_card(self, item: Any, indent: str = "") -> str:
-        """Compact HTML card: text preview, existing fields, rating, status."""
-        lines = [f"{indent}{_one_line(item.raw_text, 200)}"]
+        """Compact HTML card: text preview, existing fields, rating, status.
+
+        PR B (D4): a superseded item's text renders struck-through.
+        """
+        text_line = _one_line(item.raw_text, 200)
+        if getattr(item, "superseded_by", None) is not None:
+            text_line = strike(" ".join(str(item.raw_text).split())[:200])
+        lines = [f"{indent}{text_line}"]
         meta = item.meta or {}
         fields: list[str] = []
         who = meta.get("from") or meta.get("sender")
@@ -1072,6 +1088,50 @@ class TelegramBot:
         text = f"{notice}\n" + render_source_card(source, children, self._timezone.key)
         return Reply(text=text, keyboard=proposal_keyboard(token, children), edit=True)
 
+    # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
+
+    def _relation_transition(self, prefix: str, pending: Pending, index: int) -> Reply:
+        """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b)."""
+        from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
+
+        rel_ids = list(pending.ids[1:])
+        if not 0 <= index < len(rel_ids):
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        service = RelationsService()
+        try:
+            if prefix == CB_REL_UNDO:
+                service.undo_supersede(rel_ids[index])
+                notice = "↩️ Undone — the earlier item is current again."
+            elif prefix == CB_REL_CONFIRM:
+                service.confirm_supersede(rel_ids[index])
+                notice = "✅ Confirmed — the old version is struck through (undo anytime)."
+            else:  # CB_REL_KEEP_BOTH
+                service.remove(rel_ids[index])
+                notice = "✖ Keeping both — proposal discarded."
+        except RelationsError as exc:
+            return Reply(f"⌛ {exc}", edit=True)
+        return self._card_reply(pending, notice=notice)
+
+    def _relation_restore(self, pending: Pending) -> Reply:
+        """♻️ Restore a superseded item (D4): undo the relation that struck it."""
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+        from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
+        from brain.services.relations_view import superseded_by_rel  # noqa: PLC0415
+
+        item_id = pending.ids[0]
+        session = SessionLocal()
+        try:
+            rel = superseded_by_rel(session, item_id)
+        finally:
+            session.close()
+        if rel is None:
+            return Reply("⌛ That button expired — the card moved on.", edit=True)
+        try:
+            RelationsService().undo_supersede(rel.id)
+        except RelationsError as exc:
+            return Reply(f"⌛ {exc}", edit=True)
+        return self._card_reply(pending, notice="♻️ Restored — back in /recent.")
+
     def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
@@ -1209,6 +1269,9 @@ class TelegramBot:
                 CB_PROPOSED_KEEP,
                 CB_PROPOSED_FIX,
                 CB_PROPOSED_DROP,
+                CB_REL_UNDO,
+                CB_REL_CONFIRM,
+                CB_REL_KEEP_BOTH,
             ):
                 token, _, arg = rest.partition(":")
             elif prefix in (
@@ -1219,11 +1282,21 @@ class TelegramBot:
                 CB_WA_JOIN,
                 CB_WA_SPLIT,
                 CB_PROPOSED_KEEP_ALL,
+                CB_REL_RESTORE,
             ):
                 token, arg = rest, ""
             else:
                 return Reply("Unknown action — the button is stale or invalid.")
-            if prefix in (CB_OPEN, CB_MEM_DEL, CB_PROPOSED_KEEP, CB_PROPOSED_FIX, CB_PROPOSED_DROP):
+            if prefix in (
+                CB_OPEN,
+                CB_MEM_DEL,
+                CB_PROPOSED_KEEP,
+                CB_PROPOSED_FIX,
+                CB_PROPOSED_DROP,
+                CB_REL_UNDO,
+                CB_REL_CONFIRM,
+                CB_REL_KEEP_BOTH,
+            ):
                 index = int(arg)
         except ValueError:
             return Reply("Unknown action — the button is stale or invalid.")
@@ -1255,12 +1328,21 @@ class TelegramBot:
             return self._proposal_fix_start(user_id, pending, index)
         if prefix == CB_PROPOSED_KEEP_ALL:
             return self._proposal_keep_all(pending)
+        if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH):
+            return self._relation_transition(prefix, pending, index)
+        if prefix == CB_REL_RESTORE:
+            return self._relation_restore(pending)
         if prefix == CB_UNDO:
             return self._delete_items(pending, undo=True)
         return self._delete_items(pending, undo=False)  # CB_DELETE
 
     def _card_reply(self, pending: Pending, notice: str | None = None) -> Reply:
-        """Re-render the capture card for the pending items (edit-in-place)."""
+        """Re-render the capture card for the pending items (edit-in-place).
+
+        PR B: items with applied/proposed supersedes relations carry the
+        correction notice + the ↩︎ Undo / ✅ Confirm / ✖ Keep-both rows
+        (items 20a/20b).
+        """
         from brain.services.items import ItemNotFound  # noqa: PLC0415
 
         items = []
@@ -1272,15 +1354,35 @@ class TelegramBot:
                     continue
         if not items:
             return Reply("🗑 Deleted", edit=True)
+        relation_notices: list[str] = []
+        relation_rows: list[list[tuple[str, str]]] = []
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        session = SessionLocal()
+        try:
+            for item in items:
+                rel_notice = correction_notice(session, item.id)
+                if rel_notice:
+                    relation_notices.append(rel_notice)
+                relation_rows += self._relations_rows_for(item.id)
+        finally:
+            session.close()
         text = (
             self._card_header(items, notice=notice)
             + "\n"
             + "\n".join(self._item_card(item) for item in items)
         )
-        return Reply(text=text, keyboard=self._capture_buttons(items), edit=True)
+        if relation_notices:
+            text += "\n" + "\n".join(relation_notices)
+        return Reply(text=text, keyboard=self._capture_buttons(items) + relation_rows, edit=True)
 
     def _open_card(self, pending: Pending, index: int) -> Reply:
-        """Show one cited item's card (the Open button under /ask answers)."""
+        """Show one cited item's card (the Open button under /ask answers).
+
+        PR B: a superseded item renders struck-through with ♻️ Restore
+        (D4); a card whose item applied/proposed a supersedes shows the
+        correction notice with ↩︎ Undo / ✅ Confirm / ✖ Keep-both rows.
+        """
         from brain.services.items import ItemNotFound  # noqa: PLC0415
 
         if not 0 <= index < len(pending.ids):
@@ -1290,7 +1392,46 @@ class TelegramBot:
                 item = services.items.get(pending.ids[index])
             except ItemNotFound:
                 return Reply("⌛ That item was deleted.")
-        return Reply(self._item_card(item))
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        session = SessionLocal()
+        try:
+            replaced_by = replaced_by_notice(session, item.id)
+            notice = correction_notice(session, item.id)
+        finally:
+            session.close()
+        lines = [self._item_card(item)]
+        if replaced_by:
+            lines.append(replaced_by)
+        if notice:
+            lines.append(notice)
+        keyboard = self._relations_rows_for(item.id)
+        return Reply("\n".join(lines), keyboard=keyboard or None)
+
+    def _relations_rows_for(self, item_id) -> list[list[tuple[str, str]]]:
+        """Relation action rows for one item (D4 Restore + 20a/b rows)."""
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+        from brain.services.relations_view import (  # noqa: PLC0415
+            applied_supersedes_of,
+            proposed_supersedes_of,
+            superseded_by_rel,
+        )
+
+        rows: list[list[tuple[str, str]]] = []
+        session = SessionLocal()
+        try:
+            if superseded_by_rel(session, item_id) is not None:
+                token = self.registry.put(Pending(ids=(item_id,), kind="relation"))
+                rows.append([("♻️ Restore", f"{CB_REL_RESTORE}:{token}")])
+            applied = applied_supersedes_of(session, item_id)
+            proposed = proposed_supersedes_of(session, item_id)
+            if applied or proposed:
+                rel_ids = [rel.id for rel in applied] + [rel.id for rel in proposed]
+                token = self.registry.put(Pending(ids=(item_id, *rel_ids), kind="relation"))
+                rows += relations_keyboard(token, applied=len(applied), proposed=len(proposed))
+        finally:
+            session.close()
+        return rows
 
     def _save_whatsapp_choice(self, pending: Pending, *, split: bool) -> Reply:
         parsed = parse_paste(pending.text or "", split=split, tz=self._timezone)
