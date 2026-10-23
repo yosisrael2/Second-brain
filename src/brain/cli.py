@@ -63,6 +63,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Seconds between polls (default: WHATSAPP_POLL_INTERVAL_S, 30)",
     )
     whatsapp.add_argument(
+        "--once",
+        action="store_true",
+        help="Run ONE poll cycle and exit 0 (test seam; also useful to drain once)",
+    )
+    whatsapp.add_argument(
         "--since",
         type=str,
         default=None,
@@ -178,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "telegram":
         return _telegram(whoami_hint=args.whoami_hint)
     if args.command == "whatsapp":
-        return _whatsapp(interval_s=args.interval, since=args.since)
+        return _whatsapp(interval_s=args.interval, since=args.since, once=args.once)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
     if args.command == "enrich":
@@ -334,6 +339,9 @@ def _telegram(whoami_hint: bool) -> int:
     return run_bot(get_settings())
 
 
+EX_CONFIG = 78  # sysexits: permanent configuration problem — launchd must NOT restart
+
+
 def _cli_attachment_service(settings: Any) -> Any:
     """F3: the attachments core for side-process pollers (own queue/budget)."""
     from brain.services.attachments import (  # noqa: PLC0415
@@ -353,16 +361,22 @@ def _cli_attachment_service(settings: Any) -> Any:
     )
 
 
-def _whatsapp(interval_s: float | None, since: str | None) -> int:
+def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -> int:
     """Run the WhatsApp poller: bridge store -> per-conversation source items.
 
     Read-only against the bridge; cursor state lives in our DB (see
-    brain.services.whatsapp). Per-poll failures are logged and retried on the
-    next tick; Ctrl-C exits cleanly.
+    brain.services.whatsapp). The SAME live-store guard as the API lifespan
+    (PR #31) and 'brain enrich' applies — one definition of 'live store', one
+    opt-in flag: a bare worktree run against the live DB is refused with
+    EX_CONFIG (78), as are all permanent conditions (unconfigured bridge DB,
+    missing store file) so launchd never restart-loops them. Per-poll
+    failures are logged and retried on the next tick; Ctrl-C exits cleanly.
     """
+    import os  # noqa: PLC0415
     import time  # noqa: PLC0415
     from datetime import UTC, datetime  # noqa: PLC0415
 
+    from brain.config import assert_not_live_store  # noqa: PLC0415
     from brain.ops import heartbeat, record_event  # noqa: PLC0415
     from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
     from brain.repositories.whatsapp import WhatsAppStateRepository  # noqa: PLC0415
@@ -374,14 +388,33 @@ def _whatsapp(interval_s: float | None, since: str | None) -> int:
     )
 
     settings = get_settings()
+    # One definition of 'live store' (brain.config): the CLI must not silently
+    # write the live store either; run-whatsapp.sh exports BRAIN_ALLOW_LIVE=1.
+    try:
+        assert_not_live_store(
+            settings.database_url,
+            settings.qdrant_collection,
+            allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+        )
+    except RuntimeError as exc:
+        print(f"whatsapp: refusing to start against the live store: {exc}", file=sys.stderr)
+        return EX_CONFIG
     if not settings.whatsapp_bridge_db.strip():
         print("whatsapp: WHATSAPP_BRIDGE_DB is not configured; poller disabled", file=sys.stderr)
-        return 1
+        return EX_CONFIG
+    bridge_path = Path(settings.whatsapp_bridge_db).expanduser()
+    if not bridge_path.is_file():
+        print(
+            f"whatsapp: bridge store not found: {bridge_path} "
+            "(permanent; is the WhatsApp bridge installed?)",
+            file=sys.stderr,
+        )
+        return EX_CONFIG
     try:
         bridge = BridgeStore(settings.whatsapp_bridge_db, naive_zone=settings.timezone)
     except Exception as exc:
         print(f"whatsapp: cannot open bridge store: {exc}", file=sys.stderr)
-        return 1
+        return EX_CONFIG
 
     backfill: datetime | None = None
     if since:
@@ -415,7 +448,12 @@ def _whatsapp(interval_s: float | None, since: str | None) -> int:
         )
     except PollerError as exc:
         print(f"whatsapp: {exc}", file=sys.stderr)
-        return 1
+        return EX_CONFIG
+
+    if once:
+        poller.poll(now=datetime.now(UTC))
+        print("whatsapp: --once poll done")
+        return 0
 
     print(f"whatsapp: polling {bridge.path} every {interval:.0f}s (Ctrl-C to stop)")
     try:

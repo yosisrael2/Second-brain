@@ -13,11 +13,12 @@
 # root.
 #
 # install TAKES OVER from manual processes first: it stops our dev uvicorn
-# (pid file + orphans, per lib.sh ownership rules) and our nohup telegram bot
-# (.dev/telegram.pid + orphans) BEFORE bootstrapping, so launchd never races a
-# second getUpdates poller (409 Conflict).
+# (pid file + orphans, per lib.sh ownership rules), our nohup telegram bot
+# (.dev/telegram.pid + orphans; a second getUpdates poller means 409 for
+# both) and any manual WhatsApp poller (.dev/whatsapp.pid + orphans; a
+# second poller races the shared cursor table) BEFORE bootstrapping.
 #
-# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram]
+# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|whatsapp]
 #
 # Test seams (never needed interactively): PLIST_DIR, LOG_DIR, PORT, LINES,
 # BRAIN_BIN, UVICORN_BIN — overridable so tests never touch the real
@@ -32,6 +33,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LABEL_API="com.secondbrain.api"
 LABEL_TG="com.secondbrain.telegram"
+LABEL_WA="com.secondbrain.whatsapp"
 PLIST_DIR="${PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${LOG_DIR:-$HOME/Library/Logs/second-brain}"
 PORT="${PORT:-27800}"
@@ -39,7 +41,9 @@ BRAIN="${BRAIN_BIN:-$ROOT/.venv/bin/brain}"
 UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 RUN_SERVER="$ROOT/scripts/run-server.sh"
 RUN_BOT="$ROOT/scripts/run-bot.sh"
+RUN_WHATSAPP="$ROOT/scripts/run-whatsapp.sh"
 TG_PID_FILE="$ROOT/.dev/telegram.pid"
+WA_PID_FILE="$ROOT/.dev/whatsapp.pid"
 GUI_DOMAIN="gui/$(id -u)"
 # PATH for the service environment: brew (both arches), Rancher Desktop's CLI
 # shims (docker), then the system. The cockpit docker check needs `docker`.
@@ -47,15 +51,16 @@ SERVICE_PATH="/opt/homebrew/bin:$HOME/.rd/bin:/usr/local/bin:/usr/bin:/bin:/usr/
 
 usage() {
   cat <<EOF
-Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram]
+Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|whatsapp]
 
-install    stop our manual instances, write the two plists, bootstrap them
-uninstall  bootout both agents and remove the plists (logs are kept)
+install    stop our manual instances, write the three plists, bootstrap them
+uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
-restart    kickstart -k both agents
-logs [c]   tail the last ${LINES:-50} lines (component: api, telegram, or all)
+restart    kickstart -k all agents
+logs [c]   tail the last ${LINES:-50} lines (component: api, telegram,
+           whatsapp, or all)
 
-Agents: ${LABEL_API}, ${LABEL_TG}
+Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_WA}
 Plists: ${PLIST_DIR}   Logs: ${LOG_DIR}
 EOF
 }
@@ -72,6 +77,41 @@ is_our_bot() {
   printf '%s' "$cmd" | grep -q "brain telegram" || return 1
   cwd="$(process_cwd "$pid")"
   [ -n "$cwd" ] && [ "$cwd" = "$LIB_ROOT" ]
+}
+
+is_our_poller() {
+  # Same ownership proof for a manual WhatsApp poller ('brain whatsapp').
+  local pid="$1" cmd cwd
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  printf '%s' "$cmd" | grep -q "brain whatsapp" || return 1
+  cwd="$(process_cwd "$pid")"
+  [ -n "$cwd" ] && [ "$cwd" = "$LIB_ROOT" ]
+}
+
+stop_whatsapp_poller() {
+  # Stop the pid-file poller and any orphan of ours — never other clones'
+  # pollers or unrelated 'whatsapp' strings. Two pollers share one cursor
+  # table and could race the same overlap window into duplicate items.
+  local pid_file="$1" pid cmd orphan
+  if [ -f "$pid_file" ]; then
+    pid="$(cat "$pid_file")"
+    if is_our_poller "$pid"; then
+      say "takeover: stopping manual whatsapp poller (pid $pid)"
+      kill_tree "$pid"
+      wait_gone "$pid" || say "warning: poller pid $pid survived TERM+KILL"
+    else
+      cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      say "takeover: whatsapp pid file stale (pid ${pid:-?} is not our poller: ${cmd:-<gone>}); ignoring"
+    fi
+    rm -f "$pid_file"
+  fi
+  for orphan in $(pgrep -f "brain whatsapp" || true); do
+    [ "$orphan" = "$$" ] && continue
+    is_our_poller "$orphan" || continue
+    say "takeover: stopping orphan whatsapp poller (pid $orphan)"
+    kill_tree "$orphan"
+    wait_gone "$orphan" || say "warning: orphan poller pid $orphan survived TERM+KILL"
+  done
 }
 
 stop_telegram_bot() {
@@ -101,9 +141,11 @@ stop_telegram_bot() {
 
 takeover() {
   # Stop every manual instance of ours so the launchd bot is the ONLY
-  # getUpdates poller (a second one means 409 Conflict for both).
+  # getUpdates poller (a second one means 409 Conflict for both) and the
+  # launchd poller the ONLY WhatsApp poller (a second one races the cursor).
   stop_telegram_bot "$TG_PID_FILE"
   stop_uvicorn_app "$ROOT/.dev/uvicorn.pid" "$PORT"
+  stop_whatsapp_poller "$WA_PID_FILE"
 }
 
 # --- environment checks (never fatal; services survive both) -----------------
@@ -134,7 +176,8 @@ sleep_check() {
 
 write_plist() {
   # $1 = label, $2 = program (absolute), $3 = log base name, $4... = args.
-  local label="$1" program="$2" logbase="$3"
+  # Optional THROTTLE (seconds) overrides the default ThrottleInterval.
+  local label="$1" program="$2" logbase="$3" throttle="${THROTTLE:-10}"
   shift 3
   local args="" a
   for a in "$@"; do
@@ -169,7 +212,7 @@ ${args}    </array>
         <false/>
     </dict>
     <key>ThrottleInterval</key>
-    <integer>10</integer>
+    <integer>${throttle}</integer>
     <key>StandardOutPath</key>
     <string>${LOG_DIR}/${logbase}.log</string>
     <key>StandardErrorPath</key>
@@ -186,7 +229,8 @@ bootout_label() {
 install() {
   [ -x "$BRAIN" ] || die "$BRAIN missing — provision the venv first (scripts/dev-start.sh does)"
   [ -x "$UVICORN" ] || die "$UVICORN missing — provision the venv first"
-  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] || die "scripts/run-server.sh and scripts/run-bot.sh must be executable"
+  [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] && [ -x "$RUN_WHATSAPP" ] || \
+    die "scripts/run-server.sh, run-bot.sh and run-whatsapp.sh must be executable"
   [ -f "$ROOT/.env" ] || say "env: WARNING — no .env at $ROOT; services run on defaults (telegram disabled until a token exists)"
 
   say "takeover: stopping manual instances (no duplicate bots, no 409)"
@@ -198,10 +242,11 @@ install() {
   say "install: writing plists to $PLIST_DIR"
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
+  THROTTLE=30 write_plist "$LABEL_WA" "$RUN_WHATSAPP" "whatsapp"
 
   # Pre-create the log files mode 600: launchd writes into the existing inode
   # (preserving the mode) instead of creating them with the default umask.
-  for f in api api.err telegram telegram.err; do
+  for f in api api.err telegram telegram.err whatsapp whatsapp.err; do
     touch "$LOG_DIR/$f.log" 2>/dev/null || true
   done
   chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
@@ -209,8 +254,10 @@ install() {
   say "install: bootstrapping agents"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
+  bootout_label "$LABEL_WA"
   launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_API}.plist"
   launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_TG}.plist"
+  launchctl bootstrap "$GUI_DOMAIN" "$PLIST_DIR/${LABEL_WA}.plist"
 
   sleep 2
   say "install: done — agents are starting (RunAtLoad)"
@@ -223,7 +270,9 @@ uninstall() {
   say "uninstall: booting out agents (their processes get SIGTERM from launchd)"
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
-  rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist"
+  bootout_label "$LABEL_WA"
+  rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist" \
+    "$PLIST_DIR/${LABEL_WA}.plist"
   say "uninstall: plists removed; logs remain in $LOG_DIR"
 }
 
@@ -247,6 +296,7 @@ status() {
   local ok=0
   print_label_status "$LABEL_API" || ok=1
   print_label_status "$LABEL_TG" || ok=1
+  print_label_status "$LABEL_WA" || ok=1
   sleep_check
   docker_check
   if [ "$ok" -eq 0 ]; then
@@ -258,9 +308,9 @@ status() {
 }
 
 restart() {
-  say "restart: kickstart -k both agents"
+  say "restart: kickstart -k all agents"
   local failed=0 label
-  for label in "$LABEL_API" "$LABEL_TG"; do
+  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_WA"; do
     if launchctl kickstart -k "${GUI_DOMAIN}/${label}" 2>/dev/null; then
       printf '  %-28s kicked\n' "$label"
     else
@@ -276,8 +326,9 @@ logs() {
   case "$comp" in
     api) tail_log "api" ;;
     telegram) tail_log "telegram" ;;
-    all) tail_log "api"; tail_log "telegram" ;;
-    *) usage >&2; die "unknown component '$comp' (api|telegram|all)" ;;
+    whatsapp) tail_log "whatsapp" ;;
+    all) tail_log "api"; tail_log "telegram"; tail_log "whatsapp" ;;
+    *) usage >&2; die "unknown component '$comp' (api|telegram|whatsapp|all)" ;;
   esac
 }
 

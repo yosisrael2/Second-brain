@@ -43,6 +43,7 @@ class HealthContext:
         docker: Callable[[], dict[str, Any]] | None = None,
         disk: Callable[[], dict[str, Any]] | None = None,
         background: Callable[[], dict[str, Any]] | None = None,
+        whatsapp: Callable[[], dict[str, Any]] | None = None,
         email: Callable[[], dict[str, Any]] | None = None,
         attachments: Callable[[], dict[str, Any]] | None = None,
         enrichment: Callable[[], dict[str, Any]] | None = None,
@@ -56,6 +57,7 @@ class HealthContext:
         self.docker = docker or _docker_check
         self.disk = disk or _disk_check
         self.background = background or _background_check
+        self.whatsapp = whatsapp or _whatsapp_check
         self.email = email or _email_check
         self.attachments = attachments or _attachments_check
         self.enrichment = enrichment or _enrichment_check
@@ -148,6 +150,25 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         if age > degraded_after:
             return _entry("degraded", f"heartbeat {age:.0f}s ago", raw)
         return _entry("ok", f"heartbeat {age:.0f}s ago", raw)
+    if component == "whatsapp":
+        if not raw.get("configured", False):
+            return _entry("disabled", "WHATSAPP_BRIDGE_DB unset — poller off", raw)
+        interval = raw.get("interval_s") or 30.0
+        if not isinstance(interval, (int, float)) or interval <= 0:
+            interval = 30.0
+        heartbeat_age = raw.get("heartbeat_age_s")
+        if heartbeat_age is None:
+            return _entry("down", "poller never heartbeated", raw)
+        if heartbeat_age > 3 * interval:
+            return _entry("down", f"heartbeat {heartbeat_age:.0f}s ago", raw)
+        last_poll_age = raw.get("last_poll_age_s")
+        if last_poll_age is None:
+            return _entry("degraded", "up but never polled", raw)
+        if last_poll_age > 3 * interval:
+            return _entry("degraded", f"last poll {last_poll_age:.0f}s ago", raw)
+        channels = raw.get("channels")
+        suffix = f" · {channels} channel(s)" if isinstance(channels, int) else ""
+        return _entry("ok", f"polled {last_poll_age:.0f}s ago{suffix}", raw)
     if component == "email":
         if not raw.get("label_set", False):
             return _entry("disabled", "GMAIL_LABEL_ID unset", raw)
@@ -228,6 +249,7 @@ def run_health_checks(
         "docker": _safe(context.docker),
         "background": _safe(context.background),
         "disk": _safe(context.disk),
+        "whatsapp": _safe(context.whatsapp),
     }
     components = {name: _derive_status(name, data) for name, data in raw.items()}
     downs = [name for name, entry in components.items() if entry["status"] == "down"]
@@ -508,6 +530,44 @@ def _telegram_check() -> dict[str, Any]:
     return details
 
 
+def _whatsapp_check() -> dict[str, Any]:
+    """Cheap poller health: configured?, heartbeat + last poll ages, channels.
+
+    Healthy = last poll within 3x the poll interval AND a fresh heartbeat
+    (both signals come from the poller itself: heartbeat per cycle,
+    whatsapp_poll_state per channel).
+    """
+    try:
+        settings = get_settings()
+    except Exception:  # noqa: BLE001 — broken settings must not crash health
+        return {"configured": False}
+    configured = bool(settings.whatsapp_bridge_db.strip())
+    details: dict[str, Any] = {
+        "configured": configured,
+        "interval_s": settings.whatsapp_poll_interval_s,
+    }
+    if not configured:
+        return details
+    details["heartbeat_age_s"] = ops.heartbeat_age_seconds("whatsapp")
+    try:
+        from sqlalchemy import text  # noqa: PLC0415
+
+        from brain.db.session import engine  # noqa: PLC0415
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT max(last_poll_at), count(*) FROM whatsapp_poll_state")
+            ).one()
+    except Exception:  # noqa: BLE001 — table missing/poll never ran: ages stay None
+        return details
+    last_poll_at, channels = row[0], int(row[1])
+    details["channels"] = channels
+    if last_poll_at is not None:
+        details["last_poll_age_s"] = max(0.0, (datetime.now(UTC) - last_poll_at).total_seconds())
+        details["last_poll_at"] = _iso(last_poll_at)
+    return details
+
+
 def _docker_check() -> dict[str, Any]:
     try:
         out = subprocess.run(
@@ -544,8 +604,12 @@ def _compose_project() -> str | None:
     return os.environ.get("COMPOSE_PROJECT_NAME")
 
 
-# LaunchAgent labels managed by scripts/service.sh (the background-service pair).
-BACKGROUND_LABELS = ("com.secondbrain.api", "com.secondbrain.telegram")
+# LaunchAgent labels managed by scripts/service.sh (the background services).
+BACKGROUND_LABELS = (
+    "com.secondbrain.api",
+    "com.secondbrain.telegram",
+    "com.secondbrain.whatsapp",
+)
 
 
 def _background_check() -> dict[str, Any]:
