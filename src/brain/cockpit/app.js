@@ -461,7 +461,7 @@ const PROBEABLE = ["postgres", "qdrant", "embedder", "jev", "llm", "telegram", "
 
 function renderWhatsappCard() {
   // PR D1b + cockpit-sources: per-channel stats from GET /ops/whatsapp —
-  // last message, conversations today/total, media read/failed, cursor.
+  // last message, conversations today/total, media read/not-read, cursor.
   // The card hides itself when the poller was never configured (no state).
   const card = $("whatsapp-card");
   const wa = state.whatsapp;
@@ -687,9 +687,9 @@ async function openInspector(itemId) {
   try {
     // PR B views: relations + the current-version chain render beside the row.
     const [body, relations, current] = await Promise.all([
-      api(`/ops/item/${itemId}`),
-      api(`/items/${itemId}/relations`).catch(() => []),
-      api(`/items/${itemId}/current`).catch(() => null),
+      api(`/ops/item/${encodeURIComponent(itemId)}`),
+      api(`/items/${encodeURIComponent(itemId)}/relations`).catch(() => []),
+      api(`/items/${encodeURIComponent(itemId)}/current`).catch(() => null),
     ]);
     const item = body.item;
     const supersededById = current && current.id && current.id !== itemId ? current.id : null;
