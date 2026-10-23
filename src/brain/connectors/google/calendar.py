@@ -54,11 +54,11 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
 from brain.connectors import register
-from brain.connectors.base import ConnectorError, FetchResult, SourceRecord
+from brain.connectors.base import ConnectorError, ConnectorRetryableError, FetchResult, SourceRecord
 from brain.connectors.google.base import GoogleConnector
 from brain.services.paste import _calendar_one_liner
 
@@ -181,33 +181,16 @@ def _parse_cursor(cursor: str | None) -> dict[str, str]:
     return {str(k): str(v) for k, v in decoded.items() if str(v).strip()}
 
 
-def _is_gone(exc: BaseException) -> bool:
-    """Duck-typed 410 detection (syncToken expired/invalid).
-
-    Walks the exception chain because the base GoogleConnector's error
-    translation may wrap the original HttpError; HttpError carries
-    ``.resp.status`` (ai/gmail.py's established duck-typing).
-    """
-    seen = 0
-    current: BaseException | None = exc
-    while current is not None and seen < 5:
-        status = getattr(getattr(current, "resp", None), "status", None)
-        if status is None:
-            status = getattr(current, "status_code", None)
-        if status == 410:
-            return True
-        if "sync token" in str(current).lower():
-            return True  # translated errors that only keep the message
-        current = current.__cause__ or current.__context__
-        seen += 1
-    return False
-
-
 @register
 class GCalConnector(GoogleConnector):
     """Google Calendar source: incremental ``events.list`` over the allowlist."""
 
     name = "gcal"
+
+    # The base error translation (google/base.py, single source of truth)
+    # turns an expired sync cursor (HTTP 410) into a retryable with
+    # ``.status == 410``; fetch() catches exactly that and reports reset=True.
+    SCOPES: ClassVar[tuple[str, ...]] = (GCAL_SCOPE,)
 
     def fetch(self, cursor: str | None, *, limit: int) -> FetchResult:
         """Sync the allowlisted calendars incrementally.
@@ -303,8 +286,11 @@ class GCalConnector(GoogleConnector):
                     # remainder re-fetches next run (idempotent by
                     # external_id/version at the runner).
                     return events[:budget], None
-        except Exception as exc:  # noqa: BLE001 — translated below
-            if _is_gone(exc):
-                raise _SyncTokenExpired(f"syncToken for {calendar_id!r} expired") from exc
-            raise
+        except ConnectorRetryableError as exc:
+            # The base translation marks an expired sync cursor as a retryable
+            # with status 410 (the contract's cursor-invalidation signal);
+            # anything else stays a retryable for the runner's backoff.
+            if exc.status != 410:
+                raise
+            raise _SyncTokenExpired(f"syncToken for {calendar_id!r} expired") from exc
         return events, last_sync_token

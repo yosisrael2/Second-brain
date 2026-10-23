@@ -12,17 +12,18 @@ changed/deleted) are covered once ``brain.connectors.testing`` lands.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from tests.test_connectors_runner import Harness
 
 from brain.config import get_settings
 from brain.connectors import get as get_connector
-from brain.connectors.google.base import GoogleConnector
+from brain.connectors.base import ConnectorRetryableError
 from brain.connectors.google.calendar import (
     GCAL_SCOPE,
     GCalConnector,
@@ -45,22 +46,6 @@ def _app_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-def _iter_pages_walk(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """The contract's iter_pages walk (base stub not implemented yet)."""
-
-    def walk(request_fn: Callable[[str | None], Any]) -> Iterator[dict[str, Any]]:
-        page_token: str | None = None
-        while True:
-            page = request_fn(page_token).execute()
-            yield page
-            page_token = page.get("nextPageToken")
-            if not page_token:
-                return
-
-    monkeypatch.setattr(GoogleConnector, "iter_pages", staticmethod(walk))
 
 
 class _FakeRequest:
@@ -116,21 +101,11 @@ class _FakeEventsApi:
 
 
 def _connector(fake: _FakeCalendarService) -> GCalConnector:
-    """Build the connector with the service injected at the documented seam.
-
-    GoogleConnector.__init__ is a signature stub until worker_8's step 2, so
-    this tiny test subclass overrides ``_service()`` (the documented seam)
-    and skips the unimplemented base __init__ entirely.
-    """
-
-    class _InjectedService(GCalConnector):
-        def __init__(self, service: Any) -> None:
-            self._injected = service
-
-        def _service(self) -> Any:
-            return self._injected
-
-    return _InjectedService(fake)
+    """The real GCalConnector over an injected fake service (no network)."""
+    return GCalConnector(
+        token_loader=lambda: "refresh-token",
+        service_factory=lambda token, scopes: fake,
+    )
 
 
 def _two_calendar_pages() -> dict[str, list[dict[str, Any]]]:
@@ -344,6 +319,7 @@ def test_record_source_matches_connector_name() -> None:
     assert get_connector("gcal") is GCalConnector
     record = record_from_event(_fixture("event_timed_hebrew.json"), JERUSALEM)
     assert record.source == GCalConnector.name
+    assert GCalConnector.SCOPES == (GCAL_SCOPE,)
     assert GCAL_SCOPE == "https://www.googleapis.com/auth/calendar.readonly"
 
 
@@ -415,15 +391,17 @@ def test_fetch_410_resets_the_calendar_and_relists_without_sync_token(
     assert json.loads(result.next_cursor or "{}") == {"primary": "fresh"}
 
 
-def test_fetch_ignores_non_410_errors_without_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_propagates_non_410_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.fail_next("primary", _FakeHttpError(500))
     conn = _connector(fake)
 
-    with pytest.raises(_FakeHttpError):
+    # The base translation turns 500 into a retryable; only 410 resets.
+    with pytest.raises(ConnectorRetryableError) as exc_info:
         conn.fetch(None, limit=50)
+    assert exc_info.value.status == 500
 
 
 def test_fetch_walks_next_page_token_then_stores_next_sync_token(
@@ -531,3 +509,88 @@ def test_gcal_allowlist_setting_parses_and_defaults(monkeypatch: pytest.MonkeyPa
         assert get_settings().gcal_calendar_ids == ("primary",)
     finally:
         get_settings.cache_clear()
+
+
+# ---- runner-level semantics: this connector through the REAL ConnectorRunner ----
+
+
+@pytest.fixture(name="runner_db")
+def runner_db_fixture(database: None):
+    """Fresh connector_state/connector_records; memory_items cleaned after.
+
+    Same wiring as tests/test_connectors_runner.py (single Harness source);
+    the fixture must live in the using module (pytest does not re-register
+    imported fixture functions).
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal, engine  # noqa: PLC0415
+
+    with engine.begin() as conn:
+        for table in ("connector_records", "connector_state"):
+            conn.execute(text(f"DELETE FROM {table}"))
+    session = SessionLocal()
+    yield session
+    session.rollback()
+    session.close()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM connector_records"))
+        conn.execute(text("DELETE FROM connector_state"))
+        conn.execute(text("DELETE FROM memory_items"))
+
+
+def test_gcal_through_the_real_runner_new_unchanged_changed_deleted(runner_db):
+    """C2 runner-level leg: new/unchanged/changed/deleted with the real
+    ConnectorRunner + IngestService (test DB) and MY connector whose Google
+    service is a fake — no network, no Google account, real DB evidence."""
+    h = Harness(runner_db)
+    timed = _fixture("event_timed_hebrew.json")
+    recurring = _fixture("event_recurring_series.json")
+    event_id = "1q2w3e4r5t6y7u8i9o0p"
+
+    def sync_with(*pages: dict[str, Any]):
+        fake = _FakeCalendarService()
+        fake.queue("primary", *pages)
+        return h.runner(_connector(fake)).run()
+
+    # new -> items created through the standard capture path
+    summary = sync_with({"items": [timed, recurring], "nextSyncToken": "sync-1"})
+    assert (summary.created, summary.updated, summary.deleted) == (2, 0, 0)
+    first = h.item(event_id)
+    assert first is not None
+    assert first.source == "gcal"
+    assert first.raw_text == record_from_event(timed, JERUSALEM).text
+    assert first.occurred_at == datetime(2026, 10, 29, 15, 0, tzinfo=UTC)
+    assert first.meta["connector"] == "gcal"
+    assert first.meta["external_id"] == event_id
+    assert first.meta["version"] == '"34021f8d8b0f61d0"'
+    assert first.meta["calendar_id"] == "primary"
+
+    # unchanged -> same versions are skipped (idempotent re-run)
+    summary = sync_with({"items": [timed, recurring], "nextSyncToken": "sync-2"})
+    assert (summary.created, summary.updated, summary.deleted, summary.skipped) == (0, 0, 0, 2)
+
+    # changed -> same external_id, new etag: updated in place
+    moved = dict(timed)
+    moved["etag"] = '"moved-1"'
+    moved["start"] = {"dateTime": "2026-10-30T10:00:00+02:00"}
+    summary = sync_with({"items": [moved], "nextSyncToken": "sync-3"})
+    assert (summary.updated, summary.skipped) == (1, 0)
+    updated = h.item(event_id)
+    assert updated is not None
+    assert updated.occurred_at == datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
+
+    # deleted -> cancelled (same etag, deleted flag flips): marked + hidden,
+    # NEVER hard-deleted (runner semantics apply to the gcal record as-is).
+    gone = dict(timed)
+    gone["status"] = "cancelled"
+    summary = sync_with({"items": [gone], "nextSyncToken": "sync-4"})
+    assert summary.deleted == 1
+    item_id = updated.id
+    still_there = h.repo.get(item_id)
+    assert still_there is not None
+    assert still_there.meta["source_deleted"] is True
+    assert still_there.superseded_by == item_id
+    # hidden from the default listing paths (the recurring series stays live)
+    listed = h.repo.list(item_type=None, project=None, status=None, limit=10, offset=0)
+    assert str(item_id) not in {str(i.id) for i in listed}
