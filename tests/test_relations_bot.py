@@ -119,6 +119,23 @@ class TestOpenedSupersededItem:
         restore = _find(reply, CB_REL_RESTORE)
         assert len(restore) < 64
 
+    def test_struck_line_truncates_like_the_plain_line(self, world):
+        """Review round 2: the struck line reuses the same one-line truncation."""
+        from brain.telegram_bot import _one_line
+
+        repo, session = world
+        long_text = "word " * 60  # 300 chars — the card cuts at 200
+        old = _capture(repo, long_text)
+        new = _capture(repo, "short replacement")
+        RelationsService().apply_supersede(new_id=new.id, old_id=old.id)
+        session.expire_all()
+
+        bot, _ = _bot(world)
+        struck_line = bot._item_card(session.get(MemoryItem, old.id)).splitlines()[0]
+
+        # exactly strike() over the plain path's flat+truncated+escaped text
+        assert struck_line == f"<s>{_one_line(long_text, 200)}</s>"
+
     def test_restore_callback_unstrikes_the_item(self, world):
         repo, session = world
         old = _capture(repo, "trip on Tuesday")
@@ -257,6 +274,71 @@ class _PendingIds:
         self.kind = "relation"
         self.text = ""
         self.step = 0
+
+
+class TestMixedAppliedAndProposed:
+    """Review round 2: an item can hold BOTH applied and proposed relations.
+
+    The registry parks (item_id, *applied_ids, *proposed_ids), so a proposed
+    row's buttons must carry index applied+i — range(proposed) pointed them
+    at the applied relation (double-confirm no-op lie / discard refusal).
+    """
+
+    def _world_with_both(self, world):
+        repo, session = world
+        applied_old = _capture(repo, "trip on Tuesday")
+        new = _capture(repo, "trip moved to Monday")
+        applied_rel = RelationsService().apply_supersede(new_id=new.id, old_id=applied_old.id)
+        proposed_old = _capture(repo, "pool party at Dana's")
+        proposed_rel = RelationsService().propose_supersede(new_id=new.id, old_id=proposed_old.id)
+        session.expire_all()
+        return (
+            session,
+            applied_rel,
+            applied_old,
+            proposed_rel,
+            proposed_old,
+            new,
+        )
+
+    def _card_for_new(self, world, new):
+        bot, _ = _bot(world)
+        token = bot.registry.put(_PendingIds(ids=(new.id,)))
+        return bot._card_reply(bot.registry.get(token)), bot
+
+    def test_confirm_on_the_proposed_row_applies_it_and_strikes_its_old(self, world):
+        session, applied_rel, applied_old, proposed_rel, proposed_old, new = self._world_with_both(
+            world
+        )
+
+        reply, bot = self._card_for_new(world, new)
+        after = bot.handle_callback(_find(reply, CB_REL_CONFIRM), 7)
+
+        session.expire_all()
+        # the PROPOSED relation got applied and its old item struck...
+        assert RelationsService().get(proposed_rel.id).provenance["state"] == "applied"
+        assert session.get(MemoryItem, proposed_old.id).superseded_by == new.id
+        # ...while the already-applied row was left untouched (no fake confirm)
+        assert RelationsService().get(applied_rel.id).provenance["state"] == "applied"
+        assert session.get(MemoryItem, applied_old.id).superseded_by == new.id
+        assert "✅ Confirmed" in after.text
+
+    def test_keep_both_on_the_proposed_row_discards_only_the_proposal(self, world):
+        session, applied_rel, applied_old, proposed_rel, proposed_old, new = self._world_with_both(
+            world
+        )
+
+        reply, bot = self._card_for_new(world, new)
+        after = bot.handle_callback(_find(reply, CB_REL_KEEP_BOTH), 7)
+
+        session.expire_all()
+        # the proposal is gone, the applied supersede is untouched
+        assert RelationsService().get(proposed_rel.id) is None
+        assert session.get(MemoryItem, proposed_old.id).superseded_by is None
+        assert RelationsService().get(applied_rel.id) is not None
+        assert RelationsService().get(applied_rel.id).provenance["state"] == "applied"
+        assert session.get(MemoryItem, applied_old.id).superseded_by == new.id
+        assert "Keeping both" in after.text
 
 
 class TestStateGuards:

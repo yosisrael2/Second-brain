@@ -21,6 +21,8 @@ index travel in the callback).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -127,24 +129,27 @@ def replaced_by_notice(session: Session, item_id) -> str | None:
 def relations_keyboard(
     token: str,
     *,
-    applied: int,
-    proposed: int,
+    applied: Sequence[ItemRelation],
+    proposed: Sequence[ItemRelation],
 ) -> list[list[tuple[str, str]]]:
     """One ↩︎ Undo row per applied relation; ✅/✖ row per proposed one.
 
-    ``index`` positions into the pending ids AFTER the item id (the relation
-    ids), so callers must park ids as (item_id, *relation_ids).
+    ``index`` positions into the pending ids AFTER the item id, parked as
+    (item_id, *applied_ids, *proposed_ids). The proposed rows' offset is
+    computed here from the same lists the caller parks, so the keyboard
+    cannot drift out of sync with the registry.
     """
-    rows: list[list[tuple[str, str]]] = []
-    for index in range(applied):
-        rows.append([("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{index}")])
-    for index in range(proposed):
-        rows.append(
-            [
-                ("✅ Confirm replace", f"{CB_REL_CONFIRM}:{token}:{index}"),
-                ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{index}"),
-            ]
-        )
+    rows: list[list[tuple[str, str]]] = [
+        [("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{index}")] for index in range(len(applied))
+    ]
+    offset = len(applied)
+    rows += [
+        [
+            ("✅ Confirm replace", f"{CB_REL_CONFIRM}:{token}:{offset + index}"),
+            ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{offset + index}"),
+        ]
+        for index in range(len(proposed))
+    ]
     return rows
 
 

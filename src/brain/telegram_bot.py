@@ -370,12 +370,17 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
-def _one_line(text: str, limit: int) -> str:
+def _flat_line(text: str, limit: int) -> str:
     """Collapse to one line, cut at ``limit`` with an ellipsis when cut."""
     flat = " ".join(str(text).split())
     if len(flat) > limit:
         flat = flat[:limit].rstrip() + "…"
-    return _esc(flat)
+    return flat
+
+
+def _one_line(text: str, limit: int) -> str:
+    """_flat_line, HTML-escaped."""
+    return _esc(_flat_line(text, limit))
 
 
 _SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -631,7 +636,7 @@ class TelegramBot:
         """
         text_line = _one_line(item.raw_text, 200)
         if getattr(item, "superseded_by", None) is not None:
-            text_line = strike(" ".join(str(item.raw_text).split())[:200])
+            text_line = strike(_flat_line(item.raw_text, 200))
         lines = [f"{indent}{text_line}"]
         meta = item.meta or {}
         fields: list[str] = []
@@ -1428,7 +1433,7 @@ class TelegramBot:
             if applied or proposed:
                 rel_ids = [rel.id for rel in applied] + [rel.id for rel in proposed]
                 token = self.registry.put(Pending(ids=(item_id, *rel_ids), kind="relation"))
-                rows += relations_keyboard(token, applied=len(applied), proposed=len(proposed))
+                rows += relations_keyboard(token, applied=applied, proposed=proposed)
         finally:
             session.close()
         return rows
