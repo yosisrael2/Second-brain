@@ -1176,7 +1176,6 @@ def test_eval_runner_emits_one_row_per_child(world: World, tmp_path):
     """v6 Lever A: the eval runner groups by child — a child carrying merged
     quotes still yields exactly ONE pred row, quoting the kept link."""
     import json as _json
-    from pathlib import Path as _Path
     from zoneinfo import ZoneInfo as _ZoneInfo
 
     from brain.services.extraction.eval_runner import run_extraction_eval
