@@ -72,7 +72,7 @@ class FakeKeychain:
 @pytest.fixture(name="settings_env")
 def settings_env_fixture(monkeypatch: pytest.MonkeyPatch):
     """Hermetic settings: connectors enabled, no live-store risk."""
-    monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks")
+    monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks,gdrive")
     monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
     get_settings.cache_clear()
     yield
@@ -136,10 +136,11 @@ def test_sync_refuses_unknown_disabled_and_unavailable(settings_env, capsys):
     assert cli.main(["connectors", "sync", "nosuch"]) == 78
     assert "not enabled" in capsys.readouterr().err
     # A known name that is NOT in BRAIN_CONNECTORS for this fixture.
-    assert cli.main(["connectors", "sync", "gdrive"]) == 78
+    assert cli.main(["connectors", "sync", "email"]) == 78
     assert "not enabled" in capsys.readouterr().err
-    # Enabled but no adapter module merged yet -> 'not available'.
-    assert cli.main(["connectors", "sync", "gtasks"]) == 78
+    # Enabled but no adapter module merged yet -> 'not available'. (gtasks IS
+    # merged since #56; gdrive's adapter is still pending.)
+    assert cli.main(["connectors", "sync", "gdrive"]) == 78
     assert "not available" in capsys.readouterr().err
 
 
@@ -236,8 +237,12 @@ def test_auth_google_stores_only_the_refresh_token(
     assert cli.main(["connectors", "auth", "google", "--client-secret", str(secret)]) == 0
     out = capsys.readouterr().out
     expected_scopes = sorted(
-        {scope for name in ("gcal", "gtasks") for scope in SCOPE_BY_CONNECTOR[name]}
+        {
+            scope
+            for name in get_settings().connectors_enabled  # whatever the fixture enabled
+            for scope in SCOPE_BY_CONNECTOR[name]
+        }
     )
-    assert flow.requested_scopes == expected_scopes  # the union of enabled connectors
+    assert set(flow.requested_scopes) == set(expected_scopes)  # union of enabled connectors
     assert "1//google-union-token" not in out  # the token is NEVER printed
     assert "second-brain-gmail" in out
