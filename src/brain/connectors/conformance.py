@@ -62,10 +62,48 @@ class ConformanceScenario:
 
     Deliberately NOT the external_id order: the termination check only
     bites when emit order and cursor order disagree.
+
+    ``cursor_key`` (optional) switches the fake API to KEY-based paging, the
+    shape real sources have: records are served in (key, external_id) order
+    and the continuation cursor is ``"key|external_id"`` — resume STRICTLY
+    after it. Adapters pass their own cursor key (e.g. the record's
+    ``occurred_at`` / updated timestamp) so the tie-group termination pass
+    exercises THEIR key semantics: more records sharing one key than fit in
+    a page, followed by newer records. A connector that resumes at the bare
+    key (``key >= cursor``) re-serves the same ties forever.
     """
 
     records: tuple[Any, ...]
     name: str = "gcal"
+    cursor_key: Callable[[Any], str] | None = None
+    keys: dict[str, str] | None = None  # explicit external_id -> key override
+
+    def effective_keys(self) -> dict[str, str] | None:
+        """The cursor key per external_id (None = position paging)."""
+        if self.keys is not None:
+            return dict(self.keys)
+        if self.cursor_key is None:
+            return None
+        return {r.external_id: str(self.cursor_key(r)) for r in self.records}
+
+    def with_tie_group(self, *, limit: int) -> ConformanceScenario:
+        """The TIE-GROUP variant: the same records under key paging, with
+        ``limit + 2`` of them sharing ONE key (a tie group bigger than a
+        page) and the rest on strictly newer keys. External ids are prefixed
+        with ``tie-`` so the pass ingests fresh items instead of skipping the
+        already-ingested ones (a vacuous pass would prove nothing)."""
+        ids = [r.external_id for r in self.records]
+        by_id = {r.external_id: r for r in self.records}
+        group, rest = ids[: limit + 2], ids[limit + 2 :]
+        keys = {f"tie-{rid}": "TIE" for rid in group}
+        keys.update({f"tie-{rid}": f"TIE-{i + 1:03d}" for i, rid in enumerate(rest)})
+        records = tuple(
+            by_id[rid].__class__(**{**by_id[rid].__dict__, "external_id": f"tie-{rid}"})
+            for rid in ids
+        )
+        return ConformanceScenario(
+            records=records, name=self.name, cursor_key=self.cursor_key, keys=keys
+        )
 
 
 class FakeSourceAPI:
@@ -83,12 +121,18 @@ class FakeSourceAPI:
         self.page_size = page_size
         self.fetches: list[tuple[str | None, int]] = []
         self._next_only: FetchResult | None = None
+        # KEY MODE (scenario.keys/cursor_key set): records are served in
+        # (key, external_id) order and the continuation cursor is
+        # "key|external_id" — resume STRICTLY after it. "|" is reserved.
+        self._keys: dict[str, str] | None = scenario.effective_keys()
 
     def fetch(self, cursor: str | None, *, limit: int) -> FetchResult:
         self.fetches.append((cursor, limit))
         if self._next_only is not None:
             result, self._next_only = self._next_only, None
             return result
+        if self._keys is not None:
+            return self._fetch_by_key(cursor, limit)
         start = int(cursor) if cursor else 0
         page = self.records[start : start + limit]
         nxt = start + len(page)
@@ -96,6 +140,44 @@ class FakeSourceAPI:
             records=list(page),
             next_cursor=str(nxt) if nxt < len(self.records) else None,
         )
+
+    def _fetch_by_key(self, cursor: str | None, limit: int) -> FetchResult:
+        keys = self._keys
+        if keys is None:  # internal invariant: only called in key mode
+            raise RuntimeError("_fetch_by_key without a key-mode scenario")
+        ordered = sorted(
+            self.records, key=lambda r: (keys[r.external_id], r.external_id)
+        )
+        start = 0
+        if cursor:
+            if "|" in cursor:
+                key, eid = cursor.split("|", 1)
+                start = next(
+                    (
+                        i
+                        for i, r in enumerate(ordered)
+                        if (keys[r.external_id], r.external_id) > (key, eid)
+                    ),
+                    len(ordered),
+                )
+            else:
+                # A bare key: a naive source resumes at "key >= cursor" —
+                # the start of that key's tie group (this is the trap).
+                start = next(
+                    (
+                        i
+                        for i, r in enumerate(ordered)
+                        if keys[r.external_id] == cursor
+                    ),
+                    len(ordered),
+                )
+        page = ordered[start : start + limit]
+        if not page or start + len(page) >= len(ordered):
+            nxt = None
+        else:
+            last = page[-1]
+            nxt = f"{keys[last.external_id]}|{last.external_id}"
+        return FetchResult(records=list(page), next_cursor=nxt)
 
     def bump(self, external_id: str, **changes: Any) -> None:
         """Replace one record with a modified copy (CHANGE / DELETE checks)."""
@@ -173,6 +255,18 @@ class _KitHarness:
             if row.item_id is not None and self.repo.get(row.item_id) is not None
         }
 
+    def reset_cursor(self, source: str) -> None:
+        """Start the next sync from a fresh cursor.
+
+        Each conformance pass drives an independent scenario generation; the
+        cursor a previous pass left behind belongs to a DIFFERENT api (and,
+        for the tie-group pass, a different cursor MODE), so it must not
+        leak into the next pass's first fetch.
+        """
+        from datetime import UTC, datetime  # noqa: PLC0415
+
+        self.state.record_success(source, cursor=None, at=datetime.now(UTC))
+
 
 def assert_conforms(
     make_connector: Callable[[Any], Connector],
@@ -196,6 +290,8 @@ def assert_conforms(
             f"conformance needs a dataset larger than the limit "
             f"({n} records vs limit {limit}) — otherwise termination is trivial"
         )
+    tie_scenario = scenario.with_tie_group(limit=limit)
+    tie_api = FakeSourceAPI(tie_scenario, page_size=limit)
     harness = _KitHarness(session)
 
     def connector_for() -> Connector:
@@ -204,6 +300,17 @@ def assert_conforms(
     report = {
         "termination": _check_termination(
             harness, connector_for, api, limit=limit, max_fetches=max_fetches
+        ),
+        # The TIE-GROUP pass: more records sharing one cursor key than fit in
+        # a page, then newer records — catches the resume-at-the-bare-key
+        # livelock (key >= cursor) that scrambled ORDER alone cannot.
+        "termination_tie_group": _check_termination(
+            harness,
+            lambda: make_connector(tie_api),
+            tie_api,
+            limit=limit,
+            max_fetches=max_fetches,
+            check="termination_tie_group",
         ),
         "idempotency": _check_idempotency(harness, connector_for, api, limit=limit),
         "change": _check_change(harness, connector_for, api, scenario, limit=limit),
@@ -220,6 +327,7 @@ def _check_termination(
     *,
     limit: int,
     max_fetches: int | None,
+    check: str = "termination",
 ) -> dict[str, int]:
     """Repeated small-limit syncs must drain the dataset in bounded syncs.
 
@@ -227,6 +335,7 @@ def _check_termination(
     may bypass the kit's API entirely (that is the livelock under test), and
     the kit itself must terminate on ANY connector.
     """
+    harness.reset_cursor(api.name)
     n = len(api.records)
     cap = max_fetches if max_fetches is not None else (n // limit + 1) + 1
     used = 0
@@ -236,8 +345,8 @@ def _check_termination(
         used += 1
         if summary.errors:
             raise ConformanceFailure(
-                "termination",
-                f"termination: {summary.errors} record(s) failed on sync "
+                check,
+                f"{check}: {summary.errors} record(s) failed on sync "
                 f"{_sync_number + 1} ({summary.error})",
             )
         if summary.fetched == 0:
@@ -245,17 +354,19 @@ def _check_termination(
             drained = True
             break
     ingested = harness.ingested_ids(api.name)
-    if len(ingested) != n:
-        missing = sorted({r.external_id for r in api.records} - ingested)
+    ids = {r.external_id for r in api.records}
+    missing = sorted(ids - ingested)
+    if missing:
         raise ConformanceFailure(
-            "termination",
-            f"termination: {len(ingested)} of {n} records ingested after "
+            check,
+            f"{check}: {len(ids) - len(missing)} of {len(ids)} records ingested after "
             f"{used} syncs (limit {limit}); missing: {missing}. "
             f"The sync never drained the dataset — check the connector's cursor "
             f"semantics (emitted records must be reachable from the cursors it "
-            f"returns; emit-in-API-order + resume-at-earliest-unemitted livelocks).",
+            f"returns; emit-in-API-order + resume-at-earliest-unemitted livelocks; "
+            f"a cursor that drops the tie-break livelocks on tie groups).",
         )
-    return {"syncs": used, "drained": drained, "ingested": n}
+    return {"syncs": used, "drained": drained, "ingested": len(ids)}
 
 
 def _check_idempotency(
@@ -266,6 +377,7 @@ def _check_idempotency(
     limit: int,
 ) -> dict[str, int]:
     """Re-syncing the whole (unchanged) dataset must change nothing."""
+    harness.reset_cursor(api.name)
     totals = _sync_totals(harness, connector_for, api, limit=limit, check="idempotency")
     if (totals["created"], totals["updated"], totals["deleted"]) != (0, 0, 0):
         raise ConformanceFailure(
@@ -289,6 +401,7 @@ def _check_change(
     bumped = scenario.records[0].external_id
     new_text = f"body of {bumped}, SECOND VERSION"
     api.bump(bumped, version="conformance-v2", text=new_text)
+    harness.reset_cursor(api.name)
     updated = _sync_totals(
         harness, connector_for, api, limit=limit, check="change"
     )["updated"]
@@ -318,6 +431,7 @@ def _check_delete(
     """deleted=True hides the item via the PR B mechanism and never hard-deletes."""
     doomed = scenario.records[-1].external_id
     api.mark_deleted(doomed)
+    harness.reset_cursor(api.name)
     deletions = _sync_totals(
         harness, connector_for, api, limit=limit, check="delete"
     )["deleted"]

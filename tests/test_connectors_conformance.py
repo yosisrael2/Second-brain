@@ -97,15 +97,43 @@ class LivelockConnector(Connector):
         return FetchResult(records=list(page), next_cursor="0")
 
 
+class KeyOnlyConnector(Connector):
+    """The SECOND gtasks livelock: the connector recomputes its cursor as the
+    bare cursor KEY of its last record instead of roundtripping the API's
+    continuation cursor. When more records share that key than fit in one
+    page (a tie group), 'key >= cursor' re-serves the same ties forever and
+    the newer records behind them are never reached."""
+
+    name = "gcal"
+
+    def __init__(self, api: FakeSourceAPI) -> None:
+        self._api = api
+
+    def fetch(self, cursor: str | None, *, limit: int) -> FetchResult:
+        result = self._api.fetch(cursor, limit=limit)
+        if result.records and result.next_cursor:
+            key = result.next_cursor.split("|", 1)[0]
+            return FetchResult(records=result.records, next_cursor=key)
+        return result
+
+
 # --- the five checks ---------------------------------------------------------
 
 
 def test_kit_passes_a_well_behaved_connector(kit_db):
     report = assert_conforms(_reference_factory, _scenario(), session=kit_db)
 
-    assert set(report) == {"termination", "idempotency", "change", "delete", "reset"}
+    assert set(report) == {
+        "termination",
+        "termination_tie_group",
+        "idempotency",
+        "change",
+        "delete",
+        "reset",
+    }
     assert report["termination"]["syncs"] <= 8  # 3 pages + drain, not N-syncs
     assert report["termination"]["ingested"] == 7
+    assert report["termination_tie_group"]["ingested"] == 7  # ties drained too
 
 
 def test_kit_fails_a_livelocked_connector_on_termination(kit_db):
@@ -122,6 +150,22 @@ def test_kit_fails_a_livelocked_connector_on_termination(kit_db):
         assert "3 of 7" in str(failure)  # the same first page, forever
     else:
         raise AssertionError("the livelock connector passed the conformance kit")
+
+
+def test_kit_fails_a_key_only_connector_on_the_tie_group(kit_db):
+    """A connector that drops the tie-break from its cursor (resumes at the
+    bare key) must FAIL the tie-group termination pass: with 5 records
+    sharing one key and limit=3, the same ties repeat forever."""
+    try:
+        assert_conforms(
+            lambda api: KeyOnlyConnector(api),
+            _scenario(),
+            session=kit_db,
+        )
+    except ConformanceFailure as failure:
+        assert failure.check == "termination_tie_group"
+    else:
+        raise AssertionError("the key-only connector passed the tie-group check")
 
 
 def test_kit_idempotency_change_delete_reset(kit_db):
