@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -177,10 +178,22 @@ class AskService:
         if self._memory is None or self._items_repo is None:
             return []
         entities = self._memory.overview(status="confirmed", q=None)
-        lowered = question.lower()
 
         def mentions(name: str) -> bool:
-            return bool(name) and name.lower() in lowered
+            if not name:
+                return False
+            # Whole-word match only: 'May' must not fire inside 'mayor',
+            # 'שחר' not inside 'שחרור'. \w is Unicode-aware, so Hebrew
+            # letters count as word characters on both sides. Hebrew words,
+            # though, glue one-letter prefixes onto the word itself ('לאיתמר',
+            # 'ואיתמר', 'שלאיתמר') — so for names written in Hebrew letters
+            # allow an optional run of up to 3 Hebrew prefix letters right
+            # before the name, still requiring that nothing word-like
+            # precedes the run and that nothing word-like follows the name.
+            body = re.escape(name)
+            if re.search(r"[\u05d0-\u05ea]", name):
+                body = rf"[והבכלמש]{{0,3}}{body}"
+            return re.search(rf"(?<!\w){body}(?!\w)", question, re.IGNORECASE) is not None
 
         kids: list[dict[str, Any]] = []
         channels: list[dict[str, Any]] = []

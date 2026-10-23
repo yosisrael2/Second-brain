@@ -233,3 +233,84 @@ def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
     service.ask("מה חדש אצל איתמר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
 
     assert len(search.seen_extra[0]) == 16, "the extra leg must respect its cap"
+
+
+def test_kid_name_matches_word_boundaries_only(clean_items, memory_db) -> None:
+    """'May' inside 'mayor' (or 'שחר' inside 'שחרור') must NOT name a kid.
+
+    Substring matching is too loose: a kid whose name appears as a proper
+    sub-word of another word in the question must not widen the pool.
+    """
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)  # unrelated world so only May can fire
+    memory.add_entity("person", "May")
+    memory.set_kid("May", gender="girl", school="בראשית", grade="3", class_="ג' שקד")
+    memory.set_channel("ג' שקד - הורים", kind="parents", applies_to="May")
+    repo.add(MemoryItem(
+        raw_text="[21/10/2026, 18:00] ג' שקד - הורים / המחנכת: מחר יום ספור",
+        occurred_at=datetime(2026, 10, 21, 15, 0, tzinfo=UTC),
+    ))
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    service.ask(
+        "When is the mayor visiting the school?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
+    )
+    assert not search.seen_extra[-1], "'may' inside 'mayor' must not fire the kid leg"
+
+    service.ask("מה חדש עם השחרור הזה?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert not search.seen_extra[-1], "a Hebrew sub-word must not fire the kid leg"
+
+    service.ask("What did May bring to school?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert search.seen_extra[-1], "the real name as a whole word still fires"
+
+
+def test_hebrew_prefixes_still_name_a_kid(clean_items, memory_db) -> None:
+    """Hebrew glues prefixes onto words: 'לאיתמר'/'ואיתמר'/'שלאיתמר' are all
+    questions that NAME Itamar, so the prefix run [והבכלמש]{0,3} must be
+    allowed before the name — while 'שחר' inside 'שחרור' still must not fire
+    (the word continues with a letter, the name does not end there).
+    """
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    memory.add_entity("person", "Shachar", aliases=["שחר"])
+    memory.set_kid("Shachar", gender="boy", school="בראשית", grade="4", class_="ד' נוף")
+    memory.set_channel("שחר חוג כדורסל", kind="club", applies_to="Shachar")
+    repo.add(MemoryItem(
+        raw_text="[21/10/2026, 18:30] שחר חוג כדורסל / המאמן: מחר מתאמנים בדווקא בבוקר",
+        occurred_at=datetime(2026, 10, 21, 15, 30, tzinfo=UTC),
+    ))
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    for question in (
+        "מה צריך לאיתמר מחר?",       # single prefix ל
+        "ואיתמר, מה הוא צריך?",       # single prefix ו
+        "האם שלאיתמר יש מחר משהו?",   # prefix combo של
+    ):
+        service.ask(question, now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+        assert search.seen_extra[-1], f"'{question}' must fire the kid leg"
+
+    service.ask("מה חדש עם השחרור הזה?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert not search.seen_extra[-1], "prefixes must not resurrect the שחרור false positive"
+
+    service.ask("מה עם שחר בחוג מחר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    assert search.seen_extra[-1], "the bare alias as a whole word still fires"
+
+
+def test_by_text_any_excludes_dropped_children(clean_items, memory_db) -> None:
+    """Repo contract (design item 19): dropped extracted children are never
+    recalled; ordinary captures, proposed and kept children are."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    for state in [None, "proposed", "kept", "dropped"]:
+        repo.add(MemoryItem(
+            raw_text="[21/10/2026, 19:00] ג' שקד - הורים / המחנכת: טיול שנתי בטבעון",
+            occurred_at=datetime(2026, 10, 21, 16, 0, tzinfo=UTC),
+            child_state=state,
+        ))
+
+    hits = repo.by_text_any(["טיול שנתי בטבעון"], limit=16)
+
+    assert len(hits) == 3, "the dropped child must not be recalled"
+    assert all((hit.child_state or None) != "dropped" for hit in hits)
