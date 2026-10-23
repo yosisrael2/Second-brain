@@ -24,6 +24,7 @@ import sqlite3
 import uuid as uuid_mod
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -722,3 +723,82 @@ def test_ops_endpoint_reports_cursor_and_counts(tmp_path: Path, world: SimpleWor
     assert channel["messages_seen"] == 1
     assert channel["conversations_created"] == 1
     assert channel["conversations_updated"] == 0
+
+
+def test_ops_endpoint_today_follows_the_local_day(
+    tmp_path: Path, world: SimpleWorld, monkeypatch: pytest.MonkeyPatch
+):
+    """'today' follows the user's LOCAL day (settings.timezone), not the DB's
+    UTC day: an item created 23:30Z on day D (= 02:30 local on D+1, Israel is
+    UTC+3 until the 25 Oct 2026 DST end) counts as today when the pinned 'now'
+    is 00:30Z on D+1 (= 03:30 local D+1). A UTC day-trunc counts it as
+    yesterday — exactly the 00:00–03:00 local window the review flagged."""
+    import brain.api.routes.ops as ops_routes
+
+    pinned_now = datetime(2026, 10, 23, 0, 30, tzinfo=UTC)
+    monkeypatch.setattr(ops_routes, "_now_utc", lambda: pinned_now)
+    monkeypatch.setattr(
+        ops_routes, "get_settings", lambda: SimpleNamespace(timezone="Asia/Jerusalem")
+    )
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("z0", datetime(2026, 10, 22, 20, 0, tzinfo=UTC))],
+    )
+    poller = _poller(world, BridgeStore(path))
+    poller.poll(now=datetime(2026, 10, 22, 20, 1, tzinfo=UTC))  # live edge
+    _add_row(path, _bridge_row("a1", datetime(2026, 10, 22, 23, 30, tzinfo=UTC)))
+    poller.poll(now=datetime(2026, 10, 22, 23, 31, tzinfo=UTC))
+    world.session.commit()
+    item = world.session.query(MemoryItem).one()
+    item.created_at = datetime(2026, 10, 22, 23, 30, tzinfo=UTC)
+    world.session.commit()
+
+    client = TestClient(create_app())
+    channel = client.get("/ops/whatsapp").json()["channels"][0]
+    assert channel["conversations_today"] == 1  # 02:30 local Oct 23 — today
+    assert channel["conversations_total"] == 1
+
+
+def test_ops_endpoint_reports_today_and_media_counts(tmp_path: Path, world: SimpleWorld):
+    """Per-channel conversations today/total + media read/not-read: the cockpit
+    Sources panel's data (read-only aggregation over the poller's own rows)."""
+    world.seed_channel("Chat A")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("z0", datetime(2026, 10, 22, 8, 0, tzinfo=UTC))],
+    )
+    poller = _poller(world, BridgeStore(path))
+    poller.poll(now=datetime(2026, 10, 22, 8, 5, tzinfo=UTC))  # live edge
+    _add_row(path, _bridge_row("a1", datetime(2026, 10, 22, 10, 0, tzinfo=UTC)))
+    poller.poll(now=datetime(2026, 10, 22, 10, 2, tzinfo=UTC))
+    world.session.commit()
+    # One media entry read (status saved) + one still "not read yet".
+    item = world.session.query(MemoryItem).one()
+    meta = dict(item.meta)
+    messages = [dict(m) for m in meta["messages"]]
+    messages.append(
+        {"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}}
+    )
+    messages.append(
+        {"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}}
+    )
+    meta["messages"] = messages
+    item.meta = meta
+    world.session.commit()
+
+    get_settings.cache_clear()
+    try:
+        client = TestClient(create_app())
+        payload = client.get("/ops/whatsapp").json()
+    finally:
+        get_settings.cache_clear()
+    channel = payload["channels"][0]
+    assert channel["conversations_today"] == 1  # created_at is now -> today
+    assert channel["conversations_total"] == 1
+    assert channel["media_read"] == 1
+    assert channel["media_not_read"] == 1
