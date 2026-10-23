@@ -195,6 +195,11 @@ the AI/integrations track).
 | GET    | `/items/{id}`      | Fetch one; 404 if missing                                        |
 | PATCH  | `/items/{id}`      | Partial update (absent fields unchanged); 404 if missing         |
 | DELETE | `/items/{id}`      | Delete; 204, or 404 if missing                                   |
+| POST   | `/items/{id}/relations` | Link to another item (`to_id`, `kind` supersedes\|corrects\|derived_from\|same_as, `provenance`). kind=supersedes auto-APPLIES (item 20a: old item struck-through, undoable); `propose: true` only PROPOSES (item 20b, cross-thread LLM match — old item stays visible until confirm) |
+| GET    | `/items/{id}/relations` | Every relation touching the item                                   |
+| GET    | `/items/{id}/current`   | Resolve the supersedes chain to the CURRENT version                |
+| POST   | `/items/relations/{rid}/confirm` | Confirm a proposed supersede (old item struck-through)    |
+| POST   | `/items/relations/{rid}/undo`    | Undo/restore (item 20a/D4: old item current again)        |
 | GET    | `/search?q=`       | Semantic search (embed -> Qdrant -> Jev rerank); falls back to keyword search (`score: null`) when embeddings/Qdrant are unavailable |
 | POST   | `/ask`             | Answer a question from top-k items with citations; 502 when the LLM is unconfigured/down |
 

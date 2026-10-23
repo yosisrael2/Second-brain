@@ -217,3 +217,27 @@ class FactPatch(BaseModel):
     predicate: str | None = Field(default=None, min_length=1, max_length=FACT_PREDICATE_MAX_LENGTH)
     object_id: uuid.UUID | None = None
     value: str | None = Field(default=None, max_length=FACT_VALUE_MAX_LENGTH)
+
+
+class RelationCreate(BaseModel):
+    """PR B: create a relation between two items."""
+
+    to_id: uuid.UUID
+    kind: str
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    # item 20b: propose=True creates a PROPOSED supersede (cross-thread LLM
+    # match); the old item stays visible until POST /relations/{id}/confirm.
+    propose: bool = False
+
+
+class RelationRead(BaseModel):
+    """A relation as returned by the API."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    from_id: uuid.UUID
+    to_id: uuid.UUID
+    kind: str
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime

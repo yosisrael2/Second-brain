@@ -54,9 +54,12 @@ class ItemsRepositoryProto(Protocol):
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_superseded: bool = False,
     ) -> Sequence[MemoryItem]: ...
 
-    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]: ...
+    def search(
+        self, *, query: str, limit: int, offset: int, include_superseded: bool = False
+    ) -> Sequence[MemoryItem]: ...
 
     def by_occurrence(
         self, *, start: datetime, end: datetime, limit: int
@@ -97,9 +100,7 @@ class ItemsService:
             setattr(item, field, value)
         if _FINGERPRINT_FIELDS.intersection(changes):
             # keep the dedupe guard aligned with the edited content
-            item.fingerprint = content_fingerprint(
-                item.raw_text, item.occurred_at, item.source
-            )
+            item.fingerprint = content_fingerprint(item.raw_text, item.occurred_at, item.source)
         self._repo.commit()  # commit flushes the pending UPDATE
         self._repo.refresh(item)  # reload server-generated updated_at
         self._reindex_if_indexed_fields_changed(item, changes)
@@ -129,6 +130,7 @@ class ItemsService:
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_superseded: bool = False,
     ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status."""
         return self._repo.list(
@@ -138,11 +140,16 @@ class ItemsService:
             limit=limit,
             offset=offset,
             include_children=include_children,
+            include_superseded=include_superseded,
         )
 
-    def search(self, *, query: str, limit: int, offset: int) -> Sequence[MemoryItem]:
+    def search(
+        self, *, query: str, limit: int, offset: int, include_superseded: bool = False
+    ) -> Sequence[MemoryItem]:
         """Full-text keyword search over raw_text, best match first."""
-        return self._repo.search(query=query, limit=limit, offset=offset)
+        return self._repo.search(
+            query=query, limit=limit, offset=offset, include_superseded=include_superseded
+        )
 
     def in_occurrence_range(
         self, *, start: datetime, end: datetime, limit: int
