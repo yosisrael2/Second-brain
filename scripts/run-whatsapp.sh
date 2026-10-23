@@ -48,6 +48,10 @@ if [ -z "${WHATSAPP_BRIDGE_DB:-}" ] && [ -n "${HOME:-}" ]; then
   export WHATSAPP_BRIDGE_DB="$HOME/git/whatsapp-mcp/whatsapp-bridge/store/messages.db"
 fi
 
+# launchd log files must stream, not buffer in 4kB blocks (run-server.sh does
+# the same; without it the poller's log reads as empty while it runs fine).
+export PYTHONUNBUFFERED=1
+
 "$BRAIN" whatsapp "$@"
 rc=$?
 case "$rc" in
