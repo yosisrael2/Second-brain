@@ -17,6 +17,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import SecretStr
+
 from tests.fakes import FULL_CLASSIFICATION, FakeRepository, StubClassifier
 
 from brain.ai.ask import FakeLLMClient, LLMError
@@ -866,3 +868,77 @@ class TestLockScope:
             assert (tmp_path / "repoA" / ".dev" / "telegram.lock").exists()
         finally:
             handle.close()
+
+
+class TestPollLoopLivenessHeartbeats:
+    """Ops polish: the bot must heartbeat on the RETRY paths too.
+
+    The old loop only heartbeated after a SUCCESSFUL getUpdates, so a quiet
+    chat (50s long-poll) or a conflict/network retry storm pushed the
+    heartbeat age past health's threshold while the bot was fine.
+    """
+
+    def test_heartbeat_fires_during_conflict_backoff(self, monkeypatch):
+        telegram = pytest.importorskip("telegram")
+        events = _Events()
+        events.install(monkeypatch)
+        core, _ = _core()
+        tg = _FakeTG(
+            [
+                [telegram.error.Conflict("terminated by other getUpdates request")],
+                [RuntimeError("stop")],
+            ]
+        )
+
+        _run_poll(tg, core, conflict_backoff_s=0.01)
+
+        phases = [(hb[1] or {}).get("phase") for hb in events.heartbeats]
+        assert "backoff" in phases, "a retry loop must prove liveness while waiting"
+        assert "polling" in phases, "each poll attempt starts a fresh liveness window"
+
+    def test_heartbeat_fires_on_network_retry(self, monkeypatch):
+        telegram = pytest.importorskip("telegram")
+        events = _Events()
+        events.install(monkeypatch)
+        core, _ = _core()
+        tg = _FakeTG([[telegram.error.NetworkError("connection reset")], [RuntimeError("stop")]])
+
+        _run_poll(tg, core)
+
+        phases = [(hb[1] or {}).get("phase") for hb in events.heartbeats]
+        assert "polling" in phases
+
+    def test_run_passes_settings_poll_timeout(self, monkeypatch):
+        import brain.telegram_bot as tb
+
+        captured: dict = {}
+
+        class _Stop(Exception):
+            pass
+
+        async def fake_poll_loop(tg, core, **kwargs):
+            captured.update(kwargs)
+            raise _Stop()
+
+        monkeypatch.setattr(tb, "poll_loop", fake_poll_loop)
+        class _FakeLock:
+            def close(self) -> None: ...
+
+        class _FakeTgForRun:
+            async def initialize(self) -> None: ...
+
+            async def shutdown(self) -> None: ...
+
+            async def close(self) -> None: ...
+
+        monkeypatch.setattr(
+            tb, "build_bot", lambda settings: (_core()[0], _FakeTgForRun())
+        )
+        monkeypatch.setattr(tb, "_acquire_instance_lock", lambda token: (_FakeLock(), None))
+        fake_settings = SimpleNamespace(
+            telegram_bot_token=SecretStr("1234:abcdef"),
+            telegram_poll_timeout_s=37,
+        )
+        rc = tb.run(fake_settings)  # run() maps loop exceptions to exit codes
+        assert captured["poll_timeout_s"] == 37
+        assert rc == tb.EXIT_TRANSIENT
