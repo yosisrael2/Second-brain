@@ -30,8 +30,10 @@ resolve_docker() {
 # only plain KEY=VALUE lines, surrounding quotes stripped, inline '#' comments
 # and trailing whitespace are NOT stripped — keep values comment-free.
 load_env_file() {
-  [ -f .env ] || return 0
-  local key value
+  # Optional $1: env-file path (default: ./.env). The seam lets tests point
+  # a launcher at a temp file instead of the repo checkout.
+  local file="${1:-.env}" key value
+  [ -f "$file" ] || return 0
   while IFS='=' read -r key value; do
     [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
     [ -n "${!key:-}" ] && continue
@@ -40,7 +42,7 @@ load_env_file() {
     value="${value%\'}"
     value="${value#\'}"
     export "$key=$value"
-  done < <(grep -E '^[A-Z_][A-Z0-9_]*=' .env || true)
+  done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$file" || true)
 }
 
 # Pin the compose project: .env may set COMPOSE_PROJECT_NAME, the real

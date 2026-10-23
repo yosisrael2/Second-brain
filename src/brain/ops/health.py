@@ -602,6 +602,7 @@ def _compose_project() -> str | None:
 BACKGROUND_LABELS = (
     "com.secondbrain.api",
     "com.secondbrain.telegram",
+    "com.secondbrain.email",
     "com.secondbrain.whatsapp",
 )
 
