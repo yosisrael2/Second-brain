@@ -11,6 +11,7 @@ from brain.db.enums import (
     CONFIDENCE_MIN,
     IMPORTANCE_MAX,
     IMPORTANCE_MIN,
+    ITEM_SOURCE_DOMAIN,
     Actionability,
     ItemStatus,
     ItemType,
@@ -40,6 +41,22 @@ class ItemCreate(BaseModel):
     occurred_at: datetime | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("source")
+    @classmethod
+    def _source_in_domain(cls, value: str) -> str:
+        """The memory_items.source CHECK domain, API side too.
+
+        Every capture path writes a fixed in-domain value (paste kinds,
+        telegram, whatsapp, email poller, connectors); a client-supplied
+        source must stay inside the same closed domain or the INSERT would
+        500 on live the moment the CHECK migration runs (PR #53 review).
+        """
+        if value not in ITEM_SOURCE_DOMAIN:
+            raise ValueError(
+                f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}"
+            )
+        return value
+
 
 class ItemUpdate(BaseModel):
     """Partial payload for PATCH /items/{id}; absent fields stay unchanged."""
@@ -52,6 +69,16 @@ class ItemUpdate(BaseModel):
     actionability: Actionability | None = None
     confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
     status: ItemStatus | None = None
+
+    @field_validator("source")
+    @classmethod
+    def _source_in_domain(cls, value: str | None) -> str | None:
+        """Same closed domain as ItemCreate (absent stays absent)."""
+        if value is not None and value not in ITEM_SOURCE_DOMAIN:
+            raise ValueError(
+                f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}"
+            )
+        return value
 
 
 class ItemRead(BaseModel):

@@ -485,6 +485,36 @@ def test_poison_record_quarantines_and_releases_cursor(runner_db):
     assert h.item("bad") is None  # never captured
 
 
+def test_db_poisoned_record_quarantines_without_aborting_run(runner_db):
+    """Review round 3: a record that fails with a REAL DB error (Postgres
+    rejects the NaN in meta during flush) poisons the shared session; the
+    failure bookkeeping must roll back FIRST, or its own commit raises
+    PendingRollbackError inside the except block and aborts run(). Earlier
+    records of the same batch are already committed per record — the
+    rollback cannot touch them (the good record is asserted below)."""
+    h = Harness(runner_db)
+    poison = make_record(external_id="dbbad", meta={"weird": float("nan")})
+    good = make_record(external_id="good2", text="good two")
+    connector = FakeConnector(
+        batches=[_batch(good, poison), _batch(good, poison), _batch(good, poison)]
+    )
+    runner = h.runner(connector)
+
+    s1 = runner.run()  # pre-fix this raised PendingRollbackError out of run()
+
+    assert s1.errors == 1
+    assert s1.cursor_saved is False
+    assert h.item("good2") is not None  # earlier success survived the rollback
+
+    runner.run()  # failure 2
+    s3 = runner.run()  # failure 3 -> quarantined, cursor released
+
+    assert s3.errors == 0
+    assert s3.cursor_saved is True
+    row = h.records.get("gcal", "dbbad")
+    assert row is not None and row.status == "failed"
+
+
 def test_quarantined_record_retries_on_version_bump(runner_db):
     """A later version bump gives a quarantined record another chance; a
     success resets the quarantine bookkeeping."""
