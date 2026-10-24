@@ -77,6 +77,39 @@ _CANCEL_PHRASES = ("לא יתקיים", "לא תתקיים", "called off", "canc
 _CHANGE_WORD_STEMS = ("שינוי", "שונ", "עודכן", "עדכון", "תיקון", "הוקד", "נדחה")
 _CHANGE_PHRASES = ("במקום", "ולא ב", "correction", "update", "change", "reschedul", "postpon")
 
+# PR-b series scope: a stated scope in the candidate's own quotes. Matched
+# as normalized substrings — the same conservative style as the change/
+# cancel phrases (a hint can add, never a whole-source scan).
+_SERIES_FROM_NOW_ON = (
+    "לכל המפגשים", "לכל המועדים", "מעתה", "מעכשיו", "מהיום",
+    "from now on", "going forward", "every week", "כל השבועות",
+)
+_SERIES_THIS_TIME = ("רק הפעם", "רק השבוע", "רק לפעם הזאת", "just this time", "this time only")
+
+
+def stated_series_scope(quotes: Iterable[str]) -> str | None:
+    """A stated series scope in the candidate's own quotes (PR-b).
+
+    Returns "from_now_on", "this_time", or None. Scanned ONLY in the
+    candidate's grounded quote(s) — the same discipline as signal_for: one
+    email mentioning both a one-off change and a policy must not guess.
+    """
+    from_now = False
+    this_time = False
+    for text in quotes:
+        if not text:
+            continue
+        lowered = _norm(text)
+        if any(p in lowered for p in _SERIES_FROM_NOW_ON):
+            from_now = True
+        if any(p in lowered for p in _SERIES_THIS_TIME):
+            this_time = True
+    if from_now and not this_time:
+        return "from_now_on"
+    if this_time:
+        return "this_time"  # an explicit this-time wins when both appear
+    return None
+
 # The several-matches guard: best must beat the runner-up by this much.
 AMBIGUITY_MARGIN = 0.05
 
@@ -207,6 +240,10 @@ class ReconResult:
     fields: dict[str, tuple[str, str]] = field(default_factory=dict)
     ambiguous: bool = False
     runner_up_id: str | None = None
+    # PR-b: True when the match needed the RELAXED type gate (the cancel
+    # signal alone matched a different kind); write() stores it in the
+    # relation's provenance.
+    cross_kind: bool = False
 
 
 def _sender_address(meta: dict[str, Any]) -> str:
@@ -354,15 +391,22 @@ def _adds_info(candidate: ReconCandidate, existing: ExistingItem, tz: ZoneInfo) 
 
 
 def _compatible(
-    candidate: ReconCandidate, existing: ExistingItem, similarity: Callable[[str, str], float]
+    candidate: ReconCandidate,
+    existing: ExistingItem,
+    similarity: Callable[[str, str], float],
+    *,
+    relax_type: bool = False,
 ) -> bool:
     """The always-on guards: same type ∧ same applies_to ∧ similar enough.
 
     R5 (items 21/42): two different KNOWN audiences never match; unknown ==
     unknown is allowed (memory may have improved since). Whether a dated and
     a dateless pair can meet is the WINDOWS' business, not a guard here.
+
+    ``relax_type`` drops ONLY the type gate (PR-b cross-kind cancellation);
+    the applies_to gate and the similarity threshold never relax.
     """
-    if existing.type != candidate.kind:
+    if existing.type != candidate.kind and not relax_type:
         return False
     candidate_applies = tuple(sorted(candidate.applies_to))
     existing_applies = tuple(sorted(existing.applies_to))
@@ -379,6 +423,7 @@ def classify(
     now: datetime,
     tz_name: str,
     signal: ReconSignal | None = None,
+    relax_type: bool = False,
 ) -> ReconResult:
     """One verdict for the candidate against the existing items (pure).
 
@@ -386,10 +431,18 @@ def classify(
     signal. Verdict order per the module docstring. Several matches need a
     similarity margin >= AMBIGUITY_MARGIN or the result is NEW + ambiguous
     (the caller records the ops event; the ids travel with it).
+
+    ``relax_type`` (PR-b): cross-kind rows join the pool when the signal
+    cancels — ONLY a CANCELLATION can come out of a cross-kind match; a
+    cross-kind match with any other verdict is dropped (NEW). Callers pass
+    relax_type only for the cancel pre-pass.
     """
     tz = ZoneInfo(tz_name)
     signal = signal or ReconSignal()
-    compatible = [e for e in existing_items if _compatible(candidate, e, similarity)]
+    relax = relax_type and signal.cancel
+    compatible = [
+        e for e in existing_items if _compatible(candidate, e, similarity, relax_type=relax)
+    ]
     same_day = [e for e in compatible if _same_local_day(candidate, e, tz)]
     extended = (
         [e for e in compatible if e not in same_day and _in_extended_window(candidate, e, now, tz)]
@@ -406,6 +459,16 @@ def classify(
     if len(scored) > 1 and best_score - scored[1][0] < AMBIGUITY_MARGIN:
         return ReconResult(
             verdict=Verdict.NEW, ambiguous=True, runner_up_id=scored[1][1].id
+        )
+    if best.type != candidate.kind:
+        # a cross-kind match (only reachable with relax_type + cancel): a
+        # reminder saying an event is cancelled. Only CANCELLATION is a
+        # verdict here — a change phrased cross-kind is ambiguous speech,
+        # not evidence (PR-b decision).
+        if not (relax and signal.cancel):
+            return ReconResult(verdict=Verdict.NEW)
+        return ReconResult(
+            verdict=Verdict.CANCELLATION, matched_id=best.id, cross_kind=True
         )
     if signal.cancel:
         return ReconResult(verdict=Verdict.CANCELLATION, matched_id=best.id)
@@ -470,7 +533,7 @@ class ReconciliationService:
 
     def _window_statement(self, kind: str, exclude_ids: set[uuid.UUID],
                           candidate: ReconCandidate, signal: ReconSignal,
-                          now: datetime) -> Any:
+                          now: datetime, *, relax_type: bool = False) -> Any:
         """PERF 5 (round 2): the matchable universe is fetched with the
         windows IN SQL — the candidate's local day (no signal needed) OR,
         only when the candidate carries a signal, the extended
@@ -478,17 +541,20 @@ class ReconciliationService:
         non-dropped filters. Occurred_at IS NULL rows (dateless items) join
         the same-day leg only for a dateless candidate (dateless matches
         dateless, item 21). Bounded query, never all history.
+
+        ``relax_type`` (PR-b): drop ONLY the SQL type filter — the cancel
+        pre-pass fetches other kinds too; every other guard stays.
         """
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.repositories.items import default_hidden_conditions  # noqa: PLC0415
 
         tz = ZoneInfo(self._tz_name)
         today = now.astimezone(tz).date()
-        stmt = (
-            select(MemoryItem)
-            .filter(MemoryItem.type == kind)
-            .filter(MemoryItem.id.not_in(exclude_ids or {uuid.uuid4()}))
+        stmt = select(MemoryItem).filter(
+            MemoryItem.id.not_in(exclude_ids or {uuid.uuid4()})
         )
+        if not relax_type:
+            stmt = stmt.filter(MemoryItem.type == kind)
         for cond in default_hidden_conditions():
             stmt = stmt.where(cond)  # superseded + confirmed-cancelled
         stmt = stmt.where(
@@ -526,11 +592,13 @@ class ReconciliationService:
         candidate: ReconCandidate,
         now: datetime,
         signal: ReconSignal | None = None,
+        relax_type: bool = False,
     ) -> list[tuple[ExistingItem, Any]]:
         """Existing items a candidate may reconcile against.
 
-        Same type; NOT dropped (item 30: only the same-source diff suppresses);
-        NOT superseded (the current version matches); NOT cancelled; excludes
+        Same type (unless ``relax_type`` — the PR-b cancel pre-pass); NOT
+        dropped (item 30: only the same-source diff suppresses); NOT
+        superseded (the current version matches); NOT cancelled; excludes
         the source itself and its own children (the A1 diff owns those); the
         two windows filter IN SQL (PERF 5, round 2).
         """
@@ -538,7 +606,8 @@ class ReconciliationService:
         rows = (
             self._session.execute(
                 self._window_statement(
-                    kind, exclude_ids, candidate, signal or ReconSignal(), now
+                    kind, exclude_ids, candidate, signal or ReconSignal(), now,
+                    relax_type=relax_type,
                 )
             )
             .scalars()
@@ -588,17 +657,64 @@ class ReconciliationService:
         CONFLICT / CANCELLATION the verdict is NEW + an ops
         recon_target_unapproved event (never update what the user has not
         approved yet; decision 6)."""
+        # _ensure_embedder() guarantees a callable (factory or lexical
+        # fallback); the `or` only settles the Optional for the type checker.
+        similarity = self._similarity or similarity_ratio
         matches = self.matchable_items(
             candidate.kind, exclude_ids, candidate=candidate, now=now, signal=signal
         )
         result = classify(
             candidate,
             [pair[0] for pair in matches],
-            similarity=self._similarity,
+            similarity=similarity,
             now=now,
             tz_name=self._tz_name,
             signal=signal or ReconSignal(),
         )
+        result = self._gate_unapproved(result, matches, candidate)
+        if (
+            result.verdict is Verdict.NEW
+            and not result.ambiguous
+            and signal is not None
+            and signal.cancel
+        ):
+            # PR-b cross-kind pre-pass: ONLY the cancel signal may relax the
+            # type gate, and only when the typed pass found nothing. The
+            # relaxed verdict can only be a CANCELLATION (classify enforces);
+            # the unapproved-target gate applies to it just the same.
+            relaxed_matches = self.matchable_items(
+                candidate.kind,
+                exclude_ids,
+                candidate=candidate,
+                now=now,
+                signal=signal,
+                relax_type=True,
+            )
+            relaxed = classify(
+                candidate,
+                [pair[0] for pair in relaxed_matches],
+                similarity=similarity,
+                now=now,
+                tz_name=self._tz_name,
+                signal=signal,
+                relax_type=True,
+            )
+            relaxed = self._gate_unapproved(relaxed, relaxed_matches, candidate)
+            if relaxed.verdict is Verdict.CANCELLATION:
+                result = relaxed
+        return result
+
+    def _gate_unapproved(
+        self,
+        result: ReconResult,
+        matches: list[tuple[ExistingItem, Any]],
+        candidate: ReconCandidate,
+    ) -> ReconResult:
+        """The F3 gate (round 4): a still-PROPOSED child of ANOTHER source is
+        matchable only for ALREADY KNOWN / MORE DETAIL — for UPDATE /
+        CONFLICT / CANCELLATION the verdict is NEW + an ops
+        recon_target_unapproved event (never update what the user has not
+        approved yet; decision 6)."""
         if result.matched_id is not None and result.verdict in (
             Verdict.UPDATE, Verdict.CONFLICT, Verdict.CANCELLATION,
         ):
@@ -724,12 +840,16 @@ class ReconciliationService:
         *,
         source: Any,
         child: Any,
+        quotes: Iterable[str] | None = None,
     ) -> None:
         """Persist a NON-NEW verdict: the relation + (rare) auto-apply.
 
         The caller created the verdict's proposed child already (so the child
         id exists for the link). ALREADY KNOWN never reaches here (it links
         the quote and creates NO child).
+
+        ``quotes`` (PR-b): the candidate's grounded quote(s) — the series
+        scope scans them for a stated "from now on" / "this time only".
         """
         from brain.db.models import ItemRelation  # noqa: PLC0415
 
@@ -760,16 +880,33 @@ class ReconciliationService:
 
                 existing_row = self._session.get(MemoryItem, matched_id)
                 existing_row.superseded_by = child.id
-                self._record(result.verdict, {
-                    "child_id": str(child.id), "matched_id": result.matched_id,
-                    "auto_applied": True, "fields": fields_json,
-                })
-                self._session.commit()
-                return
+            detail: dict[str, Any] = {
+                "child_id": str(child.id), "matched_id": result.matched_id,
+                "fields": fields_json,
+            }
+            if auto:
+                detail["auto_applied"] = True
+            # PR-b series scope: question / stated answer / pre-filled future
+            # member. The spread relations (stated or pre-confirmed 'from now
+            # on') are PROPOSED — one tap confirms them, never silent.
+            series_rels, series_meta = self._note_series_scope(
+                child, source, matched_id, quotes, fields_json
+            )
+            if series_meta is not None:
+                meta = dict(child.extraction_meta or {})
+                meta["recon_series_scope"] = series_meta
+                child.extraction_meta = meta
+            self._session.add_all(series_rels)
+            self._session.commit()
+            self._record(result.verdict, detail)
+            return
         elif result.verdict is Verdict.CANCELLATION:
+            provenance: dict[str, Any] = {"how": "recon", "state": "proposed"}
+            if result.cross_kind:
+                provenance["cross_kind"] = True
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="cancels",
-                provenance={"how": "recon", "state": "proposed"},
+                provenance=provenance,
             )
         else:  # pragma: no cover — NEW/ALREADY_KNOWN never reach write()
             raise ValueError(f"write() does not handle verdict {result.verdict}")
@@ -780,6 +917,203 @@ class ReconciliationService:
             {"child_id": str(child.id), "matched_id": result.matched_id,
              "fields": fields_json},
         )
+
+    # -- series scope (PR-b) -------------------------------------------------
+
+    def answer_series_scope(
+        self, relation_id: uuid.UUID, scope: str
+    ) -> list[Any]:
+        """The card's answer to the series scope question (PR-b).
+
+        ``scope`` is what the user tapped: ``"this_time"`` or
+        ``"from_now_on"``. 'from now on' stores the decision on the child
+        and PROPOSES the same change for every already-captured LATER
+        member of the series (the caller's 'apply to all N' tap confirms
+        them; nothing here is ever applied silently). 'this time only'
+        stores the decision and spreads nothing.
+
+        Returns the newly created relations (empty for 'this time').
+        """
+        from brain.db.models import ItemRelation, MemoryItem  # noqa: PLC0415
+
+        if scope not in ("this_time", "from_now_on"):
+            raise ValueError(f"unknown series scope answer: {scope}")
+        rel = self._session.get(ItemRelation, relation_id)
+        if rel is None or rel.kind != "supersedes":
+            raise ValueError(f"not an update relation: {relation_id}")
+        child = self._session.get(MemoryItem, rel.from_id)
+        meta = dict(child.extraction_meta or {})
+        smeta = dict(meta.get("recon_series_scope") or {})
+        series_id = smeta.get("series_id")
+        if not series_id:
+            raise ValueError("the update has no series scope to answer")
+        smeta["decided_at"] = datetime.now(tz=UTC).isoformat()
+        created: list[Any] = []
+        if scope == "from_now_on":
+            smeta["scope"] = "series"
+            fields = smeta.get("fields") or (rel.provenance or {}).get("fields") or {}
+            created = self._series_spread(
+                child, series_id, uuid.UUID(str(rel.to_id)), fields
+            )
+            self._session.add_all(created)
+        else:
+            smeta["scope"] = "this_time"
+        meta["recon_series_scope"] = smeta
+        child.extraction_meta = meta
+        self._session.commit()
+        return created
+
+    def _note_series_scope(
+        self,
+        child: Any,
+        source: Any,
+        matched_id: uuid.UUID,
+        quotes: Iterable[str] | None,
+        fields_json: dict[str, list[str]],
+    ) -> tuple[list[Any], dict[str, Any] | None]:
+        """Series scope bookkeeping for one UPDATE (PR-b, decision 8).
+
+        Only an update on a SERIES member (the source's meta series_uid
+        equals the matched item's) stores anything:
+
+        - a stated 'from now on' in the candidate's own quotes -> the
+          decision is stored AND the later members get their PROPOSED
+          relations right away;
+        - a stated 'this time only' -> the decision is stored, no spread;
+        - no stated scope -> the QUESTION is stored (the card asks; a prior
+          series decision on the same series PRE-FILLS this member: one
+          tap, never silent).
+
+        Returns (spread relations, meta to store on the child) — ([], None)
+        when this is not a series update.
+        """
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+
+        source_meta = source.meta if isinstance(source.meta, dict) else {}
+        series_id = source_meta.get("series_uid")
+        if not series_id:
+            return [], None
+        matched_row = self._session.get(MemoryItem, matched_id)
+        if matched_row is None:
+            return [], None
+        matched_meta = matched_row.meta if isinstance(matched_row.meta, dict) else {}
+        if matched_meta.get("series_uid") != series_id:
+            return [], None
+        decided_at = datetime.now(tz=UTC).isoformat()
+        stated = stated_series_scope(quotes or [])
+        if stated == "from_now_on":
+            spread = self._series_spread(child, series_id, matched_id, fields_json)
+            meta = {
+                "series_id": series_id, "scope": "series",
+                "fields": fields_json, "decided_at": decided_at,
+            }
+            return spread, meta
+        if stated == "this_time":
+            return [], {
+                "series_id": series_id, "scope": "this_time",
+                "fields": fields_json, "decided_at": decided_at,
+            }
+        prior = self._prior_series_decision(series_id, exclude_child_id=child.id)
+        if prior is not None and prior.get("scope") == "series":
+            # a stored 'from now on' decision PRE-FILLS this future member:
+            # its card carries the decision (one tap confirms), never silent.
+            spread = self._series_spread(child, series_id, matched_id, fields_json)
+            meta = {
+                "series_id": series_id, "scope": "series",
+                "fields": fields_json, "decided_at": prior.get("decided_at"),
+                "pre_confirmed": True,
+            }
+            return spread, meta
+        return [], {
+            "series_id": series_id, "scope": "question",
+            "fields": fields_json, "decided_at": None,
+        }
+
+    def _prior_series_decision(
+        self, series_id: str, *, exclude_child_id: Any
+    ) -> dict[str, Any] | None:
+        """The most recent stored series decision for this series (PR-b).
+
+        Only PROPOSED/AUTO children carry scope decisions; a dropped child's
+        decision is not evidence (the user rejected that proposal).
+        """
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+
+        rows = (
+            self._session.query(MemoryItem)
+            .filter(
+                MemoryItem.extraction_meta["recon_series_scope"]["series_id"]
+                .as_string() == series_id
+            )
+            .filter(MemoryItem.id != exclude_child_id)
+            .filter(MemoryItem.child_state != "dropped")
+            .order_by(MemoryItem.created_at.desc())
+            .limit(5)
+            .all()
+        )
+        for row in rows:
+            scope_meta = (row.extraction_meta or {}).get("recon_series_scope")
+            if isinstance(scope_meta, dict) and scope_meta.get("decided_at"):
+                return scope_meta
+        return None
+
+    def _series_spread(
+        self,
+        child: Any,
+        series_id: str,
+        matched_id: uuid.UUID,
+        fields_json: dict[str, list[str]],
+    ) -> list[Any]:
+        """PROPOSED supersedes relations from ``child`` to every
+        already-captured LATER member of the series (PR-b).
+
+        Later = occurred_at at/after the matched instance's. Members already
+        superseded, cancelled, dropped, or already proposed BY THIS CHILD
+        are skipped; the query is bounded. Idempotent per child.
+        """
+        from brain.db.models import ItemRelation, MemoryItem  # noqa: PLC0415
+        from brain.repositories.items import default_hidden_conditions  # noqa: PLC0415
+
+        matched_row = self._session.get(MemoryItem, matched_id)
+        if matched_row is None or matched_row.occurred_at is None:
+            return []
+        existing_targets = {
+            str(rel.to_id)
+            for rel in self._session.query(ItemRelation)
+            .filter(ItemRelation.from_id == child.id)
+            .filter(ItemRelation.kind == "supersedes")
+            .all()
+        }
+        stmt = self._session.query(MemoryItem).filter(
+            MemoryItem.meta["series_uid"].as_string() == series_id
+        )
+        for cond in default_hidden_conditions():
+            stmt = stmt.filter(cond)
+        rows = (
+            stmt.filter(MemoryItem.id != matched_id)
+            .filter(MemoryItem.id != child.id)
+            .filter(MemoryItem.occurred_at >= matched_row.occurred_at)
+            .order_by(MemoryItem.occurred_at)
+            .limit(50)
+            .all()
+        )
+        out: list[Any] = []
+        for row in rows:
+            if str(row.id) in existing_targets:
+                continue
+            out.append(
+                ItemRelation(
+                    from_id=child.id,
+                    to_id=row.id,
+                    kind="supersedes",
+                    provenance={
+                        "how": "recon", "state": "proposed",
+                        "verdict": "update", "fields": fields_json,
+                        "series_id": series_id,
+                    },
+                )
+            )
+        return out
 
     def apply_cancellation(self, relation_id: uuid.UUID) -> None:
         """✅ on the cancellation card: strike the target (D4), never delete."""
