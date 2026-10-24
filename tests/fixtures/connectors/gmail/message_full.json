@@ -1,0 +1,42 @@
+{
+  "id": "m1",
+  "threadId": "t1",
+  "labelIds": ["Label_school", "UNREAD", "INBOX"],
+  "snippet": "The trip is tomorrow...",
+  "historyId": "9002",
+  "internalDate": "1792663200000",
+  "sizeEstimate": 2048,
+  "payload": {
+    "mimeType": "multipart/alternative",
+    "headers": [
+      {"name": "From", "value": "teacher@example.com"},
+      {"name": "To", "value": "me@example.com"},
+      {"name": "Subject", "value": "School trip tomorrow"},
+      {"name": "Date", "value": "Thu, 22 Oct 2026 10:00:00 +0000"},
+      {"name": "Message-ID", "value": "<a1b2c3@mail.gmail.com>"}
+    ],
+    "body": {},
+    "parts": [
+      {
+        "partId": "p1",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [],
+        "body": {
+          "size": 213,
+          "data": "RnJvbTogdGVhY2hlckBleGFtcGxlLmNvbQpTdWJqZWN0OgoKVGhlIHRyaXAgaXMgdG9tb3Jyb3csIHBsZWFzZSBicmluZyBhIGhhdC4K15HXlden16gg15jXldeRLCDXlNeY15nXldecINee15fXqCDigJQg16DXkCDXnNeU15HXmdeQINeb15XXkdeiLg"
+        }
+      },
+      {
+        "partId": "p2",
+        "mimeType": "application/pdf",
+        "filename": "trip-form.pdf",
+        "headers": [],
+        "body": {
+          "attachmentId": "att1",
+          "size": 1234
+        }
+      }
+    ]
+  }
+}
