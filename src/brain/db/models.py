@@ -517,7 +517,8 @@ class ItemRelation(Base):
     __table_args__ = (
         UniqueConstraint("from_id", "to_id", "kind", name="uq_item_relations_triple"),
         CheckConstraint(
-            "kind IN ('supersedes', 'corrects', 'derived_from', 'same_as')",
+            "kind IN ('supersedes', 'corrects', 'derived_from', 'same_as', "
+            "'details', 'cancels', 'conflicts')",
             name="ck_item_relations_kind",
         ),
         Index("ix_item_relations_from_id", "from_id"),

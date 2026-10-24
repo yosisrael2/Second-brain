@@ -1746,6 +1746,14 @@ async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
     A finished pass is harvested first: its outcomes become proposal cards on
     the LOOP thread (B2), its exception becomes log + ops event — the bot
     keeps running either way.
+
+    Deadline (ENRICHMENT_PASS_TIMEOUT_S): a pass older than the deadline is
+    declared stalled ONCE — ops event ``worker_pass_timeout`` (age, extractor),
+    log, and the ``enrichment-worker`` heartbeat flips to phase=stalled so
+    /ops health shows degraded — and the tick stops waiting for it. A
+    to_thread body CANNOT be killed: while the stalled thread is still
+    running no new pass is started (never two concurrent passes); the next
+    due tick starts a pass only after the old thread has actually finished.
     """
     from brain.config import get_settings  # noqa: PLC0415
 
@@ -1756,11 +1764,31 @@ async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
             core.proposals_changed(task.result())
         except Exception as exc:  # noqa: BLE001 — the worker must never kill the bot
             _record_pass_failure(exc)
+        _worker_heartbeat("idle")
+    stalled = getattr(core, "_enrich_stalled_task", None)
+    if stalled is not None:
+        if stalled.done():
+            # the old thread finished: harvest it EXACTLY like a normal pass —
+            # its children still earned their proposal cards (B2: loop thread
+            # only); a failure is logged + ops-evented like any other
+            core._enrich_stalled_task = None  # noqa: SLF001 (same module)
+            try:
+                core.proposals_changed(stalled.result())
+            except Exception as exc:  # noqa: BLE001 — the worker must never kill the bot
+                _record_pass_failure(exc)
+            _worker_heartbeat("idle")
+        else:
+            return  # never a second concurrent pass (see docstring)
     settings = get_settings()
     if not settings.enrichment_worker_enabled:
         return
-    if getattr(core, "_enrich_task", None) is not None and not core._enrich_task.done():  # noqa: SLF001
-        return  # a pass never overlaps the previous one
+    task = getattr(core, "_enrich_task", None)
+    if task is not None and not task.done():
+        now = time.monotonic()
+        age = now - getattr(core, "_enrich_started", now)
+        if age > settings.enrichment_pass_timeout_s:
+            _declare_pass_stalled(core, task, age, settings)
+        return  # in-flight: a pass never overlaps the previous one
     now = time.monotonic()
     # 0.0 = never ran (monotonic is boot-relative: a just-rebooted host would
     # otherwise silently skip the first pass) — the interval gates only
@@ -1769,9 +1797,65 @@ async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
     if last_run and (now - last_run < settings.enrichment_worker_interval_s):
         return
     core._enrich_last_run = now  # noqa: SLF001 (same module)
+    core._enrich_started = now  # noqa: SLF001 (same module)
     core._enrich_task = asyncio.create_task(  # noqa: SLF001 (same module)
         asyncio.to_thread(_run_enrichment_pass)
     )
+    _worker_heartbeat("running")
+
+
+def _worker_heartbeat(phase: str) -> None:
+    """Publish the worker's phase for /ops health (idle/running/stalled).
+
+    Heartbeats only fire on worker state transitions (a disabled worker
+    writes nothing); the enrichment health check reads this row.
+    """
+    try:
+        from brain.ops import heartbeat  # noqa: PLC0415
+
+        heartbeat("enrichment-worker", {"phase": phase})
+    except Exception:  # noqa: BLE001 — a health signal must never kill the tick
+        logger.debug("telegram: enrichment-worker heartbeat failed", exc_info=True)
+
+
+def _declare_pass_stalled(core: TelegramBot, task: Any, age: float, settings: Any) -> None:
+    """Deadline passed for the in-flight pass: ops event ONCE, health degraded,
+    and the tick stops waiting (the task moves to the stalled slot; while that
+    thread is alive no new pass may start — see _enrichment_tick)."""
+    timeout = settings.enrichment_pass_timeout_s
+    record_event(
+        "enrichment",
+        "worker_pass_timeout",
+        ok=False,
+        detail={
+            "error": f"pass running {age:.0f}s > deadline {timeout}s"[:200],
+            "age_s": round(age),
+            "deadline_s": timeout,
+            "extractor": settings.enrichment_extractor,
+        },
+    )
+    logger.error(
+        "telegram: enrichment pass exceeded its %ss deadline (%.0fs) — worker "
+        "stalled until the thread finishes; no new pass until then",
+        timeout,
+        age,
+    )
+    try:
+        from brain.ops import heartbeat  # noqa: PLC0415
+
+        heartbeat(
+            "enrichment-worker",
+            {
+                "phase": "stalled",
+                "age_s": round(age),
+                "deadline_s": timeout,
+                "extractor": settings.enrichment_extractor,
+            },
+        )
+    except Exception:  # noqa: BLE001 — a health signal must never kill the tick
+        logger.debug("telegram: enrichment-worker heartbeat failed", exc_info=True)
+    core._enrich_stalled_task = task  # noqa: SLF001 (same module)
+    core._enrich_task = None  # noqa: SLF001 (same module)
 
 
 def _record_pass_failure(exc: BaseException) -> None:
@@ -1828,7 +1912,6 @@ async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
             core._last_ping_check = now
             for chat_id, reply in core.due_pings():
                 await _send(tg, chat_id, reply)
-        await _enrichment_tick(tg, core)
     except Exception:  # noqa: BLE001 — background jobs must never kill polling
         record_event("telegram", EVENT_ERROR, ok=False, detail={"error": "proposal flush failed"})
         logger.exception("telegram: proposal flush failed")
