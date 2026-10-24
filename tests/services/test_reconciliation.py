@@ -483,6 +483,22 @@ def _make_existing_event(
     return item
 
 
+def _make_existing_fact(
+    session: Session, *, title: str, start: datetime | None = None
+) -> MemoryItem:
+    item = MemoryItem(
+        raw_text=title,
+        source="email",
+        type="fact",
+        occurred_at=start,
+        applies_to=["unknown"],
+        status="filed",
+    )
+    session.add(item)
+    session.commit()
+    return item
+
+
 def _candidate_child(
     title: str = "טיול שנתי",
     when_raw: str = "10.11 18:00",
@@ -490,14 +506,17 @@ def _candidate_child(
     recon: ReconHint | None = None,
     location: str | None = None,
     end: str | None = None,
+    amount: str | None = None,
+    kind: str = "event",
 ) -> ChildCandidate:
     return ChildCandidate(
-        kind="event",
+        kind=kind,
         title=title,
         quote=quote,
         when_raw=when_raw,
         location=location,
         end=end,
+        amount=amount,
         recon=recon,
     )
 
@@ -1424,3 +1443,101 @@ def test_recon_eval_carries_end_through_to_the_diff(tmp_path):
     report = run_recon_eval(path, tz_name="Asia/Jerusalem",
                             embedder=FakeEmbedder())
     assert report["per_verdict"]["update"]["tp"] == 1
+
+
+def test_fact_effective_date_is_more_detail(db):
+    """Follow-up (1) from the gold re-score (family b): a FACT whose only
+    addition is an effective date / validity ('מ-1.12', 'from March') states
+    a field the stored fact LACKS -> MORE_DETAIL, not ALREADY_KNOWN."""
+    # the gold frame: the pair meets via the same local day; the stored
+    # fact carries only its MENTION time (no recorded validity)
+    fact = _make_existing_fact(db, title="איתמר בחוג כדורסל בימי שלישי")
+    fact.occurred_at = datetime(2026, 12, 1, 9, 30, tzinfo=JLM)
+    db.commit()
+    source = _make_source(db, text="איתמר בחוג כדורסל בימי שלישי, מ-1.12")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(
+            title="איתמר בחוג כדורסל בימי שלישי",
+            when_raw="1.12",
+            quote="איתמר בחוג כדורסל בימי שלישי, מ-1.12",
+            kind="fact",
+        ),
+        source, NOW,
+    )
+    assert resolved is not None and resolved.start is not None
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.MORE_DETAIL
+    # the verdict child persists the effective date for later runs
+    from brain.db.models import ItemRelation as _Rel
+    rel = db.query(_Rel).filter_by(kind="details").one()
+    child = db.get(MemoryItem, rel.from_id)
+    assert (child.extraction_meta or {}).get("effective") == resolved.start.isoformat()
+
+
+def test_fact_amount_qualifier_is_more_detail(db):
+    """Follow-up (1) family (b): a stated AMOUNT the stored fact lacks
+    ('סך הכל 250 שח') is a field the existing fact lacks -> MORE_DETAIL."""
+    _make_existing_fact(db, title="דמי החוג לכיתה ה")
+    source = _make_source(db, text="דמי החוג לכיתה ה: 250 שח לחודש")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(
+            title="דמי החוג לכיתה ה",
+            when_raw="",
+            quote="דמי החוג לכיתה ה: 250 שח לחודש",
+            amount="250",
+            kind="fact",
+        ),
+        source, NOW,
+    )
+    assert resolved is not None
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.MORE_DETAIL
+
+
+def test_fact_amount_change_with_signal_is_update(db):
+    """Follow-up (1) family (b): a DIFFERING stated amount is a value diff —
+    UPDATE with a signal, CONFLICT without (the exact-diff rule)."""
+    fact = _make_existing_fact(db, title="דמי החוג לכיתה ה")
+    fact.extraction_meta = {"amount": "220"}
+    db.commit()
+    source = _make_source(db, text="שינוי: דמי החוג לכיתה ה 250 שח")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(
+            title="דמי החוג לכיתה ה",
+            when_raw="",
+            quote="שינוי: דמי החוג לכיתה ה 250 שח",
+            amount="250",
+            kind="fact",
+            recon=ReconHint(change=True),
+        ),
+        source, NOW,
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+
+
+def test_recon_eval_carries_amount_and_effective(tmp_path):
+    """Follow-up (1): eval cases may state amount/effective so the gold's
+    fact families are exercisable from the eval file."""
+    from brain.cli import run_recon_eval
+
+    case = {
+        "case_id": "fact-amount-1",
+        "now": _jlm(2, 12, 0).isoformat(),
+        "existing_items": [{"id": "e1", "type": "fact",
+                            "title": "דמי החוג לכיתה ה",
+                            "applies_to": ["unknown"]}],
+        "new_text_quote": "דמי החוג לכיתה ה: 250 שח",
+        "candidate": {"type": "fact", "title": "דמי החוג לכיתה ה",
+                      "amount": "250", "applies_to": ["unknown"]},
+        "verdict": "more_detail",
+    }
+    path = tmp_path / "cases.jsonl"
+    path.write_text(json.dumps(case), encoding="utf-8")
+    from brain.ai.embedder import FakeEmbedder
+    report = run_recon_eval(path, tz_name="Asia/Jerusalem",
+                            embedder=FakeEmbedder())
+    assert report["per_verdict"]["more_detail"]["tp"] == 1

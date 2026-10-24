@@ -631,6 +631,7 @@ class EnrichmentService:
             meta=meta,
             location=candidate.location,
             end=resolved_end,
+            amount=candidate.amount,
         )
 
     def _resolve_end(self, raw: str, day: date | None) -> datetime | None:
@@ -800,6 +801,13 @@ class EnrichmentService:
             child_meta["location"] = resolved.location
         if resolved.end is not None:
             child_meta["end"] = resolved.end.isoformat()
+        if resolved.amount is not None:
+            child_meta["amount"] = resolved.amount
+        # follow-up (1) family (b): a FACT's effective date persists (the
+        # validity, distinct from occurred_at the mention time) so a later
+        # run's reconciliation sees it as already recorded
+        if candidate.kind == "fact" and resolved.start is not None:
+            child_meta.setdefault("effective", resolved.start.isoformat())
         child.extraction_meta = child_meta
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
@@ -856,6 +864,7 @@ class EnrichmentService:
             applies_to=tuple(resolved.applies_to),
             location=resolved.location,
             end=resolved.end,
+            amount=resolved.amount,
         )
         result = recon.classify_universe(
             recon_candidate,
@@ -996,3 +1005,4 @@ class _ResolvedChild:
     extra_quotes: list[str] = field(default_factory=list)
     location: str | None = None
     end: datetime | None = None
+    amount: str | None = None
