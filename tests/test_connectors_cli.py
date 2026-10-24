@@ -24,7 +24,7 @@ class _StubGcal(FakeConnector):
 
 
 try:
-    # Merged adapters register first (worker_9/#55): the real gcal connector
+    # Merged adapters register first (#55): the real gcal connector
     # must win the 'gcal' registry slot, with this stub only filling in when
     # no adapter module provides it (plain main). Without this import the
     # stub would win the slot at collection time and the REAL adapter's
