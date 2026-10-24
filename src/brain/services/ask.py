@@ -43,11 +43,14 @@ DEFAULT_KID_RECALL_LOOKBACK_DAYS = 3
 # WA39 run 3, part 2: the rerank can rank school emails above the one
 # kid-channel conversation that answers the question, and the top_k cut
 # drops it even though the kid leg fetched it (the slippers case). When a
-# question names a confirmed kid, the final context reserves up to this
-# many top_k slots for the best-ranked kid-recall items (kid-channel
-# conversations first); unused reserved slots go back to the general
-# ranking. Settings.ask_kid_reserved_slots overrides; 0 disables.
-DEFAULT_KID_RESERVED_SLOTS = 3
+# question names a confirmed kid, the context is the general top_k PLUS up
+# to this many kid items — ADDITIONS, never displacing the general ranking
+# (run 4: carved-out slots went to unrelated chatter while the answering
+# item stayed out). Dated questions fill the additions by date relevance
+# (in-window kid-channel items first, then lookback by distance), undated
+# ones in rerank order. Settings.ask_kid_reserved_slots overrides; 0
+# disables.
+DEFAULT_KID_RESERVED_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -167,7 +170,10 @@ class AskService:
             else:
                 pool = self._search.search(question, limit=self._recall_pool)
             if kid_items:
-                hits = self._top_k_with_reserved_slots(pool, kid_items)
+                ranges = parse_question_ranges(
+                    question, self._tz, now or datetime.now(UTC)
+                )
+                hits = self._top_k_with_kid_additions(pool, kid_items, ranges)
             else:
                 # no kid named -> byte-identical to the pre-reservation cut
                 hits = pool[: self._top_k]
@@ -205,36 +211,54 @@ class AskService:
             model=result["model"],
         )
 
-    def _top_k_with_reserved_slots(
-        self, pool: list[SearchHit], kid_items: list[MemoryItem]
+    def _top_k_with_kid_additions(
+        self,
+        pool: list[SearchHit],
+        kid_items: list[MemoryItem],
+        ranges: list[tuple[datetime, datetime]] | None,
     ) -> list[SearchHit]:
-        """The top_k cut with kid-recall reservation (WA39 run 3 part 2).
+        """The context cut with kid additions (WA39 run 4 rework).
 
-        Up to ``ask_kid_reserved_slots`` of top_k are reserved for the
-        best-ranked kid-recall items — kid-channel conversations first (they
-        carry the structured meta.channel), then the leg's other items — in
-        the rerank's own order. The reserved slot comes out of the general
-        ranking (top_k is unchanged); unused reserved slots go back to it.
-        The final context keeps the rerank's order: reservation changes WHO
-        is in, not the order they appear in.
+        The general reranked top_k is NEVER displaced (run 4: carved-out
+        slots went to unrelated kid-channel chatter while the answering item
+        stayed out). The context is the general top_k PLUS up to
+        ``ask_kid_reserved_slots`` kid items not already in it. With a
+        resolved window the additions fill by DATE RELEVANCE before rerank
+        order: kid-channel items inside the window first, then the lookback
+        items ordered by distance to the window (nearest first) — the
+        announcement about day D outranks same-channel chatter the reranker
+        happened to rank higher. Undated questions fill in rerank order, as
+        before.
         """
+        general = pool[: self._top_k]
         if self._kid_reserved_slots <= 0 or not kid_items:
-            return pool[: self._top_k]
+            return general
+        general_ids = {h.item.id for h in general}
         kid_ids = {i.id for i in kid_items}
-        ranked_kid = [h for h in pool if h.item.id in kid_ids]
-        kid_channel = [h for h in ranked_kid if (h.item.meta or {}).get("channel")]
-        kid_other = [h for h in ranked_kid if h.item.id not in {x.item.id for x in kid_channel}]
-        reserved = (kid_channel + kid_other)[: self._kid_reserved_slots]
-        if not reserved:
-            return pool[: self._top_k]
-        reserved_ids = {h.item.id for h in reserved}
-        rest = [
-            h for h in pool if h.item.id not in reserved_ids
-        ][: self._top_k - len(reserved)]
-        position = {h.item.id: idx for idx, h in enumerate(pool)}
-        selected = reserved + rest
-        selected.sort(key=lambda h: position[h.item.id])
-        return selected
+        candidates = [
+            h for h in pool if h.item.id in kid_ids and h.item.id not in general_ids
+        ]
+        if not candidates:
+            return general
+        if ranges:
+            position = {h.item.id: idx for idx, h in enumerate(pool)}
+
+            def key(h: SearchHit) -> tuple[int, timedelta, int]:
+                occ = h.item.occurred_at
+                channel = bool((h.item.meta or {}).get("channel"))
+                if channel and occ is not None:
+                    for start, end in ranges:
+                        if start <= occ < end:
+                            return (0, timedelta(0), position[h.item.id])
+                    nearest = min(abs(occ - start) for start, _ in ranges)
+                    return (1, nearest, position[h.item.id])
+                if channel:  # kid-channel item without an occurred_at
+                    return (1, timedelta.max, position[h.item.id])
+                return (2, timedelta(0), position[h.item.id])
+
+            candidates.sort(key=key)
+        additions = candidates[: self._kid_reserved_slots]
+        return general + additions
 
     def _kid_recall_items(
         self,
