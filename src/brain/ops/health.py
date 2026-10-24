@@ -454,7 +454,17 @@ def _llm_check() -> dict[str, Any]:
     return {"provider": settings.llm_provider, "model": model or None}
 
 
-TELEGRAM_HEARTBEAT_MARGIN_S = 30
+# A healthy poll cycle spans one full long-poll window (poll_timeout_s) PLUS
+# post-poll work (update batch processing, network overhead) — observed 89s
+# against a timeout+30s threshold = 80s on 2026-10-24. The degraded threshold
+# is therefore 2x the poll timeout: it scales with the configured timeout
+# (one source of truth, no absolute constant) and leaves headroom over the
+# worst observed healthy cycle; a truly stalled bot still crosses it and then
+# the unchanged 1800s down rule. The timeout setting is unbounded, so the
+# result is floored at 60s — with short polling (0) or a tiny timeout, 2x
+# alone would make the card permanently degraded.
+TELEGRAM_DEGRADED_FACTOR = 2
+TELEGRAM_DEGRADED_FLOOR_S = 60
 
 
 def _email_check() -> dict[str, Any]:
@@ -511,7 +521,9 @@ def _telegram_check() -> dict[str, Any]:
         "allowlist_set": allowlist_set,
         "heartbeat_age_s": age,
         "poll_timeout_s": poll_timeout_s,
-        "degraded_after_s": poll_timeout_s + TELEGRAM_HEARTBEAT_MARGIN_S,
+        "degraded_after_s": max(
+            poll_timeout_s * TELEGRAM_DEGRADED_FACTOR, TELEGRAM_DEGRADED_FLOOR_S
+        ),
     }
     last_error = ops.latest_event("telegram", ok=False)
     if last_error:
