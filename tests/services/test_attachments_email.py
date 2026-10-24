@@ -219,7 +219,7 @@ class TestEmailAttachments:
         )
         real = _make_service(svc_env, FakeQuery(reply="the attached note"))
         svc = _RecordingAttachments(real)
-        poller, _ = _poller(client, svc, ingest=_RealIngest())
+        poller, ingest = _poller(client, svc, ingest=_RealIngest())
         summary = poller.poll_once()
         assert summary.new == 1
         assert client.attachment_calls == [("m1", "att1")]
@@ -235,12 +235,47 @@ class TestEmailAttachments:
         from brain.db.session import SessionLocal
 
         with SessionLocal() as session:
-            row = session.query(Attachment).one()
+            # Scoped to THIS test's email item (T1): a stray attachment row in
+            # the shared *_test db from an interrupted session must not break it.
+            row = session.query(Attachment).filter_by(parent_item_id=ingest.last_item_id).one()
             assert row.source == "email" and row.status == "done"
             assert "the attached note" in (row.text or "")
             parent = session.get(MemoryItem, row.parent_item_id)
             assert parent is not None, "the email item is the attachment's parent"
             assert parent.meta["gmail_id"] == "m1"
+
+    def test_email_attachment_test_ignores_stray_rows(self, svc_env):
+        """T1: the DB assertions must be scoped to THIS test's own parent item.
+
+        A stray attachment row left in the shared *_test database by an
+        interrupted earlier session used to break query(Attachment).one()
+        on the whole table. Plants one stray row (its own parent item, so FK
+        holds) and then runs the test body above verbatim: it must still
+        pass. svc_env's teardown removes both the stray and the real rows.
+        """
+        from brain.db.models import Attachment, MemoryItem
+        from brain.db.session import SessionLocal
+
+        with SessionLocal() as session:
+            stray_parent = MemoryItem(raw_text="stray from an earlier session", status="inbox")
+            session.add(stray_parent)
+            session.flush()
+            session.add(
+                Attachment(
+                    item_id=stray_parent.id,
+                    parent_item_id=stray_parent.id,
+                    sha256="0" * 64,
+                    mime="text/plain",
+                    filename="stray.txt",
+                    size_bytes=4,
+                    source="email",
+                    source_ref="stray-m1",
+                    status="done",
+                )
+            )
+            session.commit()
+
+        TestEmailAttachments().test_attachment_bytes_captured_with_source_email(svc_env=svc_env)
 
     def test_too_large_reference_is_skipped_before_the_fetch(self, svc_env):
         from brain.services.attachments import MAX_FILE_BYTES
