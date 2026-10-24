@@ -120,8 +120,26 @@ def _connector(fake: _FakeCalendarService) -> GCalConnector:
     """The real GCalConnector over an injected fake service (no network)."""
     return GCalConnector(
         token_loader=lambda: "refresh-token",
-        service_factory=lambda token, scopes: fake,
+        service_factory=lambda token, scopes, api_name, api_version: fake,
     )
+
+
+def test_connector_builds_with_calendar_v3() -> None:
+    """Contract (connectors/api-name): the adapter declares the ClassVars and
+    the injected factory receives exactly ('calendar', 'v3') — a gcal adapter
+    must never be handed another API's service."""
+    seen: list[tuple[str, str]] = []
+    connector = GCalConnector(
+        token_loader=lambda: "refresh-token",
+        service_factory=lambda token, scopes, api_name, api_version: seen.append(
+            (api_name, api_version)
+        )
+        or object(),
+    )
+    assert GCalConnector.API_NAME == "calendar"
+    assert GCalConnector.API_VERSION == "v3"
+    connector._service()  # constructs the service through the factory
+    assert seen == [("calendar", "v3")]
 
 
 def _timed() -> dict[str, Any]:

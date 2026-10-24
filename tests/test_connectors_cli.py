@@ -24,8 +24,16 @@ class _StubGcal(FakeConnector):
 
 
 try:
+    # Merged adapters register first (worker_9/#55): the real gcal connector
+    # must win the 'gcal' registry slot, with this stub only filling in when
+    # no adapter module provides it (plain main). Without this import the
+    # stub would win the slot at collection time and the REAL adapter's
+    # @register would raise on ensure_registered() inside every CLI command.
+    from brain.connectors import ensure_registered
+
+    ensure_registered()
     register(_StubGcal)
-except ValueError:  # already registered by an earlier import of this module
+except ValueError:  # 'gcal' already registered (real adapter or this stub)
     pass
 
 

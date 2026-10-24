@@ -248,6 +248,9 @@ class GCalConnector(GoogleConnector):
 
     name = "gcal"
 
+    API_NAME: ClassVar[str] = "calendar"
+    API_VERSION: ClassVar[str] = "v3"
+
     # The base error translation (google/base.py, single source of truth)
     # turns an expired sync cursor (HTTP 410) into a retryable with
     # ``.status == 410``; fetch() catches exactly that and reports reset=True.
