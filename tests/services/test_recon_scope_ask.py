@@ -669,3 +669,30 @@ def test_cross_kind_cancellation_of_a_proposed_target_stays_gated(db):
     assert rels == []
     kinds = [row[0] for row in db.execute(text("SELECT kind FROM ops_events")).all()]
     assert "recon_target_unapproved" in kinds
+
+
+def test_series_scope_phrase_outside_the_quotes_leaves_question(db):
+    """The quotes-only discipline, proved directly: the SOURCE carries a
+    series phrase ('לכל המפגשים') but the candidate's grounded quote does
+    not — the decision stays 'question' and nothing spreads. One email
+    mentioning both a one-off change and a policy must not guess
+    (same rule as signal_for: only the candidate's own words count)."""
+    source = _make_source(
+        db,
+        text="שינוי: הטיול יוצא ב-18:00\n\nהודעה כללית: השעה החדשה תחול לכל המפגשים",
+        series_uid="S1",
+    )
+    _member(db, start=_jlm(10, 16, 0))
+    later = _member(db, start=_jlm(17, 16, 0), title=TITLE_LATER)
+    service, outcome = _run_update(
+        db, source, hint=ReconHint(change=True), quote="הטיול יוצא ב-18:00"
+    )
+    assert outcome is not None and outcome.verdict is Verdict.UPDATE
+    child = db.query(MemoryItem).filter(MemoryItem.child_state == "proposed").one()
+    scope = child.extraction_meta["recon_series_scope"]
+    assert scope["scope"] == "question"  # the phrase was outside the quote
+    assert scope["decided_at"] is None
+    rels = db.query(ItemRelation).filter_by(kind="supersedes").all()
+    assert len(rels) == 1  # only the original update; the later member untouched
+    db.refresh(later)
+    assert later.superseded_by is None
