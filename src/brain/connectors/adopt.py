@@ -186,44 +186,67 @@ def adopt_connector(
         report.adopted.append(((record.external_id, record.version), item_id))
 
     if report.adopted and not dry_run:
-        for (external_id, version), item_id in report.adopted:
-            records_repo.put(name, external_id, version, item_id)
-        _stamp_baseline(session, report)
-        _log_adopt(session, name, report)
-        report.wrote = True
+        try:
+            # ONE transaction: ledger rows + baseline stamp + provenance
+            # event commit together or not at all. undo reads ONLY the last
+            # adopt event — a crash in between would strand ledger rows no
+            # undo can ever find.
+            prior_shas = _prior_shas(session, report)
+            for (external_id, version), item_id in report.adopted:
+                records_repo.put(name, external_id, version, item_id, commit=False)
+            _stamp_baseline(session, report, commit=False)
+            _log_adopt(session, name, report, prior_shas, commit=False)
+            session.commit()
+            report.wrote = True
+        except Exception:
+            session.rollback()
+            raise
     return report
 
 
 def undo_adopt(name: str, session: Session) -> UndoReport:
-    """Remove exactly the ledger rows the last REAL adopt of ``name`` wrote."""
+    """Remove exactly the ledger rows the last REAL adopt of ``name`` wrote.
+
+    Also reverses the baseline stamp for every row actually removed (the
+    plan's 'byte-identical after a clean undo'); refused rows keep it."""
     report = UndoReport(connector=name)
     event = _last_adopt_event(session, name)
     if event is None:
         return report  # nothing recorded: nothing to undo
     records_repo = ConnectorRecordRepo(session)
-    for external_id, version, item_id in event.detail.get("adopted", []):
-        row = records_repo.get(name, external_id)
-        if row is None:
-            continue  # already gone (undone before, or removed out-of-band)
-        if row.item_id is None:
-            report.refused.append(external_id)  # user deleted the item since
-            continue
-        if row.version != (version or None) or str(row.item_id) != item_id:
-            report.refused.append(external_id)  # a sync touched it: load-bearing
-            continue
-        records_repo.delete(name, external_id)
-        report.removed.append(external_id)
-    session.add(
-        _ops_event(
-            {
-                "connector": name,
-                "undo": True,
-                "removed": report.removed,
-                "refused": report.refused,
-            }
+    try:
+        for quad in event.detail.get("adopted", []):
+            external_id, version, item_id = quad[0], quad[1], quad[2]
+            prior_sha = quad[3] if len(quad) > 3 else None
+            row = records_repo.get(name, external_id)
+            if row is None:
+                continue  # already gone (undone before, or removed out-of-band)
+            if row.item_id is None:
+                report.refused.append(external_id)  # user deleted the item since
+                continue
+            if row.version != (version or None) or str(row.item_id) != item_id:
+                report.refused.append(external_id)  # a sync touched it: load-bearing
+                continue
+            records_repo.delete(name, external_id, commit=False)
+            report.removed.append(external_id)
+            if prior_sha is None:
+                _strip_baseline(session, uuid.UUID(item_id))
+            else:
+                _restore_baseline(session, uuid.UUID(item_id), prior_sha)
+        session.add(
+            _ops_event(
+                {
+                    "connector": name,
+                    "undo": True,
+                    "removed": report.removed,
+                    "refused": report.refused,
+                }
+            )
         )
-    )
-    session.commit()
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     return report
 
 
@@ -288,7 +311,7 @@ def _legacy_items(session: Session, legacy_source: str) -> list[Any]:
     )
 
 
-def _stamp_baseline(session: Session, report: AdoptReport) -> None:
+def _stamp_baseline(session: Session, report: AdoptReport, *, commit: bool = True) -> None:
     """Declare each adopted item's CURRENT text as the framework baseline.
 
     The runner's user-edited guard compares ``meta['connector_text_sha']``
@@ -300,7 +323,8 @@ def _stamp_baseline(session: Session, report: AdoptReport) -> None:
     before adopt is indistinguishable from the original capture and becomes
     the baseline — the accepted trade-off (a stale event is worse than a
     re-rendered one). Bookkeeping meta only: raw_text/occurred_at/source
-    never move here.
+    never move here. ``commit=False`` folds the stamp into the caller's
+    one-transaction commit (undo reverses it, see undo_adopt).
     """
     from brain.connectors.runner import _text_sha
     from brain.db.models import MemoryItem
@@ -309,7 +333,42 @@ def _stamp_baseline(session: Session, report: AdoptReport) -> None:
         item = session.get(MemoryItem, item_id)
         if item is not None:
             item.meta = {**(item.meta or {}), "connector_text_sha": _text_sha(item.raw_text)}
-    session.commit()
+    if commit:
+        session.commit()
+
+
+def _strip_baseline(session: Session, item_id: uuid.UUID) -> None:
+    """Remove the baseline stamp undo wrote (the pre-adopt state had none)."""
+    from brain.db.models import MemoryItem
+
+    item = session.get(MemoryItem, item_id)
+    if item is not None and isinstance(item.meta, dict):
+        item.meta = {k: v for k, v in item.meta.items() if k != "connector_text_sha"}
+
+
+def _restore_baseline(session: Session, item_id: uuid.UUID, prior_sha: str) -> None:
+    """Restore a PRE-EXISTING stamp value (defensive: legacy items have none)."""
+    from brain.db.models import MemoryItem
+
+    item = session.get(MemoryItem, item_id)
+    if item is not None:
+        item.meta = {**(item.meta or {}), "connector_text_sha": prior_sha}
+
+
+def _prior_shas(session: Session, report: AdoptReport) -> dict[uuid.UUID, str | None]:
+    """Each adopted item's connector_text_sha BEFORE adopt (None expected).
+
+    Recorded in the adopt event so undo can restore the exact prior state —
+    byte-identical after a clean undo.
+    """
+    from brain.db.models import MemoryItem
+
+    out: dict[uuid.UUID, str | None] = {}
+    for _, item_id in report.adopted:
+        item = session.get(MemoryItem, item_id)
+        meta = item.meta if (item is not None and isinstance(item.meta, dict)) else {}
+        out[item_id] = meta.get("connector_text_sha")
+    return out
 
 
 def _fetch_all(connector: Connector, *, limit: int) -> list[Any]:
@@ -393,14 +452,24 @@ def _ops_event(detail: dict[str, Any]) -> Any:
     return OpsEvent(component="connectors", kind="adopt", ok=True, detail=detail)
 
 
-def _log_adopt(session: Session, name: str, report: AdoptReport) -> None:
+def _log_adopt(
+    session: Session,
+    name: str,
+    report: AdoptReport,
+    prior_shas: dict[uuid.UUID, str | None],
+    *,
+    commit: bool = True,
+) -> None:
+    """Provenance: the exact (external_id, version, item_id, prior_sha)
+    quadruples written, so undo can remove the rows AND reverse the stamp.
+    Commits only when asked (the adopt path commits once at the end)."""
     session.add(
         _ops_event(
             {
                 "connector": name,
                 "dry_run": False,
                 "adopted": [
-                    [external_id, version or "", str(item_id)]
+                    [external_id, version or "", str(item_id), prior_shas.get(item_id)]
                     for (external_id, version), item_id in report.adopted
                 ],
                 "ambiguous": len(report.ambiguous),
@@ -410,7 +479,8 @@ def _log_adopt(session: Session, name: str, report: AdoptReport) -> None:
             }
         )
     )
-    session.commit()
+    if commit:
+        session.commit()
 
 
 def _last_adopt_event(session: Session, name: str) -> Any:

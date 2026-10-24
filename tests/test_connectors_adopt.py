@@ -320,7 +320,9 @@ def test_adopt_logs_one_ops_event_with_the_triples_it_wrote(adopt_db):
     assert len(events) == 1
     detail = events[0].detail
     assert detail["connector"] == "gcal"
-    assert detail["adopted"] == [["evt_1", '"etag-1"', str(legacy.id)]]
+    assert detail["adopted"] == [
+        ["evt_1", '"etag-1"', str(legacy.id), None]
+    ]  # quad incl. prior_sha
 
 
 # --- ambiguity / guards --------------------------------------------------------
@@ -795,3 +797,109 @@ def test_adopt_mixed_report_sections(adopt_db):
     ids = {item_id for _, item_id in report.adopted}
     assert ids == {matched.id}
     assert report.new == ["miss"]
+
+
+# --- review round 1: atomicity + undo-the-stamp ---------------------------------
+
+
+def test_adopt_crash_leaves_no_partial_writes(adopt_db, monkeypatch):
+    """A crash between the ledger puts and the ops event must leave NOTHING:
+    no ledger rows, no stamps, no event — one transaction, rolled back whole
+    (undo reads only the last adopt event; orphaned rows would be invisible)."""
+    import brain.connectors.adopt as adopt_mod
+    from brain.db.session import engine
+
+    h = Harness(adopt_db)
+    h.seed_legacy(
+        source="calendar",
+        raw_text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+    record = make_record(
+        external_id="evt_1",
+        version='"etag-1"',
+        text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("ops event write failed")
+
+    monkeypatch.setattr(adopt_mod, "_log_adopt", boom)
+    with pytest.raises(RuntimeError):
+        adopt_connector(FakeConnector(name="gcal", batches=[_batch(record)]), adopt_db)
+
+    with engine.begin() as conn:
+        assert conn.execute(text("SELECT count(*) FROM connector_records")).scalar() == 0
+        assert conn.execute(text("SELECT count(*) FROM ops_events")).scalar() == 0
+        assert (
+            conn.execute(text("SELECT meta->>'connector_text_sha' FROM memory_items")).scalar()
+            is None
+        )
+
+
+def test_adopt_undo_restores_items_byte_identical(adopt_db, adopt_env, monkeypatch):
+    """Undo removes the connector_text_sha stamp it wrote: the adopted item's
+    meta after undo equals its meta before adopt (byte-identical)."""
+    import brain.cli as cli
+
+    h = Harness(adopt_db)
+    legacy = h.seed_legacy(
+        source="calendar",
+        raw_text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+    before_meta = dict(legacy.meta)
+    record = make_record(
+        external_id="evt_1",
+        version='"etag-1"',
+        text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+    connector = FakeConnector(name="gcal", batches=[_batch(record)])
+    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    _stub_registry(monkeypatch, "gcal", _StubGcal)
+
+    assert cli.main(["connectors", "adopt", "gcal"]) == 0
+    adopt_db.expire_all()  # the CLI committed in its own session
+    stamped = h.repo.get(legacy.id)
+    assert stamped is not None
+    assert stamped.meta.get("connector_text_sha") is not None
+
+    assert cli.main(["connectors", "adopt", "gcal", "--undo"]) == 0
+    adopt_db.expire_all()
+    restored = h.repo.get(legacy.id)
+    assert restored is not None
+    assert restored.meta == before_meta  # stamp GONE after undo
+
+
+def test_adopt_undo_keeps_stamp_on_refused_rows(adopt_db):
+    """A refused row (sync touched it) keeps its stamp: undo only reverts what
+    it actually removed."""
+    h = Harness(adopt_db)
+    h.seed_legacy(
+        source="calendar",
+        raw_text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+    at_adopt = make_record(
+        external_id="evt_1",
+        version='"etag-1"',
+        text="אימון כדורסל — Thu 29 Oct 17:00–18:30",
+        occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+    )
+    adopt_connector(FakeConnector(name="gcal", batches=[_batch(at_adopt)]), adopt_db)
+    moved = make_record(
+        external_id="evt_1",
+        version='"etag-2"',
+        text="אימון כדורסל — Fri 30 Oct 10:00–11:00",
+        occurred_at=datetime(2026, 10, 30, 7, 0, tzinfo=UTC),
+    )
+    summary = h.runner(FakeConnector(name="gcal", batches=[_batch(moved)])).run()
+    assert summary.updated == 1
+
+    report = undo_adopt("gcal", adopt_db)
+    assert report.refused == ["evt_1"]
+    kept = h.repo.get(h.records.get("gcal", "evt_1").item_id)
+    assert kept is not None
+    assert "connector_text_sha" in (kept.meta or {})  # untouched

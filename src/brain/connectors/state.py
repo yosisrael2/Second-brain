@@ -92,11 +92,21 @@ class ConnectorRecordRepo:
         )
         return self._session.scalars(stmt).first()
 
-    def put(self, source: str, external_id: str, version: str | None, item_id: object) -> None:
+    def put(
+        self,
+        source: str,
+        external_id: str,
+        version: str | None,
+        item_id: object,
+        *,
+        commit: bool = True,
+    ) -> None:
         """Insert or update the ledger row for one synced record.
 
         A successful sync also resets the poison-record bookkeeping: the
-        record is back in the runner's good graces.
+        record is back in the runner's good graces. ``commit=False`` defers
+        the commit to the caller (the adopt path writes ledger rows, the
+        baseline stamp and the provenance event as ONE transaction).
         """
         row = self.get(source, external_id)
         if row is None:
@@ -107,7 +117,8 @@ class ConnectorRecordRepo:
         row.status = "synced"
         row.fail_count = 0
         row.last_error = None
-        self._session.commit()
+        if commit:
+            self._session.commit()
 
     def mark_failure(self, source: str, external_id: str, version: str | None, error: str) -> bool:
         """Count one more consecutive failure for this record.
@@ -152,17 +163,19 @@ class ConnectorRecordRepo:
             row.last_error = None
             self._session.commit()
 
-    def delete(self, source: str, external_id: str) -> bool:
+    def delete(self, source: str, external_id: str, *, commit: bool = True) -> bool:
         """Remove ONE ledger row (adopt --undo only). True when a row went.
 
         The caller decides the safety conditions (undo_adopt refuses rows a
         sync touched or a user deleted through); the repo just deletes.
+        ``commit=False`` defers to the caller's one-transaction commit.
         """
         row = self.get(source, external_id)
         if row is None:
             return False
         self._session.delete(row)
-        self._session.commit()
+        if commit:
+            self._session.commit()
         return True
 
     def quarantined_counts(self) -> dict[str, int]:
