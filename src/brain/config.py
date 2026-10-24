@@ -229,6 +229,16 @@ class Settings(BaseSettings):
     # cap: a dropped future instance would never be re-delivered.
     brain_gcal_past_days: int = 60
 
+    # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
+    # of task lists to sync, comma-separated list IDs or titles (titles matched
+    # case-insensitively); empty = sync every list. IDs are stable while titles
+    # can be renamed, so prefer IDs; an allowlist change invalidates the sync
+    # cursor (full resync) so old tasks of newly-allowed lists are picked up.
+    gtasks_lists: str = Field(
+        default="",
+        validation_alias=AliasChoices("BRAIN_GTASKS_LISTS", "GTASKS_LISTS"),
+    )
+
     @field_validator("telegram_allowed_user_ids")
     @classmethod
     def _validate_telegram_user_ids(cls, value: str) -> str:

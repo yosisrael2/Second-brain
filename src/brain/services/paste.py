@@ -143,10 +143,14 @@ def parse(
 
     ``tz`` is the IANA zone used to interpret zone-less times (defaults to
     the machine's local zone; the /capture route passes the ``TIMEZONE``
-    setting). All ``occurred_at`` values are returned aware (UTC for
-    zone-less times, the explicit offset otherwise). ``now`` is the paste
-    instant (defaults to the real clock); a recurring ICS event fans out
-    into one item per occurrence within [now, now + BRAIN_PASTE_RRULE_DAYS].
+    setting). All ``occurred_at`` values are aware; the offset depends on
+    the source: explicit offsets are honored as given (ICS ``Z``/
+    ``TZID``, Outlook ``+0300``), zone-less times become UTC — except an
+    ICS VEVENT's zone-less forms (date-only, bare timed), which KEEP
+    ``tz`` so an RRULE anchor stays wall-clock stable across DST.
+    ``now`` is the paste instant (defaults to the real clock); a recurring
+    ICS event fans out into one item per occurrence within
+    [now, now + BRAIN_PASTE_RRULE_DAYS].
     """
     zone = tz if tz is not None else ZoneInfo(local_timezone_name())
     paste_time = now if now is not None else datetime.now(UTC)
