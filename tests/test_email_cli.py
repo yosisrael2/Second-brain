@@ -140,6 +140,51 @@ class TestGmailPoll:
         assert code == 0
         assert slept == [60.0], f"a backoff pass must sleep the interval, got {slept}"
 
+    def test_cycle_failure_stall_goes_through_the_seam(self, monkeypatch, database, fake_keychain):
+        """The cycle-FAILED stall (an exception escaping _gmail_poll_cycle)
+        must route through the #94 sleep seam like every other pause — it
+        still called time.sleep directly. time.sleep is neutralized so the
+        pre-fix direct call records nothing (red) and cannot stall the run."""
+        import time as time_mod
+
+        import brain.config as config
+
+        settings = config.Settings(
+            gmail_label_id="Label_1",
+            database_url="postgresql+psycopg://brain:brain@localhost:27432/brain_w8_test",
+            qdrant_collection="brain_items_w8_test",
+            _env_file=None,
+        )
+        monkeypatch.setattr(cli, "get_settings", lambda: settings)
+        fake_keychain.store(GMAIL_ACCOUNT, "1//fake-refresh-token")
+        monkeypatch.setattr(cli, "_side_process_indexer", lambda: object())
+        monkeypatch.setattr(cli, "_cli_attachment_service", lambda settings, indexer: object())
+        state = {"n": 0}
+
+        def raising_cycle(indexer, attachments):
+            state["n"] += 1
+            if state["n"] <= 2:
+                raise RuntimeError("cycle blew up")
+            from brain.connectors.runner import SyncSummary
+
+            return SyncSummary(connector="email", state="ok")
+
+        monkeypatch.setattr(cli, "_gmail_poll_cycle", raising_cycle)
+        monkeypatch.setattr(time_mod, "sleep", lambda seconds: None)
+        slept: list[float] = []
+        code = cli._gmail_poll(
+            argparse.Namespace(command="gmail-poll", once=False),
+            sleep=slept.append,
+            max_cycles=2,
+        )
+        assert code == 0
+        # POST-FIX the two failing cycles stall through the seam ([300.0, 300.0]).
+        # PRE-FIX they bypassed it entirely: the neutralized time.sleep records
+        # nothing, the loop falls through to the ok cycle's interval pauses.
+        assert slept == [300.0, 300.0], (
+            f"the cycle-failure stall must use the seam's stall value, got {slept}"
+        )
+
     def test_label_unset_is_config_error(self, monkeypatch, capsys, fake_keychain):
         import brain.config as config
 

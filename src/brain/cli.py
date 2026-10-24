@@ -448,6 +448,8 @@ def run_recon_eval(
                     end=_parse_eval_dt(row.get("end")),
                     applies_to=tuple(row.get("applies_to") or ()),
                     location=row.get("location"),
+                    amount=row.get("amount"),
+                    effective=_parse_eval_dt(row.get("effective")),
                 )
                 for row in case.get("existing_items", [])
             ]
@@ -461,6 +463,7 @@ def run_recon_eval(
                 applies_to=tuple(cand.get("applies_to") or ()),
                 location=cand.get("location"),
                 end=_parse_eval_dt(cand.get("end")),
+                amount=cand.get("amount"),
             )
             signal = signal_for([str(case.get("new_text_quote", ""))])
             # E5: a dated correction is judged inside ITS OWN window — the
@@ -1174,7 +1177,10 @@ def _gmail_poll(
             raise
         except Exception as exc:  # noqa: BLE001 — one bad cycle never kills the agent
             logger.error("gmail-poll: cycle failed: %s", exc, exc_info=True)
-            time.sleep(stall_pause_s)
+            do_sleep(stall_pause_s)
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                return 0  # the test seam bounds this path too
             continue
         heartbeat_email_summary(summary)
         with SessionLocal() as session:
