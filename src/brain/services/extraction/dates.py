@@ -211,5 +211,30 @@ def extract_clock(when_raw: str) -> time | None:
     return time(int(match.group(1)), int(match.group(2)))
 
 
+def quote_clock(quote: str, when_raw: str) -> time | None:
+    """The quote's clock time when it is unambiguous and adjacent (v4).
+
+    Deterministic backstop for the model dropping the time from when_raw:
+    the QUOTE must contain EXACTLY ONE clock time (never guess among
+    several) AND that time must sit within +/- 20 characters of the date
+    expression's occurrence in the quote; otherwise None (stays all-day).
+    """
+    import re as _re  # noqa: PLC0415
+
+    if not quote or not when_raw:
+        return None
+    matches = _re.findall(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)", quote)
+    if len(matches) != 1:
+        return None
+    at = quote.find(when_raw)
+    if at < 0:
+        return None
+    lo, hi = max(0, at - 20), at + len(when_raw) + 20
+    window = quote[lo:hi]
+    if not _re.search(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)", window):
+        return None
+    return time(int(matches[0][0]), int(matches[0][1]))
+
+
 def utc_now() -> datetime:
     return datetime.now(tz=UTC)
