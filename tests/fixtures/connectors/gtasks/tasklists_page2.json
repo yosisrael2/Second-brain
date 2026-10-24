@@ -1,0 +1,14 @@
+{
+  "kind": "tasks#taskLists",
+  "etag": "W/\"tasklists-page-2\"",
+  "items": [
+    {
+      "kind": "tasks#taskList",
+      "id": "MjIyMjIyMjIyMjIyMjIyMjIyMjI6MDow",
+      "etag": "W/\"list-work\"",
+      "title": "Work",
+      "updated": "2026-03-03T06:45:00.000Z",
+      "selfLink": "https://www.googleapis.com/tasks/v1/lists/MjIyMjIyMjIyMjIyMjIyMjIyMjI6MDow"
+    }
+  ]
+}

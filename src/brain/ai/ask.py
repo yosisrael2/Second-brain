@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -158,7 +158,14 @@ class FakeLLMClient:
 
     ``reply`` is either a fixed string or a callable receiving the prompt.
     ``prompts`` records every prompt it was given.
+
+    ClassVar ``synthetic``: this client is a test double, never a real
+    provider. AskService skips ops recording for synthetic clients so a
+    verification run cannot write ask->llm events that flip /ops/health's
+    llm component (seen 22:40Z 22 Oct after the A1 deploy check).
     """
+
+    synthetic: ClassVar[bool] = True
 
     def __init__(
         self,

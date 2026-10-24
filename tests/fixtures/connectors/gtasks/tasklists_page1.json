@@ -1,0 +1,23 @@
+{
+  "kind": "tasks#taskLists",
+  "etag": "W/\"tasklists-page-1\"",
+  "nextPageToken": "tasklists-page-token-2",
+  "items": [
+    {
+      "kind": "tasks#taskList",
+      "id": "MDAwMDAwMDAwMDAwMDAwMDAwMDA6MDow",
+      "etag": "W/\"list-personal\"",
+      "title": "Personal",
+      "updated": "2026-03-01T08:15:30.000Z",
+      "selfLink": "https://www.googleapis.com/tasks/v1/lists/MDAwMDAwMDAwMDAwMDAwMDAwMDA6MDow"
+    },
+    {
+      "kind": "tasks#taskList",
+      "id": "MTExMTExMTExMTExMTExMTExMTE6MDow",
+      "etag": "W/\"list-home\"",
+      "title": "בית",
+      "updated": "2026-03-02T10:00:00.000Z",
+      "selfLink": "https://www.googleapis.com/tasks/v1/lists/MTExMTExMTExMTExMTExMTExMTE6MDow"
+    }
+  ]
+}
