@@ -33,7 +33,6 @@ from typing import Any, ClassVar
 from brain.ai.gmail import (
     GMAIL_SCOPE,
     GmailAuthError,
-    GmailClient,
     GmailError,
     GmailMessage,
     RestGmailClient,
@@ -59,10 +58,14 @@ def record_from_message(msg: GmailMessage, *, deleted: bool = False) -> SourceRe
     stripped, forward preambles skipped, header lines preserved — so items
     keep their pre-port shape and the ingest fingerprint matches.
     """
+    from zoneinfo import ZoneInfo  # noqa: PLC0415 (lazy: config never imports ai)
+
     from brain.config import get_settings  # noqa: PLC0415 (lazy: config never imports ai)
     from brain.services.paste import parse
 
-    parsed = parse(msg.body_text, kind_hint="email", tz=get_settings().timezone)
+    parsed = parse(
+        msg.body_text, kind_hint="email", tz=ZoneInfo(get_settings().timezone)
+    )
     chunk = parsed.chunks[0]
     # The old poller's rule: the message instant wins only when the body
     # carries no parsed date of its own.
@@ -168,12 +171,14 @@ class GmailConnector(GoogleConnector):
 
     name: ClassVar[str] = "email"  # == items.source for the existing data
     SCOPES: ClassVar[tuple[str, ...]] = (GMAIL_SCOPE,)
+    API_NAME: ClassVar[str] = "gmail"
+    API_VERSION: ClassVar[str] = "v1"
 
     def __init__(
         self,
         *,
         token_loader: Callable[[], str],
-        service_factory: Callable[[str, list[str]], Any],
+        service_factory: Callable[[str, list[str], str, str], Any],
         user_id: str = "me",
         settings: Any = None,
         legacy_seed: Callable[[], int] | None = None,
@@ -190,7 +195,7 @@ class GmailConnector(GoogleConnector):
         self._settings: Any = settings or get_settings()
         self._legacy_seed = legacy_seed
         self._is_known = is_known
-        self._client: GmailClient | None = None
+        self._client: RestGmailClient | None = None
 
     # --- plumbing -------------------------------------------------------------
 
@@ -198,7 +203,7 @@ class GmailConnector(GoogleConnector):
         """The shared read client over the (cached) service object."""
         if self._client is None:
             self._client = RestGmailClient(service=self._service())
-        return self._client  # type: ignore[return-value]
+        return self._client
 
     def _label_id(self) -> str:
         label = (getattr(self._settings, "gmail_label_id", "") or "").strip()
@@ -377,8 +382,19 @@ class GmailConnector(GoogleConnector):
         )
 
     def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
+        """Release the cached google service (one service per connector).
+
+        Duck-typed close: the real googleapiclient Resource has .close();
+        test fakes may not. The RestGmailClient wrapper shares this service,
+        so closing it here is THE single release point — never double-close
+        via the client."""
+        service = self._service_instance
+        if service is None:
+            return
+        close = getattr(service, "close", None)
+        if close is not None:
+            close()
+        self._service_instance = None  # released: a later use rebuilds
 
 
 def _tombstone(message_id: str) -> Any:

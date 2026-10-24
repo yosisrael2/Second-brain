@@ -59,6 +59,7 @@ import base64
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -201,9 +202,13 @@ class _FakeUsers:
 class _FakeService:
     def __init__(self, state):
         self._state = state
+        self.closed = False
 
     def users(self):
         return _FakeUsers(self._state)
+
+    def close(self) -> None:
+        self._state.calls.append(("service.close", {}))
 
 
 class _ServiceState:
@@ -235,7 +240,7 @@ def _connector(
 
     return GmailConnector(
         token_loader=lambda: "refresh-token",
-        service_factory=lambda token, scopes: _FakeService(state),
+        service_factory=lambda token, scopes, api_name, api_version: _FakeService(state),
         settings=Settings(
             gmail_label_id=label, gmail_query=query, gmail_credentials_path="", _env_file=None
         ),
@@ -544,6 +549,123 @@ class TestAttachments:
         ref = result.records[0].attachments[0]
         assert connector.fetch_attachment(result.records[0], ref) == b"%PDF-fake"
         assert ("attachments.get", {"messageId": "m1", "id": "att1"}) in state.calls
+
+    def test_build_declares_gmail_v1_to_the_service_factory(self):
+        """Round-4 base contract: the adapter declares its API and the cached
+        factory receives exactly (token, scopes, "gmail", "v1")."""
+        from brain.ai.gmail import GMAIL_SCOPE
+        from brain.config import Settings
+        from brain.connectors.google.gmail import GmailConnector
+
+        assert GmailConnector.API_NAME == "gmail"
+        assert GmailConnector.API_VERSION == "v1"
+        seen: list[tuple[str, list[str], str, str]] = []
+
+        def factory(token: str, scopes: list[str], api_name: str, api_version: str) -> Any:
+            seen.append((token, scopes, api_name, api_version))
+            return _FakeService(_ServiceState())
+
+        connector = GmailConnector(
+            token_loader=lambda: "refresh-token",
+            service_factory=factory,
+            settings=Settings(
+                gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
+            ),
+        )
+        connector._service()
+        assert seen == [("refresh-token", [GMAIL_SCOPE], "gmail", "v1")]
+
+    def test_close_releases_the_cached_google_service(self):
+        """Regression (found by mypy): the old close() called
+        RestGmailClient.close(), which does not exist — a real poll cycle
+        would crash in the finally. close() must release THE cached google
+        service (duck-typed; one service per connector, no double-close)."""
+        state = _ServiceState()
+        connector = _connector(state)
+        connector.fetch(None, limit=200)  # materializes the cached service
+        connector.close()
+        assert ("service.close", {}) in state.calls
+        connector.close()  # idempotent: already-released service is a no-op
+        assert state.calls.count(("service.close", {})) == 1
+
+    def _capture_attachment_bytes(self, harness: Any, svc_env: Any) -> None:
+        """Body shared by the DB-level capture test and the stray-row test:
+        the REAL AttachmentService in the runner (the gmail-poll wiring), the
+        REAL ingest (real memory_items parent), the runner capture+submit,
+        then one drain — exactly one `brain gmail-poll` cycle."""
+        from tests.test_attachments import FakeQuery, _make_service
+
+        h = harness
+        real = _make_service(svc_env, FakeQuery(reply="the attached note"))
+        h.runner._attachments = real
+        _queue_message(h._state_service, "m1", with_attachment=True)
+        # Swap the fixture's pdf part for a png so the read goes through the
+        # Claude reader (FakeQuery) — same shape the old F3 test used.
+        part = h._state_service.messages["m1"]["payload"]["parts"][1]
+        part["mimeType"] = "image/png"
+        part["filename"] = "photo.png"
+        blob = base64.urlsafe_b64encode(b"\x89PNG fake bytes").decode().rstrip("=")
+        h._state_service.attachment_blobs["att1"] = blob
+        summary = h.runner.run()
+        assert summary.created == 1
+        assert ("attachments.get", {"messageId": "m1", "id": "att1"}) in h._state_service.calls
+        real.drain()  # the CLI cycle drains once per poll (_gmail_poll_cycle)
+
+        from brain.db.models import Attachment, MemoryItem
+        from brain.db.session import SessionLocal
+
+        item = h.item_for("m1")
+        assert item is not None
+        with SessionLocal() as session:
+            # Scoped to THIS test's email item (T1): a stray attachment row in
+            # the shared *_test db from an interrupted session must not break it.
+            row = session.query(Attachment).filter_by(parent_item_id=item.id).one()
+            assert row.source == "email" and row.status == "done"
+            assert "the attached note" in (row.text or "")
+            assert row.filename == "photo.png" and row.mime == "image/png"
+            parent = session.get(MemoryItem, row.parent_item_id)
+            assert parent is not None, "the email item is the attachment's parent"
+            assert parent.meta["gmail_id"] == "m1"
+
+    def test_attachment_bytes_captured_with_source_email(self, svc_env, gmail_harness):
+        """Old F3 (moved 1:1 from tests/services/test_attachments_email.py):
+        attachment BYTES flow through the attachments core with the REAL
+        service — captured under the email item, queued, drained, row done."""
+        self._capture_attachment_bytes(gmail_harness, svc_env)
+
+    def test_email_attachment_test_ignores_stray_rows(self, svc_env):
+        """T1 (moved with the test): the DB assertions must be scoped to THIS
+        test's own parent item. A stray attachment row left in the shared
+        *_test database by an interrupted earlier session must not break the
+        capture test — plant one (its own parent item, so FK holds) and run
+        the same body verbatim."""
+        from brain.db.models import Attachment, MemoryItem
+        from brain.db.session import SessionLocal
+
+        with SessionLocal() as session:
+            stray_parent = MemoryItem(raw_text="stray from an earlier session", status="inbox")
+            session.add(stray_parent)
+            session.flush()
+            session.add(
+                Attachment(
+                    item_id=stray_parent.id,
+                    parent_item_id=stray_parent.id,
+                    sha256="0" * 64,
+                    mime="text/plain",
+                    filename="stray.txt",
+                    size_bytes=4,
+                    source="email",
+                    source_ref="stray-m1",
+                    status="done",
+                )
+            )
+            session.commit()
+
+        harness = _Harness()  # no wipe: the stray row must survive
+        try:
+            self._capture_attachment_bytes(harness, svc_env)
+        finally:
+            harness.close()
 
 
 # --- legacy ledger seed (approved dedupe decision) ----------------------------
