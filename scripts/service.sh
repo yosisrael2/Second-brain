@@ -21,7 +21,7 @@
 # both) and any manual WhatsApp poller (.dev/whatsapp.pid + orphans; a
 # second poller races the shared cursor table) BEFORE bootstrapping.
 #
-# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|whatsapp]
+# Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|connectors|whatsapp]
 #
 # Test seams (never needed interactively): PLIST_DIR, LOG_DIR, PORT, LINES,
 # BRAIN_BIN, UVICORN_BIN — overridable so tests never touch the real
@@ -37,6 +37,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 LABEL_API="com.secondbrain.api"
 LABEL_TG="com.secondbrain.telegram"
 LABEL_EMAIL="com.secondbrain.email"
+LABEL_CONNECTORS="com.secondbrain.connectors"
 LABEL_WA="com.secondbrain.whatsapp"
 PLIST_DIR="${PLIST_DIR:-$HOME/Library/LaunchAgents}"
 LOG_DIR="${LOG_DIR:-$HOME/Library/Logs/second-brain}"
@@ -46,6 +47,7 @@ UVICORN="${UVICORN_BIN:-$ROOT/.venv/bin/uvicorn}"
 RUN_SERVER="$ROOT/scripts/run-server.sh"
 RUN_BOT="$ROOT/scripts/run-bot.sh"
 RUN_EMAIL="$ROOT/scripts/run-email.sh"
+RUN_CONNECTORS="$ROOT/scripts/run-connectors.sh"
 RUN_WHATSAPP="$ROOT/scripts/run-whatsapp.sh"
 TG_PID_FILE="$ROOT/.dev/telegram.pid"
 WA_PID_FILE="$ROOT/.dev/whatsapp.pid"
@@ -63,19 +65,44 @@ email_configured() {
   [ -n "${GMAIL_LABEL_ID:-}" ]
 }
 
+connectors_configured() {
+  # Connectors are OPT-IN the same way: the agent runs only when
+  # BRAIN_CONNECTORS contains a non-email connector (email AND its registry
+  # alias 'gmail' are excluded — the Gmail poller keeps its own agent,
+  # run-email.sh). Without one the scheduler would loop doing nothing —
+  # install skips it instead and removes any stale plist.
+  load_env_file
+  [ -n "${BRAIN_CONNECTORS:-}" ] || return 1
+  local part part_lc
+  local old_ifs="$IFS"
+  IFS=','
+  for part in ${BRAIN_CONNECTORS}; do
+    part="$(printf '%s' "$part" | tr -d '[:space:]')"
+    part_lc="$(printf '%s' "$part" | tr '[:upper:]' '[:lower:]')"
+    if [ -n "$part_lc" ] && [ "$part_lc" != "email" ] && [ "$part_lc" != "gmail" ]; then
+      IFS="$old_ifs"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
 usage() {
   cat <<EOF
-Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|whatsapp]
+Usage: scripts/service.sh install|uninstall|status|restart|logs [api|telegram|email|connectors|whatsapp]
 
 install    stop our manual instances, write the plists, bootstrap them
-           (email is opt-in: only installed when GMAIL_LABEL_ID is set)
+           (email is opt-in: only installed when GMAIL_LABEL_ID is set;
+           connectors is opt-in: only installed when BRAIN_CONNECTORS has a
+           non-email connector)
 uninstall  bootout all agents and remove the plists (logs are kept)
 status     per-agent state/pid/last-exit, plus sleep + docker notes
 restart    kickstart -k all installed agents (skips the rest)
 logs [c]   tail the last ${LINES:-50} lines (component: api, telegram,
-           email, whatsapp, or all)
+           email, connectors, whatsapp, or all)
 
-Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_EMAIL}, ${LABEL_WA}
+Agents: ${LABEL_API}, ${LABEL_TG}, ${LABEL_EMAIL}, ${LABEL_CONNECTORS}, ${LABEL_WA}
 Plists: ${PLIST_DIR}   Logs: ${LOG_DIR}
 EOF
 }
@@ -271,8 +298,8 @@ install() {
   [ -x "$BRAIN" ] || die "$BRAIN missing — provision the venv first (scripts/dev-start.sh does)"
   [ -x "$UVICORN" ] || die "$UVICORN missing — provision the venv first"
   [ -x "$RUN_SERVER" ] && [ -x "$RUN_BOT" ] && [ -x "$RUN_EMAIL" ] \
-    && [ -x "$RUN_WHATSAPP" ] || \
-    die "scripts/run-server.sh, run-bot.sh, run-email.sh and run-whatsapp.sh must be executable"
+    && [ -x "$RUN_CONNECTORS" ] && [ -x "$RUN_WHATSAPP" ] || \
+    die "scripts/run-server.sh, run-bot.sh, run-email.sh, run-connectors.sh and run-whatsapp.sh must be executable"
   [ -f "$ROOT/.env" ] || say "env: WARNING — no .env at $ROOT; services run on defaults (telegram disabled until a token exists)"
 
   say "takeover: stopping manual instances (no duplicate bots, no 409)"
@@ -286,6 +313,10 @@ install() {
   if email_configured; then
     install_email=1
   fi
+  local install_connectors=0
+  if connectors_configured; then
+    install_connectors=1
+  fi
   write_plist "$LABEL_API" "$RUN_SERVER" "api"
   write_plist "$LABEL_TG" "$RUN_BOT" "telegram"
   if [ "$install_email" -eq 1 ]; then
@@ -296,6 +327,14 @@ install() {
     bootout_label "$LABEL_EMAIL"
     rm -f "$PLIST_DIR/${LABEL_EMAIL}.plist"
     say "email: skipped (GMAIL_LABEL_ID not set)"
+  fi
+  if [ "$install_connectors" -eq 1 ]; then
+    write_plist "$LABEL_CONNECTORS" "$RUN_CONNECTORS" "connectors"
+  else
+    # Same opt-out hygiene as email: no stale agent looping on nothing.
+    bootout_label "$LABEL_CONNECTORS"
+    rm -f "$PLIST_DIR/${LABEL_CONNECTORS}.plist"
+    say "connectors: skipped (no non-email connector in BRAIN_CONNECTORS)"
   fi
   THROTTLE=30 write_plist "$LABEL_WA" "$RUN_WHATSAPP" "whatsapp"
 
@@ -309,6 +348,11 @@ install() {
       touch "$LOG_DIR/$f.log" 2>/dev/null || true
     done
   fi
+  if [ "$install_connectors" -eq 1 ]; then
+    for f in connectors connectors.err; do
+      touch "$LOG_DIR/$f.log" 2>/dev/null || true
+    done
+  fi
   chmod 600 "$LOG_DIR"/*.log 2>/dev/null || true
 
   say "install: bootstrapping agents"
@@ -317,12 +361,18 @@ install() {
   if [ "$install_email" -eq 1 ]; then
     bootout_label "$LABEL_EMAIL"
   fi
+  if [ "$install_connectors" -eq 1 ]; then
+    bootout_label "$LABEL_CONNECTORS"
+  fi
   bootout_label "$LABEL_WA"
   local failed=0
   bootstrap_label "$LABEL_API" || failed=1
   bootstrap_label "$LABEL_TG" || failed=1
   if [ "$install_email" -eq 1 ]; then
     bootstrap_label "$LABEL_EMAIL" || failed=1
+  fi
+  if [ "$install_connectors" -eq 1 ]; then
+    bootstrap_label "$LABEL_CONNECTORS" || failed=1
   fi
   bootstrap_label "$LABEL_WA" || failed=1
   if [ "$failed" -ne 0 ]; then
@@ -341,9 +391,11 @@ uninstall() {
   bootout_label "$LABEL_API"
   bootout_label "$LABEL_TG"
   bootout_label "$LABEL_EMAIL"
+  bootout_label "$LABEL_CONNECTORS"
   bootout_label "$LABEL_WA"
   rm -f "$PLIST_DIR/${LABEL_API}.plist" "$PLIST_DIR/${LABEL_TG}.plist" \
-    "$PLIST_DIR/${LABEL_EMAIL}.plist" "$PLIST_DIR/${LABEL_WA}.plist"
+    "$PLIST_DIR/${LABEL_EMAIL}.plist" "$PLIST_DIR/${LABEL_CONNECTORS}.plist" \
+    "$PLIST_DIR/${LABEL_WA}.plist"
   say "uninstall: plists removed; logs remain in $LOG_DIR"
 }
 
@@ -372,6 +424,11 @@ status() {
   else
     printf '  %-28s skipped (GMAIL_LABEL_ID not set)\n' "$LABEL_EMAIL"
   fi
+  if connectors_configured; then
+    print_label_status "$LABEL_CONNECTORS" || ok=1
+  else
+    printf '  %-28s skipped (no non-email connector in BRAIN_CONNECTORS)\n' "$LABEL_CONNECTORS"
+  fi
   print_label_status "$LABEL_WA" || ok=1
   sleep_check
   docker_check
@@ -386,7 +443,7 @@ status() {
 restart() {
   say "restart: kickstart -k installed agents (labels with no plist are skipped)"
   local failed=0 label
-  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_EMAIL" "$LABEL_WA"; do
+  for label in "$LABEL_API" "$LABEL_TG" "$LABEL_EMAIL" "$LABEL_CONNECTORS" "$LABEL_WA"; do
     if [ ! -f "$PLIST_DIR/${label}.plist" ]; then
       printf '  %-28s skipped (not installed)\n' "$label"
       continue
@@ -407,9 +464,10 @@ logs() {
     api) tail_log "api" ;;
     telegram) tail_log "telegram" ;;
     email) tail_log "email" ;;
+    connectors) tail_log "connectors" ;;
     whatsapp) tail_log "whatsapp" ;;
-    all) tail_log "api"; tail_log "telegram"; tail_log "email"; tail_log "whatsapp" ;;
-    *) usage >&2; die "unknown component '$comp' (api|telegram|email|whatsapp|all)" ;;
+    all) tail_log "api"; tail_log "telegram"; tail_log "email"; tail_log "connectors"; tail_log "whatsapp" ;;
+    *) usage >&2; die "unknown component '$comp' (api|telegram|email|connectors|whatsapp|all)" ;;
   esac
 }
 

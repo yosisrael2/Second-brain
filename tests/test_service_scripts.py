@@ -751,3 +751,323 @@ class TestServiceEmailAgent:
         result = _run([str(SCRIPTS / "service.sh"), "logs", "email"], env=env)
         assert result.returncode == 0, result.stderr
         assert "email-poll-line" in result.stdout
+
+
+
+class TestConnectorsAgentGating:
+    """service.sh manages the connectors agent (com.secondbrain.connectors)
+    OPT-IN like email: install writes/bootstraps it only when BRAIN_CONNECTORS
+    contains a non-email connector (email keeps its own agent); otherwise the
+    agent is skipped and no stale plist is left behind."""
+
+    CONNECTORS_PLIST = "com.secondbrain.connectors.plist"
+
+    @need_venv
+    def test_install_writes_and_bootstraps_connectors_when_non_email_set(self, tmp_path):
+        env = _service_env(tmp_path, extra={"BRAIN_CONNECTORS": "gcal,gtasks"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        plist = tmp_path / "LaunchAgents" / self.CONNECTORS_PLIST
+        assert plist.exists(), result.stdout
+        text = plist.read_text()
+        assert "<string>com.secondbrain.connectors</string>" in text
+        assert str(SCRIPTS / "run-connectors.sh") in text
+        # Config stays out of the plist: run-connectors.sh reads
+        # BRAIN_CONNECTORS from the environment/.env at runtime.
+        assert "gcal" not in text and "gtasks" not in text
+        calls = _calls(tmp_path)
+        assert any("bootstrap" in c and "com.secondbrain.connectors" in c for c in calls)
+
+    @need_venv
+    def test_install_precreates_connectors_log_files_0600(self, tmp_path):
+        env = _service_env(tmp_path, extra={"BRAIN_CONNECTORS": "gcal"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        log_dir = tmp_path / "Logs"
+        for name in ("connectors.log", "connectors.err.log"):
+            log = log_dir / name
+            assert log.exists(), f"{name} not pre-created"
+            assert log.stat().st_mode & 0o777 == 0o600, f"{name} not 0600"
+
+    def test_install_skips_connectors_without_a_non_email_connector(self, tmp_path):
+        """Without a non-email connector (unset / empty / only 'email') install
+        must NOT write or bootstrap the agent, and must remove any stale plist
+        (a leftover agent would loop forever doing nothing)."""
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        stale = plist_dir / self.CONNECTORS_PLIST
+        stale.write_text("<plist/>\n")
+        for connectors in (None, "", "email"):
+            extra = {} if connectors is None else {"BRAIN_CONNECTORS": connectors}
+            env = _service_env(tmp_path, extra=extra)
+            result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert not plist_dir.joinpath(self.CONNECTORS_PLIST).exists(), result.stdout
+            assert "connectors: skipped" in result.stdout
+            assert any(
+                "bootout" in c and "com.secondbrain.connectors" in c for c in _calls(tmp_path)
+            )
+
+    @need_venv
+    def test_install_skips_connectors_when_only_email_set(self, tmp_path):
+        env = _service_env(tmp_path, extra={"BRAIN_CONNECTORS": "email"})
+        result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (tmp_path / "LaunchAgents" / self.CONNECTORS_PLIST).exists()
+
+    def test_uninstall_removes_the_connectors_plist(self, tmp_path):
+        env = _service_env(tmp_path, extra={"BRAIN_CONNECTORS": "gcal"})
+        _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+        result = _run([str(SCRIPTS / "service.sh"), "uninstall"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (tmp_path / "LaunchAgents" / self.CONNECTORS_PLIST).exists()
+
+    def test_restart_kickstarts_the_connectors_label(self, tmp_path):
+        env = _service_env(tmp_path)
+        plist_dir = tmp_path / "LaunchAgents"
+        plist_dir.mkdir()
+        (plist_dir / self.CONNECTORS_PLIST).write_text("<plist/>\n")
+        result = _run([str(SCRIPTS / "service.sh"), "restart"], env=env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert any(
+            "kickstart" in c and "com.secondbrain.connectors" in c for c in _calls(tmp_path)
+        )
+
+    def test_status_reports_connectors_skipped_when_not_configured(self, tmp_path):
+        env = _service_env(tmp_path)
+        result = _run([str(SCRIPTS / "service.sh"), "status"], env=env)
+        assert "com.secondbrain.connectors" in result.stdout
+
+
+    def test_gating_treats_gmail_alias_and_case_like_email(self, tmp_path):
+        """service.sh gating: BRAIN_CONNECTORS='gmail' (the alias) or 'EMAIL'
+        must NOT install the connectors agent — they mean the email poller."""
+        for connectors in ("gmail", "EMAIL", "Gmail"):
+            env = _service_env(tmp_path, extra={"BRAIN_CONNECTORS": connectors})
+            result = _run([str(SCRIPTS / "service.sh"), "install"], env=env)
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "connectors: skipped" in result.stdout, connectors
+
+class TestRunConnectorsScript:
+    """run-connectors.sh: one sync cycle per non-email connector per interval,
+    per-connector failure isolation (one failing source never blocks the
+    others), email NEVER synced here. Exit contract: exit 0 when every
+    attempted connector returned 78 (permanent — nothing to do until the user
+    acts); transient failures are LOGGED and the pass loop CONTINUES at the
+    interval cadence (never an exit — a launchd restart storm would poll every
+    connector at the throttle because of the sick one); launchd restarts only
+    when the script itself crashes."""
+
+    @staticmethod
+    def _stub_brain(tmp_path, rc_by_name: dict[str, int], extra_line: str = "") -> str:
+        """A fake `brain` that logs invocations and exits per connector name."""
+        fake_bin = tmp_path / "bin-connectors"
+        fake_bin.mkdir(exist_ok=True)
+        cases = "".join(
+            f'  "{name}") exit {rc} ;;\n' for name, rc in rc_by_name.items()
+        )
+        stub = fake_bin / "brain"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "%s %s %s ALLOW=%s\\n" "$1" "${2-}" "${3-}" "${BRAIN_ALLOW_LIVE-unset}"'
+            ' >> "$CONNECTORS_CALL_LOG"\n'
+            "case \"${3-}\" in\n"
+            f"{cases}"
+            "  *) exit 0 ;;\n"
+            "esac\n"
+            + (extra_line or "")
+        )
+        stub.chmod(0o755)
+        return str(stub)
+
+    @staticmethod
+    def _run_script(fake_bin: str, tmp_path, extra: dict[str, str] | None = None):
+        log = tmp_path / "calls.log"
+        env = {
+            "BRAIN_BIN": fake_bin,
+            "CONNECTORS_CALL_LOG": str(log),
+            "BRAIN_CONNECTORS": "gcal,gtasks",
+            "BRAIN_CONNECTORS_PASSES": "1",
+        }
+        if extra:
+            env.update(extra)
+        return _run([str(SCRIPTS / "run-connectors.sh")], env=env), log
+
+    def test_passes_bash_syntax_check(self):
+        result = _run(["bash", "-n", str(SCRIPTS / "run-connectors.sh")])
+        assert result.returncode == 0, result.stderr
+
+    def test_passes_shellcheck_when_installed(self):
+        shellcheck = _shellcheck_binary()
+        if shellcheck is None:
+            pytest.skip("shellcheck not installed (pip install shellcheck-py)")
+        result = _run([shellcheck, str(SCRIPTS / "run-connectors.sh")])
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_all_permanent_78_exits_0_no_restart(self, tmp_path):
+        """Every connector says 78 (needs user consent): permanent — exit 0,
+        launchd keeps the agent down (the run-email EX_CONFIG contract)."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 78, "gtasks": 78})
+        result, _ = self._run_script(fake_bin, tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "78" in result.stdout
+
+    def test_transient_failure_does_not_exit_and_names_the_connector(self, tmp_path):
+        """A transient failure must NOT exit: exiting would make launchd
+        restart the agent at its throttle (~seconds), turning one sick source
+        into a restart storm polling EVERY connector instead of the interval
+        cadence. The pass loop continues; the log line names the connector."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 1, "gtasks": 0})
+        result, _ = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={"BRAIN_CONNECTORS_PASSES": "2", "BRAIN_CONNECTORS_INTERVAL_S": "1"},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "gcal transient failure (rc=1); retrying next interval" in result.stderr
+
+    def test_one_failing_connector_does_not_block_the_other(self, tmp_path):
+        """Per-connector isolation: gcal fails (transient), gtasks STILL synced
+        in the same pass — and in the NEXT pass too (the loop continues)."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 1, "gtasks": 0})
+        result, log = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={"BRAIN_CONNECTORS_PASSES": "2", "BRAIN_CONNECTORS_INTERVAL_S": "1"},
+        )
+        calls = log.read_text()
+        assert calls.count("connectors sync gcal") == 2  # both passes
+        assert calls.count("connectors sync gtasks") == 2
+        assert result.returncode == 0
+
+    def test_email_is_never_synced_by_this_agent(self, tmp_path):
+        """email keeps its own agent (run-email.sh); the connectors agent must
+        never run a sync cycle for it."""
+        fake_bin = self._stub_brain(tmp_path, {"email": 0, "gcal": 0})
+        result, log = self._run_script(
+            fake_bin, tmp_path, extra={"BRAIN_CONNECTORS": "email,gcal"}
+        )
+        calls = log.read_text()
+        assert "sync email" not in calls
+        assert "sync gcal" in calls
+        assert result.returncode == 0
+
+    def test_empty_or_email_only_list_exits_0_without_invoking_brain(self, tmp_path):
+        for connectors in ("", "email"):
+            fake_bin = self._stub_brain(tmp_path, {"gcal": 0})
+            result, log = self._run_script(
+                fake_bin, tmp_path, extra={"BRAIN_CONNECTORS": connectors}
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert not log.exists() or log.read_text() == ""
+
+    def test_exports_allow_live_and_compose_project(self, tmp_path):
+        """The launchd path IS the real service: BRAIN_ALLOW_LIVE=1 (the
+        live-store guard would refuse otherwise) + COMPOSE_PROJECT_NAME."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 0})
+        result, log = self._run_script(fake_bin, tmp_path)
+        assert "ALLOW=1" in log.read_text()
+        assert result.returncode == 0
+
+    def test_sources_lib_and_loads_the_env_file(self, tmp_path):
+        """lib.sh must be sourced BEFORE load_env_file (the #43 review trap);
+        BRAIN_ENV_FILE is the test seam. The connector list comes from the
+        env file when the real environment does not set it."""
+        env_file = tmp_path / "connectors.env"
+        env_file.write_text("BRAIN_CONNECTORS=gcal\n")
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 0})
+        result, log = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={
+                "BRAIN_ENV_FILE": str(env_file),
+                "BRAIN_CONNECTORS": "",  # neutralize any inherited value
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "command not found" not in result.stderr, result.stderr
+        assert "sync gcal" in log.read_text()
+
+    def test_mixed_permanent_and_ok_syncs_both_and_exits_at_the_bound(self, tmp_path):
+        """Mixed pass {gcal: 78, gtasks: 0}: gcal is permanent-down but gtasks
+        keeps syncing — BOTH attempted in BOTH passes, and the run ends at the
+        pass bound with exit 0 (no early all-permanent exit, no exit 1)."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 78, "gtasks": 0})
+        result, log = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={"BRAIN_CONNECTORS_PASSES": "2", "BRAIN_CONNECTORS_INTERVAL_S": "1"},
+        )
+        calls = log.read_text()
+        assert calls.count("connectors sync gcal") == 2
+        assert calls.count("connectors sync gtasks") == 2
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_mixed_transient_and_ok_neither_exits_early(self, tmp_path):
+        """Mixed pass {gcal: 1 (transient), gtasks: 0}: the restart-storm fix —
+        no exit 1; both connectors synced in both passes; exit 0 at the bound."""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 1, "gtasks": 0})
+        result, log = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={"BRAIN_CONNECTORS_PASSES": "2", "BRAIN_CONNECTORS_INTERVAL_S": "1"},
+        )
+        calls = log.read_text()
+        assert calls.count("connectors sync gcal") == 2
+        assert calls.count("connectors sync gtasks") == 2
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_email_filter_is_case_insensitive_and_excludes_gmail(self, tmp_path):
+        """EMAIL/Email are the same connector, and 'gmail' is email's registry
+        alias — none of them may be synced by this agent."""
+        fake_bin = self._stub_brain(tmp_path, {"email": 0, "gmail": 0, "gcal": 0})
+        result, log = self._run_script(
+            fake_bin,
+            tmp_path,
+            extra={
+                "BRAIN_CONNECTORS": "EMAIL, Gmail, gcal",
+                "BRAIN_CONNECTORS_PASSES": "1",
+            },
+        )
+        calls = log.read_text()
+        assert "sync email" not in calls and "sync gmail" not in calls
+        assert calls.count("connectors sync gcal") == 1
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def test_loops_until_killed(self, tmp_path):
+        """All-ok passes sleep BRAIN_CONNECTORS_INTERVAL_S and rerun: the stub
+        log grows past one pass. (The script is killed by the test — launchd
+        would keep it alive.)"""
+        fake_bin = self._stub_brain(tmp_path, {"gcal": 0})
+        log = tmp_path / "calls-loop.log"
+        import signal
+        import time
+
+        env = {
+            "BRAIN_BIN": fake_bin,
+            "CONNECTORS_CALL_LOG": str(log),
+            "BRAIN_CONNECTORS": "gcal",
+            "BRAIN_CONNECTORS_INTERVAL_S": "1",
+            # the REAL forever-loop: the passes seam deliberately NOT set —
+            # this test proves the production loop actually loops.
+        }
+        env = {k: v for k, v in {**os.environ, **env}.items() if k != "BRAIN_CONNECTORS_PASSES"}
+        proc = subprocess.Popen(
+            [str(SCRIPTS / "run-connectors.sh")],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                if log.exists() and len(log.read_text().splitlines()) >= 2:
+                    break
+                time.sleep(0.1)
+            assert log.exists() and len(log.read_text().splitlines()) >= 2, (
+                "the agent did not run a second pass"
+            )
+        finally:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+
