@@ -25,7 +25,7 @@ against a cases file. :class:`ReconciliationService` is the thin DB adapter
 
 Matching (thread recon/plan, manager veto 24 Oct 2026) — split the WINDOW,
 not the verdict. Both windows always require, code-checked:
-same type ∧ same applies_to set ∧ similarity >= relations.SIMILARITY_THRESHOLD.
+same type ∧ same applies_to set ∧ similarity >= RECON_SIMILARITY_THRESHOLD.
 
 - SAME LOCAL DAY window (no signal required): the existing item's LOCAL day
   (Settings.timezone, item 41) equals the candidate's local day. Covers the
@@ -61,7 +61,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import or_, select
 
 from brain import ops
-from brain.services.relations import DATE_TOLERANCE, SIMILARITY_THRESHOLD, similarity_ratio
+from brain.services.relations import similarity_ratio
 
 # Item 20a/30 signals, code-detected (the LLM only narrows, never creates).
 # Substrings, casefolded; Hebrew morphological families share the root.
@@ -101,6 +101,12 @@ class ReconSignal:
         return self.change or self.cancel
 
 
+# Round 5: matching runs on EMBEDDING cosine (the local embedder); the
+# lexical ratio is only a fast accept for near-identical strings.
+RECON_SIMILARITY_THRESHOLD = 0.80
+RECON_LEXICAL_FAST_ACCEPT = 0.95
+
+
 def _cosine(a: list[float], b: list[float]) -> float:
     """Cosine of two (already L2-normalized or not) vectors; 0 on zero vecs."""
     dot = sum(x * y for x, y in zip(a, b, strict=False))
@@ -128,8 +134,8 @@ def embedder_similarity(
         if not na or not nb:
             return 0.0
         lexical = similarity_ratio(na, nb)
-        if lexical >= SIMILARITY_THRESHOLD:
-            return lexical  # fast accept: no embedding call needed
+        if lexical >= RECON_LEXICAL_FAST_ACCEPT:
+            return lexical  # near-identical strings: no embedding call
         for key, text in ((na, a), (nb, b)):
             if key not in store:
                 store[key] = embedder.embed(text)
@@ -287,20 +293,22 @@ def _field_diffs(
         pattern = "%H:%M" if same_day and _clock_stated(moment, tz) else "%d.%m %H:%M"
         return local.strftime(pattern)
 
-    beyond = DATE_TOLERANCE.total_seconds()
+    # E2 (round 5): the +-1h DATE_TOLERANCE is the IDENTITY rule of the
+    # windows only. Field diffs are EXACT: any stated clock that differs at
+    # all (15 minutes included) is a differing value.
     diffs: dict[str, tuple[str, str]] = {}
     if (
         candidate.start is not None
         and existing.start is not None
         and _clock_stated(candidate.start, tz)
         and _clock_stated(existing.start, tz)
-        and abs((candidate.start - existing.start).total_seconds()) > beyond
+        and candidate.start != existing.start
     ):
         diffs["time"] = (fmt(existing.start), fmt(candidate.start))
     if (
         candidate.end is not None
         and existing.end is not None
-        and abs((candidate.end - existing.end).total_seconds()) > beyond
+        and candidate.end != existing.end
     ):
         diffs["end"] = (fmt(existing.end), fmt(candidate.end))
     if (
@@ -343,7 +351,7 @@ def _compatible(
     existing_applies = tuple(sorted(existing.applies_to))
     if candidate_applies != existing_applies:
         return False
-    return similarity(candidate.title, existing.title) >= SIMILARITY_THRESHOLD
+    return similarity(candidate.title, existing.title) >= RECON_SIMILARITY_THRESHOLD
 
 
 def classify(

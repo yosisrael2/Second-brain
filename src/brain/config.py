@@ -94,6 +94,11 @@ class Settings(BaseSettings):
 
     # Local embeddings (used when embedder_provider="fastembed", the default)
     fastembed_model: str = DEFAULT_FASTEMBED_MODEL
+    # Round 5 (E1): the embedder used for RECONCILIATION matching only —
+    # a stronger multilingual model than the search one; search and Qdrant
+    # keep fastembed_model (no vector-dim change anywhere). Loaded lazily
+    # once per process on the first reconciled candidate.
+    recon_embed_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8

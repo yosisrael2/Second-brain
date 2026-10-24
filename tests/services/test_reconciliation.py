@@ -141,8 +141,11 @@ def test_same_time_location_differs_no_signal_is_conflict():
 
 
 def test_plus_minus_1h_nothing_new_is_already_known():
+    # E2 (round 5): identity tolerance lives in the windows only; an exactly
+    # stated different clock is a diff (the E2 cases above). "Nothing new"
+    # now means the SAME stated instant:
     result = classify(
-        _candidate(title=BASE, start=_jlm(10, 16, 30)),
+        _candidate(title=BASE, start=_jlm(10, 16, 0)),
         [_existing(start=_jlm(10, 16, 0))],
         similarity=_similarity, now=NOW, tz_name="Asia/Jerusalem",
     )
@@ -204,8 +207,17 @@ def test_each_of_the_six_verdicts_is_reachable():
             _candidate(start=_jlm(10, 16, 0), location="פארק השרון"),
             ReconSignal(), Verdict.MORE_DETAIL,
         ),
-        # ALREADY KNOWN: ±1h, nothing new
-        (_candidate(start=_jlm(10, 16, 30)), ReconSignal(), Verdict.ALREADY_KNOWN),
+        # ALREADY KNOWN: the same stated instant, nothing new (E2: diffs are
+        # EXACT, so +-1h is identity only in the windows — 16:30 vs 16:00 is
+        # now a differing value -> CONFLICT without a signal)
+        (_candidate(start=_jlm(10, 16, 0)), ReconSignal(), Verdict.ALREADY_KNOWN),
+        # E2: 16:30 vs 16:00 same day, no signal -> exact diff -> CONFLICT
+        (_candidate(start=_jlm(10, 16, 30)), ReconSignal(), Verdict.CONFLICT),
+        # E2: 16:30 vs 16:00 same day, with a change signal -> UPDATE
+        (
+            _candidate(title=BASE, start=_jlm(10, 16, 30)),
+            ReconSignal(change=True), Verdict.UPDATE,
+        ),
     ]
     for candidate, signal, expected in cases:
         result = classify(
@@ -1192,3 +1204,74 @@ def test_matchable_items_sql_windows_across_the_dst_change(db):
     ids_signal = [pair[1].id for pair in matches_signal]
     assert item_edge_in.id in ids_signal   # 24 Nov = today+29d (in)
     assert item_edge_out.id not in ids_signal  # 3 Dec = today+31d (out)
+
+
+def test_exact_clock_diff_conflict_without_signal(db):
+    """E2 (round 5): the +-1h tolerance is IDENTITY only (the windows); field
+    diffs are EXACT — 16:00 vs 16:15 same day with NO signal is a CONFLICT,
+    not a silent drop and not ALREADY_KNOWN."""
+    _make_calendar_item(
+        db, title=CAL_BASE, location=None,
+        start=_jlm(10, 16, 0), end=_jlm(10, 17, 0),
+    )
+    source = _make_source(db, text=CAL_BASE + " 16:15")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(title=CAL_BASE, when_raw="10.11 16:15",
+                         quote=CAL_BASE + " 16:15"), source, NOW
+    )
+    assert resolved is not None and resolved.start is not None
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.CONFLICT
+
+
+def test_exact_clock_diff_update_with_signal(db):
+    """E2 (round 5): the same exact 15-minute diff WITH a change signal is an
+    UPDATE whose provenance records the exact stated values."""
+    _make_calendar_item(
+        db, title=CAL_BASE, location=None,
+        start=_jlm(10, 16, 0), end=_jlm(10, 17, 0),
+    )
+    source = _make_source(db, text="שינוי: " + CAL_BASE + " 16:15")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(title=CAL_BASE, when_raw="10.11 16:15",
+                         quote="שינוי: " + CAL_BASE + " 16:15",
+                         recon=ReconHint(change=True)), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("fields", {}).get("time") == ["16:00", "16:15"]
+
+
+def test_recon_uses_the_mini_lm_model_and_the_0_80_threshold():
+    """Round-5 decision 1: RECON_EMBED_MODEL selects the recon embedder
+    (MiniLM-L12, offline, in-memory; search/Qdrant keep potion); the match
+    threshold is 0.80 and the lexical fast-accept fires only at >= 0.95."""
+    from brain.config import Settings
+    from brain.services.extraction.reconciliation import (
+        RECON_LEXICAL_FAST_ACCEPT,
+        RECON_SIMILARITY_THRESHOLD,
+    )
+    assert RECON_SIMILARITY_THRESHOLD == 0.80
+    assert RECON_LEXICAL_FAST_ACCEPT == 0.95
+    s = Settings(
+        recon_embed_model="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
+    assert s.recon_embed_model.endswith("MiniLM-L12-v2")
+    import inspect
+
+    from brain.services.extraction.service import EnrichmentService
+    src = inspect.getsource(EnrichmentService._build_recon_embedder)
+    assert "recon_embed_model" in src
+    # the callable: a 0.9x lexical near-identity pair must NOT fast-accept
+    # (a Hebrew trap — the fake embedder gives it cosine ~0, so any score
+    # the callable returns below 0.95 proves lexical did not fire)
+    from brain.ai.embedder import FakeEmbedder
+    from brain.services.extraction.reconciliation import embedder_similarity
+    from brain.services.relations import similarity_ratio
+    a, b = "טיול שנתי 2026", "טיול שנתי 2027"
+    assert similarity_ratio(a.casefold(), b.casefold()) >= 0.9  # a lexical trap
+    sim = embedder_similarity(FakeEmbedder())
+    assert sim(a, b) < RECON_LEXICAL_FAST_ACCEPT

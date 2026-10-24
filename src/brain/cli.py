@@ -388,9 +388,11 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
     import json  # noqa: PLC0415
     from datetime import UTC, datetime  # noqa: PLC0415
 
+    # E1 (round 5): the eval matches with the SAME embedding callable as
+    # production — the local embedder (offline); tests inject a fake.
+    from brain.ai.embedder import FastEmbedEmbedder  # noqa: PLC0415
     from brain.config import get_settings  # noqa: PLC0415
-    from brain.factories import build_embedder  # noqa: PLC0415
-    from brain.services.extraction.reconciliation import (  # noqa: PLC0415  # noqa: PLC0415
+    from brain.services.extraction.reconciliation import (  # noqa: PLC0415
         ExistingItem,
         ReconCandidate,
         classify,
@@ -398,9 +400,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
         signal_for,
     )
 
-    # E1 (round 5): the eval matches with the SAME embedding callable as
-    # production — the local embedder (offline); tests inject a fake.
-    embedder = embedder or build_embedder(get_settings())
+    embedder = embedder or FastEmbedEmbedder(get_settings().recon_embed_model)
     now = now or datetime.now(tz=UTC)
     per_verdict: dict[str, dict[str, int]] = {}
     confusion: dict[str, dict[str, int]] = {}

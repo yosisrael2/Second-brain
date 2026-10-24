@@ -807,10 +807,12 @@ class EnrichmentService:
         return child
 
     def _build_recon_embedder(self) -> Any:
+        # Round 5: recon matches with the RECON_EMBED_MODEL (a stronger
+        # multilingual embedder); search/Qdrant keep FASTEMBED_MODEL.
+        from brain.ai.embedder import FastEmbedEmbedder  # noqa: PLC0415
         from brain.config import get_settings  # noqa: PLC0415
-        from brain.factories import build_embedder  # noqa: PLC0415
 
-        return build_embedder(get_settings())
+        return FastEmbedEmbedder(get_settings().recon_embed_model)
 
     def _reconcile_child(
         self,
