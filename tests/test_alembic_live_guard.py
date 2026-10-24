@@ -110,9 +110,13 @@ def test_alembic_online_allow_live_opt_in_still_reaches_the_database() -> None:
         "upgrade", "head",
         env_overrides={"DATABASE_URL": _LIVE_SHAPED_URL, "BRAIN_ALLOW_LIVE": "1"},
     )
-    assert result.returncode != 0  # it DID try to connect (and auth failed)
+    assert result.returncode != 0  # it DID try to connect (and failed somewhere)
+    # The guard must NOT have refused. The failure mode is environment-
+    # specific (local: auth failure against the real server; CI: connection
+    # refused — no live Postgres there), so assert only what both share:
+    # a psycopg connection error, never the guard message.
     assert "refusing to start against the LIVE store" not in result.stderr
-    assert "password authentication failed" in result.stderr
+    assert "connection failed" in result.stderr
 
 
 def test_alembic_online_test_database_url_still_works() -> None:
