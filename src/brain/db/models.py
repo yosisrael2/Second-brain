@@ -439,11 +439,15 @@ class ItemSource(Base):
 
     __tablename__ = "item_sources"
     __table_args__ = (
-        # UNIQUE(child_id, source_id): one link per child-source pair; the
-        # quote (possibly very long) stays OUT of the btree index — a long
-        # TEXT in the UNIQUE index fails with 'index row size exceeds
-        # maximum'. Extra quotes live in extraction_meta.extra_quotes.
-        UniqueConstraint("child_id", "source_id"),
+        # Item 7, many-to-many WITHOUT a uniqueness cap: one pair may carry
+        # SEVERAL quote rows (a deduped near-duplicate's quote, or a re-run
+        # that grounded the same child through different spans). No UNIQUE
+        # (child_id, source_id): the quote is a long TEXT and a UNIQUE btree
+        # over it fails with 'index row size exceeds maximum' (reproduced
+        # with a 5,000-char incompressible quote); plain indexes serve the
+        # lookups. Historical: the constraint existed until
+        # drop_item_sources_unique (this branch).
+        Index("ix_item_sources_child_id", "child_id"),
         Index("ix_item_sources_source_id", "source_id"),
     )
 
