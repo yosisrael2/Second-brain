@@ -929,6 +929,37 @@ class TestPollLoopLivenessHeartbeats:
         phases = [(hb[1] or {}).get("phase") for hb in events.heartbeats]
         assert "polling" in phases
 
+    def test_recovery_event_after_network_failure_streak(self, monkeypatch):
+        """First successful getUpdates after >=1 network failure records ONE
+        ops event telegram/network_recovered {failures, outage_s} + resets the
+        counter — streaks become visible in ops without grepping logs."""
+        telegram = pytest.importorskip("telegram")
+        events = _Events()
+        events.install(monkeypatch)
+        core, _ = _core()
+        tg = _FakeTG(
+            [
+                [telegram.error.NetworkError("connection reset")],
+                [telegram.error.NetworkError("timed out")],
+                [],  # the recovering poll: success after 2 failures
+                [RuntimeError("stop")],
+            ]
+        )
+
+        _run_poll(tg, core)
+
+        recovered = [e for e in events.events if e[0] == "network_recovered"]
+        assert len(recovered) == 1, f"exactly one recovery event, got {events.events}"
+        kind, ok, detail = recovered[0]
+        assert ok is True
+        assert detail["failures"] == 2
+        assert detail["outage_s"] >= 0
+        # a clean streak afterwards must NOT re-record
+        assert all(
+            e[0] != "network_recovered"
+            for e in events.events[events.events.index(recovered[0]) + 1 :]
+        )
+
     def test_run_passes_settings_poll_timeout(self, monkeypatch):
         import brain.telegram_bot as tb
 

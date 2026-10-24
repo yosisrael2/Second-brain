@@ -1538,6 +1538,11 @@ async def poll_loop(
     last_update_id = 0
     conflict_until: float | None = None
     backoff = conflict_backoff_s
+    # Network-failure streak tracking: the first successful poll after >=1
+    # failure records one telegram/network_recovered event (failures + outage
+    # seconds) so streaks are visible in ops without grepping logs.
+    net_failures = 0
+    net_first_failure_monotonic: float | None = None
     try:
         while True:
             # Liveness on the poll path: the long-poll itself can occupy the
@@ -1600,6 +1605,9 @@ async def poll_loop(
                 raise
             except NetworkError as exc:
                 logger.warning("telegram: network error, retrying (%s)", type(exc).__name__)
+                net_failures += 1
+                if net_first_failure_monotonic is None:
+                    net_first_failure_monotonic = time.monotonic()
                 # Liveness on the retry path (see the conflict branch).
                 heartbeat("telegram", {"phase": "backoff", "last_update_id": last_update_id})
                 await asyncio.sleep(3)
@@ -1607,6 +1615,21 @@ async def poll_loop(
             # A successful poll means the other poller is gone: fresh window.
             conflict_until = None
             backoff = conflict_backoff_s
+            if net_failures:
+                outage_s = time.monotonic() - (net_first_failure_monotonic or time.monotonic())
+                logger.info(
+                    "telegram: network recovered after %d failure(s) (%.0fs)",
+                    net_failures,
+                    outage_s,
+                )
+                record_event(
+                    "telegram",
+                    "network_recovered",
+                    ok=True,
+                    detail={"failures": net_failures, "outage_s": round(outage_s, 1)},
+                )
+                net_failures = 0
+                net_first_failure_monotonic = None
             heartbeat(
                 "telegram",
                 {
@@ -1871,9 +1894,7 @@ async def _shutdown_enrichment(tg: Any, core: TelegramBot, *, grace_s: float = 3
             ok=False,
             detail={"error": f"pass exceeded the {grace_s:.0f}s shutdown grace"[:200]},
         )
-        logger.warning(
-            "telegram: enrichment pass cancelled at shutdown (grace %.0fs)", grace_s
-        )
+        logger.warning("telegram: enrichment pass cancelled at shutdown (grace %.0fs)", grace_s)
     except Exception as exc:  # noqa: BLE001 — shutdown must complete
         _record_pass_failure(exc)
 
