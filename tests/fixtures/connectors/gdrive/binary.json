@@ -1,0 +1,13 @@
+{
+  "kind": "drive#file",
+  "id": "1Z1pM0ck456789abcdefghijklmnopqrstuvzy",
+  "name": "backup-2026-08.zip",
+  "mimeType": "application/zip",
+  "version": "3",
+  "createdTime": "2026-08-01T07:00:00.000Z",
+  "modifiedTime": "2026-08-01T07:15:00.000Z",
+  "webViewLink": "https://drive.google.com/file/d/1Z1pM0ck456789abcdefghijklmnopqrstuvzy/view",
+  "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+  "trashed": false,
+  "size": "1048576"
+}

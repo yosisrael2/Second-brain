@@ -1,0 +1,18 @@
+{
+  "history": [
+    {
+      "id": "9001",
+      "messages": [
+        {"id": "m2", "threadId": "t2"}
+      ],
+      "labelsAdded": [
+        {
+          "labelIds": ["Label_school", "UNREAD"],
+          "message": {"id": "m2", "threadId": "t2"}
+        }
+      ]
+    }
+  ],
+  "historyId": "9002",
+  "nextPageToken": "tok-page2"
+}

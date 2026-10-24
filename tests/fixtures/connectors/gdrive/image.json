@@ -1,0 +1,13 @@
+{
+  "kind": "drive#file",
+  "id": "1ImggM0ck456789abcdefghijklmnopqrstuvx",
+  "name": "whiteboard.jpg",
+  "mimeType": "image/jpeg",
+  "version": "9",
+  "createdTime": "2026-09-30T18:40:00.000Z",
+  "modifiedTime": "2026-09-30T18:45:12.345Z",
+  "webViewLink": "https://drive.google.com/file/d/1ImggM0ck456789abcdefghijklmnopqrstuvx/view",
+  "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+  "trashed": false,
+  "size": "234512"
+}
