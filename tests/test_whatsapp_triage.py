@@ -604,6 +604,45 @@ def test_triage_records_one_ops_event_per_decision(monkeypatch) -> None:
     assert isinstance(detail["confidence"], float)
 
 
+def test_health_noise_today_excludes_blocked_downgrades(monkeypatch) -> None:
+    """#49 follow-up: a blocked downgrade must not count as noise.
+
+    The trier records 'decided' (label noise) BEFORE the poller's
+    keep-relevant guard rejects the apply and records 'downgrade_blocked' —
+    one blocked pass = exactly one decided(noise) + one downgrade_blocked.
+    Health's 'noise today' must count only APPLIED decisions, i.e. subtract
+    the blocked ones."""
+    from brain import ops  # noqa: PLC0415
+    from brain.ops.health import run_health_checks
+    from brain.services.whatsapp import WhatsAppPoller  # noqa: PLC0415
+
+    def _noise_today() -> int:
+        summary = run_health_checks(use_cache=False)["components"]["triage"]["summary"]
+        return int(summary.split(" / ")[1].split()[1])  # 'relevant N / noise M today'
+
+    noise_before = _noise_today()
+
+    # the REAL event flow: triage_conversation records decided(noise), the
+    # poller hook then keeps the item relevant and records downgrade_blocked
+    jev = FakeJev(JevChoice(option="noise", confidence=0.97))
+
+    def trier(item: MemoryItem) -> TriageResult | None:
+        return triage_conversation(item.raw_text, jev=jev, llm=FakeLLM("unused"))
+
+    service = WhatsAppPoller.__new__(WhatsAppPoller)
+    service._trier = trier  # type: ignore[attr-defined]
+    service._items = None  # type: ignore[attr-defined]
+    item = _conversation("[WhatsApp · ב] מעין: מחר חולצה לבנה וקלמר")
+    item.triage_label = "relevant"  # a previous decision the update must not undo
+    service._triage_item(item)  # type: ignore[attr-defined]
+    assert item.triage_label == "relevant", "the downgrade is blocked"
+
+    monkeypatch.setattr(ops, "record_event", lambda *a, **kw: None)  # no further writes
+    assert _noise_today() == noise_before, (
+        "the blocked downgrade must not count in health's 'noise today'"
+    )
+
+
 def test_health_reports_today_triage_counts(monkeypatch) -> None:
     from datetime import datetime as dt
 
