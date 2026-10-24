@@ -1541,3 +1541,53 @@ def test_recon_eval_carries_amount_and_effective(tmp_path):
     report = run_recon_eval(path, tz_name="Asia/Jerusalem",
                             embedder=FakeEmbedder())
     assert report["per_verdict"]["more_detail"]["tp"] == 1
+
+
+def test_amount_compares_as_a_number_not_a_string(db):
+    """Follow-up (1) review fix: amounts compare as NUMBERS — 250 vs 250.00
+    is the SAME stated value (no diff), thousands separators vanish, currency
+    symbols/letters are stripped; only a genuinely different value diffs."""
+    from brain.services.extraction.reconciliation import (
+        ExistingItem,
+        ReconCandidate,
+        _field_diffs,
+    )
+
+    def _pair(cand_amount: str, existing_amount: str) -> dict:
+        cand = ReconCandidate(
+            kind="fact", title="דמי החוג לכיתה ה", amount=cand_amount,
+            applies_to=("unknown",),
+        )
+        existing = ExistingItem(
+            id="e", type="fact", title="דמי החוג לכיתה ה",
+            amount=existing_amount, applies_to=("unknown",),
+        )
+        return _field_diffs(cand, existing, JLM)
+
+    assert _pair("250", "250.00") == {}          # same value, different shape
+    assert _pair("1,250", "1250") == {}          # thousands separators vanish
+    assert _pair("₪250", '250 ש"ח') == {}        # currency stripped
+    diffs = _pair("220", "250")                  # a genuinely different value
+    assert diffs["amount"] == ("250", "220")     # (existing, candidate)
+
+
+def test_amount_unparseable_is_no_stated_amount(db):
+    """Follow-up (1) review fix: an unparseable amount ('the usual fee') is
+    treated as NO stated amount — never a diff, never MORE_DETAIL."""
+    from brain.services.extraction.reconciliation import (
+        ExistingItem,
+        ReconCandidate,
+        _field_diffs,
+        _norm_amount,
+    )
+    assert _norm_amount("הרבה כסף") is None
+    assert _norm_amount("250") is not None
+    cand = ReconCandidate(
+        kind="fact", title="דמי החוג לכיתה ה", amount="250",
+        applies_to=("unknown",),
+    )
+    existing = ExistingItem(
+        id="e", type="fact", title="דמי החוג לכיתה ה",
+        amount="הרבה כסף", applies_to=("unknown",),
+    )
+    assert _field_diffs(cand, existing, JLM) == {}  # unparseable never diffs

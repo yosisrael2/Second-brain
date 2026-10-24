@@ -55,6 +55,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -264,6 +265,33 @@ def signal_for(
     return ReconSignal(change=change, cancel=cancel)
 
 
+def _norm_amount(raw: str | None) -> Decimal | None:
+    """Follow-up (1) review: an amount compares as a NUMBER — strip currency
+    symbols/letters and thousands separators, keep ONE decimal point, compare
+    as Decimal (250 == 250.00). Unparseable -> None: treated as NO stated
+    amount (never a diff, never MORE_DETAIL evidence)."""
+    if raw is None:
+        return None
+    # thousands separators first: a comma (or dot) between a digit and
+    # EXACTLY three more digits is a group separator, not a decimal point
+    # ("1,250" == "1250"; "250.000" == "250000")
+    cleaned_raw = re.sub(r"(?<=[0-9])[.,](?=[0-9]{3}(?![0-9]))", "", raw)
+    cleaned: list[str] = []
+    seen_point = False
+    for ch in cleaned_raw:
+        if ch.isdigit():
+            cleaned.append(ch)
+        elif ch in {".", ","} and not seen_point and cleaned:
+            seen_point = True
+            cleaned.append(".")
+    if not cleaned or cleaned == ["."]:
+        return None
+    try:
+        return Decimal("".join(cleaned))
+    except InvalidOperation:
+        return None
+
+
 def _clock_stated(moment: datetime, tz: ZoneInfo) -> bool:
     """A date-only resolution lands at local midnight — no time was stated."""
     return moment.astimezone(tz).time() != datetime(2000, 1, 1).time()
@@ -342,9 +370,9 @@ def _field_diffs(
     ):
         diffs["location"] = (existing.location, candidate.location)
     if (
-        candidate.amount is not None
-        and existing.amount is not None
-        and _norm(candidate.amount) != _norm(existing.amount)
+        _norm_amount(candidate.amount) is not None
+        and _norm_amount(existing.amount) is not None
+        and _norm_amount(candidate.amount) != _norm_amount(existing.amount)
     ):
         diffs["amount"] = (existing.amount, candidate.amount)
     return diffs
@@ -373,8 +401,9 @@ def _adds_info(candidate: ReconCandidate, existing: ExistingItem, tz: ZoneInfo) 
         and existing.effective is None
     ):
         return True
-    # a stated AMOUNT the existing item lacks ('סך הכל 250 שח')
-    if candidate.amount is not None and not existing.amount:
+    # a stated AMOUNT the existing item lacks ('סך הכל 250 שח') — a stated
+    # amount is a PARSEABLE one; unparseable text is no stated amount
+    if _norm_amount(candidate.amount) is not None and existing.amount is None:
         return True
     return False
 
