@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -137,7 +138,9 @@ class AskService:
             # rerank sees the whole pool; only the top_k best reach the prompt.
             # No kid named -> the call is EXACTLY the pre-0d one (byte-identical
             # pool; also keeps third-party search fakes without the kwarg working).
-            kid_items = self._kid_recall_items(question, record_ops=recording)
+            kid_items = self._kid_recall_items(
+                question, record_ops=recording, now=now
+            )
             if kid_items:
                 pool = self._search.search(
                     question,
@@ -181,16 +184,31 @@ class AskService:
             model=result["model"],
         )
 
-    def _kid_recall_items(self, question: str, *, record_ops: bool = True) -> list[MemoryItem]:
+    def _kid_recall_items(
+        self,
+        question: str,
+        *,
+        record_ops: bool = True,
+        now: datetime | None = None,
+    ) -> list[MemoryItem]:
         """Extra candidates: items from a named kid's channels and class (PR 0d).
 
         The question is NEVER rewritten — this only widens recall. A kid is
         named when the question contains their name or an alias
-        (case-insensitive); their channels are the ones whose current
-        confirmed ``applies_to`` is that kid or ``family``. WhatsApp captures
-        keep the chat name in their raw_text header, so the exact stored
-        channel name matches those items. No kid named -> no leg at all:
-        behaviour is byte-identical to the pre-0d pipeline.
+        (case-insensitive); their channels are the ones memory says apply to
+        them (MemoryService.channel_names_for_kid — THE one channel->kid
+        mapping; a channel's confirmed ``applies_to`` is that kid or
+        ``family``). Those channels' WhatsApp conversations join the pool TWICE
+        over: by their STRUCTURED meta.channel (bounded by the question's
+        resolved time window when one resolves — the SAME parse the temporal
+        leg runs; WA39 run 1: a mid-week question must not drown under the
+        newest items of the same channels — else the newest-N cap, never all
+        history) and by the channel NAME as a text needle (captures predating
+        meta.channel keep the chat name only in their raw_text header). The
+        kid's class name stays a text needle too (a class is not a channel;
+        nothing structured carries it). Noise-triaged conversations are
+        excluded, exactly as from listings. No kid named ->
+        no leg at all: behaviour is byte-identical to the pre-0d pipeline.
         """
         if self._memory is None or self._items_repo is None:
             return []
@@ -202,28 +220,19 @@ class AskService:
             return mentions_name(name, question)
 
         kids: list[dict[str, Any]] = []
-        channels: list[dict[str, Any]] = []
         for entity in entities:
             facts = entity.get("facts", [])
             if entity.get("kind") == "person" and any(
                 fact.get("predicate") == "grade" for fact in facts
             ):
                 kids.append(entity)
-            elif entity.get("kind") == "channel":
-                channels.append(entity)
         needles: list[str] = []
+        kid_channels: set[str] = set()
         for kid in kids:
             names = [kid.get("name", ""), *(kid.get("aliases") or [])]
             if not any(mentions(name) for name in names):
                 continue
-            for channel in channels:
-                applies = [
-                    fact.get("value")
-                    for fact in channel.get("facts", [])
-                    if fact.get("predicate") == "applies_to"
-                ]
-                if kid.get("name") in applies or "family" in applies:
-                    needles.append(channel.get("name", ""))
+            kid_channels.update(self._memory.channel_names_for_kid(kid.get("name", "")))
             class_value = next(
                 (
                     fact.get("value")
@@ -234,10 +243,53 @@ class AskService:
             )
             if class_value:
                 needles.append(class_value)
+        # The channel names double as text needles: captures predating
+        # meta.channel keep the chat name only in their raw_text header, and
+        # the same strings drive the structured query above.
+        needles.extend(sorted(kid_channels))
         needles = [needle for needle in dict.fromkeys(needles) if needle]
-        if not needles:
+        items: dict[uuid.UUID, MemoryItem] = {}
+        if needles:
+            for item in self._items_repo.by_text_any(
+                needles, limit=self._kid_recall_limit
+            ):
+                items[item.id] = item
+        window_ids: set[uuid.UUID] = set()
+        if kid_channels:
+            # The SAME date resolution the temporal leg runs: with a resolved
+            # window the channel leg is bounded BY the window (a mid-week
+            # question must not drown under the newest items of the same
+            # channels — WA39 run 1); without one it falls back to newest-N,
+            # never all history.
+            ranges = parse_question_ranges(
+                question, self._tz, now or datetime.now(UTC)
+            )
+            for item in self._items_repo.by_channels(
+                kid_channels,
+                limit=self._kid_recall_limit,
+                ranges=ranges or None,
+            ):
+                items.setdefault(item.id, item)
+                if ranges:
+                    window_ids.add(item.id)
+        if not items:
             return []
-        items = list(self._items_repo.by_text_any(needles, limit=self._kid_recall_limit))
+        # The overall extra pool still respects the kid-recall cap. When the
+        # question resolved a window, the in-window channel items ARE what
+        # the question is about: they keep their slots and the newest
+        # text-needle items fill the rest — the newest flood must not crowd
+        # them out (WA39 run 1). Without a window everything competes by
+        # recency.
+        window_items = [i for i in items.values() if i.id in window_ids]
+        rest = [i for i in items.values() if i.id not in window_ids]
+        rest.sort(
+            key=lambda i: (
+                i.occurred_at or datetime.min.replace(tzinfo=UTC),
+                i.created_at,
+            ),
+            reverse=True,
+        )
+        pool = (window_items + rest)[: self._kid_recall_limit]
         if record_ops:
             ops.record_event(
                 "ask",
@@ -245,10 +297,11 @@ class AskService:
                 ok=True,
                 detail={
                     "needles": len(needles),
-                    "fetched": len(items),
+                    "channels": len(kid_channels),
+                    "fetched": len(pool),
                 },
             )
-        return items
+        return pool
 
     def _temporal_hits(self, question: str, now: datetime | None) -> list[SearchHit]:
         """Fetch every item inside the question's resolved date ranges."""
