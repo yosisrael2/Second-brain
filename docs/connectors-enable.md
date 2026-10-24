@@ -126,9 +126,10 @@ If you change your mind before the first sync:
 exactly the ledger rows the adopt wrote (the DB is byte-identical to
 pre-adopt afterwards). Undo refuses per-row if a sync already touched a row.
 
-> The `adopt` command is available after the connectors-adopt PR merges.
-> Until then, do NOT run the first gcal sync on live: without adoption the
-> first sync duplicates the pasted calendar items.
+> `adopt` is available on main. Still: do NOT run the first gcal or email
+> sync on live before adopting — without the ledger the first sync
+> duplicates the already-captured items (pasted calendar events,
+> bot-captured email).
 
 ### 4. Preview — sync --dry-run
 
@@ -364,8 +365,12 @@ BRAIN_ALLOW_LIVE=1 QDRANT_COLLECTION=brain_items .venv/bin/brain connectors adop
 BRAIN_ALLOW_LIVE=1 QDRANT_COLLECTION=brain_items .venv/bin/brain connectors adopt email
 ```
 
-(Adopt requires no cursor; it refuses after a first sync — see the gcal
-section for the full report semantics and `--undo`.)
+If you change your mind before the first sync:
+`BRAIN_ALLOW_LIVE=1 QDRANT_COLLECTION=brain_items .venv/bin/brain connectors
+adopt email --undo` — deletes exactly the ledger rows the adopt wrote (the
+DB is byte-identical to pre-adopt afterwards; undo refuses per-row if a sync
+already touched a row). Adopt requires no cursor; it refuses after a first
+sync — see the gcal section for the full report semantics.
 
 ### 4. Preview — sync --dry-run
 
