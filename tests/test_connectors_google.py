@@ -52,6 +52,8 @@ class _StubGoogleConnector(GoogleConnector):
 
     name = "gcal"
     SCOPES = ("https://www.googleapis.com/auth/calendar.readonly",)
+    API_NAME = "calendar"
+    API_VERSION = "v3"
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -61,11 +63,78 @@ class _StubGoogleConnector(GoogleConnector):
 
 
 def _fake_factory(calls: list[tuple[str, list[str]]], service: Any = None):
-    def factory(token: str, scopes: list[str]) -> Any:
+    def factory(token: str, scopes: list[str], api_name: str, api_version: str) -> Any:
         calls.append((token, list(scopes)))
         return service if service is not None else object()
 
     return factory
+
+
+def test_default_service_factory_builds_the_subclass_api(monkeypatch, tmp_path):
+    """Contract: the default factory passes the SUBCLASS's api name/version
+    into discovery.build — a gcal adapter must never receive a gmail
+    service. importlib.import_module is faked (no network, no google libs)."""
+    import importlib
+    import json as json_mod
+    from types import SimpleNamespace
+
+    from brain.connectors.base import FetchResult as _FR  # noqa: F401
+
+    secret = tmp_path / "client_secret.json"
+    secret.write_text(
+        json_mod.dumps(
+            {"installed": {
+                "client_id": "cid",
+                "client_secret": "sec",
+                "token_uri": "https://token-uri",
+            }}
+        )
+    )
+    monkeypatch.setattr(
+        "brain.config.get_settings",
+        lambda: SimpleNamespace(gmail_credentials_path=str(secret)),
+    )
+    built: list[tuple[str, str]] = []
+
+    class _FakeDiscovery:
+        @staticmethod
+        def build(api_name: str, api_version: str, **kwargs: Any) -> Any:
+            built.append((api_name, api_version))
+            assert kwargs.get("cache_discovery") is False
+            return object()
+
+    class _FakeCredentials:
+        @staticmethod
+        def Credentials(**kwargs: Any) -> Any:
+            assert kwargs["refresh_token"] == "refresh-token"
+            return object()
+
+    def fake_import_module(name: str) -> Any:
+        if name == "googleapiclient.discovery":
+            return _FakeDiscovery
+        if name == "google.oauth2.credentials":
+            return _FakeCredentials
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+
+    class _GcalDefaultFactory(_StubGoogleConnector):
+        pass  # inherits API_NAME/API_VERSION from the stub
+
+    _GcalDefaultFactory(token_loader=lambda: "refresh-token")._service()
+    assert built == [("calendar", "v3")]
+
+
+def test_subclass_must_declare_api_name_and_version() -> None:
+    """A GoogleConnector subclass that forgets API_NAME/API_VERSION fails at
+    construction — never as a mystery AttributeError on the first sync."""
+
+    class _Forgotten(_StubGoogleConnector):
+        API_NAME = ""
+        API_VERSION = ""
+
+    with pytest.raises(ConnectorError, match="API_NAME"):
+        _Forgotten(token_loader=lambda: "refresh-token")
 
 
 # --- construction + service caching -------------------------------------------
