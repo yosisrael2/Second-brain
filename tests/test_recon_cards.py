@@ -343,6 +343,42 @@ class TestMixedCardTaps:
         session.expire_all()
         assert session.get(MemoryItem, old_b.id).superseded_by == child_b.id
 
+    def test_foreign_relation_id_through_another_cards_token_refused(self, world):
+        """Two open cards: a callback rc:<tokenA>:<relation-of-B> through
+        card A's token must change NOTHING — the handler may only resolve
+        relations that belong to THIS card's children."""
+        repo, session = world
+        source_a = _capture(repo, "email: plans A")
+        old_a = _capture(repo, "family dinner on Friday")
+        child_a = _recon_child(repo, session, source=source_a, matched=old_a,
+                               verdict="update", text="family dinner moved to Saturday")
+        source_b = _capture(repo, "email: plans B")
+        old_b = _capture(repo, "gym on Thursday")
+        child_b = _recon_child(repo, session, source=source_b, matched=old_b,
+                               verdict="update", text="gym moved to Friday")
+        bot, _ = _bot(world)
+        card_a = bot._proposal_reply_for(source_a)  # parks tokenA
+        rel_b = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
+        token_a = next(
+            data.split(":")[1]
+            for row in card_a.keyboard or []
+            for _label, data in row
+            if data.startswith(f"{CB_REL_CONFIRM}:")
+        )
+
+        forged = f"{CB_REL_CONFIRM}:{token_a}:{rel_b.id}"
+        tapped = bot.handle_callback(forged, 7)
+        session.expire_all()
+        assert "already handled" in tapped.text
+        rel_b_row = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
+        assert (rel_b_row.provenance or {}).get("state") == "proposed"  # untouched
+        assert session.get(MemoryItem, old_b.id).superseded_by is None
+        # card A's own relation is still appliable from its own row
+        own = bot.handle_callback(_find(card_a, CB_REL_CONFIRM), 7)
+        session.expire_all()
+        assert session.get(MemoryItem, old_a.id).superseded_by == child_a.id
+        assert "✅" in own.text
+
     def test_plain_child_row_tap_never_touches_a_relation(self, world):
         """[plain(0), recon(1)]: dropping the PLAIN child touches no relation."""
         repo, session = world

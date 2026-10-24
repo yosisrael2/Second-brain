@@ -1214,6 +1214,9 @@ class TelegramBot:
             rel = session.get(ItemRelation, rel_id)
             if rel is None:
                 return Reply(already, edit=True)
+            if rel.from_id not in pending.ids[1:]:
+                # a relation id from ANOTHER card must never resolve here
+                return Reply(already, edit=True)
             child_id = rel.from_id  # the verdict child owns the relation
             state = (rel.provenance or {}).get("state")
             service = ReconciliationService(
