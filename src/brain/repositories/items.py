@@ -17,6 +17,33 @@ from brain.db.models import ItemSource, MemoryItem
 SOURCE_WHATSAPP = "whatsapp"
 
 
+def default_hidden_conditions() -> list[Any]:
+    """PR B (item 20/D4) + D-recon (D4): items hidden by default —
+
+    superseded (struck-through) and confirmed-cancelled
+    (extraction_meta.cancelled: a truthy stamp — a dict or true — never
+    hides; an explicit false or an absent key stays visible). ONE shared
+    predicate for every SQL leg; Python legs use is_hidden_by_default()
+    below so the two layers cannot drift.
+    """
+    cancelled_json = MemoryItem.extraction_meta.op("->")("cancelled")
+    cancelled_text = func.jsonb_extract_path_text(MemoryItem.extraction_meta, "cancelled")
+    return [
+        MemoryItem.superseded_by.is_(None),
+        or_(cancelled_json.is_(None), func.coalesce(cancelled_text, "") == "false"),
+    ]
+
+
+def is_hidden_by_default(item: MemoryItem) -> bool:
+    """The Python twin of default_hidden_conditions() (search's vector
+    post-filter): superseded or confirmed-cancelled -> hidden by default."""
+    if item.superseded_by is not None:
+        return True
+    meta = item.extraction_meta if isinstance(item.extraction_meta, dict) else {}
+    cancelled = meta.get("cancelled")
+    return cancelled is not None and cancelled is not False
+
+
 def _escape_like(needle: str) -> str:
     """Neutralise LIKE wildcards in user/entity-derived needles."""
     return re.sub(r"([\\%_])", r"\\\1", needle)
@@ -108,9 +135,11 @@ class ItemsRepository:
                     MemoryItem.triage_label != "noise",
                 )
             )
-        # PR B (item 20/D4): superseded items are hidden by default.
+        # PR B (item 20/D4) + D-recon (D4): superseded and confirmed-cancelled
+        # items are hidden by default (one shared predicate).
         if not include_superseded:
-            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+            for cond in default_hidden_conditions():
+                stmt = stmt.where(cond)
         return list(self._db.scalars(stmt.limit(limit).offset(offset)))
 
     def untriaged_whatsapp(self, *, limit: int) -> Sequence[MemoryItem]:
@@ -161,8 +190,11 @@ class ItemsRepository:
             .limit(limit)
             .offset(offset)
         )
+        # PR B (item 20/D4) + D-recon (D4): superseded and confirmed-cancelled
+        # items are hidden by default (one shared predicate).
         if not include_superseded:
-            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+            for cond in default_hidden_conditions():
+                stmt = stmt.where(cond)
         return list(self._db.scalars(stmt))
 
     def by_occurrence(
@@ -183,8 +215,11 @@ class ItemsRepository:
             .order_by(MemoryItem.occurred_at.asc(), MemoryItem.id.desc())
             .limit(limit)
         )
+        # PR B (item 20/D4) + D-recon (D4): superseded and confirmed-cancelled
+        # items are hidden by default (one shared predicate).
         if not include_superseded:
-            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+            for cond in default_hidden_conditions():
+                stmt = stmt.where(cond)
         return list(self._db.scalars(stmt))
 
     def by_text_any(
@@ -220,8 +255,11 @@ class ItemsRepository:
             .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)
         )
+        # PR B (item 20/D4) + D-recon (D4): superseded and confirmed-cancelled
+        # items are hidden by default (one shared predicate).
         if not include_superseded:
-            stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+            for cond in default_hidden_conditions():
+                stmt = stmt.where(cond)
         return list(self._db.scalars(stmt))
 
     def children_of(self, item_id: uuid.UUID) -> Sequence[MemoryItem]:

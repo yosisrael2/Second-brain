@@ -20,23 +20,25 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from brain.db.models import ItemRelation, ItemSource, MemoryItem
+from brain.db.models import ItemRelation, ItemSource, MemoryItem, OpsEvent
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
-from brain.services.extraction.candidates import ChildCandidate
+from brain.services.extraction.candidates import ChildCandidate, ReconHint
 from brain.services.extraction.reconciliation import (
     ExistingItem,
     ReconCandidate,
+    ReconciliationService,
     ReconSignal,
     Verdict,
     classify,
-    detect_signal,
+    signal_for,
 )
 from brain.services.extraction.service import EnrichmentService
 from brain.services.relations import RelationsService, similarity_ratio
@@ -149,14 +151,22 @@ def test_plus_minus_1h_nothing_new_is_already_known():
 
 
 def test_plus_minus_1h_adds_info_is_more_detail():
-    detail_title = BASE + " להביא כובע"
-    assert _similarity(detail_title, BASE) >= 0.85  # the key still matches
+    """E3 (round 3): MORE DETAIL = the candidate states a field the existing
+    item LACKS (here: a location). Title length alone is never evidence —
+    a plain longer re-mention is ALREADY KNOWN."""
+    assert _similarity(BASE + " להביא כובע", BASE) >= 0.85  # the key still matches
     result = classify(
-        _candidate(title=detail_title, start=_jlm(10, 16, 0)),
-        [_existing(title=BASE, start=_jlm(10, 16, 0))],
+        _candidate(start=_jlm(10, 16, 0), location="פארק השרון"),
+        [_existing(start=_jlm(10, 16, 0))],
         similarity=_similarity, now=NOW, tz_name="Asia/Jerusalem",
     )
     assert result.verdict is Verdict.MORE_DETAIL
+    longer_only = classify(
+        _candidate(title=BASE + " להביא כובע", start=_jlm(10, 16, 0)),
+        [_existing(start=_jlm(10, 16, 0))],
+        similarity=_similarity, now=NOW, tz_name="Asia/Jerusalem",
+    )
+    assert longer_only.verdict is Verdict.ALREADY_KNOWN  # length is not info
 
 
 def test_cancellation_signal_match_is_cancellation_even_dateless():
@@ -189,9 +199,9 @@ def test_each_of_the_six_verdicts_is_reachable():
         ),
         # CONFLICT: same day 16:00 vs 18:00 no signal
         (_candidate(start=_jlm(10, 18, 0)), ReconSignal(), Verdict.CONFLICT),
-        # MORE DETAIL: same instant, extra content
+        # MORE DETAIL: same instant, states a field the item lacks (E3)
         (
-            _candidate(title=BASE + " להביא כובע", start=_jlm(10, 16, 0)),
+            _candidate(start=_jlm(10, 16, 0), location="פארק השרון"),
             ReconSignal(), Verdict.MORE_DETAIL,
         ),
         # ALREADY KNOWN: ±1h, nothing new
@@ -353,16 +363,19 @@ def test_extractor_hints_cannot_create_a_match():
     assert result.verdict is Verdict.NEW
 
 
-def test_detect_signal_phrases():
-    assert detect_signal("תיקון טעות: האספה ב-18:00").change is True
-    assert detect_signal("שינוי בשעה").change is True
-    assert detect_signal("update: the trip starts later").change is True
-    assert detect_signal("הטיול בוטל").cancel is True
-    assert detect_signal("הטיול מבוטל").cancel is True
-    assert detect_signal("cancelled due to rain").cancel is True
-    assert detect_signal("בוטל והועבר ל-19:00").cancel is True
-    assert detect_signal("נא לשלוח חולצה לבנה").change is False
-    assert detect_signal("הטיול מחר").cancel is False
+def test_signal_for_phrases():
+    assert signal_for(["תיקון טעות: האספה ב-18:00"]).change is True
+    assert signal_for(["שינוי בשעה"]).change is True
+    assert signal_for(["update: the trip starts later"]).change is True
+    assert signal_for(["הטיול בוטל"]).cancel is True
+    assert signal_for(["הטיול מבוטל"]).cancel is True
+    assert signal_for(["cancelled due to rain"]).cancel is True
+    assert signal_for(["בוטל והועבר ל-19:00"]).cancel is True
+    assert signal_for(["נא לשלוח חולצה לבנה"]).change is False
+    assert signal_for(["הטיול מחר"]).cancel is False
+    # multiple quotes OR together; hints add but never remove
+    assert signal_for(["נא לשלוח חולצה", "הטיול בוטל"]).cancel is True
+    assert signal_for([], hint_cancel=True).cancel is True
 
 
 # --- DST (item 41): local-day windows resolve through ZoneInfo ------------------
@@ -427,11 +440,14 @@ class _FakeMemory:
         return list(audience.get("named_kids", ["unknown"])) or ["unknown"]
 
 
-def _make_source(session: Session, *, text: str, sender: str = "rinat@school") -> MemoryItem:
+def _make_source(
+    session: Session, *, text: str, sender: str = "rinat@school.org.il",
+    meta: dict[str, Any] | None = None,
+) -> MemoryItem:
     item = MemoryItem(
         raw_text=text,
         source="email",
-        meta={"sender": sender, "subject": "טיול שנתי"},
+        meta=meta if meta is not None else {"sender": sender, "subject": "טיול שנתי"},
         occurred_at=datetime(2026, 11, 2, 8, 0, tzinfo=UTC),
     )
     session.add(item)
@@ -447,7 +463,6 @@ def _make_existing_event(
         source="email",
         type="event",
         occurred_at=start,
-        child_state="kept",
         applies_to=["unknown"],  # memory=None -> the pipeline resolves unknown
         status="filed",
     )
@@ -460,12 +475,16 @@ def _candidate_child(
     title: str = "טיול שנתי",
     when_raw: str = "10.11 18:00",
     quote: str = "הטיול יוצא ב-18:00",
+    recon: ReconHint | None = None,
+    location: str | None = None,
 ) -> ChildCandidate:
     return ChildCandidate(
         kind="event",
         title=title,
         quote=quote,
         when_raw=when_raw,
+        location=location,
+        recon=recon,
     )
 
 
@@ -477,10 +496,12 @@ def _service(session, source: MemoryItem, *, tz_name: str = "Asia/Jerusalem") ->
 
 def test_update_verdict_proposes_change_never_applies(db):
     """Cross-thread: the OLD item stays intact; a proposed supersedes lands."""
-    source = _make_source(db, text="שינוי: הטיול יוצא ב-18:00", sender="other@school")
+    source = _make_source(db, text="שינוי: הטיול יוצא ב-18:00", sender="other@school.org.il")
     existing = _make_existing_event(db, start=_jlm(10, 16, 0))
     service = _service(db, source)
-    resolved = service._validate(_candidate_child(), source, NOW)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
     assert resolved is not None
     outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
     assert outcome.verdict is Verdict.UPDATE
@@ -502,7 +523,9 @@ def test_same_thread_same_sender_update_auto_applies_with_undo(db):
     db.add(ItemSource(child_id=existing.id, source_id=original.id, quote="טיול שנתי"))
     db.commit()
     service = _service(db, source)
-    resolved = service._validate(_candidate_child(), source, NOW)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
     outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
     assert outcome.verdict is Verdict.UPDATE
     rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
@@ -526,7 +549,9 @@ def test_same_thread_different_sender_is_propose_only(db):
     db.add(ItemSource(child_id=existing.id, source_id=original.id, quote="טיול שנתי"))
     db.commit()
     service = _service(db, source)
-    resolved = service._validate(_candidate_child(), source, NOW)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
     outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
     assert outcome.verdict is Verdict.UPDATE
     rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
@@ -596,7 +621,7 @@ def test_dropped_child_suppresses_only_same_thread(db):
     resolved = service._validate(_candidate_child(title="טיול שנתי"), source, NOW)
     outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
     assert outcome is None  # NEW -> the caller creates; here: nothing (dropped)
-    other = _make_source(db, text="הטיול יוצא ב-18:00 מהצ'אט", sender="chat")
+    other = _make_source(db, text="הטיול יוצא ב-18:00 מהצ'אט", sender="chat@whatsapp.local")
     resolved2 = service._validate(_candidate_child(title="טיול שנתי"), other, NOW)
     outcome2 = service._reconcile_child(resolved2, other, {}, uuid.uuid4(), NOW)
     assert outcome2 is None  # cross-source look-alike of a DROPPED child: NEW (-> None)
@@ -632,3 +657,388 @@ def test_recon_eval_offline_end_to_end(tmp_path, capsys):
     assert report["per_verdict"]["update"]["tp"] == 1
     assert report["per_verdict"]["cancellation"]["tp"] == 1
     assert sum(sum(row.values()) for row in report["confusion"].values()) == 2
+
+
+def test_signal_scoped_to_the_candidates_own_quote(db):
+    """BLOCKER-1 (review round 1): the change/cancel signal is read from the
+    candidate's OWN grounded quote — never the whole source.
+
+    One school email cancels activity X and lists activity Y with no signal
+    word for it. Both candidates match existing same-day items. Exactly one
+    CANCELLATION (X) and one ALREADY_KNOWN (Y) — a whole-source scan would
+    give BOTH a cancel signal.
+    """
+    Y_BASE = "איסוף מוקדם מהחוג ביום שלישי 10.11"
+    cancel_quote = "בוטל: " + BASE
+    plain_quote = "נזכיר: " + Y_BASE
+    source = _make_source(db, text=cancel_quote + "\n" + plain_quote)
+    _make_existing_event(db, start=_jlm(10, 16, 0), title=BASE)
+    _make_existing_event(db, start=_jlm(10, 18, 0), title=Y_BASE)
+    service = _service(db, source)
+
+    resolved_x = service._validate(
+        ChildCandidate(kind="event", title="בוטל: " + BASE,
+                       quote=cancel_quote, when_raw=""),
+        source, NOW,
+    )
+    assert resolved_x is not None
+    outcome_x = service._reconcile_child(resolved_x, source, {}, uuid.uuid4(), NOW)
+    assert outcome_x.verdict is Verdict.CANCELLATION  # X's own quote has the phrase
+
+    resolved_y = service._validate(
+        ChildCandidate(kind="event", title=Y_BASE,
+                       quote=plain_quote, when_raw="10.11 18:00"),
+        source, NOW,
+    )
+    assert resolved_y is not None
+    outcome_y = service._reconcile_child(resolved_y, source, {}, uuid.uuid4(), NOW)
+    # Y's own quote is phrase-free: same-day identity with nothing new ->
+    # ALREADY KNOWN, never CANCELLATION via the sibling's cancel words
+    assert outcome_y.verdict is Verdict.ALREADY_KNOWN
+
+
+def test_auto_apply_never_touches_a_user_acted_item(db):
+    """BLOCKER-2 (review round 2): decision 6 — proposals MAY target kept
+    items, but NOTHING on them changes until the user confirms. Same thread
+    AND same sender AND a KEPT existing item -> the UPDATE stays proposed;
+    superseded_by is untouched."""
+    original = _make_source(db, text="טיול שנתי יוצא ב-16:00")
+    source = _make_source(db, text="תיקון טעות: הטיול יוצא ב-18:00")  # same sender
+    existing = _make_existing_event(db, start=_jlm(10, 16, 0))
+    existing.child_state = "kept"  # the user already acted on this item
+    db.add(ItemSource(child_id=existing.id, source_id=original.id, quote="טיול שנתי"))
+    db.commit()
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("state") == "proposed"
+    db.refresh(existing)
+    assert existing.superseded_by is None  # user-acted: immutable until confirmed
+
+
+def test_email_sender_comes_from_the_real_parse_path(db):
+    """BUG 4 (review round 2): email sources carry the sender under
+    meta['from'] ("Name <addr>"), not meta['sender'] — only WhatsApp writes
+    'sender'. The source below is built through the REAL paste.parse() email
+    path (no hand-written meta). Same thread + same sender -> auto-apply
+    fires (20a) instead of failing safe forever."""
+    from brain.services.paste import parse as parse_paste
+
+    original = parse_paste(
+        "From: Rinat <rinat@school.org.il>\nTo: parents@school.org.il\n"
+        "Subject: טיול שנתי\nDate: Sun, 1 Nov 2026 10:00:00 +0200\n\n"
+        "טיול שנתי יוצא ב-16:00\n",
+        kind_hint="email", tz=JLM, now=NOW,
+    )
+    original_item = _make_source(
+        db, text="טיול שנתי יוצא ב-16:00", meta=dict(original.chunks[0].meta)
+    )
+    reply = parse_paste(
+        "From: Rinat <rinat@school.org.il>\nTo: parents@school.org.il\n"
+        "Subject: Re: טיול שנתי\nDate: Sun, 1 Nov 2026 11:00:00 +0200\n\n"
+        "תיקון טעות: הטיול יוצא ב-18:00\n",
+        kind_hint="email", tz=JLM, now=NOW,
+    )
+    source = _make_source(db, text="תיקון טעות: הטיול יוצא ב-18:00",
+                          meta=dict(reply.chunks[0].meta))
+    existing = _make_existing_event(db, start=_jlm(10, 16, 0))
+    db.add(ItemSource(child_id=existing.id, source_id=original_item.id,
+                      quote="טיול שנתי"))
+    db.commit()
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("state") == "applied"
+    db.refresh(existing)
+    assert existing.superseded_by == rel.from_id
+
+
+def test_confirmed_cancellation_hides_until_restored(db):
+    """BLOCKER-3 (review round 2): a confirmed cancellation hides the item in
+    every default listing/search/ask leg — the same default-hiding rule as
+    superseded_by (item 20/D4) — and restore makes it visible again."""
+    from brain.repositories.items import ItemsRepository
+
+    source = _make_source(db, text="בוטל: " + BASE)
+    existing = _make_existing_event(db, start=_jlm(10, 16, 0), title=BASE)
+    service = _service(db, source)
+    resolved = service._validate(
+        ChildCandidate(kind="event", title="בוטל: " + BASE,
+                       quote="בוטל: " + BASE, when_raw=""),
+        source, NOW,
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.CANCELLATION
+    rel = db.query(ItemRelation).filter_by(kind="cancels").one()
+    service.recon.apply_cancellation(rel.id)
+    db.refresh(existing)
+    assert (existing.extraction_meta or {}).get("cancelled")  # truthy (D4 stamp)
+
+    repo = ItemsRepository(db)
+    ids = [i.id for i in repo.list(item_type=None, project=None, status=None, limit=50, offset=0)]
+    assert existing.id not in ids  # default list hides
+    occ = repo.by_occurrence(start=_jlm(10, 0, 0), end=_jlm(10, 23, 59), limit=50)
+    assert existing.id not in [i.id for i in occ]
+    hits = repo.by_text_any([BASE[:12]], limit=50)
+    assert existing.id not in [i.id for i in hits]
+
+    # restore: visible again everywhere
+    service.recon.restore_cancellation(rel.id)
+    db.refresh(existing)
+    assert not (existing.extraction_meta or {}).get("cancelled")
+    ids = [i.id for i in repo.list(item_type=None, project=None, status=None, limit=50, offset=0)]
+    assert existing.id in ids
+    occ = repo.by_occurrence(start=_jlm(10, 0, 0), end=_jlm(10, 23, 59), limit=50)
+    assert existing.id in [i.id for i in occ]
+
+
+def test_signal_for_hebrew_inflections_and_english_patterns():
+    """E4 (review round 3): signals match STEMS/patterns, not a word list —
+    my own examples for every inflection family the manager named."""
+    # cancel family: בוטל* / מבוטל* / מתבטל* / ביטול / לא יתקיים / called off
+    for sample in (
+        "החוג בוטלה השבוע",          # בוטלה
+        "הטיולים בוטלו",              # בוטלו
+        "המסיבה מבוטלת",              # מבוטל*
+        "השיעור מתבטל",               # מתבטל*
+        "עקב הגשם: ביטול הטיול",      # ביטול
+        "האספה לא תתקיים",            # לא תתקיים
+        "the trip is cancelled due to rain",   # cancel family
+        "the trip is canceled",                # one-l spelling
+        "the trip is called off",              # called off
+    ):
+        assert signal_for([sample]).cancel is True, sample
+    # change family: שונה / עודכן / נדחה / הוקדם / במקום / ולא ב
+    for sample in (
+        "השעה שונתה",                 # שונה*
+        "המפגש עודכן ל-19:00",        # עודכן*
+        "הטיול נדחה ליום חמישי",      # נדחה* (change)
+        "האספה הוקדמה ל-17:00",       # הוקדם* stem of הוקדמה
+        "ניפגש בפארק במקום הגן",      # במקום
+        "ניפגש בפארק ולא בגן",        # ולא ב
+    ):
+        assert signal_for([sample]).change is True, sample
+    # neutral text: no signal
+    assert signal_for(["נא לשלוח כובע ובקבוק מים"]).change is False
+    assert signal_for(["נא לשלוח כובע ובקבוק מים"]).cancel is False
+    # a cancelled-STAYED-cancelled sentence is not a change
+    assert signal_for(["הטיול בוטל"]).change is False
+
+
+CAL_BASE = BASE + " עם כל ההורים והילדים והחברים של כיתה ה והמדריכים וגם הסבים"
+
+
+def _make_calendar_item(
+    session: Session, *, title: str, location: str | None,
+    start: datetime, end: datetime | None = None,
+) -> MemoryItem:
+    """A REAL pasted calendar item: meta comes from the actual paste parser
+    (title/location/start/end keys), not hand-written recon-friendly data."""
+    from brain.services.paste import parse as parse_paste
+
+    lines = [
+        "BEGIN:VEVENT", f"UID:cal-{title.count(' ')}@example.com",
+        f"SUMMARY:{title}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{location}")
+    lines.append(f"DTSTART;TZID=Asia/Jerusalem:{start.strftime('%Y%m%dT%H%M%S')}")
+    if end is not None:
+        lines.append(f"DTEND;TZID=Asia/Jerusalem:{end.strftime('%Y%m%dT%H%M%S')}")
+    lines.append("END:VEVENT")
+    parsed = parse_paste("\n".join(lines) + "\n", kind_hint="calendar",
+                         tz=JLM, now=NOW)
+    meta = dict(parsed.chunks[0].meta)
+    item = MemoryItem(
+        raw_text=parsed.chunks[0].raw_text,
+        source="calendar",
+        type="event",
+        occurred_at=start,
+        meta=meta,
+        status="filed",
+    )
+    session.add(item)
+    session.commit()
+    return item
+
+
+def test_more_detail_when_candidate_states_a_missing_location(db):
+    """F2 + E3 (rounds 2-3): the existing item's location/end come from the
+    REAL paste meta; the candidate carries location through resolution. The
+    existing calendar item states NO location; the candidate states one ->
+    MORE DETAIL. Title length is never evidence."""
+    _make_calendar_item(
+        db, title=CAL_BASE, location=None, start=_jlm(10, 16, 0),
+    )
+    source = _make_source(db, text="לזכור: " + CAL_BASE + " בפארק השרון")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(title=CAL_BASE, when_raw="10.11 16:00",
+                         quote="לזכור: " + CAL_BASE + " בפארק השרון",
+                         location="פארק השרון"), source, NOW
+    )
+    assert resolved is not None
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.MORE_DETAIL
+
+
+def test_location_change_with_signal_is_update(db):
+    """F2: differing location + change signal -> UPDATE (fields carry the
+    location diff). Same day, same time — only the place moved."""
+    _make_calendar_item(
+        db, title=CAL_BASE, location="פארק השרון", start=_jlm(10, 16, 0),
+    )
+    source = _make_source(db, text="שינוי מקום: " + CAL_BASE + " בגן הלאומי")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(title=CAL_BASE, when_raw="10.11 16:00",
+                         quote="שינוי מקום: " + CAL_BASE + " בגן הלאומי",
+                         location="גן הלאומי",
+                         recon=ReconHint(change=True)), source, NOW
+    )
+    assert resolved is not None
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("fields", {}).get("location") == [
+        "פארק השרון", "גן הלאומי",
+    ]
+
+
+def test_update_never_targets_another_sources_proposed_child(db):
+    """F3 (round 4): still-PROPOSED children of OTHER sources are matchable
+    only for ALREADY KNOWN / MORE DETAIL. An UPDATE (or CONFLICT/CANCELLATION)
+    against one is emitted as NEW + ops recon/target_unapproved. A KEPT child
+    is a reliable target and takes the UPDATE."""
+    other = _make_source(db, text="טיול שנתי יוצא ב-16:00", sender="chat@whatsapp.local")
+    source = _make_source(db, text="תיקון טעות: הטיול יוצא ב-18:00")
+    proposed = MemoryItem(
+        raw_text="טיול שנתי", source="email", type="event",
+        occurred_at=_jlm(10, 16, 0), child_state="proposed",
+        applies_to=["unknown"], status="filed",
+    )
+    db.add(proposed)
+    db.commit()
+    db.add(ItemSource(child_id=proposed.id, source_id=other.id, quote="טיול שנתי"))
+    db.commit()
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome is None  # NEW: never update an unapproved proposal
+    events = db.query(OpsEvent).filter_by(
+        component="enrichment", kind="recon_target_unapproved").all()
+    assert len(events) == 1
+    # the kept side: the same child approved -> a reliable target
+    db.query(OpsEvent).delete()
+    db.commit()
+    proposed.child_state = "kept"
+    db.commit()
+    resolved2 = service._validate(
+        _candidate_child(recon=ReconHint(change=True)), source, NOW
+    )
+    outcome2 = service._reconcile_child(resolved2, source, {}, uuid.uuid4(), NOW)
+    assert outcome2.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("state") == "proposed"
+
+
+def test_matchable_items_windows_are_pushed_into_sql(db):
+    """PERF 5 (round 2): the same-day/extended windows filter in SQL — an
+    item outside every window is never loaded (the compiled WHERE carries
+    the occurred_at bounds), and results equal the Python reference."""
+    from brain.services.extraction.reconciliation import ReconSignal
+
+    _make_existing_event(db, start=_jlm(10, 16, 0), title=BASE)          # in-window
+    _make_existing_event(db, start=_jlm(20, 16, 0), title=BASE + " חלק ב")  # Dec 20: outside
+    service = _service(db, _make_source(db, text="טיול שנתי"))
+    cand = ReconCandidate(kind="event", title=BASE, start=_jlm(10, 16, 0),
+                          applies_to=("unknown",))
+    matches = service.recon.matchable_items(
+        "event", set(), candidate=cand, now=NOW, signal=ReconSignal()
+    )
+    titles = [pair[0].title for pair in matches]
+    assert len(titles) == 1 and BASE in titles[0]
+    # the SQL statement itself carries the window bounds
+    stmt = service.recon._window_statement("event", set(), cand, ReconSignal(), NOW)
+    compiled = str(stmt)
+    assert "occurred_at" in compiled and ">=" in compiled
+
+
+def test_a_verdict_is_one_transaction(db):
+    """F1 (round 4): a non-ALREADY_KNOWN verdict commits ONCE — child,
+    relation and (rare) supersede land together or not at all. If write()
+    fails after the child is flushed, a rollback leaves NEITHER: a re-run
+    can then classify from a clean slate (no half-applied verdict)."""
+    source = _make_source(db, text="בוטל: " + BASE)
+    _make_existing_event(db, start=_jlm(10, 16, 0), title=BASE)
+    service = _service(db, source)
+    resolved = service._validate(
+        ChildCandidate(kind="event", title="בוטל: " + BASE,
+                       quote="בוטל: " + BASE, when_raw=""),
+        source, NOW,
+    )
+    assert resolved is not None
+
+    original_write = ReconciliationService.write
+
+    def exploding_write(self, result, *, source, child):
+        raise RuntimeError("boom between child and relation")
+
+    ReconciliationService.write = exploding_write
+    try:
+        with pytest.raises(RuntimeError):
+            service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    finally:
+        ReconciliationService.write = original_write
+
+    db.rollback()  # the caller's crash recovery
+    assert db.query(MemoryItem).filter(MemoryItem.type == "event").filter(
+        MemoryItem.child_state == "proposed").count() == 0  # no verdict child
+    assert db.query(ItemRelation).count() == 0  # no relation
+
+
+def test_recon_eval_accepts_spec_shape(tmp_path):
+    """E5 (round 3): the eval accepts the SPEC's case shape — `type` (kind
+    as an alias), verdicts compared CASE-INSENSITIVELY, and an optional
+    per-case `now` (the message's own timestamp, so a dated correction in
+    the past is judged inside its own window, not today's)."""
+    from brain.cli import run_recon_eval
+
+    cases = [
+        # `type` instead of `kind`, verdict in CAPS, dated correction in the
+        # past: its own `now` (2 Nov) keeps 10.11 inside the extended window
+        {"case_id": "spec-1", "now": "2026-11-02T12:00:00+02:00",
+         "existing_items": [
+             {"id": "e1", "type": "event", "title": "טיול שנתי",
+              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"]}],
+         "new_text_quote": "תיקון: הטיול ב-18:00",
+         "candidate": {"type": "event", "title": "טיול שנתי",
+                       "start": _jlm(10, 18, 0).isoformat(),
+                       "applies_to": ["Rona"]},
+         "verdict": "UPDATE"},
+        # mixed-case verdict + kind still works
+        {"case_id": "spec-2",
+         "existing_items": [
+             {"id": "e2", "type": "event", "title": "טיול שנתי",
+              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"]}],
+         "new_text_quote": "הטיול בוטל",
+         "candidate": {"kind": "event", "title": "טיול שנתי", "start": None,
+                       "applies_to": ["Rona"]},
+         "verdict": "Cancellation"},
+    ]
+    path = tmp_path / "cases.jsonl"
+    path.write_text("\n".join(json.dumps(c) for c in cases), encoding="utf-8")
+    report = run_recon_eval(path, tz_name="Asia/Jerusalem")
+    assert report["cases"] == 2
+    assert report["per_verdict"]["update"]["tp"] == 1
+    assert report["per_verdict"]["cancellation"]["tp"] == 1

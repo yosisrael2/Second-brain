@@ -39,6 +39,7 @@ Return STRICT JSON only — no markdown, no commentary. Schema:
     "when_raw": "...",
     "time_raw": "",
     "all_day": false,
+    "location": null,
     "due": false,
     "derived_from": null,
     "recon": {{"change": false, "cancel": false, "detail_only": false}},
@@ -86,6 +87,8 @@ Rules (labeling rules from the design spec, plain words):
   due = true, when_raw = the date the action applies (exactly as the
   message writes it), and an audience naming the kid. Only when the memory
   context makes it concrete — never speculative.
+- location: the event's PLACE stated for THIS child ("בפארק השרון",
+  "האולם בבית הספר") or null. Never infer from the title alone.
 - recon: set a flag ONLY when the message states it about THIS child:
   change = it corrects/updates something already announced ("תיקון",
   "עדכון", "שינוי", "correction", a new time/place for it); cancel = it
@@ -315,6 +318,9 @@ class LLMExtractor:
             when_raw=str(raw.get("when_raw", "") or "").strip(),
             time_raw=str(raw.get("time_raw", "") or "").strip(),
             all_day=bool(raw.get("all_day", False)),
+            location=(str(raw.get("location")).strip() or None)
+            if raw.get("location") is not None
+            else None,
             due=bool(raw.get("due", False)),
             audience=audience,
             importance=importance,

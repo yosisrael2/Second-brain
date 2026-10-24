@@ -44,7 +44,7 @@ from brain.services.extraction.reconciliation import (
     ReconciliationService,
     ReconOutcome,
     Verdict,
-    detect_signal,
+    signal_for,
 )
 from brain.services.items import ItemsRepositoryProto
 from brain.services.memory import MemoryService
@@ -582,6 +582,7 @@ class EnrichmentService:
             applies_to=applies_to,
             date_conflict=date_conflict,
             meta=meta,
+            location=candidate.location,
         )
 
     def _source_sent_local(self, source: MemoryItem) -> datetime:
@@ -700,9 +701,15 @@ class EnrichmentService:
         now: datetime,
         *,
         extra_meta: dict[str, Any],
+        commit: bool = True,
     ) -> MemoryItem:
         """The one place a NEW proposed child is stored (pre-recon path +
-        the verdict children — every verdict is still a proposal, D2)."""
+        the verdict children — every verdict is still a proposal, D2).
+
+        ``commit=False`` (F1, round 4) leaves the child FLUSHED but
+        uncommitted — the verdict's write() commits child + relation (+ any
+        supersede) as ONE transaction, so a crash cannot half-apply.
+        """
         candidate = resolved.candidate
         moment = resolved.start or resolved.due
         kind = ItemType(candidate.kind)  # validated child kind (spec section 2)
@@ -727,8 +734,9 @@ class EnrichmentService:
         self._session.flush()  # assign child.id before linking
         self._add_quote_links(child, source, resolved)
         existing_children[child.id] = child  # visible to later candidates this run
-        self._repo.commit()
-        self._index_child(child)
+        if commit:
+            self._repo.commit()
+            self._index_child(child)
         return child
 
     def _reconcile_child(
@@ -738,7 +746,7 @@ class EnrichmentService:
         existing_children: dict[uuid.UUID, MemoryItem],
         run_id: uuid.UUID,
         now: datetime,
-    ) -> str | None:
+    ) -> ReconOutcome | None:
         """Item 37: classify one candidate against existing items (any source).
 
         Returns None when the verdict is NEW (the caller creates normally) or
@@ -751,8 +759,10 @@ class EnrichmentService:
         """
         candidate = resolved.candidate
         hint = candidate.recon
-        signal = detect_signal(
-            source.raw_text,
+        # blocker 1 (review round 1): the signal is scoped to the
+        # candidate's OWN grounded quote(s) + its hints — never the source
+        signal = signal_for(
+            [candidate.quote, *resolved.extra_quotes],
             hint_change=hint.change if hint else False,
             hint_cancel=hint.cancel if hint else False,
         )
@@ -762,6 +772,7 @@ class EnrichmentService:
             title=candidate.title,
             start=resolved.start or resolved.due,
             applies_to=tuple(resolved.applies_to),
+            location=resolved.location,
         )
         result = recon.classify_universe(
             recon_candidate,
@@ -769,6 +780,7 @@ class EnrichmentService:
             now=now,
             signal=signal,
         )
+
         if result.ambiguous:
             ops.record_event(
                 "enrichment",
@@ -799,6 +811,7 @@ class EnrichmentService:
                 "recon_fields": {k: list(v) for k, v in result.fields.items()},
                 "recon_matched_id": result.matched_id,
             },
+            commit=False,  # F1: write() below owns the single commit
         )
         recon.write(result, source=source, child=verdict_child)
         return ReconOutcome(
@@ -898,3 +911,4 @@ class _ResolvedChild:
     date_conflict: bool
     meta: dict[str, Any]
     extra_quotes: list[str] = field(default_factory=list)
+    location: str | None = None

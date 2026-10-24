@@ -46,6 +46,9 @@ class ChildCandidate:
     # pipeline can combine date + time deterministically).
     time_raw: str = ""
     all_day: bool = False
+    # PR D-recon (item 37, F2): where the event takes place, when the source
+    # states it for THIS child (feeds the reconciliation location diff).
+    location: str | None = None
     # Audience selector per item 17: keys from {school, grades, role, gender,
     # named_kids, channel}; resolved to applies_to by the pipeline (R1-R5).
     audience: dict[str, object] = field(default_factory=dict)

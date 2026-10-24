@@ -49,20 +49,30 @@ runner-up; otherwise NEW + an ops event (never pick silently).
 
 from __future__ import annotations
 
+import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import or_, select
+
+from brain import ops
 from brain.services.relations import DATE_TOLERANCE, SIMILARITY_THRESHOLD, similarity_ratio
 
 # Item 20a/30 signals, code-detected (the LLM only narrows, never creates).
 # Substrings, casefolded; Hebrew morphological families share the root.
-_CHANGE_PHRASES = ("תיקון", "עדכון", "שינוי", "correction", "update:", "change")
-_CANCEL_PHRASES = ("בוטל", "מבוטל", "ביטול", "cancelled", "canceled")
+# E4 (review round 3): stems and patterns, not a word list — Hebrew
+# inflections share a root (בוטל/בוטלה/בוטלו, מבוטלת, מתבטל...) and a
+# WORD-PREFIX match catches the family; phrases are substrings.
+_CANCEL_WORD_STEMS = ("בוטל", "מבוטל", "מתבטל")
+_CANCEL_WORDS = ("ביטול",)
+_CANCEL_PHRASES = ("לא יתקיים", "לא תתקיים", "called off", "cancel")
+_CHANGE_WORD_STEMS = ("שינוי", "שונ", "עודכן", "עדכון", "תיקון", "הוקד", "נדחה")
+_CHANGE_PHRASES = ("במקום", "ולא ב", "correction", "update", "change", "reschedul", "postpon")
 
 # The several-matches guard: best must beat the runner-up by this much.
 AMBIGUITY_MARGIN = 0.05
@@ -89,6 +99,16 @@ class ReconSignal:
     @property
     def any(self) -> bool:
         return self.change or self.cancel
+
+
+def _meta_instant(value: Any) -> datetime | None:
+    """Parse an iso meta instant (paste 'end', extraction_meta 'end')."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -128,22 +148,51 @@ class ReconResult:
     runner_up_id: str | None = None
 
 
+def _sender_address(meta: dict[str, Any]) -> str:
+    """The sender's bare email address from a source's meta (bug 4, review
+    round 2): email sources write it under 'from' ("Rinat <rinat@x>" or the
+    bare address), WhatsApp under 'sender'. Empty when neither holds one."""
+    for key in ("from", "sender"):
+        value = str(meta.get(key) or "")
+        match = re.search(r"[\w.+-]+@[\w-]+\.[\w.+-]+", value)
+        if match:
+            return _norm(match.group(0))
+    return ""
+
+
 def _norm(value: str | None) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def detect_signal(
-    text: str, *, hint_change: bool = False, hint_cancel: bool = False
+def signal_for(
+    quotes: Iterable[str], *, hint_change: bool = False, hint_cancel: bool = False
 ) -> ReconSignal:
-    """Code-detected change/cancel phrases ORed with the extractor's hints.
+    """THE signal helper — production and recon-eval both call this.
 
-    The phrases are SUBSTRINGS on the normalized text (the LLM's hint can
-    add a signal, never remove one; and a hint alone can never create a
-    match — classify() still demands type + applies_to + similarity).
+    The change/cancel phrases are scanned in the CANDIDATE'S OWN texts only
+    (its grounded verbatim quote(s) in production; the eval case's
+    new_text_quote in recon-eval), ORed with the extractor's hints. Never
+    the whole source: one email that cancels activity X must not hand a
+    cancel signal to the five other activities it mentions (review round 1,
+    blocker 1). A hint can add a signal, never remove one; and a hint alone
+    can never create a match — classify() still demands type + applies_to +
+    similarity.
     """
-    lowered = _norm(text)
-    change = hint_change or any(p in lowered for p in _CHANGE_PHRASES)
-    cancel = hint_cancel or any(p in lowered for p in _CANCEL_PHRASES)
+    change = hint_change
+    cancel = hint_cancel
+    for text in quotes:
+        if not text:
+            continue
+        lowered = _norm(text)
+        words = re.findall(r"[\w]+", lowered)
+        change = change or any(
+            w.startswith(stem) for w in words for stem in _CHANGE_WORD_STEMS
+        ) or any(p in lowered for p in _CHANGE_PHRASES)
+        cancel = cancel or any(
+            w.startswith(stem) for w in words for stem in _CANCEL_WORD_STEMS
+        ) or any(w in _CANCEL_WORDS for w in words) or any(
+            p in lowered for p in _CANCEL_PHRASES
+        )
     return ReconSignal(change=change, cancel=cancel)
 
 
@@ -225,10 +274,20 @@ def _field_diffs(
     return diffs
 
 
-def _adds_info(candidate: ReconCandidate, existing: ExistingItem) -> bool:
-    """Nothing differs, but the candidate carries extra text (a dress code,
-    what to bring). Deterministic: a longer title than the stored one."""
-    return len(_norm(candidate.title)) > len(_norm(existing.title))
+def _adds_info(candidate: ReconCandidate, existing: ExistingItem, tz: ZoneInfo) -> bool:
+    """E3 (round 3): MORE DETAIL = no differing value AND the candidate
+    states a field the existing item LACKS — a location, an end time, or a
+    clock time on a date-only item. Title length is NEVER evidence (a plain
+    re-mention is longer and states nothing new)."""
+    if candidate.location and not existing.location:
+        return True
+    if candidate.end is not None and existing.end is None:
+        return True
+    if candidate.start is not None and _clock_stated(candidate.start, tz):
+        if existing.start is None or not _clock_stated(existing.start, tz):
+            # a stated clock time on a date-only (or dateless) item
+            return True
+    return False
 
 
 def _compatible(
@@ -294,7 +353,7 @@ def classify(
         # the extended window REQUIRES a signal, so a no-signal diff can only
         # come from a same-day match (the VETO's CONFLICT row)
         return ReconResult(verdict=Verdict.CONFLICT, matched_id=best.id, fields=diffs)
-    if best in same_day and _adds_info(candidate, best):
+    if best in same_day and _adds_info(candidate, best, tz):
         return ReconResult(verdict=Verdict.MORE_DETAIL, matched_id=best.id)
     if best in same_day:
         return ReconResult(verdict=Verdict.ALREADY_KNOWN, matched_id=best.id)
@@ -335,22 +394,80 @@ class ReconciliationService:
 
     # -- universe ---------------------------------------------------------
 
+    def _window_statement(self, kind: str, exclude_ids: set[uuid.UUID],
+                          candidate: ReconCandidate, signal: ReconSignal,
+                          now: datetime) -> Any:
+        """PERF 5 (round 2): the matchable universe is fetched with the
+        windows IN SQL — the candidate's local day (no signal needed) OR,
+        only when the candidate carries a signal, the extended
+        [today, today+30d] span — plus the same type/exclusion/hidden/
+        non-dropped filters. Occurred_at IS NULL rows (dateless items) join
+        the same-day leg only for a dateless candidate (dateless matches
+        dateless, item 21). Bounded query, never all history.
+        """
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.repositories.items import default_hidden_conditions  # noqa: PLC0415
+
+        tz = ZoneInfo(self._tz_name)
+        today = now.astimezone(tz).date()
+        stmt = (
+            select(MemoryItem)
+            .filter(MemoryItem.type == kind)
+            .filter(MemoryItem.id.not_in(exclude_ids or {uuid.uuid4()}))
+        )
+        for cond in default_hidden_conditions():
+            stmt = stmt.where(cond)  # superseded + confirmed-cancelled
+        stmt = stmt.where(
+            MemoryItem.child_state.is_(None) | (MemoryItem.child_state != "dropped")
+        )
+        today_start = datetime.combine(today, time(0, 0), tzinfo=tz).astimezone(UTC)
+        today_end = datetime.combine(
+            today + timedelta(days=EXTENDED_WINDOW_DAYS + 1), time(0, 0), tzinfo=tz
+        ).astimezone(UTC)
+        extended = MemoryItem.occurred_at >= today_start
+        if signal.any:
+            extended = extended & (MemoryItem.occurred_at < today_end)
+        if candidate.start is None:
+            day_leg = MemoryItem.occurred_at.is_(None)  # dateless matches dateless
+        else:
+            day = candidate.start.astimezone(tz).date()
+            day_start = datetime.combine(day, time(0, 0), tzinfo=tz).astimezone(UTC)
+            day_end = datetime.combine(
+                day + timedelta(days=1), time(0, 0), tzinfo=tz
+            ).astimezone(UTC)
+            day_leg = (MemoryItem.occurred_at >= day_start) & (
+                MemoryItem.occurred_at < day_end
+            )
+        if signal.any:
+            stmt = stmt.where(or_(day_leg, extended))
+        else:
+            stmt = stmt.where(day_leg)
+        return stmt
+
     def matchable_items(
-        self, kind: str, exclude_ids: set[uuid.UUID]
+        self,
+        kind: str,
+        exclude_ids: set[uuid.UUID],
+        *,
+        candidate: ReconCandidate,
+        now: datetime,
+        signal: ReconSignal | None = None,
     ) -> list[tuple[ExistingItem, Any]]:
         """Existing items a candidate may reconcile against.
 
         Same type; NOT dropped (item 30: only the same-source diff suppresses);
         NOT superseded (the current version matches); NOT cancelled; excludes
-        the source itself and its own children (the A1 diff owns those).
+        the source itself and its own children (the A1 diff owns those); the
+        two windows filter IN SQL (PERF 5, round 2).
         """
-        from brain.db.models import MemoryItem  # noqa: PLC0415
 
         rows = (
-            self._session.query(MemoryItem)
-            .filter(MemoryItem.type == kind)
-            .filter(MemoryItem.id.not_in(exclude_ids or {uuid.uuid4()}))
-            .filter(MemoryItem.superseded_by.is_(None))
+            self._session.execute(
+                self._window_statement(
+                    kind, exclude_ids, candidate, signal or ReconSignal(), now
+                )
+            )
+            .scalars()
             .all()
         )
         out: list[tuple[ExistingItem, Any]] = []
@@ -360,6 +477,7 @@ class ReconciliationService:
             meta = row.extraction_meta if isinstance(row.extraction_meta, dict) else {}
             if meta.get("cancelled"):
                 continue
+            row_meta = row.meta if isinstance(row.meta, dict) else {}
             out.append(
                 (
                     ExistingItem(
@@ -367,8 +485,15 @@ class ReconciliationService:
                         type=getattr(row.type, "value", row.type) if row.type else kind,
                         title=row.raw_text,
                         start=row.occurred_at,
-                        applies_to=tuple(row.applies_to or ()),
-                        location=meta.get("location"),
+                        # NULL applies_to = the audience was never resolved
+                        # (real pasted/user items) — equivalent to "unknown";
+                        # R5 only forbids two DIFFERENT KNOWN audiences.
+                        applies_to=tuple(row.applies_to) if row.applies_to else ("unknown",),
+                        # F2 (round 2): end/location from where real items
+                        # store them — children in extraction_meta, pasted
+                        # calendar items in meta (verified paste keys).
+                        end=_meta_instant(meta.get("end") or row_meta.get("end")),
+                        location=meta.get("location") or row_meta.get("location"),
                     ),
                     row,
                 )
@@ -383,15 +508,54 @@ class ReconciliationService:
         now: datetime,
         signal: ReconSignal | None = None,
     ) -> ReconResult:
-        """classify() against the DB universe (the pure function, unchanged)."""
-        matches = self.matchable_items(candidate.kind, exclude_ids)
-        return classify(
+        """classify() against the DB universe (the pure function, unchanged)
+        plus the F3 gate (round 4): a still-PROPOSED child of ANOTHER source
+        is matchable only for ALREADY KNOWN / MORE DETAIL — for UPDATE /
+        CONFLICT / CANCELLATION the verdict is NEW + an ops
+        recon_target_unapproved event (never update what the user has not
+        approved yet; decision 6)."""
+        matches = self.matchable_items(
+            candidate.kind, exclude_ids, candidate=candidate, now=now, signal=signal
+        )
+        result = classify(
             candidate,
             [pair[0] for pair in matches],
             similarity=similarity_ratio,
             now=now,
             tz_name=self._tz_name,
             signal=signal or ReconSignal(),
+        )
+        if result.matched_id is not None and result.verdict in (
+            Verdict.UPDATE, Verdict.CONFLICT, Verdict.CANCELLATION,
+        ):
+            matched_row = next(
+                (row for pair_id, row in
+                 ((uuid.UUID(pair[0].id), pair[1]) for pair in matches)
+                 if pair_id == uuid.UUID(str(result.matched_id))),
+                None,
+            )
+            if matched_row is not None and matched_row.child_state == "proposed":
+                self._record_target_unapproved(candidate, result)
+                return ReconResult(verdict=Verdict.NEW)
+        return result
+
+    def _record_target_unapproved(self, candidate: ReconCandidate,
+                                  result: ReconResult) -> None:
+        """Ops evidence for the F3 gate (auditable, never silent)."""
+        self._record(Verdict.NEW, {
+            "candidate": candidate.title[:60],
+            "matched_id": str(result.matched_id),
+            "would_have_been": result.verdict.value,
+        })
+        ops.record_event(
+            "enrichment",
+            "recon_target_unapproved",
+            ok=True,
+            detail={
+                "candidate": candidate.title[:60],
+                "matched_id": str(result.matched_id),
+                "would_have_been": result.verdict.value,
+            },
         )
 
     # -- same-thread / same-sender (item 20a + decision 3) ------------------
@@ -424,16 +588,23 @@ class ReconciliationService:
                 return _norm(text)
 
     def _auto_apply_allowed(self, source: Any, existing_item_id: str) -> bool:
-        """Same thread AND same sender as the existing item's source (20a)."""
+        """20a + decision 6: same thread AND same sender AND the existing item
+        is not user-acted. A kept/dropped item is immutable — proposals may
+        TARGET it, but nothing on it changes until the user confirms."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+
+        matched_row = self._session.get(MemoryItem, uuid.UUID(existing_item_id))
+        if matched_row is not None and matched_row.child_state in ("kept", "dropped"):
+            return False
         current_thread = self._thread_key(source)
         current_meta = source.meta if isinstance(source.meta, dict) else {}
-        current_sender = _norm(current_meta.get("sender") or "")
+        current_sender = _sender_address(current_meta)
         for other in self._sources_of(uuid.UUID(existing_item_id)):
             if other.id == source.id:
                 return True  # the very same source item
             if current_thread is not None and self._thread_key(other) == current_thread:
                 other_meta = other.meta if isinstance(other.meta, dict) else {}
-                if current_sender and _norm(other_meta.get("sender") or "") == current_sender:
+                if current_sender and _sender_address(other_meta) == current_sender:
                     return True
         return False
 

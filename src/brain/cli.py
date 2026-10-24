@@ -394,7 +394,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
         ExistingItem,
         ReconCandidate,
         classify,
-        detect_signal,
+        signal_for,
     )
     from brain.services.relations import similarity_ratio  # noqa: PLC0415
 
@@ -423,24 +423,29 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
             ]
             cand = case["candidate"]
             candidate = ReconCandidate(
-                kind=str(cand["kind"]),
+                # E5 (round 3): the spec's shape says `type`; `kind` stays as
+                # an alias for the files written before this change.
+                kind=str(cand.get("type") or cand["kind"]),
                 title=str(cand.get("title", "")),
                 start=_parse_eval_dt(cand.get("start")),
                 applies_to=tuple(cand.get("applies_to") or ()),
                 location=cand.get("location"),
             )
-            signal = detect_signal(str(case.get("new_text_quote", "")))
+            signal = signal_for([str(case.get("new_text_quote", ""))])
+            # E5: a dated correction is judged inside ITS OWN window — the
+            # optional per-case `now` (the message's timestamp) wins.
+            case_now = _parse_eval_dt(case.get("now")) or now
             computed = classify(
                 candidate,
                 existing,
                 similarity=similarity_ratio,
-                now=now,
+                now=case_now,
                 tz_name=tz_name,
                 signal=signal,
             ).verdict.value
-            expected = str(case["verdict"])
+            expected = str(case["verdict"]).strip().lower()
             stats = per_verdict.setdefault(expected, {"tp": 0, "fp": 0, "fn": 0})
-            if computed == expected:
+            if computed == expected:  # both lowercase (E5)
                 stats["tp"] += 1
             else:
                 stats["fn"] += 1
