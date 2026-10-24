@@ -39,3 +39,9 @@ class ChildCandidate:
     importance: int | None = None
     actionability: str | None = None
     due: bool = False  # True when when_raw is a DEADLINE (task) not a start
+    # Item 22 (derived tasks): this candidate is DERIVED from the candidate
+    # whose ``ref`` appears here ("sign the form" -> reminder to actually do
+    # it by the due date). Empty quote is allowed ONLY for derived children
+    # (they cite the fact they derive from); the pipeline skips their
+    # grounding check and records the link in extraction_meta.
+    derived_from: str | None = None

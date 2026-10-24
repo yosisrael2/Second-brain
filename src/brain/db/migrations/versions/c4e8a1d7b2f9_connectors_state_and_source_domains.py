@@ -10,7 +10,8 @@ The connectors ticket's ONE migration (owned by worker_8; adapters add none):
   counters)`` — per-connector cursor + heartbeat fields.
 - ``connector_records(source, external_id, version, item_id,
   PK(source, external_id))`` — the idempotency ledger; FK to memory_items is
-  ON DELETE CASCADE so a user-deleted item is re-captured on the next sync.
+  ON DELETE SET NULL so a user-deleted item keeps its ledger row (item_id
+  NULL) and the runner never re-captures it.
 - Source domains widened for the connector names (read-only this ticket):
   ``memory_items.source`` gets its CHECK here (it never had one; the live
   table predates it, so it is added NOT VALID — new rows are enforced,
@@ -26,10 +27,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c4e8a1d7b2f9"
-# Re-pointed onto the whatsapp-triage migration when this branch merged main
-# (feature-plans.md: whoever merges second re-points down_revision so the PR
-# branch keeps a single alembic head).
-down_revision: str | None = "c9d2e7f4a1b8"
+down_revision: str | None = "d7b3e9c1a5f4"  # re-pointed: #49 (triage) and #39 (A2) merged first
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -77,8 +75,8 @@ def upgrade() -> None:
         sa.Column(
             "item_id",
             postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("memory_items.id", ondelete="CASCADE"),
-            nullable=False,
+            sa.ForeignKey("memory_items.id", ondelete="SET NULL"),
+            nullable=True,
         ),
         sa.Column(
             "created_at",
@@ -86,6 +84,12 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        # Poison-record quarantine: 3 consecutive record-level failures put
+        # the row in status 'failed'; the runner then skips it (cursor can
+        # advance) until the source bumps the version.
+        sa.Column("status", sa.String(16), nullable=False, server_default="synced"),
+        sa.Column("fail_count", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("last_error", sa.Text(), nullable=True),
     )
     op.create_index(
         op.f("ix_connector_records_item_id"), "connector_records", ["item_id"], unique=False
