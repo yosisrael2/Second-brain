@@ -90,7 +90,8 @@ to its section or doc.
 **In progress** (work in progress, 24 Oct 2026)
 
 - Connectors: Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
-- Connector adoption pass — turning Calendar/Tasks on needs one-time Google consent plus a one-time adoption step so already-pasted items are not duplicated (in progress)
+- Connector adoption pass — enabling Calendar or Gmail on live needs one-time Google consent plus a one-time adoption step so already-pasted items are not duplicated (Tasks and Drive need consent only)
+- Connectors background agent — runs the enabled Calendar/Tasks/Drive connectors on a schedule (until it lands, enabled connectors sync only when run by hand)
 - Connector conformance kit — termination/idempotency/change/delete/reset scenarios every source must pass (PR #60)
 - Cockpit Sources panel — read-only connector status card (PR #64 landed on a stale base; needs re-landing on main)
 - WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation
