@@ -14,6 +14,11 @@ callbacks, HTML escaping, pure render functions over a session):
 - D4: a superseded item's card renders its text struck-through
   ("↪︎ replaced by: <new>") with a ♻️ Restore button.
 
+PR D-recon-2a adds the recon side of the same surface: the verdict
+relation of one recon child (any of the four recon kinds), the CONFLICT
+both-versions block, the MORE_DETAIL 🔔 line, and the cancelled target's
+♻️ Restore (cancelled_by_rel).
+
 All card text is HTML-escaped here; callback data stays < 64 bytes because
 relation ids ride the bot's pending registry (only the short token + an
 index travel in the callback).
@@ -23,7 +28,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.models import ItemRelation, MemoryItem
@@ -33,6 +38,10 @@ CB_REL_UNDO = "ru"  # ru:<token>:<index>  undo an applied supersede
 CB_REL_CONFIRM = "rc"  # rc:<token>:<index>  confirm a proposed supersede
 CB_REL_KEEP_BOTH = "rk"  # rk:<token>:<index>  reject a proposed supersede
 CB_REL_RESTORE = "rs"  # rs:<token>          restore a superseded item
+CB_RECON_DISCARD = "rd"  # rd:<token>:<index>  keep existing / not cancelled
+
+# The four recon relation kinds (D-recon-1's verdict writes).
+RECON_KINDS = ("supersedes", "conflicts", "cancels", "details")
 
 
 def applied_supersedes_of(session: Session, item_id) -> list[ItemRelation]:
@@ -97,6 +106,12 @@ def one_line_escaped(session: Session, item_id) -> str:
     return _esc(_summary(session, item_id))
 
 
+def summary_of(session: Session, item_id) -> str:
+    """Raw (unescaped) one-line summary of one item — for callers that
+    escape later (verdict markers render through child_line's _esc)."""
+    return _summary(session, item_id)
+
+
 def correction_notice(session: Session, item_id) -> str | None:
     """'↩︎ replaced: old → new' / '❓ maybe replaces' for the card of item_id.
 
@@ -156,3 +171,79 @@ def relations_keyboard(
 def strike(text: str) -> str:
     """HTML struck-through rendering for a superseded item's text (D4)."""
     return f"<s>{_esc(text)}</s>"
+
+
+# --- recon verdict helpers (PR D-recon-2a) -----------------------------------
+
+
+def recon_relation_of(session: Session, child_id) -> ItemRelation | None:
+    """The verdict relation parked for one recon child (latest first).
+
+    A recon child carries exactly one relation written by
+    ReconciliationService.write() — supersedes / conflicts / cancels /
+    details with provenance.how='recon'. None for a non-recon child or
+    when the proposal was already discarded (keep-both rows disappear).
+    """
+    for rel in session.scalars(
+        select(ItemRelation)
+        .where(ItemRelation.from_id == child_id)
+        .where(ItemRelation.kind.in_(RECON_KINDS))
+        .order_by(ItemRelation.created_at.desc(), ItemRelation.id.desc())
+    ):
+        if (rel.provenance or {}).get("how") == "recon":
+            return rel
+    return None
+
+
+def conflict_notice(session: Session, rel: ItemRelation) -> str:
+    """The CONFLICT card's block: which is right? + both versions escaped."""
+    return (
+        "which is right?\n"
+        f"  existing: {one_line_escaped(session, rel.to_id)}\n"
+        f"  new: {one_line_escaped(session, rel.from_id)}"
+    )
+
+
+def details_notice(session: Session, item_id) -> str | None:
+    """The MORE_DETAIL 🔔 line for an item's card: every recon details
+    relation touching it (either direction) as one escaped line, or None.
+    Never adds buttons — the detail itself is the other side's text."""
+    lines: list[str] = []
+    for rel in session.scalars(
+        select(ItemRelation)
+        .where(ItemRelation.kind == "details")
+        .where(or_(ItemRelation.from_id == item_id, ItemRelation.to_id == item_id))
+        .order_by(ItemRelation.created_at.asc(), ItemRelation.id.asc())
+    ):
+        if (rel.provenance or {}).get("how") != "recon":
+            continue
+        other = rel.to_id if rel.from_id == item_id else rel.from_id
+        lines.append(f"🔔 more detail captured: {one_line_escaped(session, other)}")
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
+def cancelled_by_rel(session: Session, item_id) -> ItemRelation | None:
+    """The applied cancels relation that struck THIS item (its ♻️ Restore)."""
+    for rel in session.scalars(
+        select(ItemRelation)
+        .where(ItemRelation.to_id == item_id, ItemRelation.kind == "cancels")
+        .order_by(ItemRelation.created_at.desc(), ItemRelation.id.desc())
+    ):
+        if (rel.provenance or {}).get("state") == "applied":
+            return rel
+    return None
+
+
+def resolved_conflict_by_rel(session: Session, item_id) -> ItemRelation | None:
+    """The applied conflicts relation that struck THIS item keep-new
+    (D-recon-2a; the loser's ♻️ Restore)."""
+    for rel in session.scalars(
+        select(ItemRelation)
+        .where(ItemRelation.to_id == item_id, ItemRelation.kind == "conflicts")
+        .order_by(ItemRelation.created_at.desc(), ItemRelation.id.desc())
+    ):
+        if (rel.provenance or {}).get("state") == "applied":
+            return rel
+    return None
