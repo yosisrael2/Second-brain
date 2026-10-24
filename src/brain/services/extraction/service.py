@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -43,7 +43,33 @@ from brain.services.items import ItemsRepositoryProto
 from brain.services.memory import MemoryService
 from brain.services.textnorm import quote_in_source, title_similarity
 
+if TYPE_CHECKING:
+    from brain.config import Settings
+
 logger = logging.getLogger(__name__)
+
+
+def build_extractor(settings: Settings) -> Extractor:
+    """The A2 activation seam: the ONE place that picks the extractor.
+
+    ``enrichment_extractor`` (env ENRICHMENT_EXTRACTOR, Literal-validated by
+    Settings) selects it: 'stub' (default) = the deterministic placeholder —
+    live behaviour unchanged; 'llm' = the real LLMExtractor on the SAME
+    shared LLM client ``brain extract-eval`` uses (brain.api.deps
+    .get_llm_client) — no second wiring. EnrichmentService falls back to
+    this factory for every production construction site that passes no
+    extractor (cli brain enrich, /ops/enrichment, /ops/health); eval keeps
+    its explicit choice when it passes one.
+    """
+    if settings.enrichment_extractor == "llm":
+        from brain.api.deps import get_llm_client  # noqa: PLC0415 (lazy: heavy chain)
+        from brain.services.extraction.llm_extractor import (  # noqa: PLC0415
+            LLMExtractor,
+        )
+
+        return LLMExtractor(get_llm_client())
+    return StubExtractor()
+
 
 _JOB_STATES = ("queued", "running", "done", "failed")
 _BUDGETS = ("daily", "backfill")
@@ -155,7 +181,14 @@ class EnrichmentService:
         """
         self._repo = repo
         self._session = session
-        self._extractor: Extractor = extractor if extractor is not None else StubExtractor()
+        if extractor is None:
+            # A2 activation seam: production sites that pass no extractor
+            # (cli brain enrich, /ops/enrichment, /ops/health) get the
+            # settings-driven product of the ONE factory (stub by default).
+            from brain.config import get_settings  # noqa: PLC0415 (cheap, local)
+
+            extractor = build_extractor(get_settings())
+        self._extractor: Extractor = extractor
         self._memory = memory
         self._indexer = indexer
         self._daily_cap = daily_cap
