@@ -1,0 +1,12 @@
+{
+  "kind": "drive#file",
+  "id": "1M0v3dO0tM0ck456789abcdefghijklmnopqrs",
+  "name": "Moved away",
+  "mimeType": "application/vnd.google-apps.document",
+  "version": "12",
+  "createdTime": "2026-05-01T00:00:00.000Z",
+  "modifiedTime": "2026-10-22T09:00:00.000Z",
+  "webViewLink": "https://docs.google.com/document/d/1M0v3dO0tM0ck456789abcdefghijklmnopqrs/edit",
+  "parents": ["1F0ld3rN0tAll0w3d000000000000000003"],
+  "trashed": false
+}

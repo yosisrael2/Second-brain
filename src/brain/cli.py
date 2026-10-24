@@ -13,14 +13,13 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from brain.ai.embedder import Embedder, EmbedderError
-from brain.ai.gmail import GMAIL_SCOPE, RestGmailClient
+from brain.ai.gmail import GMAIL_SCOPE
 from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreError
 from brain.config import Settings, get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
-from brain.services.email_poller import EmailPoller, heartbeat_email
 from brain.services.eval_extraction import (
     DEFAULT_TITLE_THRESHOLD,
     EvalError,
@@ -1042,47 +1041,120 @@ def _gmail_auth(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_email_poller(settings: Settings) -> EmailPoller:
-    """Assemble the poller from the shared AI singletons (same path as the bot)."""
-    from brain.api import deps  # noqa: PLC0415  (deferred: shared client singletons)
-    from brain.repositories.email import EmailMessageRepository  # noqa: PLC0415
+def _gmail_poll_cycle(indexer: Any, attachments: Any) -> Any:
+    """One ConnectorRunner cycle for the email connector (the ONE live path)."""
+    from brain.api import deps  # noqa: PLC0415 (deferred: shared client singletons)
+    from brain.connectors.google.gmail import GmailConnector  # noqa: F401 (registers)
+    from brain.connectors.runner import ConnectorRunner
+    from brain.connectors.state import ConnectorRecordRepo, ConnectorStateRepo
 
-    session = SessionLocal()
-    ingest = IngestService(
-        ItemsRepository(session),
-        deps.get_classifier(),
-        deps.get_item_indexer(),
-    )
-    return EmailPoller(
-        client=RestGmailClient(token_loader=lambda: Keychain().read(GMAIL_ACCOUNT) or ""),
-        ingest=ingest,
-        seen_repo=EmailMessageRepository(session),
-        settings=settings,
-    )
+    with SessionLocal() as session:
+        ingest = IngestService(
+            ItemsRepository(session),
+            deps.get_classifier(),
+            deps.get_item_indexer(),
+        )
+        connector = _build_connector("email", session=session)
+        runner = ConnectorRunner(
+            connector,
+            ingest=ingest,
+            repo=ItemsRepository(session),
+            state=ConnectorStateRepo(session),
+            records=ConnectorRecordRepo(session),
+            indexer=indexer,
+            attachments=attachments,
+        )
+        try:
+            summary = runner.run(limit=200)
+        finally:
+            connector.close()
+    try:
+        attachments.drain()  # F3: one budgeted read per poll cycle
+    except Exception as exc:  # noqa: BLE001 — reading never fails the poll
+        logger.warning("gmail-poll: attachment drain failed (%s)", exc)
+    return summary
 
 
 def _gmail_poll(args: argparse.Namespace) -> int:
+    """The email source loop — the launchd agent path (com.secondbrain.email).
+
+    C5: the F2 EmailPoller is DELETED; this drives the Gmail CONNECTOR through
+    the shared ConnectorRunner (historyId cursor, query fallback, ledger
+    dedupe). Same external contract as before: 78 = permanent config error (no
+    restart), BRAIN_ALLOW_LIVE=1 is the sanctioned live-store opt-in (set by
+    scripts/run-email.sh), one cockpit heartbeat per cycle (transitional
+    'email' heartbeat until the Sources panel owns it), exponential backoff on
+    retryable failures, 5-minute stalls on auth (user action required).
+    """
+    import os  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store  # noqa: PLC0415
+    from brain.connectors.google.gmail import heartbeat_email_summary  # noqa: PLC0415
+    from brain.connectors.runner import backoff_seconds  # noqa: PLC0415
+    from brain.connectors.state import ConnectorStateRepo  # noqa: PLC0415
+
     settings: Settings = get_settings()
     if not settings.gmail_label_id:
         print("gmail-poll: GMAIL_LABEL_ID unset — nothing to poll", file=sys.stderr)
         return 78
-    token = Keychain().read(GMAIL_ACCOUNT)
-    if not token:
+    if not (Keychain().read(GMAIL_ACCOUNT) or "").strip():
         print(
             "gmail-poll: no refresh token in the keychain — run `brain gmail-auth` first",
             file=sys.stderr,
         )
         return 78
-    poller = _build_email_poller(settings)
+    try:
+        assert_not_live_store(
+            settings.database_url,
+            settings.qdrant_collection,
+            allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+        )
+    except RuntimeError as exc:
+        print(f"gmail-poll: refusing to start against the live store: {exc}", file=sys.stderr)
+        return 78
+
+    indexer = _side_process_indexer()
+    attachments = _cli_attachment_service(settings, indexer=indexer)
+
     if args.once:
-        summary = poller.poll_once()
-        heartbeat_email(summary)
+        summary = _gmail_poll_cycle(indexer, attachments)
+        heartbeat_email_summary(summary)
         print(
-            f"gmail-poll: state={summary.state} listed={summary.listed} new={summary.new} "
-            f"skipped={summary.skipped} errors={summary.errors}"
+            f"gmail-poll: state={summary.state} listed={summary.fetched} "
+            f"new={summary.created} skipped={summary.skipped} errors={summary.errors}"
         )
         return 0
-    return poller.run_forever()
+
+    stall_pause_s = 300.0
+    while True:
+        try:
+            summary = _gmail_poll_cycle(indexer, attachments)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 — one bad cycle never kills the agent
+            logger.error("gmail-poll: cycle failed: %s", exc, exc_info=True)
+            time.sleep(stall_pause_s)
+            continue
+        heartbeat_email_summary(summary)
+        with SessionLocal() as session:
+            attempt = ConnectorStateRepo(session).attempt("email")
+        if summary.state == "ok":
+            pause = float(settings.gmail_poll_interval_s)
+        elif summary.state == "auth_error":
+            pause = stall_pause_s  # user must re-consent; polling cannot help
+        else:
+            pause = max(float(settings.gmail_poll_interval_s), backoff_seconds(attempt))
+        logger.info(
+            "gmail-poll: state=%s listed=%s new=%s skipped=%s errors=%s; next poll in %.0fs",
+            summary.state,
+            summary.fetched,
+            summary.created,
+            summary.skipped,
+            summary.errors,
+            pause,
+        )
+        time.sleep(pause)
 
 
 # --- connectors (connectors ticket) -------------------------------------------
@@ -1135,10 +1207,19 @@ def _connectors_list() -> int:
     return 0
 
 
-def _build_connector(name: str) -> Any:
+def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:
     """Instantiate the registry's connector with production seams: the shared
     keychain token (same item as gmail-auth — one OAuth client, one token)
-    and the default google service factory. Registry aliases resolve."""
+    and the default google service factory. Registry aliases resolve.
+
+    For the email source a session wires the C5 legacy-seed + fast-path seams:
+    the first sync (and every full resync) copies the old seen-ledger into
+    connector_records (idempotent), and known gmail ids skip the GET.
+
+    ``dry_run=True`` (review B1) wires READ-ONLY seams only: no legacy seed
+    runs and the Message-ID backstop only REPORTS its decision — --dry-run
+    writes nothing (no ledger, no cursor, no state, no items).
+    """
     from brain.connectors import get
     from brain.connectors.google.base import default_service_factory
     from brain.services.keychain import GMAIL_ACCOUNT, Keychain
@@ -1152,7 +1233,31 @@ def _build_connector(name: str) -> Any:
             file=sys.stderr,
         )
         raise SystemExit(78)
-    return cls(token_loader=lambda: token, service_factory=default_service_factory)
+    kwargs: dict[str, Any] = {
+        "token_loader": lambda: token,
+        "service_factory": default_service_factory,
+    }
+    if session is not None and name in ("email", "gmail"):
+        if dry_run:
+            # --dry-run writes NOTHING: no seed; the backstop only reports.
+            from brain.connectors.google.gmail import rfc_backstop_report
+            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_report(
+                session, rfc, gmail_id
+            )
+        else:
+            from brain.connectors.google.gmail import (
+                rfc_backstop_put,
+                seed_connector_records_from_email_ledger,
+            )
+            from brain.connectors.state import ConnectorRecordRepo
+
+            records = ConnectorRecordRepo(session)
+            kwargs["legacy_seed"] = lambda: seed_connector_records_from_email_ledger(session)
+            kwargs["is_known"] = lambda gmail_id: records.get("email", gmail_id) is not None
+            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(
+                session, rfc, gmail_id
+            )
+    return cls(**kwargs)
 
 
 def _connectors_sync(args: argparse.Namespace) -> int:
@@ -1194,7 +1299,7 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         from brain.repositories.items import ItemsRepository  # noqa: PLC0415
 
         if args.dry_run:
-            connector = _build_connector(args.name)
+            connector = _build_connector(args.name, session=session, dry_run=True)
             state = ConnectorStateRepo(session).get(connector.name)
             result = connector.fetch(state.cursor if state else None, limit=args.limit)
             print(
@@ -1215,7 +1320,7 @@ def _connectors_sync(args: argparse.Namespace) -> int:
             deps.get_classifier(),
             deps.get_item_indexer(),
         )
-        connector = _build_connector(args.name)
+        connector = _build_connector(args.name, session=session)
         state_repo = ConnectorStateRepo(session)
         runner = ConnectorRunner(
             connector,
@@ -1244,7 +1349,8 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         connector.close()
     print(
         f"connectors sync {summary.connector}: state={summary.state} "
-        f"created={summary.created} updated={summary.updated} deleted={summary.deleted} "
+        f"created={summary.created} deduped={summary.deduped} updated={summary.updated} "
+        f"deleted={summary.deleted} "
         f"skipped={summary.skipped} errors={summary.errors} "
         f"cursor_saved={summary.cursor_saved}"
         + (f" error={summary.error}" if summary.error else "")
@@ -1267,6 +1373,7 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
         state=nxt.state,
         fetched=acc.fetched + nxt.fetched,
         created=acc.created + nxt.created,
+        deduped=acc.deduped + nxt.deduped,
         updated=acc.updated + nxt.updated,
         deleted=acc.deleted + nxt.deleted,
         skipped=acc.skipped + nxt.skipped,

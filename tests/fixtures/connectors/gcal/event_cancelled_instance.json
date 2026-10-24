@@ -1,0 +1,8 @@
+{
+  "kind": "calendar#event",
+  "etag": "\"34025dd0e0f61d0\"",
+  "id": "weekly-series-id-5678_20261105T150000Z",
+  "status": "cancelled",
+  "recurringEventId": "weekly-series-id-5678",
+  "originalStartTime": {"dateTime": "2026-11-05T17:00:00+02:00", "timeZone": "Asia/Jerusalem"}
+}

@@ -1,0 +1,22 @@
+{
+  "kind": "calendar#event",
+  "etag": "\"34021f8d8b0f61d0\"",
+  "id": "1q2w3e4r5t6y7u8i9o0p",
+  "status": "confirmed",
+  "htmlLink": "https://www.google.com/calendar/event?eid=MXEydzNlNHI1dDZ5N3U4aTlvMHAK",
+  "created": "2026-10-01T06:30:00.000Z",
+  "updated": "2026-10-02T08:15:21.032Z",
+  "summary": "אימון כדורסל",
+  "description": "להביא כדור ומים\nאולם 2",
+  "location": "אולם הספורט, רחוב החלוצים 12, תל אביב",
+  "creator": {"email": "coach@example.com", "displayName": "דני כהן"},
+  "organizer": {"email": "coach@example.com", "displayName": "דני כהן"},
+  "start": {"dateTime": "2026-10-29T17:00:00+02:00", "timeZone": "Asia/Jerusalem"},
+  "end": {"dateTime": "2026-10-29T18:30:00+02:00", "timeZone": "Asia/Jerusalem"},
+  "iCalUID": "1q2w3e4r5t6y7u8i9o0p@google.com",
+  "attendees": [
+    {"email": "parent1@example.com", "displayName": "אבי לוי", "responseStatus": "accepted"},
+    {"email": "parent2@example.com", "responseStatus": "needsAction"}
+  ],
+  "eventType": "default"
+}

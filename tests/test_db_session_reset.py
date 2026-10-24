@@ -42,7 +42,10 @@ _EMPTY_TABLE_TEST = (
     "::test_attachments_table_is_empty_at_session_start"
 )
 _EMAIL_TEST = (
-    "tests/services/test_attachments_email.py::TestEmailAttachments"
+    # C5: the old tests/services/test_attachments_email.py moved 1:1 onto the
+    # connector path (the ONE live Gmail path); the DB-level capture test is
+    # its replacement, with the same T1-scoped parent_item_id assertion.
+    "tests/test_connectors_gmail.py::TestAttachments"
     "::test_attachment_bytes_captured_with_source_email"
 )
 

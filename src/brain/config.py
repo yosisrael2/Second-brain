@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from brain.schemas import RAW_TEXT_MAX_LENGTH
+
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
 DEFAULT_ANTHROPIC_URL = "https://api.anthropic.com/v1"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
@@ -119,6 +121,12 @@ class Settings(BaseSettings):
     # real extractor (never blocks the capture reply either way).
     enrichment_daily_cap: int = 100
     enrichment_worker_enabled: bool = False
+    # A2 activation seam: which extractor the enrichment pipeline builds
+    # (services.extraction.service.build_extractor is the ONE chooser).
+    # 'stub' (default) keeps live behaviour exactly as A1 shipped it; 'llm'
+    # selects the real LLM extractor. Activation = this + the worker switch,
+    # never a code change. Literal validation rejects anything else.
+    enrichment_extractor: Literal["stub", "llm"] = "stub"
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
@@ -180,6 +188,19 @@ class Settings(BaseSettings):
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
 
+    # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
+    # comma-separated list of immutable Drive folder ids; EMPTY (the default)
+    # means the connector fetches nothing at all. gdrive_text_cap bounds each
+    # file's exported text in chars (truncation flagged in the record's meta);
+    # gdrive_depth bounds how many folder levels below the allowlisted folders
+    # the full listing walks (the connector hard-caps it at 5).
+    gdrive_folders: str = Field(default="", validation_alias="BRAIN_GDRIVE_FOLDERS")
+    gdrive_text_cap: int = Field(
+        default=RAW_TEXT_MAX_LENGTH,  # the runner clamps to the item max anyway
+        validation_alias="BRAIN_GDRIVE_TEXT_CAP",
+    )
+    gdrive_depth: int = Field(default=1, validation_alias="BRAIN_GDRIVE_DEPTH")
+
     # Connectors (connectors ticket): the enabled data sources, comma
     # separated (BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"). Default empty
     # = none enabled; `brain connectors sync` refuses disabled names and
@@ -218,6 +239,16 @@ class Settings(BaseSettings):
             if canonical not in enabled:
                 enabled.append(canonical)
         return tuple(enabled)
+
+    # Google Calendar connector (connectors ticket): comma-separated calendar
+    # ids to sync (allowlist, order preserved). 'primary' is the authenticated
+    # user's main calendar; an empty value syncs nothing.
+    brain_gcal_calendars: str = "primary"
+    # How far back the first gcal full sync reaches (instances that ENDED more
+    # than this many days ago are never fetched; the cutoff is frozen at the
+    # first sync and persisted in the connector cursor). There is NO future
+    # cap: a dropped future instance would never be re-delivered.
+    brain_gcal_past_days: int = 60
 
     # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
     # of task lists to sync, comma-separated list IDs or titles (titles matched
@@ -258,6 +289,11 @@ class Settings(BaseSettings):
             for part in self.telegram_allowed_user_ids.split(",")
             if part.strip()
         )
+
+    @property
+    def gcal_calendar_ids(self) -> tuple[str, ...]:
+        """The calendar allowlist in order; empty means the gcal connector syncs nothing."""
+        return tuple(part.strip() for part in self.brain_gcal_calendars.split(",") if part.strip())
 
     @field_validator("timezone")
     @classmethod

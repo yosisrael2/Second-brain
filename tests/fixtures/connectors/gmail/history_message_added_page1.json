@@ -1,0 +1,13 @@
+{
+  "history": [
+    {
+      "id": "9002",
+      "messagesAdded": [
+        {
+          "message": {"id": "m2", "threadId": "t2", "labelIds": ["Label_school"]}
+        }
+      ]
+    }
+  ],
+  "historyId": "9003"
+}

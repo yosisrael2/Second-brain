@@ -24,6 +24,7 @@ const state = {
   health: null,
   flow: null,
   whatsapp: null,
+  connectors: null,
   events: { events: [], total: 0, offset: 0, limit: 25 },
   stats: null,
   traceHighlight: null,
@@ -104,6 +105,10 @@ async function refreshAll() {
     api("/ops/whatsapp").then((wa) => {
       state.whatsapp = wa;
       if (state.tab === "health") renderWhatsappCard();
+    }).catch(() => {}),
+    api("/ops/connectors").then((connectors) => {
+      state.connectors = connectors;
+      if (state.tab === "health") renderConnectorsCard();
     }).catch(() => {}),
     api("/ops/flow").then((flow) => {
       state.flow = flow;
@@ -494,6 +499,40 @@ function renderWhatsappCard() {
   $("whatsapp-channels").textContent = lines.join("\n\n");
 }
 
+function renderConnectorsCard() {
+  // C6 Sources panel: every registered connector + stale state rows, from
+  // GET /ops/connectors — last ok, cursor present, records, quarantined,
+  // last error. Rows are plain text (textContent), so last_error cannot
+  // inject HTML. Chip + summary are decided by the endpoint (sources_chip,
+  // tested in tests/test_ops_connectors.py); this file only renders them.
+  const card = $("connectors-card");
+  const payload = state.connectors;
+  if (!card || !payload) return;
+  const connectors = payload.connectors || [];
+  const chip = $("connectors-chip");
+  const chipInfo = payload.chip || { status: "disabled", summary: "" };
+  const chipClass = {
+    ok: "ok",
+    error: "down",
+    pending: "degraded",
+    disabled: "disabled",
+  }[chipInfo.status] || "disabled";
+  chip.textContent = chipInfo.status;
+  chip.className = `chip ${chipClass}`;
+  $("connectors-summary").textContent = chipInfo.summary;
+  const lines = connectors.map((entry) => {
+    const lastOk = entry.last_ok_at ? ago(entry.last_ok_at) : "never";
+    const error = entry.last_error ? ` — ${String(entry.last_error).slice(0, 140)}` : "";
+    return (
+      `${entry.name}${entry.enabled ? "" : " (disabled)"}\n` +
+      `  last ok ${lastOk} · cursor ${entry.cursor_present ? "yes" : "no"} · ` +
+      `records ${entry.records ?? 0} · quarantined ${entry.quarantined ?? 0}` +
+      error
+    );
+  });
+  $("connectors-rows").textContent = lines.join("\n\n");
+}
+
 function renderHealth() {
   const health = state.health;
   if (!health) return;
@@ -798,6 +837,14 @@ function switchTab(name) {
   }
   const title = $("page-title");
   if (title) title.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+  if (name === "health") {
+    // Render from the state we already have: a slow or failed fetch must
+    // not blank the Health-tab cards until the next 5s tick lands.
+    renderOverall();
+    renderHealth();
+    renderWhatsappCard();
+    renderConnectorsCard();
+  }
   refreshAll();
 }
 

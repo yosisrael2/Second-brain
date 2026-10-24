@@ -13,6 +13,7 @@ import pytest
 from brain.ai.gmail import (
     GMAIL_SCOPE,
     GmailAuthError,
+    GmailError,
     GmailLabelError,
     RestGmailClient,
     default_service_factory,
@@ -286,3 +287,122 @@ class TestListPagination:
         stubs = client.list_messages(query="", label_ids=["L"])
         assert endless.calls <= 5  # small cap: bounded walk per poll
         assert len(stubs) == endless.calls
+
+
+# --- C5 additions: history walk, profile cursor, injected service --------------
+
+
+class _FakeHistoryResource:
+    def __init__(self, calls, pages, error=None):
+        self._calls = calls
+        self._pages = pages
+        self._error = error
+
+    def list(self, **kwargs):
+        self._calls.append({"history.list": kwargs})
+        page_token = kwargs.get("pageToken")
+        if self._error is not None:
+            return _FakeRequest(error=self._error)
+        page = self._pages.get(page_token or "first", {"history": [], "historyId": "1"})
+        return _FakeRequest(result=page)
+
+
+class _FakeHistoryUsers:
+    def __init__(self, calls, pages, profile, error=None):
+        self._calls = calls
+        self._pages = pages
+        self._profile = profile
+        self._error = error
+
+    def history(self):
+        return _FakeHistoryResource(self._calls, self._pages, self._error)
+
+    def getProfile(self, userId):  # noqa: N803
+        self._calls.append({"getProfile": userId})
+        return _FakeRequest(result={"historyId": self._profile})
+
+
+class TestHistoryWalk:
+    def test_list_history_yields_pages_until_no_next_token(self):
+        calls: list = []
+        pages = {
+            "first": {"history": [{"id": "1"}], "historyId": "2", "nextPageToken": "p2"},
+            "p2": {"history": [{"id": "2"}], "historyId": "3"},
+        }
+        client = RestGmailClient(
+            token_loader=lambda: "tok",
+            service_factory=lambda token, user_id: _FakeService(
+                _FakeUsers(_FakeMessages(calls, None, None))
+            )
+            if False
+            else type(
+                "S",
+                (),
+                {
+                    "users": lambda self: _FakeHistoryUsers(
+                        calls, pages, profile="3"
+                    )
+                },
+            )(),
+        )
+        pages_out = list(
+            client.list_history(start_history_id="9000", label_id="LABEL_1")
+        )
+        assert [p["historyId"] for p in pages_out] == ["2", "3"]
+        assert calls[0]["history.list"]["startHistoryId"] == "9000"
+        assert calls[0]["history.list"]["labelId"] == "LABEL_1"
+        assert calls[1]["history.list"]["pageToken"] == "p2"
+
+    def test_list_history_translates_http_errors(self):
+        calls: list = []
+        client = RestGmailClient(
+            token_loader=lambda: "tok",
+            service_factory=lambda token, user_id: type(
+                "S", (), {"users": lambda self: _FakeHistoryUsers(
+                    calls, pages={}, profile=None, error=_FakeHttpError(503)
+                )}
+            )(),
+        )
+        with pytest.raises(GmailError) as excinfo:
+            list(client.list_history(start_history_id="1", label_id="L"))
+        assert excinfo.value.status == 503
+
+    def test_profile_history_id_returns_the_current_cursor(self):
+        calls: list = []
+        client = RestGmailClient(
+            token_loader=lambda: "tok",
+            service_factory=lambda token, user_id: type(
+                "S", (), {"users": lambda self: _FakeHistoryUsers(calls, pages={}, profile="42")}
+            )(),
+        )
+        assert client.profile_history_id() == "42"
+
+
+class TestInjectedService:
+    def test_prebuilt_service_skips_the_token_loader(self):
+        """The connector passes the ONE shared service; no token read, no
+        factory call."""
+        calls: list = []
+
+        class S:
+            def users(self):
+                calls.append("users")
+                return _FakeUsers(_FakeMessages(calls, {"messages": []}, None))
+
+        client = RestGmailClient(service=S())  # no token_loader at all
+        stubs = client.list_messages(query="", label_ids=["L"])
+        assert stubs == []
+        assert calls  # the service was used directly
+
+
+class TestDecodeAttachmentPayload:
+    def test_decodes_b64url_and_refuses_empty_data(self):
+        import base64
+
+        from brain.ai.gmail import decode_attachment_payload
+
+        blob = base64.urlsafe_b64encode(b"bytes!").decode().rstrip("=")
+        raw = {"data": blob, "size": 6}
+        assert decode_attachment_payload(raw, "a1", "m1") == b"bytes!"
+        with pytest.raises(GmailError):
+            decode_attachment_payload({}, "a1", "m1")
