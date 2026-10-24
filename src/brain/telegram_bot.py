@@ -311,6 +311,7 @@ class BotServices:
     ask: Any  # AskService
     memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
     attachments: Any = None  # AttachmentService (F1; None -> feature missing)
+    enrichment: Any = None  # EnrichmentService (A2 worker; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -346,6 +347,12 @@ def _live_services_factory() -> ServicesFactory:
             from brain.services.memory import MemoryService  # noqa: PLC0415
 
             memory = MemoryService(MemoryRepository(session))
+            from brain.config import get_settings  # noqa: PLC0415
+            from brain.services.extraction.service import (  # noqa: PLC0415
+                EnrichmentService,
+            )
+
+            settings = get_settings()
             yield BotServices(
                 ingest=IngestService(repo, deps.get_classifier(), deps.get_item_indexer()),
                 items=ItemsService(repo, deps.get_item_indexer()),
@@ -358,6 +365,14 @@ def _live_services_factory() -> ServicesFactory:
                     items_repo=repo,
                 ),
                 memory=memory,
+                enrichment=EnrichmentService(
+                    repo,
+                    session,
+                    memory=memory,
+                    indexer=deps.get_item_indexer(),
+                    daily_cap=settings.enrichment_daily_cap,
+                    timezone=settings.timezone,
+                ),
             )
         finally:
             session.close()
@@ -426,6 +441,9 @@ class TelegramBot:
         self._fix_flow: dict[int, str] = {}
         self._outbound: list[tuple[int, Reply]] = []
         self._last_ping_check = 0.0
+        # A2 enrichment worker: last-run marker (monotonic) + overlap guard
+        self._enrich_last_run = 0.0
+        self._enrich_running = False
 
     def is_allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self._allowed_ids
@@ -1647,6 +1665,61 @@ def _repo_of(session):
     return ItemsRepository(session)
 
 
+def _run_enrichment_pass(core: TelegramBot) -> int:
+    """One synchronous enrichment pass (A2 worker; runs in a worker thread).
+
+    Reuses the per-update service factory (fresh session); the completion hook
+    is the SAME ``on_children_changed`` the PR C tests wire, so every changed
+    source queues its proposal card. Returns the children the pass created.
+    """
+    with core._services_factory() as services:  # noqa: SLF001 (same module)
+        service = services.enrichment
+        if service is None:
+            return 0
+        service.on_children_changed = core.proposals_changed
+        report = service.run_once(datetime.now(tz=UTC), limit=20)
+        return int(report.children_created)
+
+
+async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
+    """The scheduled enrichment pass (A2 wiring; ENRICHMENT_WORKER_ENABLED).
+
+    Off by default: when the switch is false nothing is scheduled and nothing
+    changes. When true: one ``run_once`` pass per interval, run in a worker
+    thread (LLM calls are slow; polling must stay responsive), never
+    overlapping the previous pass, errors logged + ops events — the bot keeps
+    running. Proposal cards queued by the pass are flushed here.
+    """
+    from brain.config import get_settings  # noqa: PLC0415
+
+    settings = get_settings()
+    if not settings.enrichment_worker_enabled:
+        return
+    now = time.monotonic()
+    if core._enrich_running:  # noqa: SLF001 (same module)
+        return  # a pass never overlaps the previous one
+    if now - core._enrich_last_run < settings.enrichment_worker_interval_s:
+        return
+    core._enrich_running = True
+    core._enrich_last_run = now
+    try:
+        created = await asyncio.to_thread(_run_enrichment_pass, core)
+        if created:
+            logger.info("telegram: enrichment pass created %d child(ren)", created)
+        for chat_id, reply in core.drain_outbound():
+            await _send(tg, chat_id, reply)
+    except Exception:  # noqa: BLE001 — the worker must never kill the bot
+        record_event(
+            "enrichment",
+            "worker_pass_failed",
+            ok=False,
+            detail={"error": "enrichment worker pass failed"},
+        )
+        logger.exception("telegram: enrichment worker pass failed")
+    finally:
+        core._enrich_running = False
+
+
 async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
     """Send queued proposal cards + the throttled 48h pings; never stops the loop."""
     import time as _time  # noqa: PLC0415
@@ -1659,6 +1732,7 @@ async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
             core._last_ping_check = now
             for chat_id, reply in core.due_pings():
                 await _send(tg, chat_id, reply)
+        await _enrichment_tick(tg, core)
     except Exception:  # noqa: BLE001 — background jobs must never kill polling
         record_event("telegram", EVENT_ERROR, ok=False, detail={"error": "proposal flush failed"})
         logger.exception("telegram: proposal flush failed")

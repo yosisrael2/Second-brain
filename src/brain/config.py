@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     # real extractor (never blocks the capture reply either way).
     enrichment_daily_cap: int = 100
     enrichment_worker_enabled: bool = False
+    # A2 wiring: the in-bot worker's tick interval. Only read when
+    # enrichment_worker_enabled is true (default OFF: nothing scheduled).
+    enrichment_worker_interval_s: int = 300
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
