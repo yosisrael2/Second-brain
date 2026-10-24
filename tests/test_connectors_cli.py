@@ -9,7 +9,7 @@ import pytest
 
 import brain.cli as cli
 from brain.config import get_settings
-from brain.connectors import register
+from brain.connectors import Connector, register
 from brain.connectors.base import FetchResult
 from brain.connectors.testing import FakeConnector, make_record
 from brain.db.models import ConnectorState
@@ -72,7 +72,12 @@ class FakeKeychain:
 
 @pytest.fixture(name="settings_env")
 def settings_env_fixture(monkeypatch: pytest.MonkeyPatch):
-    """Hermetic settings: connectors enabled, no live-store risk."""
+    """Hermetic settings: connectors enabled, no live-store risk.
+
+    Only connectors THIS PR needs — never gdrive: its adapter merges with
+    #57 and an enabled-here assertion would depend on merge order (the
+    'not available' case simulates its own adapterless name instead).
+    """
     monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks")
     monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
     get_settings.cache_clear()
@@ -156,11 +161,51 @@ def test_sync_refuses_unknown_disabled_and_unavailable(settings_env, capsys):
     assert cli.main(["connectors", "sync", "nosuch"]) == 78
     assert "not enabled" in capsys.readouterr().err
     # A known name that is NOT in BRAIN_CONNECTORS for this fixture.
-    assert cli.main(["connectors", "sync", "gdrive"]) == 78
+    assert cli.main(["connectors", "sync", "email"]) == 78
     assert "not enabled" in capsys.readouterr().err
-    # Enabled but no adapter module merged yet -> 'not available'.
-    assert cli.main(["connectors", "sync", "gtasks"]) == 78
-    assert "not available" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("adapter_registered", [False, True])
+def test_sync_enabled_but_not_available_is_merge_order_safe(
+    settings_env, capsys, monkeypatch, adapter_registered
+):
+    """'Enabled but not available' must not depend on MERGE ORDER.
+
+    This case used to name gdrive and rely on its adapter not being merged
+    ("gdrive's adapter is still pending") — the moment #57 merges, main goes
+    red. Hermetic instead: enable gdrive HERE, neuter the registry bootstrap
+    (so no real module import/register can interfere, ever), patch the exact
+    lookup the CLI uses to raise KeyError for gdrive, and prove the outcome
+    with AND without an adapter registered under that name.
+    """
+    import brain.connectors as registry
+
+    monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks,gdrive")
+    get_settings.cache_clear()
+    monkeypatch.setattr(registry, "ensure_registered", lambda: None)
+    real_get = registry.get
+
+    def fake_get(name: str):
+        if name == "gdrive":
+            raise KeyError(name)  # simulate: no adapter resolves on this install
+        return real_get(name)
+
+    monkeypatch.setattr(registry, "get", fake_get)
+    if adapter_registered:
+
+        class _FakeGdrive(Connector):
+            name = "gdrive"
+
+            def fetch(self, cursor, *, limit):  # pragma: no cover - never reached
+                raise AssertionError("the CLI must refuse before any fetch")
+
+        # Direct dict insert, not register(): no name collision with the real
+        # gdrive adapter once #57 merges, and monkeypatch restores the dict.
+        monkeypatch.setitem(registry._REGISTRY, "gdrive", _FakeGdrive)
+
+    assert cli.main(["connectors", "sync", "gdrive"]) == 78
+    err = capsys.readouterr().err
+    assert "not available" in err
 
 
 def test_sync_dry_run_prints_records_and_writes_nothing(
@@ -285,8 +330,12 @@ def test_auth_google_stores_only_the_refresh_token(
     assert cli.main(["connectors", "auth", "google", "--client-secret", str(secret)]) == 0
     out = capsys.readouterr().out
     expected_scopes = sorted(
-        {scope for name in ("gcal", "gtasks") for scope in SCOPE_BY_CONNECTOR[name]}
+        {
+            scope
+            for name in get_settings().connectors_enabled  # whatever the fixture enabled
+            for scope in SCOPE_BY_CONNECTOR[name]
+        }
     )
-    assert flow.requested_scopes == expected_scopes  # the union of enabled connectors
+    assert set(flow.requested_scopes) == set(expected_scopes)  # union of enabled connectors
     assert "1//google-union-token" not in out  # the token is NEVER printed
     assert "second-brain-gmail" in out
