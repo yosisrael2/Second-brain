@@ -22,6 +22,10 @@ Semantics that matter:
 - Returns None only when the rule itself cannot be parsed (the caller falls
   back to the single DTSTART item — a paste is never lost to a malformed
   rule); a valid rule with an empty window returns an empty list.
+- A MISSING python-dateutil fails LOUDLY: the import is module-level, so an
+  env that skipped the editable install errors on the first recurring paste
+  instead of silently degrading every series to one item (worker_10 hit
+  exactly that). The broad except below is ONLY for malformed rule text.
 """
 
 from __future__ import annotations
@@ -29,6 +33,8 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+
+from dateutil.rrule import rrulestr
 
 _UNTIL_RE = re.compile(r"(^|;)UNTIL=([^;]+)", re.IGNORECASE)
 
@@ -68,8 +74,6 @@ def expand_occurrences(
 
 def _build_rule(dtstart: datetime, rrule_text: str):
     """dateutil rule for the RRULE value; UNTIL normalized to the DTSTART's zone."""
-    from dateutil.rrule import rrulestr  # noqa: PLC0415 — cheap, local import
-
     text = rrule_text.strip()
 
     def _until_naive(match: re.Match) -> str:
