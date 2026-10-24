@@ -14,8 +14,16 @@ Current state on main:
 | Gmail | `email` (alias `gmail`) | yes — bot-captured `email` items | now |
 
 All connector scopes are READ-ONLY. Enabling never lets a connector write to
-Google. Sync is manual (you run `brain connectors sync`); only the Gmail
-poller runs as a background agent (and only after its own opt-in below).
+Google. Once the opt-in **connectors scheduler** (`com.secondbrain.connectors`)
+is installed, enabled non-Gmail connectors sync on a schedule with no
+hand-running — `scripts/service.sh install` installs it only when
+`BRAIN_CONNECTORS` names a non-email connector (email keeps its own agent,
+`com.secondbrain.email`, which the scheduler never touches); each pass runs
+one `brain connectors sync <name>` per enabled connector, sleeps
+`BRAIN_CONNECTORS_INTERVAL_S` (default 300) between passes, isolates failures
+per source (one failing connector never blocks the others), and maps exits
+onto launchd's KeepAlive like the other agents. Until it is installed, sync
+is manual (`brain connectors sync <name>`).
 
 ## How enabling works (read once)
 
@@ -30,7 +38,11 @@ poller runs as a background agent (and only after its own opt-in below).
   both do this, and `load_env_file` only fills variables that are not already
   set in the environment). Editing `.env` does nothing to a running process.
   After editing: `scripts/service.sh restart` (kickstarts every installed
-  agent; there is no per-agent restart target).
+  agent; there is no per-agent restart target) — and if the connectors
+  scheduler is not installed yet, `scripts/service.sh install` installs it
+  now that `BRAIN_CONNECTORS` names a non-email connector (a later `install`
+  also picks up an allowlist change; an uninstall removes the plist when the
+  list is empty or email-only).
 - Hand-run `brain connectors` commands read `.env` fresh on every invocation
   (a new process each time) — no restart involved for them.
 - **Every live command below pins the live store explicitly**: the app
@@ -418,5 +430,5 @@ historyId cursor stay; re-enabling later resumes from the cursor.
 | --- | --- | --- | --- | --- |
 | Enable switch | `BRAIN_CONNECTORS=gcal` + `BRAIN_GCAL_CALENDARS` | `BRAIN_CONNECTORS=gtasks` (+ `GTASKS_LISTS`) | `BRAIN_CONNECTORS=gdrive` + allowlist | `BRAIN_CONNECTORS=email` + `GMAIL_LABEL_ID` |
 | Adopt first? | **yes** (pasted calendar items) | no (nothing to adopt) | no | **yes** (bot-captured email) |
-| Background agent | none (manual sync) | none (manual sync) | none (manual sync) | `com.secondbrain.email` (opt-in via install) |
+| Background agent | `com.secondbrain.connectors` (opt-in via install) | `com.secondbrain.connectors` (opt-in via install) | `com.secondbrain.connectors` (opt-in via install) | `com.secondbrain.email` (opt-in via install) |
 | Switch off | unset + restart | unset + restart | unset + restart | unset label + `service.sh install` |
