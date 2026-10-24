@@ -7,7 +7,7 @@ are recording fakes. No network anywhere.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -77,6 +77,15 @@ class Harness:
         )
         self.state = ConnectorStateRepo(session)
         self.records = ConnectorRecordRepo(session)
+        # Movable clock: tests tick PAST the persisted backoff window to
+        # simulate the next scheduler pass (an immediate retry of a FAILED
+        # connector is deliberately skipped now — that is the backoff
+        # contract). Successful runs reset the counter and need no tick.
+        self.clock_box = {"now": datetime(2026, 10, 23, 12, 0, tzinfo=UTC)}
+
+    def tick(self, seconds: float) -> None:
+        """Move the harness clock forward (past a backoff window)."""
+        self.clock_box["now"] += timedelta(seconds=seconds)
 
     def runner(self, connector: FakeConnector) -> ConnectorRunner:
         return ConnectorRunner(
@@ -88,7 +97,7 @@ class Harness:
             indexer=self.indexer,
             enrichment=self.enrichment,
             attachments=self.attachments,
-            clock=lambda: datetime(2026, 10, 23, 12, 0, tzinfo=UTC),
+            clock=lambda: self.clock_box["now"],
         )
 
     def item(self, external_id: str) -> MemoryItem | None:
@@ -142,9 +151,7 @@ def test_new_record_creates_item_with_framework_meta(runner_db):
 
 def test_same_version_rerun_is_idempotent(runner_db):
     h = Harness(runner_db)
-    connector = FakeConnector(
-        batches=[_batch(make_record()), _batch(make_record())]
-    )
+    connector = FakeConnector(batches=[_batch(make_record()), _batch(make_record())])
     runner = h.runner(connector)
     first = runner.run()
     second = runner.run()
@@ -260,9 +267,7 @@ def test_deletion_touches_only_the_marks_not_the_content(runner_db):
 def test_user_edited_item_is_still_hidden_when_source_deletes(runner_db):
     """Review bug 2: deletion applies regardless of who owns the text."""
     h = Harness(runner_db)
-    connector = FakeConnector(
-        batches=[_batch(make_record()), _batch(make_record(deleted=True))]
-    )
+    connector = FakeConnector(batches=[_batch(make_record()), _batch(make_record(deleted=True))])
     runner = h.runner(connector)
     runner.run()
     item = h.item("r1")
@@ -399,9 +404,9 @@ def test_long_text_record_is_clamped_not_fatal(runner_db):
     assert item.meta["original_length"] == 12_345
     # the marker is the sha of the CLAMPED text, or every long item would
     # look user-edited forever
-    assert item.meta["connector_text_sha"] == hashlib.sha256(
-        item.raw_text.encode("utf-8")
-    ).hexdigest()
+    assert (
+        item.meta["connector_text_sha"] == hashlib.sha256(item.raw_text.encode("utf-8")).hexdigest()
+    )
 
 
 def test_long_text_update_clamps_too(runner_db):
@@ -460,9 +465,11 @@ def test_poison_record_quarantines_and_releases_cursor(runner_db):
 
     s1 = runner.run()
     assert s1.errors == 1 and s1.cursor_saved is False
+    h.tick(backoff_seconds(1) + 1)
     s2 = runner.run()
     assert s2.errors == 1 and s2.cursor_saved is False
 
+    h.tick(backoff_seconds(2) + 1)
     s3 = runner.run()  # 3rd failure: quarantine, not an error -> cursor moves
     assert s3.errors == 0
     assert s3.cursor_saved is True
@@ -507,7 +514,9 @@ def test_db_poisoned_record_quarantines_without_aborting_run(runner_db):
     assert s1.cursor_saved is False
     assert h.item("good2") is not None  # earlier success survived the rollback
 
+    h.tick(backoff_seconds(1) + 1)
     runner.run()  # failure 2
+    h.tick(backoff_seconds(2) + 1)
     s3 = runner.run()  # failure 3 -> quarantined, cursor released
 
     assert s3.errors == 0
@@ -538,11 +547,14 @@ def test_quarantined_record_retries_on_version_bump(runner_db):
         ]
     )
     runner = h.runner(connector)
-    for _ in range(3):
+    for i in range(3):
+        if i:
+            h.tick(backoff_seconds(i) + 1)
         runner.run()
     row = h.records.get("gcal", "bad")
     assert row is not None and row.status == "failed"
 
+    h.tick(backoff_seconds(3) + 1)
     summary = runner.run()  # v2: retried and it works now
 
     assert summary.created == 1
@@ -604,9 +616,7 @@ def test_new_version_updates_item_in_place_and_reindexes(runner_db):
 
 def test_deleted_marks_and_hides_but_never_hard_deletes(runner_db):
     h = Harness(runner_db)
-    connector = FakeConnector(
-        batches=[_batch(make_record()), _batch(make_record(deleted=True))]
-    )
+    connector = FakeConnector(batches=[_batch(make_record()), _batch(make_record(deleted=True))])
     runner = h.runner(connector)
     first = runner.run()
     item = h.item("r1")
@@ -709,9 +719,7 @@ def test_cursor_advances_only_after_full_batch_success(runner_db):
         text="body 3",
         attachments=(AttachmentRef(ref_id="missing", filename="f", mime_type="text/plain"),),
     )
-    connector = FakeConnector(
-        batches=[_batch(*records)], attachments={("r3", "present"): b"x"}
-    )
+    connector = FakeConnector(batches=[_batch(*records)], attachments={("r3", "present"): b"x"})
     runner = h.runner(connector)
     summary = runner.run()
 
@@ -724,13 +732,9 @@ def test_cursor_advances_only_after_full_batch_success(runner_db):
     assert h.item("r2") is not None
     # Fix the failure and re-run: nothing duplicates, cursor advances now.
     connector._batches.append(
-        _batch(
-            *[
-                make_record(external_id=f"r{i}", text=f"body {i}")
-                for i in range(1, 6)
-            ]
-        )
+        _batch(*[make_record(external_id=f"r{i}", text=f"body {i}") for i in range(1, 6)])
     )
+    h.tick(backoff_seconds(1) + 1)
     retry = runner.run()
     # The loop continues past a failed record, so r4/r5 were already written
     # in the first run; the retry finds them UNCHANGED (no duplicates),
@@ -765,26 +769,98 @@ def test_auth_error_stops_the_run_with_clear_state(runner_db):
     assert state.cursor is None
 
 
+def test_backoff_window_skips_the_fetch_and_reports_retry_in_s(runner_db):
+    """The persisted backoff is ENFORCED: after a retryable failure with
+    attempt=1 (window 10s) an immediate re-run must NOT fetch — the runner
+    returns state='backoff' with the seconds remaining, and the persisted
+    state (last_run_at/attempt) is left untouched so the window keeps
+    shrinking."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        errors=[ConnectorRetryableError("http 500")], batches=[_batch(make_record())]
+    )
+    runner = h.runner(connector)
+    first = runner.run()
+    assert first.state == "retry_error"
+    first_state = h.state.get("gcal")
+
+    h.tick(3)  # 3s into the 10s window
+    second = runner.run()
+
+    assert second.state == "backoff"
+    assert second.retry_in_s is not None
+    assert 0 < second.retry_in_s <= 7.0  # 10s window, 3s elapsed
+    assert second.fetched == 0 and second.created == 0
+    assert connector.cursors == [None]  # the second run NEVER fetched
+    after = h.state.get("gcal")
+    assert after.last_run_at == first_state.last_run_at  # untouched
+    assert h.state.attempt("gcal") == 1  # not bumped by the skip
+
+
+def test_backoff_window_expires_and_the_fetch_resumes(runner_db):
+    """Past the window the connector is fetched again (the backoff only ever
+    DELAYS, never disables)."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        errors=[ConnectorRetryableError("http 500")], batches=[_batch(make_record())]
+    )
+    runner = h.runner(connector)
+    assert runner.run().state == "retry_error"
+
+    h.tick(backoff_seconds(1) + 1)
+    resumed = runner.run()
+
+    assert resumed.state == "ok"
+    assert resumed.retry_in_s is None
+    assert connector.cursors == [None, None]  # fetched again past the window
+
+
+def test_healthy_connector_is_never_backed_off(runner_db):
+    """A connector with NO failure history (attempt=0, last_error None) is
+    fetched on every run, even back-to-back with an unmoving clock."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[_batch(make_record()), _batch(make_record(external_id="r2"))]
+    )
+    runner = h.runner(connector)
+
+    first = runner.run()
+    second = runner.run()
+
+    assert (first.state, second.state) == ("ok", "ok")
+    assert connector.cursors == [None, "c1"]  # both fetched
+
+
 def test_retryable_error_backs_off_and_is_capped(runner_db):
     h = Harness(runner_db)
     connector = FakeConnector(
         errors=[ConnectorRetryableError("http 429"), ConnectorRetryableError("http 500")],
         batches=[_batch(make_record())],
     )
-    runner = h.runner(connector)
-    first = runner.run()
-    second = runner.run()
+    r = h.runner(connector)
+    first = r.run()
 
-    assert (first.state, second.state) == ("retry_error", "retry_error")
+    # Inside the window: the persisted backoff DELAYS the fetch entirely.
+    second = r.run()
+    assert (first.state, second.state) == ("retry_error", "backoff")
     assert first.cursor_saved is False
+    assert connector.cursors == [None]  # run 2 never fetched
     state = h.state.get("gcal")
-    assert state.last_error == "retryable: http 500"
-    assert h.state.attempt("gcal") == 2
+    assert state.last_error == "retryable: http 429"  # untouched by the skip
+    assert h.state.attempt("gcal") == 1
     assert backoff_seconds(2) > backoff_seconds(1) > backoff_seconds(0)
     assert backoff_seconds(99) == backoff_seconds(98)  # capped
-    # A success resets the backoff counter and saves the cursor.
-    third = runner.run()
-    assert third.state == "ok"
+
+    # Past the window the retry actually runs (attempt 2).
+    h.tick(backoff_seconds(1) + 1)
+    third = r.run()
+    assert third.state == "retry_error"
+    assert h.state.attempt("gcal") == 2
+
+    # A success (after its window) resets the backoff counter and saves the cursor.
+    h.tick(backoff_seconds(2) + 1)
+    fourth = r.run()
+    assert fourth.state == "ok"
     assert h.state.attempt("gcal") == 0
     assert h.state.get("gcal").cursor == "c1"
 
@@ -804,9 +880,7 @@ def test_attachments_flow_through_the_attachments_pipeline(runner_db):
     record = make_record(
         attachments=(AttachmentRef(ref_id="att1", filename="a.pdf", mime_type="application/pdf"),)
     )
-    connector = FakeConnector(
-        batches=[_batch(record)], attachments={("r1", "att1"): b"%PDF-bytes"}
-    )
+    connector = FakeConnector(batches=[_batch(record)], attachments={("r1", "att1"): b"%PDF-bytes"})
     summary = h.runner(connector).run()
 
     assert summary.created == 1
@@ -865,4 +939,3 @@ def test_deduped_create_counts_as_deduped_not_created(runner_db):
     assert h.item("new-id").id == existing.id
     # … and no second item exists.
     assert runner_db.query(MemoryItem).filter(MemoryItem.source == "gcal").count() == 1
-
