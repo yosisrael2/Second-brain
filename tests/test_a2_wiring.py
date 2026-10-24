@@ -4,7 +4,8 @@ When ENRICHMENT_WORKER_ENABLED=true the bot process runs one enrichment pass
 per interval as a BACKGROUND task (the poll loop never waits for it) and
 delivers proposal cards through the SAME on_children_changed hook the PR C
 tests use — translated to cards on the loop thread, never from the worker.
-When false (the default) nothing is scheduled and nothing changes.
+The pass builds its own session + service (the per-update factory stays as
+it was). When false (the default) nothing is scheduled and nothing changes.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import asyncio
 import inspect
 import threading
 from contextlib import contextmanager
-from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -25,7 +25,12 @@ from brain.db.models import ItemSource, MemoryItem
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
 from brain.services.extraction.service import EnrichmentService, RunReport
-from brain.telegram_bot import BotServices, TelegramBot, _flush_bot_jobs
+from brain.telegram_bot import (
+    BotServices,
+    TelegramBot,
+    _flush_bot_jobs,
+    _shutdown_enrichment,
+)
 from conftest import assert_test_database
 
 assert_test_database(str(engine.url))
@@ -58,17 +63,30 @@ def _settings(**overrides):
     return Settings(**base)
 
 
-def _services(enrichment: Any) -> BotServices:
-    return BotServices(
-        ingest=None, items=None, search=None, ask=None, enrichment=enrichment
-    )
+def _services() -> BotServices:
+    return BotServices(ingest=None, items=None, search=None, ask=None)
 
 
-def _bot(factory) -> TelegramBot:
+_NOOP_FACTORY = _services  # the per-update factory: unused by the worker tests
+
+
+def _bot() -> TelegramBot:
+    @contextmanager
+    def factory():
+        yield _NOOP_FACTORY()
+
     return TelegramBot(
         services_factory=factory,
         allowed_ids={7},
         timezone=ZoneInfo("UTC"),
+    )
+
+
+def _use_pass_service(monkeypatch, service) -> None:
+    """Swap the pass's service construction (the test seam; B3 keeps the
+    per-update factory untouched)."""
+    monkeypatch.setattr(
+        "brain.telegram_bot._build_pass_service", lambda settings, session: service
     )
 
 
@@ -91,7 +109,7 @@ class _BlockingEnrichment:
     """Fake service: fires the hook, then blocks until released (B1/B2)."""
 
     def __init__(self, outcomes: list | None = None) -> None:
-        self.calls: list[datetime] = []
+        self.calls: list[Any] = []
         self.on_children_changed = None
         self._outcomes = outcomes or []
         self.started = threading.Event()
@@ -122,19 +140,25 @@ async def _await_pass_done(core, timeout: float = 5.0) -> None:
     await asyncio.wait_for(wait(), timeout)
 
 
+async def _await_started(fake, timeout: float = 5.0) -> None:
+    """The pass runs in a worker thread: give it a beat to actually enter."""
+    async def wait():
+        while not fake.started.is_set():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait(), timeout)
+
+
 # --- (a) the default: switch off -> nothing runs ------------------------------
 
 
 def test_worker_disabled_schedules_nothing(monkeypatch):
     fake = _BlockingEnrichment()
     fake.release.set()
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr("brain.config.get_settings", lambda: _settings())
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
     _flush(core, _Tg())
     assert fake.calls == []  # zero passes
@@ -147,15 +171,12 @@ def test_worker_disabled_schedules_nothing(monkeypatch):
 
 def test_worker_pass_does_not_block_the_flush(monkeypatch):
     fake = _BlockingEnrichment()
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
@@ -165,7 +186,7 @@ def test_worker_pass_does_not_block_the_flush(monkeypatch):
         except TimeoutError:
             fake.release.set()  # unblock the thread before the loop closes
             raise
-        assert fake.started.is_set()  # the pass is running...
+        await _await_started(fake)  # the pass thread actually entered
         assert not fake.done  # ...but NOT finished
         # the poll loop stays responsive: a scripted update is processed
         # and answered while the pass is still in flight
@@ -191,7 +212,6 @@ def test_outcomes_become_exactly_one_card_per_changed_source(monkeypatch):
         source = repo.add(MemoryItem(raw_text=body, source="email"))
         sources.append(source)
     repo.commit()
-    fake_sources = []
     for source in sources:
         child = repo.add(
             MemoryItem(
@@ -205,17 +225,13 @@ def test_outcomes_become_exactly_one_card_per_changed_source(monkeypatch):
             ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text)
         )
         repo.commit()
-        fake_sources.append(source)
-    fake = _BlockingEnrichment(outcomes=_outcomes_for(*fake_sources))
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    fake = _BlockingEnrichment(outcomes=_outcomes_for(*sources))
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
@@ -247,7 +263,7 @@ def test_update_factory_does_not_build_the_enrichment_service():
     src = inspect.getsource(_live_services_factory)
     # the enrichment service is built inside the pass only (once per pass,
     # never per update) — with the switch off the factory is untouched.
-    assert "EnrichmentService" not in src
+    assert "enrichment" not in src.lower()
 
 
 # --- (c) a raising pass is logged + ops event; the bot keeps running ----------
@@ -266,10 +282,7 @@ def test_worker_pass_error_is_recorded_and_bot_survives(monkeypatch):
             raise RuntimeError("boom")
 
     fake = _Raising()
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
@@ -277,20 +290,21 @@ def test_worker_pass_error_is_recorded_and_bot_survives(monkeypatch):
     monkeypatch.setattr(
         "brain.telegram_bot.record_event",
         lambda component, name, ok=True, detail=None: events.append(
-            {"component": component, "name": name, "ok": ok}
+            {"component": component, "name": name, "ok": ok, "detail": detail}
         ),
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
         await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
         await _await_pass_done(core)
-        # the harvest turns the task's exception into an ops event
+        # the harvest turns the task's exception into an ops event that
+        # carries the error type + message
         await _flush_bot_jobs(_Tg(), core)
-        assert any(
-            e["name"] == "worker_pass_failed" and e["ok"] is False for e in events
-        )
+        failed = [e for e in events if e["name"] == "worker_pass_failed"]
+        assert failed and failed[0]["ok"] is False
+        assert "RuntimeError: boom" in failed[0]["detail"]["error"]
         # the bot is alive: after the interval the next tick runs again
         core._enrich_last_run = 0.0  # noqa: SLF001
         await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
@@ -306,21 +320,18 @@ def test_worker_pass_error_is_recorded_and_bot_survives(monkeypatch):
 
 def test_overlapping_tick_is_skipped(monkeypatch):
     fake = _BlockingEnrichment()
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
         try:
             await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
-            assert fake.started.is_set()
+            await _await_started(fake)
             await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
             assert not fake.done  # still the SAME pass in flight
             assert len(fake.calls) == 1  # no second pass started
@@ -331,24 +342,23 @@ def test_overlapping_tick_is_skipped(monkeypatch):
     asyncio.run(go())
 
 
-# --- (e) the interval gates consecutive passes --------------------------------
+# --- (e) the interval gates consecutive passes (never the first) --------------
 
 
 def test_worker_pass_respects_the_interval(monkeypatch):
     fake = _BlockingEnrichment()
     fake.release.set()  # passes finish instantly
-
-    @contextmanager
-    def factory():
-        yield _services(fake)
+    _use_pass_service(monkeypatch, fake)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
+        # monotonic is boot-relative: _enrich_last_run == 0.0 means NEVER
+        # ran, so the FIRST pass runs even on a freshly booted host.
         await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
         await _await_pass_done(core)
         await _flush_bot_jobs(_Tg(), core)  # harvest + still inside 300s
@@ -372,15 +382,12 @@ def test_worker_enabled_runs_pass_and_delivers_card(monkeypatch):
     repo.commit()
     service = EnrichmentService(repo, session)  # default (stub) extractor: deterministic
     service.enqueue(source)  # production state: capture already queued the source
-
-    @contextmanager
-    def factory():
-        yield _services(service)
+    _use_pass_service(monkeypatch, service)
 
     monkeypatch.setattr(
         "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
     )
-    core = _bot(factory)
+    core = _bot()
     _fresh_bot_state(core)
 
     async def go():
@@ -400,3 +407,93 @@ def test_worker_enabled_runs_pass_and_delivers_card(monkeypatch):
     asyncio.run(go())
     _wipe(session)
     session.close()
+
+
+# --- (shutdown) a finished-but-unharvested pass still delivers its card -------
+
+
+def test_shutdown_delivers_a_finished_unharvested_pass(monkeypatch):
+    session = SessionLocal()
+    _wipe(session)
+    repo = ItemsRepository(session)
+    source = repo.add(MemoryItem(raw_text=SOURCE_BODY, source="email"))
+    repo.commit()
+    child = repo.add(
+        MemoryItem(raw_text="child x", source="email", child_state="proposed")
+    )
+    repo.commit()
+    session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
+    repo.commit()
+    fake = _BlockingEnrichment(outcomes=_outcomes_for(source))
+    fake.release.set()  # the pass finishes on its own
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)  # finished, but no flush harvested it yet
+        tg = _Tg()
+        await _shutdown_enrichment(tg, core)
+        assert len(tg.sent) == 1  # the card went out during shutdown
+        assert "🧠 found" in tg.sent[0]["text"]
+        assert core._enrich_task is None  # noqa: SLF001  reference cleared
+
+    asyncio.run(go())
+    _wipe(session)
+    session.close()
+
+
+# --- (shutdown) a pass past the grace is cancelled and logged -----------------
+
+
+def test_shutdown_cancels_a_pass_past_the_grace(monkeypatch):
+    events: list[dict] = []
+    fake = _BlockingEnrichment()  # blocks until released
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
+    )
+    monkeypatch.setattr(
+        "brain.telegram_bot.record_event",
+        lambda component, name, ok=True, detail=None: events.append(
+            {"component": component, "name": name}
+        ),
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        try:
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+            await _await_started(fake)
+            # a pass past the grace: shutdown does not hang on it
+            await asyncio.wait_for(
+                _shutdown_enrichment(_Tg(), core, grace_s=0.05), timeout=2.0
+            )
+        finally:
+            fake.release.set()
+        assert any(
+            e["name"] == "worker_pass_cancelled_at_shutdown" for e in events
+        )
+        assert core._enrich_task is None  # noqa: SLF001
+
+    asyncio.run(go())
+
+
+# --- (shutdown) no pass in flight: shutdown is a no-op ------------------------
+
+
+def test_shutdown_without_a_pass_is_a_noop():
+    core = _bot()
+
+    async def go():
+        await asyncio.wait_for(_shutdown_enrichment(_Tg(), core), timeout=2.0)
+
+    asyncio.run(go())  # returns immediately, nothing raised
+    assert core._enrich_task is None  # noqa: SLF001

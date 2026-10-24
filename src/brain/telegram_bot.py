@@ -311,7 +311,6 @@ class BotServices:
     ask: Any  # AskService
     memory: Any = None  # MemoryService (PR 0 core; None -> feature missing)
     attachments: Any = None  # AttachmentService (F1; None -> feature missing)
-    enrichment: Any = None  # EnrichmentService (A2 worker; None -> feature missing)
 
 
 ServicesFactory = Callable[[], AbstractContextManager["BotServices"]]
@@ -1631,6 +1630,9 @@ async def poll_loop(
                     logger.exception("telegram: update handling failed")
             await _flush_bot_jobs(tg, core)
     finally:
+        # An in-flight enrichment pass gets a short grace: deliver what it
+        # produced, cancel what overruns (see _shutdown_enrichment).
+        await _shutdown_enrichment(tg, core)
         shutdown = getattr(tg, "shutdown", None)
         if shutdown is not None:
             await shutdown()
@@ -1653,31 +1655,63 @@ def _repo_of(session):
     return ItemsRepository(session)
 
 
+def _record_pass_failure(exc: BaseException) -> None:
+    """One ops event per failed pass: error type + message, truncated."""
+    record_event(
+        "enrichment",
+        "worker_pass_failed",
+        ok=False,
+        detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
+    )
+    logger.exception("telegram: enrichment worker pass failed")
+
+
+def _build_pass_service(settings: Any, session: Any) -> Any:
+    """The pass's own EnrichmentService — built ONCE PER PASS, never per
+    update (the per-update factory stays exactly as it was). Same seams as
+    the factory used to wire: settings-driven extractor (the A2 activation
+    seam's default), memory compaction, shared indexer, daily cap, timezone.
+    """
+    from brain.api import deps  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.repositories.memory import (  # noqa: PLC0415
+        MemoryRepository,
+        MemoryService,
+    )
+    from brain.services.extraction.service import (  # noqa: PLC0415
+        EnrichmentService,
+    )
+
+    return EnrichmentService(
+        ItemsRepository(session),
+        session,
+        memory=MemoryService(MemoryRepository(session)),
+        indexer=deps.get_item_indexer(),
+        daily_cap=settings.enrichment_daily_cap,
+        timezone=settings.timezone,
+    )
+
+
 def _enrich_pass(service: Any) -> list:
     """One ``run_once`` pass with a LOCAL completion collector (B2).
 
-    The hook appends to a plain local list — core state is NEVER touched from
-    the worker thread; the outcomes return to the loop thread, which alone
-    turns them into proposal cards.
+    The hook delivers one LIST of changed-source outcomes per call — they
+    collect into a plain local list; core state is NEVER touched from the
+    worker thread. The loop thread alone turns outcomes into proposal cards.
     """
     outcomes: list = []
-    service.on_children_changed = outcomes.extend  # hook delivers a LIST per call
+    service.on_children_changed = outcomes.extend
     service.run_once(datetime.now(tz=UTC), limit=20)
     return outcomes
 
 
-def _run_enrichment_pass(core: TelegramBot) -> list:
+def _run_enrichment_pass() -> list:
     """One synchronous enrichment pass (A2 worker; runs in a worker thread).
 
-    B3: builds its OWN session + service here — the per-update factory stays
-    exactly as it was (the service is constructed once per pass, never per
-    update). A factory-provided ``enrichment`` service (tests inject fakes
-    there) wins. Returns the changed-source outcomes (possibly empty).
+    Own session + own service (B3: the per-update factory stays as it was).
+    Returns the changed-source outcomes (possibly empty); the LOOP thread
+    turns them into proposal cards.
     """
-    with core._services_factory() as services:  # noqa: SLF001 (same module)
-        service = services.enrichment
-        if service is not None:
-            return _enrich_pass(service)
     from brain.config import get_settings  # noqa: PLC0415
 
     settings = get_settings()
@@ -1685,25 +1719,7 @@ def _run_enrichment_pass(core: TelegramBot) -> list:
 
     session = SessionLocal()
     try:
-        from brain.api import deps  # noqa: PLC0415
-        from brain.repositories.items import ItemsRepository  # noqa: PLC0415
-        from brain.repositories.memory import (  # noqa: PLC0415
-            MemoryRepository,
-            MemoryService,
-        )
-        from brain.services.extraction.service import (  # noqa: PLC0415
-            EnrichmentService,
-        )
-
-        service = EnrichmentService(
-            ItemsRepository(session),
-            session,
-            memory=MemoryService(MemoryRepository(session)),
-            indexer=deps.get_item_indexer(),
-            daily_cap=settings.enrichment_daily_cap,
-            timezone=settings.timezone,
-        )
-        return _enrich_pass(service)
+        return _enrich_pass(_build_pass_service(settings, session))
     finally:
         session.close()
 
@@ -1721,32 +1737,72 @@ async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
     """
     from brain.config import get_settings  # noqa: PLC0415
 
-    task = core._enrich_task  # noqa: SLF001 (same module)
+    task = getattr(core, "_enrich_task", None)  # stub cores (old tests) lack it
     if task is not None and task.done():
         core._enrich_task = None  # noqa: SLF001 (same module)
         try:
-            outcomes = task.result()
-            core.proposals_changed(outcomes)
-        except Exception:  # noqa: BLE001 — the worker must never kill the bot
-            record_event(
-                "enrichment",
-                "worker_pass_failed",
-                ok=False,
-                detail={"error": "enrichment worker pass failed"},
-            )
-            logger.exception("telegram: enrichment worker pass failed")
+            core.proposals_changed(task.result())
+        except Exception as exc:  # noqa: BLE001 — the worker must never kill the bot
+            _record_pass_failure(exc)
     settings = get_settings()
     if not settings.enrichment_worker_enabled:
         return
-    if core._enrich_task is not None and not core._enrich_task.done():  # noqa: SLF001
+    if getattr(core, "_enrich_task", None) is not None and not core._enrich_task.done():  # noqa: SLF001
         return  # a pass never overlaps the previous one
     now = time.monotonic()
-    if now - core._enrich_last_run < settings.enrichment_worker_interval_s:  # noqa: SLF001
+    # 0.0 = never ran (monotonic is boot-relative: a just-rebooted host would
+    # otherwise silently skip the first pass) — the interval gates only
+    # CONSECUTIVE passes.
+    last_run = getattr(core, "_enrich_last_run", 0.0)  # stub cores: treat as never
+    if last_run and (now - last_run < settings.enrichment_worker_interval_s):
         return
     core._enrich_last_run = now  # noqa: SLF001 (same module)
     core._enrich_task = asyncio.create_task(  # noqa: SLF001 (same module)
-        asyncio.to_thread(_run_enrichment_pass, core)
+        asyncio.to_thread(_run_enrichment_pass)
     )
+
+
+def _record_pass_failure(exc: BaseException) -> None:
+    """One ops event per failed pass: error type + message, truncated."""
+    record_event(
+        "enrichment",
+        "worker_pass_failed",
+        ok=False,
+        detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
+    )
+    logger.exception("telegram: enrichment worker pass failed")
+
+
+async def _shutdown_enrichment(tg: Any, core: TelegramBot, *, grace_s: float = 30.0) -> None:
+    """Poll-loop shutdown: give an in-flight enrichment pass a short grace.
+
+    A finished-but-unharvested pass still delivers its cards; a pass that
+    exceeds the grace is cancelled (a to_thread worker cannot be
+    interrupted, but the bot stops waiting) and logged + ops-evented —
+    shutdown itself must always complete.
+    """
+    task = getattr(core, "_enrich_task", None)  # stub cores (old tests) lack it
+    if task is None:
+        return
+    core._enrich_task = None  # noqa: SLF001 (same module)
+    try:
+        outcomes = await asyncio.wait_for(task, timeout=grace_s)
+        core.proposals_changed(outcomes)
+        for chat_id, reply in core.drain_outbound():
+            await _send(tg, chat_id, reply)
+    except TimeoutError:
+        task.cancel()
+        record_event(
+            "enrichment",
+            "worker_pass_cancelled_at_shutdown",
+            ok=False,
+            detail={"error": f"pass exceeded the {grace_s:.0f}s shutdown grace"[:200]},
+        )
+        logger.warning(
+            "telegram: enrichment pass cancelled at shutdown (grace %.0fs)", grace_s
+        )
+    except Exception as exc:  # noqa: BLE001 — shutdown must complete
+        _record_pass_failure(exc)
 
 
 async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
