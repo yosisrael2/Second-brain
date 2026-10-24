@@ -164,6 +164,36 @@ def _connector(service: FakeTasksService, *, allowlist: str = "") -> GTasksConne
     return conn
 
 
+def test_connector_builds_tasks_v1_service() -> None:
+    """Round-4 base: API_NAME/API_VERSION ClassVars drive the service factory
+    (4-arg: refresh_token, scopes, api_name, api_version). Construction with
+    an empty ClassVar set must fail loudly; the real declaration must build
+    exactly ("tasks", "v1") with the gtasks scope — never a Gmail service."""
+
+    def fake_factory(refresh_token: str, scopes: list[str], api_name: str, api_version: str):
+        fake_factory.calls.append((refresh_token, list(scopes), api_name, api_version))
+        return object()  # never used beyond this assertion
+
+    fake_factory.calls = []  # type: ignore[attr-defined]
+    conn = GTasksConnector(token_loader=lambda: "keychain-token", service_factory=fake_factory)
+    conn._service()  # lazily builds the service on first use
+    assert fake_factory.calls == [  # type: ignore[attr-defined]
+        ("keychain-token", [GTASKS_SCOPE], "tasks", "v1")
+    ]
+
+
+def test_connector_without_api_classvars_fails_at_construction() -> None:
+    """A subclass that forgets the ClassVars fails with a NAMED error at
+    construction (base round 4) — never as a mystery failure on first sync."""
+
+    class _Undeclared(GTasksConnector):
+        API_NAME = ""
+        API_VERSION = ""
+
+    with pytest.raises(ConnectorError, match="must declare API_NAME and API_VERSION"):
+        _Undeclared(token_loader=lambda: "tok", service_factory=lambda *a: None)
+
+
 def _all_lists_pages() -> list[dict]:
     return [_fixture("tasklists_page1.json"), _fixture("tasklists_page2.json")]
 

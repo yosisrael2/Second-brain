@@ -270,12 +270,17 @@ class GTasksConnector(GoogleConnector):
     name: ClassVar[str] = "gtasks"
     # Single source for the scope string: the base's SCOPE_BY_CONNECTOR.
     SCOPES: ClassVar[tuple[str, ...]] = SCOPE_BY_CONNECTOR["gtasks"]
+    # Which Google API the default service factory builds (base round 4:
+    # empty on the base on purpose — a subclass that forgets these fails at
+    # construction, never as a mystery Gmail service on the first sync).
+    API_NAME: ClassVar[str] = "tasks"
+    API_VERSION: ClassVar[str] = "v1"
 
     def __init__(
         self,
         *,
         token_loader: Callable[[], str],
-        service_factory: Callable[[str, list[str]], Any] = default_service_factory,
+        service_factory: Callable[[str, list[str], str, str], Any] = default_service_factory,
         user_id: str = "me",
         lists_allowlist: str | None = None,
     ) -> None:
