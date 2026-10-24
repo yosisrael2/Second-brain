@@ -93,6 +93,40 @@ class TestTelegramHealthyPollNeverDegraded:
         entry = ops_health._derive_status("telegram", _telegram_raw(89.0))
         assert entry["status"] == "ok"
 
+    @pytest.mark.parametrize("poll_timeout_s", [0, 5])
+    def test_zero_or_tiny_timeout_gets_a_60s_floor(self, monkeypatch, poll_timeout_s):
+        """telegram_poll_timeout_s is an unbounded int: with short polling (0)
+        or a tiny timeout, 2x would make degraded_after_s 0/tiny and the card
+        permanently degraded. The threshold must never drop below a 60s floor
+        (review of PR #67)."""
+        from brain.config import Settings
+
+        monkeypatch.setattr(
+            ops_health,
+            "get_settings",
+            lambda: Settings(
+                telegram_bot_token="1234:abc",
+                telegram_allowed_user_ids="1",
+                telegram_poll_timeout_s=poll_timeout_s,
+                _env_file=None,
+            ),
+        )
+        raw = ops_health._telegram_check()
+        assert raw["degraded_after_s"] == 60
+
+    def test_with_floor_age_30s_is_ok_and_61s_is_degraded(self):
+        """Card behaviour at the floor threshold (short-polling bot)."""
+        raw = {
+            "token_set": True,
+            "allowlist_set": True,
+            "heartbeat_age_s": 30.0,
+            "poll_timeout_s": 0,
+            "degraded_after_s": 60,
+        }
+        assert ops_health._derive_status("telegram", raw)["status"] == "ok"
+        raw["heartbeat_age_s"] = 61.0
+        assert ops_health._derive_status("telegram", raw)["status"] == "degraded"
+
 
 class TestAttachmentsComponent:
     def test_present_with_queue_budget_and_read_today(self, client, ops_tables):
