@@ -313,7 +313,7 @@ def assert_conforms(
     def connector_for() -> Connector:
         return make_connector(api)
 
-    report = {
+    report: dict[str, Any] = {
         "termination": _check_termination(
             harness, connector_for, api, limit=limit, max_fetches=max_fetches
         ),
@@ -419,7 +419,7 @@ def _check_change(
     *,
     limit: int,
     immutable_source: bool = False,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """One upstream change -> exactly one ingested change, and the item takes
     the text the ADAPTER emitted for the new state.
 
@@ -501,7 +501,7 @@ def _check_change_immutable(
     scenario: ConformanceScenario,
     *,
     limit: int,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """The CHANGE check for sources whose records never change under an id.
 
     (1) A NEW record added upstream is ingested exactly once. (2) The SAME

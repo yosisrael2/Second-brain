@@ -163,7 +163,7 @@ class _KitCollection:
         return _KitRequest(self._svc, self._kind, params)
 
 
-def build(api: Any) -> Connector:
+def build(api: Any) -> GTasksConnector:
     """The registered gtasks connector on a fake service backed by ``api``."""
     conn = object.__new__(GTasksConnector)
     conn._lists_allowlist = ""  # no allowlist: every list (the kit's one list)

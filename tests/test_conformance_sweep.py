@@ -23,7 +23,6 @@ that is the enforcement for every future adapter PR.
 from __future__ import annotations
 
 import importlib.util
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
