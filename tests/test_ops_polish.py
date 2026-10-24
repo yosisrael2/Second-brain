@@ -4,7 +4,8 @@
    default) and only heartbeats on SUCCESS, so a quiet chat or a retry loop
    legitimately pushes the heartbeat age past the old fixed 60s threshold.
    The threshold now follows the bot's actual getUpdates timeout
-   (settings.telegram_poll_timeout_s + margin), and the bot heartbeats on
+   (2x settings.telegram_poll_timeout_s — a healthy cycle is one full poll
+   window plus post-poll work), and the bot heartbeats on
    the retry paths too (honest liveness, tested in test_telegram_bot.py).
 2. /ops/health gains read-only 'attachments' and 'enrichment' components
    (the cockpit renders every component automatically).
@@ -39,7 +40,7 @@ def _telegram_raw(age: float, *, poll_timeout_s: int = 50) -> dict:
         "allowlist_set": True,
         "heartbeat_age_s": age,
         "poll_timeout_s": poll_timeout_s,
-        "degraded_after_s": poll_timeout_s + 30,
+        "degraded_after_s": poll_timeout_s * 2,
     }
 
 
@@ -49,11 +50,11 @@ class TestTelegramThresholdFollowsPollTimeout:
         assert entry["status"] == "ok"
 
     def test_age_just_under_threshold_is_ok(self):
-        entry = ops_health._derive_status("telegram", _telegram_raw(79.0))
+        entry = ops_health._derive_status("telegram", _telegram_raw(99.0))
         assert entry["status"] == "ok"
 
     def test_age_just_over_threshold_is_degraded(self):
-        entry = ops_health._derive_status("telegram", _telegram_raw(81.0))
+        entry = ops_health._derive_status("telegram", _telegram_raw(101.0))
         assert entry["status"] == "degraded"
 
     def test_age_over_1800_is_down(self):
@@ -61,7 +62,7 @@ class TestTelegramThresholdFollowsPollTimeout:
         assert entry["status"] == "down"
 
     def test_check_derives_threshold_from_settings(self, monkeypatch):
-        """_telegram_check reads settings.telegram_poll_timeout_s (50 -> 80)."""
+        """_telegram_check reads settings.telegram_poll_timeout_s (50 -> 100)."""
         from brain.config import Settings
 
         monkeypatch.setattr(
@@ -76,7 +77,21 @@ class TestTelegramThresholdFollowsPollTimeout:
         )
         raw = ops_health._telegram_check()
         assert raw["poll_timeout_s"] == 50
-        assert raw["degraded_after_s"] == 80
+        assert raw["degraded_after_s"] == 100
+
+
+class TestTelegramHealthyPollNeverDegraded:
+    """Red (telegram flap, 2026-10-24): the live bot showed heartbeat age 89s
+    right after a restart with the default 50s long-poll and went 'degraded'.
+    A healthy cycle legitimately spans one full long-poll window PLUS the
+    post-poll work (update batch processing, network overhead), so a threshold
+    of timeout + 30s sits INSIDE the healthy range. The threshold must be
+    derived from the poll timeout with real headroom (2x), one source of
+    truth, while age > 1800s stays 'down'."""
+
+    def test_observed_flap_age_89s_is_ok_with_default_timeout(self):
+        entry = ops_health._derive_status("telegram", _telegram_raw(89.0))
+        assert entry["status"] == "ok"
 
 
 class TestAttachmentsComponent:
