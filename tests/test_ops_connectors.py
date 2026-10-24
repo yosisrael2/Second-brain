@@ -87,7 +87,7 @@ def _get(monkeypatch: pytest.MonkeyPatch, *, registered: list[str], enabled: str
 def test_zero_connectors_render_an_empty_panel(conn_db, monkeypatch: pytest.MonkeyPatch):
     payload = _get(monkeypatch, registered=[], enabled="")
 
-    assert payload == {"connectors": []}
+    assert payload["connectors"] == []
 
 
 def test_one_ok_and_one_errored_with_last_error_and_counts(
@@ -146,6 +146,88 @@ def test_last_error_is_returned_verbatim_for_text_rendering(
     payload = _get(monkeypatch, registered=["gcal"], enabled="gcal")
 
     assert payload["connectors"][0]["last_error"] == raw
+
+
+def test_endpoint_registers_adapters_before_reading_the_registry(
+    conn_db, monkeypatch: pytest.MonkeyPatch
+):
+    """The API process never imports adapter modules on its own — without
+    ensure_registered() every merged adapter would render as a STALE state
+    row (enabled=False) and an enabled connector could never exist."""
+    import brain.api.routes.ops as ops_routes
+
+    calls: list[bool] = []
+    monkeypatch.setattr(ops_routes, "ensure_registered", lambda: calls.append(True))
+    monkeypatch.setattr(ops_routes, "all_names", lambda: ["gtasks"])
+    monkeypatch.setattr(
+        ops_routes, "get_settings", lambda: SimpleNamespace(connectors_enabled=())
+    )
+    client = TestClient(create_app())
+    client.get("/ops/connectors")
+
+    assert calls == [True]
+
+
+def test_chip_disabled_when_registered_but_none_enabled(conn_db, monkeypatch):
+    """Registered, never run, nothing enabled: the chip must NOT claim ok —
+    'disabled' (grey) with a summary that says none are enabled."""
+    _state(conn_db, "gtasks", cursor=None)
+    payload = _get(monkeypatch, registered=["gtasks"], enabled="")
+
+    assert payload["chip"] == {
+        "status": "disabled",
+        "summary": "1 registered · none enabled",
+    }
+
+
+def test_chip_error_when_an_enabled_connector_has_last_error(conn_db, monkeypatch):
+    _state(conn_db, "gtasks", cursor="c1", last_error="refresh token rejected")
+    payload = _get(monkeypatch, registered=["gtasks"], enabled="gtasks")
+
+    assert payload["chip"]["status"] == "error"
+
+
+def test_chip_pending_when_enabled_connector_never_ok(conn_db, monkeypatch):
+    _state(conn_db, "gtasks", cursor=None, last_error=None, last_ok_at=None)
+    payload = _get(monkeypatch, registered=["gtasks"], enabled="gtasks")
+
+    assert payload["chip"]["status"] == "pending"
+
+
+def test_chip_ok_when_enabled_connector_is_ok(conn_db, monkeypatch):
+    _state(
+        conn_db,
+        "gtasks",
+        cursor="c1",
+        last_ok_at=datetime(2026, 10, 24, 8, 0, tzinfo=UTC),
+    )
+    payload = _get(monkeypatch, registered=["gtasks"], enabled="gtasks")
+
+    assert payload["chip"]["status"] == "ok"
+
+
+def test_chip_ignores_last_error_on_a_disabled_connector(conn_db, monkeypatch):
+    """A last_error on a DISABLED connector shows in its row but must not
+    colour the chip while an enabled connector is healthy."""
+    _state(
+        conn_db,
+        "email",
+        cursor="c1",
+        last_ok_at=datetime(2026, 10, 24, 8, 0, tzinfo=UTC),
+    )
+    _state(conn_db, "gcal", last_error="stale token")
+    payload = _get(monkeypatch, registered=["email", "gcal"], enabled="email")
+
+    assert payload["chip"]["status"] == "ok"
+
+
+def test_chip_empty_registry_reports_disabled_no_connectors(conn_db, monkeypatch):
+    payload = _get(monkeypatch, registered=[], enabled="")
+
+    assert payload["chip"] == {
+        "status": "disabled",
+        "summary": "no connectors configured",
+    }
 
 
 def test_stale_state_row_without_registration_shows_disabled(

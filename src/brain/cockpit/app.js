@@ -502,26 +502,24 @@ function renderWhatsappCard() {
 function renderConnectorsCard() {
   // C6 Sources panel: every registered connector + stale state rows, from
   // GET /ops/connectors — last ok, cursor present, records, quarantined,
-  // last error. The card always renders (empty state when nothing is
-  // configured); rows are plain text (textContent), so last_error cannot
-  // inject HTML.
+  // last error. Rows are plain text (textContent), so last_error cannot
+  // inject HTML. Chip + summary are decided by the endpoint (sources_chip,
+  // tested in tests/test_ops_connectors.py); this file only renders them.
   const card = $("connectors-card");
   const payload = state.connectors;
   if (!card || !payload) return;
   const connectors = payload.connectors || [];
   const chip = $("connectors-chip");
-  const errored = connectors.filter((entry) => entry.last_error);
-  if (!connectors.length) {
-    chip.textContent = "—";
-    chip.className = "chip disabled";
-    $("connectors-summary").textContent = "no connectors configured";
-    $("connectors-rows").textContent = "";
-    return;
-  }
-  chip.textContent = errored.length ? "error" : "ok";
-  chip.className = `chip ${errored.length ? "down" : "ok"}`;
-  $("connectors-summary").textContent =
-    `${connectors.length} connector(s) · ${errored.length} with last error`;
+  const chipInfo = payload.chip || { status: "disabled", summary: "" };
+  const chipClass = {
+    ok: "ok",
+    error: "down",
+    pending: "degraded",
+    disabled: "disabled",
+  }[chipInfo.status] || "disabled";
+  chip.textContent = chipInfo.status;
+  chip.className = `chip ${chipClass}`;
+  $("connectors-summary").textContent = chipInfo.summary;
   const lines = connectors.map((entry) => {
     const lastOk = entry.last_ok_at ? ago(entry.last_ok_at) : "never";
     const error = entry.last_error ? ` — ${String(entry.last_error).slice(0, 140)}` : "";
@@ -839,6 +837,14 @@ function switchTab(name) {
   }
   const title = $("page-title");
   if (title) title.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+  if (name === "health") {
+    // Render from the state we already have: a slow or failed fetch must
+    // not blank the Health-tab cards until the next 5s tick lands.
+    renderOverall();
+    renderHealth();
+    renderWhatsappCard();
+    renderConnectorsCard();
+  }
   refreshAll();
 }
 

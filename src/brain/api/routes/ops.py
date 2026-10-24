@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import text
 
 from brain.config import get_settings, unwrap_secret
-from brain.connectors import all_names
+from brain.connectors import all_names, ensure_registered
 from brain.connectors.state import ConnectorRecordRepo
 from brain.db.session import SessionLocal, engine
 from brain.ops import flow as ops_flow
@@ -341,6 +341,44 @@ def get_ops_whatsapp() -> dict[str, Any]:
     return {"last_poll_at": _iso(max(polls)) if polls else None, "channels": channels}
 
 
+def sources_chip(connectors: list[dict[str, Any]]) -> dict[str, str]:
+    """Chip + summary decision for the Sources card (pure function; the
+    cockpit only renders it — tests in tests/test_ops_connectors.py).
+
+    - nothing registered at all             -> disabled, "no connectors configured"
+    - registered but none enabled           -> disabled, "N registered · none enabled"
+    - any ENABLED connector with last_error -> error (down)
+    - any enabled connector never ok yet    -> pending (degraded style)
+    - otherwise                             -> ok
+
+    A last_error on a DISABLED connector shows in its row but never colours
+    the chip: a source that is switched off cannot claim health or failure.
+    """
+    if not connectors:
+        return {"status": "disabled", "summary": "no connectors configured"}
+    enabled = [c for c in connectors if c.get("enabled")]
+    if not enabled:
+        return {
+            "status": "disabled",
+            "summary": f"{len(connectors)} registered · none enabled",
+        }
+    errored = sum(1 for c in enabled if c.get("last_error"))
+    never_ok = sum(1 for c in enabled if not c.get("last_ok_at"))
+    if errored:
+        status = "error"
+    elif never_ok:
+        status = "pending"
+    else:
+        status = "ok"
+    summary = (
+        f"{len(connectors)} connector(s) · {len(enabled)} enabled · "
+        f"{errored} with last error"
+    )
+    if status == "pending":
+        summary += f" · {never_ok} never ok yet"
+    return {"status": status, "summary": summary}
+
+
 @router.get("/ops/connectors")
 def get_ops_connectors() -> dict[str, Any]:
     """Cockpit Sources panel feed (C6): every registered connector plus every
@@ -349,6 +387,7 @@ def get_ops_connectors() -> dict[str, Any]:
     never exposed (it is an opaque OAuth page token), and ``last_error`` is
     rendered by the cockpit as text (textContent), not HTML."""
     enabled = set(get_settings().connectors_enabled)
+    ensure_registered()  # the API process imports no adapter modules on its own
     registered = set(all_names())
     with SessionLocal() as session:
         state_rows = (
@@ -392,7 +431,7 @@ def get_ops_connectors() -> dict[str, Any]:
         entry["last_ok_at"] = _iso(row["last_ok_at"]) if row["last_ok_at"] else None
         entry["last_error"] = row["last_error"]
         entry["cursor_present"] = row["cursor"] is not None
-    return {"connectors": list(rows.values())}
+    return {"connectors": list(rows.values()), "chip": sources_chip(list(rows.values()))}
 
 
 @router.get("/ops/stats")
