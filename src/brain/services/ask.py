@@ -40,6 +40,14 @@ DEFAULT_KID_RECALL_LIMIT = 16
 # bounds by occurred_at (the SENT time), so it widens the resolved window's
 # START by this many days. Settings.ask_kid_recall_lookback_days overrides.
 DEFAULT_KID_RECALL_LOOKBACK_DAYS = 3
+# WA39 run 3, part 2: the rerank can rank school emails above the one
+# kid-channel conversation that answers the question, and the top_k cut
+# drops it even though the kid leg fetched it (the slippers case). When a
+# question names a confirmed kid, the final context reserves up to this
+# many top_k slots for the best-ranked kid-recall items (kid-channel
+# conversations first); unused reserved slots go back to the general
+# ranking. Settings.ask_kid_reserved_slots overrides; 0 disables.
+DEFAULT_KID_RESERVED_SLOTS = 3
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,7 @@ class AskService:
         items_repo: KidRecallRepoProto | None = None,
         kid_recall_limit: int = DEFAULT_KID_RECALL_LIMIT,
         kid_recall_lookback_days: int = DEFAULT_KID_RECALL_LOOKBACK_DAYS,
+        kid_reserved_slots: int = DEFAULT_KID_RESERVED_SLOTS,
         conflict_leg_limit: int = DEFAULT_CONFLICT_LEG_LIMIT,
     ) -> None:
         self._search = search
@@ -125,6 +134,7 @@ class AskService:
         self._items_repo = items_repo
         self._kid_recall_limit = kid_recall_limit
         self._kid_recall_lookback_days = kid_recall_lookback_days
+        self._kid_reserved_slots = kid_reserved_slots
         # PR-b conflict leg: both must be present for the leg to run.
         self._conflict_leg_limit = conflict_leg_limit
 
@@ -168,7 +178,11 @@ class AskService:
                 )
             else:
                 pool = self._search.search(question, limit=self._recall_pool)
-            hits = pool[: self._top_k]
+            if kid_items:
+                hits = self._top_k_with_reserved_slots(pool, kid_items)
+            else:
+                # no kid named -> byte-identical to the pre-reservation cut
+                hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
             conflict_hits, conflict_map = self._conflict_leg(
                 pool_ids, recording=recording
@@ -214,6 +228,37 @@ class AskService:
             sources=_unique_by_text(context_hits),
             model=result["model"],
         )
+
+    def _top_k_with_reserved_slots(
+        self, pool: list[SearchHit], kid_items: list[MemoryItem]
+    ) -> list[SearchHit]:
+        """The top_k cut with kid-recall reservation (WA39 run 3 part 2).
+
+        Up to ``ask_kid_reserved_slots`` of top_k are reserved for the
+        best-ranked kid-recall items — kid-channel conversations first (they
+        carry the structured meta.channel), then the leg's other items — in
+        the rerank's own order. The reserved slot comes out of the general
+        ranking (top_k is unchanged); unused reserved slots go back to it.
+        The final context keeps the rerank's order: reservation changes WHO
+        is in, not the order they appear in.
+        """
+        if self._kid_reserved_slots <= 0 or not kid_items:
+            return pool[: self._top_k]
+        kid_ids = {i.id for i in kid_items}
+        ranked_kid = [h for h in pool if h.item.id in kid_ids]
+        kid_channel = [h for h in ranked_kid if (h.item.meta or {}).get("channel")]
+        kid_other = [h for h in ranked_kid if h.item.id not in {x.item.id for x in kid_channel}]
+        reserved = (kid_channel + kid_other)[: self._kid_reserved_slots]
+        if not reserved:
+            return pool[: self._top_k]
+        reserved_ids = {h.item.id for h in reserved}
+        rest = [
+            h for h in pool if h.item.id not in reserved_ids
+        ][: self._top_k - len(reserved)]
+        position = {h.item.id: idx for idx, h in enumerate(pool)}
+        selected = reserved + rest
+        selected.sort(key=lambda h: position[h.item.id])
+        return selected
 
     def _kid_recall_items(
         self,
