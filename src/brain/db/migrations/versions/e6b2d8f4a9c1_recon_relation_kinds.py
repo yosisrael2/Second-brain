@@ -24,7 +24,7 @@ Create Date: 2026-10-24
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 from sqlalchemy import bindparam
 
 revision: str = "e6b2d8f4a9c1"
@@ -46,18 +46,23 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    conn = op.get_bind()
-    alive = conn.execute(
-        sa.text("SELECT count(*) FROM item_relations WHERE kind IN :kinds").bindparams(
-            bindparam("kinds", expanding=True)
-        ),
-        {"kinds": list(_NEW_KINDS)},
-    ).scalar()
-    if alive:
-        raise RuntimeError(
-            "cannot downgrade: item_relations rows with reconciliation kinds "
-            f"{_NEW_KINDS} exist ({alive} rows) — delete them first; they are "
-            "user-visible decisions, never silently destroyed"
-        )
+    if not context.is_offline_mode():
+        # the row-guard needs a LIVE connection; offline mode (--sql) only
+        # RENDERS the SQL, so there is nothing to refuse there (and
+        # op.get_bind() has no results to read). The guardedMigrationTest
+        # (#70) renders the downgrade offline through this exact path.
+        conn = op.get_bind()
+        alive = conn.execute(
+            sa.text("SELECT count(*) FROM item_relations WHERE kind IN :kinds").bindparams(
+                bindparam("kinds", expanding=True)
+            ),
+            {"kinds": list(_NEW_KINDS)},
+        ).scalar()
+        if alive:
+            raise RuntimeError(
+                "cannot downgrade: item_relations rows with reconciliation kinds "
+                f"{_NEW_KINDS} exist ({alive} rows) — delete them first; they are "
+                "user-visible decisions, never silently destroyed"
+            )
     op.drop_constraint(op.f("ck_item_relations_kind"), "item_relations", type_="check")
     op.create_check_constraint(op.f("ck_item_relations_kind"), "item_relations", _LEGACY)
