@@ -1088,14 +1088,19 @@ def _connectors_list() -> int:
     return 0
 
 
-def _build_connector(name: str, session: Any = None) -> Any:
+def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:
     """Instantiate the registry's connector with production seams: the shared
     keychain token (same item as gmail-auth — one OAuth client, one token)
     and the default google service factory. Registry aliases resolve.
 
     For the email source a session wires the C5 legacy-seed + fast-path seams:
     the first sync (and every full resync) copies the old seen-ledger into
-    connector_records (idempotent), and known gmail ids skip the GET."""
+    connector_records (idempotent), and known gmail ids skip the GET.
+
+    ``dry_run=True`` (review B1) wires READ-ONLY seams only: no legacy seed
+    runs and the Message-ID backstop only REPORTS its decision — --dry-run
+    writes nothing (no ledger, no cursor, no state, no items).
+    """
     from brain.connectors import get
     from brain.connectors.google.base import default_service_factory
     from brain.services.keychain import GMAIL_ACCOUNT, Keychain
@@ -1114,18 +1119,25 @@ def _build_connector(name: str, session: Any = None) -> Any:
         "service_factory": default_service_factory,
     }
     if session is not None and name in ("email", "gmail"):
-        from brain.connectors.google.gmail import (
-            rfc_backstop_put,
-            seed_connector_records_from_email_ledger,
-        )
-        from brain.connectors.state import ConnectorRecordRepo
+        if dry_run:
+            # --dry-run writes NOTHING: no seed; the backstop only reports.
+            from brain.connectors.google.gmail import rfc_backstop_report
+            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_report(
+                session, rfc, gmail_id
+            )
+        else:
+            from brain.connectors.google.gmail import (
+                rfc_backstop_put,
+                seed_connector_records_from_email_ledger,
+            )
+            from brain.connectors.state import ConnectorRecordRepo
 
-        records = ConnectorRecordRepo(session)
-        kwargs["legacy_seed"] = lambda: seed_connector_records_from_email_ledger(session)
-        kwargs["is_known"] = lambda gmail_id: records.get("email", gmail_id) is not None
-        kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(
-            session, rfc, gmail_id
-        )
+            records = ConnectorRecordRepo(session)
+            kwargs["legacy_seed"] = lambda: seed_connector_records_from_email_ledger(session)
+            kwargs["is_known"] = lambda gmail_id: records.get("email", gmail_id) is not None
+            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(
+                session, rfc, gmail_id
+            )
     return cls(**kwargs)
 
 
@@ -1168,7 +1180,7 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         from brain.repositories.items import ItemsRepository  # noqa: PLC0415
 
         if args.dry_run:
-            connector = _build_connector(args.name, session=session)
+            connector = _build_connector(args.name, session=session, dry_run=True)
             state = ConnectorStateRepo(session).get(connector.name)
             result = connector.fetch(state.cursor if state else None, limit=args.limit)
             print(

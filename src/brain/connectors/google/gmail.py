@@ -37,6 +37,7 @@ from brain.ai.gmail import (
     GmailMessage,
     RestGmailClient,
 )
+from brain.connectors import alias, register
 from brain.connectors.base import (
     AttachmentRef,
     ConnectorAuthError,
@@ -139,22 +140,13 @@ def seed_connector_records_from_email_ledger(session: Any) -> int:
     return len(result.all())
 
 
-def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
-    """The Message-ID backstop (second-pass review, finding 2).
-
-    The ledger keys on gmail_id; the ingest fingerprint also hashes the
-    occurred_at MINUTE, so the same Message-ID re-delivered under a NEW
-    gmail id (Gmail re-delivers with a fresh id) escapes both when the
-    internal_date differs even slightly. Before create: when an existing
-    email item already carries this rfc_message_id, point the new gmail id
-    at that item in the ledger (idempotent put) and tell the caller to drop
-    the record. Returns True when the backstop caught the message.
-    """
+def _item_with_rfc(session: Any, rfc_message_id: str) -> Any:
+    """The oldest email item carrying this RFC Message-ID (or None)."""
     from sqlalchemy import select
 
-    from brain.db.models import ConnectorRecord, MemoryItem
+    from brain.db.models import MemoryItem
 
-    existing = (
+    return (
         session.execute(
             select(MemoryItem)
             .where(MemoryItem.source == "email")
@@ -165,9 +157,29 @@ def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
         .scalars()
         .first()
     )
-    if existing is None:
-        return False
-    row = (
+
+
+def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
+    """The Message-ID backstop (second-pass review, finding 2).
+
+    The ledger keys on gmail_id; the ingest fingerprint also hashes the
+    occurred_at MINUTE, so the same Message-ID re-delivered under a NEW
+    gmail id (Gmail re-delivers with a fresh id) escapes both when the
+    internal_date differs even slightly. Before create: when an existing
+    email item already carries this rfc_message_id, point the new gmail id
+    at that item in the ledger (idempotent put) and tell the caller to drop
+    the record. Returns True when the backstop caught the message.
+
+    Guard (review round 3, B2): applies ONLY when this gmail_id has NO
+    ledger row yet — a known id belongs to the runner (version updates);
+    the backstop must never swallow a legitimate re-sync of an
+    already-ledgered message.
+    """
+    from sqlalchemy import select
+
+    from brain.db.models import ConnectorRecord
+
+    ledgered = (
         session.execute(
             select(ConnectorRecord).where(
                 ConnectorRecord.source == "email",
@@ -177,13 +189,32 @@ def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
         .scalars()
         .first()
     )
-    if row is None:
-        row = ConnectorRecord(source="email", external_id=gmail_id)
-        session.add(row)
-    row.version = None
-    row.item_id = existing.id
+    if ledgered is not None:
+        return False  # a known id: the runner owns it (updates/version)
+    existing = _item_with_rfc(session, rfc_message_id)
+    if existing is None:
+        return False
+    session.add(
+        ConnectorRecord(
+            source="email", external_id=gmail_id, version=None, item_id=existing.id
+        )
+    )
     session.commit()
     return True
+
+
+def rfc_backstop_report(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
+    """READ-ONLY dry-run twin of :func:`rfc_backstop_put` (review B1):
+    report what a real sync would ledger, write NOTHING, and never drop the
+    record — the dry-run listing must show every record the source yields."""
+    existing = _item_with_rfc(session, rfc_message_id)
+    if existing is None:
+        return False
+    print(
+        f"  backstop: would ledger {gmail_id} -> existing item "
+        f"{existing.id} (same Message-ID {rfc_message_id})"
+    )
+    return False
 
 
 def heartbeat_email_summary(summary: Any) -> None:
@@ -213,6 +244,7 @@ def heartbeat_email_summary(summary: Any) -> None:
         logger.debug("connectors: email heartbeat raised", exc_info=True)
 
 
+@register
 class GmailConnector(GoogleConnector):
     """Gmail label -> SourceRecords (the email source on the framework)."""
 
@@ -504,3 +536,8 @@ def _tombstone(message_id: str) -> Any:
         meta={"gmail_id": message_id, "tombstone": True},
         deleted=True,
     )
+
+
+# The contract: items.source stays "email" for the existing data; the
+# registry also answers to "gmail" (the docs/UI name) via the alias.
+alias("gmail", "email")

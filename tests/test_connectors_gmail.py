@@ -564,6 +564,22 @@ class TestErrorTranslation:
 # --- attachments ---------------------------------------------------------------
 
 
+class TestRegistration:
+    """The registry contract (found missing in review round 3): without
+    @register + the alias, `brain connectors sync email` reports 'not
+    available on this install' — the whole CLI path is dead, and every CLI
+    test missed it because they monkeypatch _build_connector."""
+
+    def test_connector_registers_as_email_with_the_gmail_alias(self):
+        import brain.connectors as registry
+        from brain.connectors.google.gmail import GmailConnector
+
+        registry.ensure_registered()
+        assert registry.get("email") is GmailConnector
+        assert registry.get("gmail") is GmailConnector  # the alias resolves
+        assert "email" in registry.all_names()
+
+
 class TestAttachments:
     def test_fetch_attachment_returns_the_decoded_bytes(self):
         state = _ServiceState()
@@ -1057,6 +1073,52 @@ class TestRunnerSemantics:
         ledger_m2 = h.records.get("email", "m2")
         assert ledger_m2 is not None and ledger_m2.item_id is not None
         assert str(ledger_m2.item_id) == str(h.item_for("m1").id)
+
+    def test_backstop_never_swallows_a_known_gmail_id(self, gmail_harness):
+        """Review round 3, B2: the backstop matches its OWN item when the
+        SAME gmail id returns — a label change re-delivers the identical
+        message through the history path, and the pre-fix backstop reset the
+        ledger row to version=None and DROPPED the record, staling the
+        version and losing a legitimate update. The backstop must apply
+        only when the gmail id has NO ledger row yet; a known id belongs to
+        the runner (version update)."""
+        from brain.connectors.google.gmail import rfc_backstop_put
+
+        h = gmail_harness
+        h.connector._rfc_backstop = lambda rfc, gid: rfc_backstop_put(
+            h.session, rfc, gid
+        )  # the production wiring (cli._build_connector)
+        _queue_message(h._state_service, "m1", rfc="<same@msg>")
+        first = h.runner.run()
+        assert first.created == 1
+        row = h.records.get("email", "m1")
+        assert row is not None and row.version is None
+        h.records.put("email", "m1", "v1", row.item_id)  # an already-ledgered VERSION
+        # The SAME gmail id returns through the history path (label change).
+        h._state_service.history_pages = {
+            "first": {
+                "history": [
+                    {
+                        "id": "9001",
+                        "messagesAdded": [
+                            {
+                                "message": {
+                                    "id": "m1",
+                                    "labelIds": [LABEL],
+                                    "historyId": "9001",
+                                }
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        second = h.runner.run()
+        assert second.fetched == 1, "the backstop must NOT swallow a known id"
+        assert second.updated == 1
+        assert h.records.get("email", "m1").version is None  # reconciled to the source
+        items = h.repo.list(item_type=None, project=None, status=None, limit=50, offset=0)
+        assert len([i for i in items if i.source == "email"]) == 1
 
     def test_same_body_without_rfc_id_dedupes_by_fingerprint(self, gmail_harness):
         h = gmail_harness
