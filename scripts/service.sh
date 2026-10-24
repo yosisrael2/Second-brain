@@ -67,17 +67,19 @@ email_configured() {
 
 connectors_configured() {
   # Connectors are OPT-IN the same way: the agent runs only when
-  # BRAIN_CONNECTORS contains a non-email connector (email keeps its own
-  # agent, run-email.sh). Without one the scheduler would loop doing
-  # nothing — install skips it instead and removes any stale plist.
+  # BRAIN_CONNECTORS contains a non-email connector (email AND its registry
+  # alias 'gmail' are excluded — the Gmail poller keeps its own agent,
+  # run-email.sh). Without one the scheduler would loop doing nothing —
+  # install skips it instead and removes any stale plist.
   load_env_file
   [ -n "${BRAIN_CONNECTORS:-}" ] || return 1
-  local part
+  local part part_lc
   local old_ifs="$IFS"
   IFS=','
   for part in ${BRAIN_CONNECTORS}; do
     part="$(printf '%s' "$part" | tr -d '[:space:]')"
-    if [ -n "$part" ] && [ "$part" != "email" ]; then
+    part_lc="$(printf '%s' "$part" | tr '[:upper:]' '[:lower:]')"
+    if [ -n "$part_lc" ] && [ "$part_lc" != "email" ] && [ "$part_lc" != "gmail" ]; then
       IFS="$old_ifs"
       return 0
     fi

@@ -16,12 +16,13 @@
 #
 #   every attempted connector exited 78 (auth/config: needs consent) -> exit 0
 #       NO restart — permanent until the user acts (mirrors run-email's
-#       EX_CONFIG handling; mixed ok+78 keeps looping: the ok ones keep
-#       syncing, isolation first)
-#   any transient failure (1/crash)                                  -> exit 1
-#       launchd restarts with its throttle backoff; the next pass re-runs
-#       every connector (idempotent by external_id/version)
-#   otherwise (all ok)                                               -> sleep, loop
+#       EX_CONFIG handling)
+#   any transient failure (1/crash)                                  -> LOG and
+#       CONTINUE: the pass loop keeps the INTERVAL cadence (a restart storm
+#       polling every source at launchd's throttle would burn quota because
+#       of the sick one); the runner persists a per-connector failure
+#       counter, surfaced in the heartbeat
+#   launchd restarts only when the script itself crashes.
 #
 # The launchd path IS the real service: BRAIN_ALLOW_LIVE=1 is exported (the
 # live-store startup guard refuses bare worktree runs otherwise). Secrets
@@ -57,14 +58,18 @@ PASSES="${BRAIN_CONNECTORS_PASSES:-0}"
 case "$PASSES" in ''|*[!0-9]*) PASSES=0 ;; esac
 
 # The enabled non-email connectors: comma list, whitespace-tolerant.
+# Case-insensitive; 'email' AND its registry alias 'gmail' are excluded —
+# the Gmail poller keeps its own agent (run-email.sh).
 names=""
 if [ -n "${BRAIN_CONNECTORS:-}" ]; then
   old_ifs="$IFS"
   IFS=','
   for part in ${BRAIN_CONNECTORS}; do
     part="$(printf '%s' "$part" | tr -d '[:space:]')"
+    part="$(printf '%s' "$part" | tr '[:upper:]' '[:lower:]')"
     [ -z "$part" ] && continue
-    [ "$part" = "email" ] && continue  # email keeps its own agent
+    [ "$part" = "email" ] && continue
+    [ "$part" = "gmail" ] && continue  # registry alias of email
     names="$names $part"
   done
   IFS="$old_ifs"
@@ -78,7 +83,6 @@ fi
 pass=0
 while :; do
   pass=$((pass + 1))
-  had_transient=0
   all_permanent=1
   for name in $names; do
     "$BRAIN" connectors sync "$name"
@@ -86,13 +90,15 @@ while :; do
     case "$rc" in
       0) all_permanent=0 ;;
       78) ;;  # permanent for THIS connector (needs consent); the others keep going
-      *) all_permanent=0; had_transient=1 ;;
+      *)
+        # Transient: NEVER exit (a restart storm would poll every source at
+        # launchd's throttle because of the sick one). Name the connector and
+        # keep the INTERVAL cadence.
+        all_permanent=0
+        echo "run-connectors: $name transient failure (rc=$rc); retrying next interval" >&2
+        ;;
     esac
   done
-  if [ "$had_transient" -eq 1 ]; then
-    echo "run-connectors: transient failure in pass (launchd will restart with backoff)" >&2
-    exit 1
-  fi
   if [ "$all_permanent" -eq 1 ]; then
     echo "run-connectors: every connector needs user action (78) — not restarting"
     exit 0
