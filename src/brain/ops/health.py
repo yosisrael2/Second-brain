@@ -204,6 +204,7 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
         summary = (
             f"queue {raw.get('queue_depth', 0)} · cap {raw.get('cap_used_today', 0)}"
             f"/{raw.get('cap_limit', '?')} · worker {'on' if worker else 'off (inert)'}"
+            f" · extractor {raw.get('extractor', '?')}"
         )
         return _entry("ok", summary, raw)
     if component == "triage":
@@ -880,6 +881,7 @@ def _enrichment_check() -> dict[str, Any]:
         service = EnrichmentService(ItemsRepository(session), session)
         details: dict[str, Any] = {
             "worker_enabled": get_settings().enrichment_worker_enabled,
+            "extractor": get_settings().enrichment_extractor,
             "queue_depth": service.queue_depth(),
             "cap_used_today": service.cap_used_today(now),
             "cap_limit": get_settings().enrichment_daily_cap,

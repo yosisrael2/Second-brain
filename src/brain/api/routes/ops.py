@@ -115,6 +115,7 @@ def get_ops_enrichment() -> dict[str, Any]:
             "queue_depth": service.queue_depth(),
             "cap_used_today": service.cap_used_today(now),
             "cap_limit": get_settings().enrichment_daily_cap,
+            "extractor": get_settings().enrichment_extractor,
         }
 
 
