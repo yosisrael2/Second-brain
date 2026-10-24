@@ -26,7 +26,8 @@ from sqlalchemy import text
 
 from brain.config import get_settings, unwrap_secret
 from brain.connectors import all_names
-from brain.db.session import engine
+from brain.connectors.state import ConnectorRecordRepo
+from brain.db.session import SessionLocal, engine
 from brain.ops import flow as ops_flow
 from brain.ops import health as ops_health
 from brain.ops import stats as ops_stats
@@ -349,9 +350,9 @@ def get_ops_connectors() -> dict[str, Any]:
     rendered by the cockpit as text (textContent), not HTML."""
     enabled = set(get_settings().connectors_enabled)
     registered = set(all_names())
-    with engine.connect() as conn:
+    with SessionLocal() as session:
         state_rows = (
-            conn.execute(
+            session.execute(
                 text(
                     "SELECT name, cursor, last_run_at, last_ok_at, last_error, counters "
                     "FROM connector_state ORDER BY name"
@@ -361,21 +362,14 @@ def get_ops_connectors() -> dict[str, Any]:
             .all()
         )
         counts = dict(
-            conn.execute(
+            session.execute(
                 text("SELECT source, count(*) FROM connector_records GROUP BY source")
             ).all()
         )
         # Quarantine (review round 2 of #53): poison records are ledger rows
-        # with status 'failed' — the same source of truth as
-        # ConnectorRecordRepo.quarantined_counts().
-        quarantined = dict(
-            conn.execute(
-                text(
-                    "SELECT source, count(*) FROM connector_records "
-                    "WHERE status = 'failed' GROUP BY source"
-                )
-            ).all()
-        )
+        # with status 'failed' — read through ConnectorRecordRepo so the
+        # panel has exactly one source of truth for quarantine counts.
+        quarantined = ConnectorRecordRepo(session).quarantined_counts()
     names = sorted(registered | {row["name"] for row in state_rows})
     rows: dict[str, dict[str, Any]] = {
         name: {
