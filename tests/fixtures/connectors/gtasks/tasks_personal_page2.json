@@ -1,0 +1,15 @@
+{
+  "kind": "tasks#tasks",
+  "etag": "W/\"tasks-personal-page-2\"",
+  "items": [
+    {
+      "kind": "tasks#task",
+      "id": "task-no-due",
+      "etag": "W/\"task-no-due-1\"",
+      "title": "Someday: learn the piano",
+      "updated": "2026-03-05T21:10:00.000Z",
+      "notes": "Open task without a due date.",
+      "status": "needsAction"
+    }
+  ]
+}
