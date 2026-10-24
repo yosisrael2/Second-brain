@@ -6,12 +6,15 @@ import re
 import uuid
 from collections.abc import Sequence
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
-from brain.db.models import MemoryItem
+from brain.db.models import ItemSource, MemoryItem
+
+SOURCE_WHATSAPP = "whatsapp"
 
 
 def _escape_like(needle: str) -> str:
@@ -70,12 +73,16 @@ class ItemsRepository:
         limit: int,
         offset: int,
         include_children: bool = False,
+        include_noise: bool = False,
         include_superseded: bool = False,
     ) -> Sequence[MemoryItem]:
         """List items newest-first, optionally filtered by type/project/status.
 
         ``include_children=True`` opts IN to extracted children (used by the
         parent's child list); default listings never show them (item 19).
+        ``include_noise=True`` opts IN to triaged-noise WhatsApp conversations
+        (D2a, item 36); default listings hide them — noise stays stored and
+        searchable, just not listed. Untriaged items are always listed.
         ``include_superseded=True`` opts IN to superseded (struck-through)
         items; default listings never show them (item 20/D4).
         """
@@ -93,10 +100,44 @@ class ItemsRepository:
             stmt = stmt.where(
                 MemoryItem.child_state.is_(None) | (MemoryItem.child_state == "kept")
             )
+        if not include_noise:
+            stmt = stmt.where(
+                or_(
+                    MemoryItem.source != SOURCE_WHATSAPP,
+                    MemoryItem.triage_label.is_(None),
+                    MemoryItem.triage_label != "noise",
+                )
+            )
         # PR B (item 20/D4): superseded items are hidden by default.
         if not include_superseded:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
         return list(self._db.scalars(stmt.limit(limit).offset(offset)))
+
+    def untriaged_whatsapp(self, *, limit: int) -> Sequence[MemoryItem]:
+        """WhatsApp conversations without a triage decision, oldest first.
+
+        Drives the `brain whatsapp-triage` backfill (D2a): only UNTRIAGED
+        items — a re-triage happens through the update path, never silently
+        by the backfill.
+        """
+        stmt = (
+            select(MemoryItem)
+            .where(
+                MemoryItem.source == SOURCE_WHATSAPP,
+                MemoryItem.triage_label.is_(None),
+            )
+            .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+            .limit(limit)
+        )
+        return list(self._db.scalars(stmt))
+
+    def apply_triage(self, item: MemoryItem, result: Any) -> None:
+        """Write one triage decision onto the item (flushed, not committed)."""
+        item.triage_label = result.label
+        item.triage_confidence = result.confidence
+        item.triage_method = result.method
+        item.triage_version = result.version
+        self._db.flush()
 
     def search(
         self, *, query: str, limit: int, offset: int, include_superseded: bool = False
@@ -105,6 +146,8 @@ class ItemsRepository:
 
         Superseded (struck-through) items are hidden by default (item 20/D4);
         ``include_superseded=True`` opts back in (the bot's Undo/Restore views).
+        Noise WhatsApp conversations (D2a) REMAIN searchable — hiding noise
+        from listings must never remove it from search.
         """
         tsquery = func.websearch_to_tsquery(FTS_LANGUAGE, query)
         stmt = (
@@ -179,6 +222,21 @@ class ItemsRepository:
         )
         if not include_superseded:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+        return list(self._db.scalars(stmt))
+
+    def children_of(self, item_id: uuid.UUID) -> Sequence[MemoryItem]:
+        """Extraction children quoting this item as a source (item_sources).
+
+        Used by the connector runner: when a source deletes a parent, its
+        proposed children must hide with it (review bug 4). Oldest first for
+        deterministic order.
+        """
+        stmt = (
+            select(MemoryItem)
+            .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+            .where(ItemSource.source_id == item_id)
+            .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+        )
         return list(self._db.scalars(stmt))
 
     def delete(self, item: MemoryItem) -> None:

@@ -124,6 +124,11 @@ def get_llm_client() -> LLMClient:
     return _llm_client()
 
 
+def get_jev_client() -> JevClient:
+    """Provide the shared Jev client (public accessor for CLI consumers)."""
+    return _jev_client()
+
+
 def get_items_repository(db: Session = Depends(get_db)) -> ItemsRepository:
     """Provide a request-scoped ItemsRepository."""
     return ItemsRepository(db)

@@ -533,3 +533,75 @@ def test_set_channel_rejects_invalid_kind(memory: MemoryService):
         memory.set_channel("ערוץ", kind="family", applies_to="me")
     # the valid set still works
     memory.set_channel("ערוץ", kind="teacher", applies_to="me")
+
+
+# -- A2 run-#1 fix 1: normalized label comparison -------------------------------
+
+
+def test_class_label_variants_all_match(memory: MemoryService):
+    """ה' ספיר (memory) == ה׳ ספיר / ה ספיר / כיתה ה' ספיר / ה-ספיר (text)."""
+    _seed_world(memory)
+    for variant in ("ה׳ ספיר", "ה ספיר", "כיתה ה' ספיר", "ה-ספיר", "ה' ספיר"):
+        assert memory.resolve_applies_to({"class": variant}) == ["Rona"], variant
+
+
+def test_school_label_variant_still_matches(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.resolve_applies_to({"school": "בָּרָאשִׁית"}) == ["Rona", "Itamar"]
+
+
+def test_different_class_still_incompatible(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.resolve_applies_to({"class": "ו' אלון"}) == ["nobody"]
+
+
+# -- A2 run-#1 fix 2: sender -> default audience (R1) ---------------------------
+
+
+def test_sender_matching_teacher_is_the_default_audience(memory: MemoryService):
+    _seed_world(memory)
+    assert memory.default_audience_for_sender("Rinat <rinat@bereshit.edu>") == ["Rona"]
+    assert memory.default_audience_for_sender("Maayan") == ["Itamar"]
+    assert memory.default_audience_for_sender("דואר כללי <office@edu>") is None
+    assert memory.default_audience_for_sender(None) is None
+    assert memory.default_audience_for_sender("") is None
+
+
+def test_sender_default_uses_whole_word_teacher_matching(memory: MemoryService):
+    """Review round 2, bug 2: raw containment matched BOTH ways — a parent
+    'Rinat Levi' whose first name equals the teacher's, a word merely
+    CONTAINING the teacher name, and a short sender inside a long teacher
+    name all defaulted to the kid. The shared whole-word matcher
+    (triage.mentions_name, one direction) fixes all three."""
+    _seed_world(memory)
+    # whole-word: a parent whose first name equals the teacher's still matches
+    assert memory.default_audience_for_sender("Rinat Levi <rinat.levi@gmail.com>") == ["Rona"]
+    # a longer word merely containing the teacher name does not
+    assert memory.default_audience_for_sender("Rinatech Ltd <office@rinatech.co>") is None
+    # a short sender string inside a longer teacher name does not
+    assert memory.default_audience_for_sender("Rin") is None
+
+
+def test_sender_default_hebrew_teacher_prefix_rule(memory: MemoryService):
+    """Review round 2, bug 2 (Hebrew): mentions_name allows attached Hebrew
+    prepositions (והבכלמש) before the name but not arbitrary letters —
+    'קרינת' is NOT the teacher 'רינת'."""
+    _seed_world(memory)
+    memory.set_kid(
+        "Noa",
+        gender="girl",
+        school="בראשית",
+        grade="3",
+        class_="ג' כוכב",
+        teacher="רינת",
+    )
+    assert memory.default_audience_for_sender("רינת לוי") == ["Noa"]
+    # Hebrew display name + an address containing the Latin 'rinat': BOTH
+    # teacher facts match — the acknowledged residual (a first-name-only
+    # teacher fact can match a same-named parent; results are proposals,
+    # D2 Keep/Fix/Drop)
+    assert memory.default_audience_for_sender("רינת לוי <rinat.levi@gmail.com>") == [
+        "Noa",
+        "Rona",
+    ]
+    assert memory.default_audience_for_sender("משפחת קרינת") is None
