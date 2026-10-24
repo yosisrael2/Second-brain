@@ -195,6 +195,8 @@ class EvalResult:
     grounding_by_pred: dict[str, bool | str | None] = field(default_factory=dict)
     conflict_gold: int = 0
     conflict_reproduced: int = 0
+    applies_excl_gold_unknown_ok: int = 0
+    applies_excl_gold_unknown_denominator: int = 0
 
 
 # ---- input parsing -----------------------------------------------------------
@@ -585,6 +587,12 @@ def evaluate(
         if child.child_id in match_of_gold and match_of_gold[child.child_id].pred.date_conflict
     )
 
+    # applies_to accuracy EXCLUDING gold {unknown} rows: a gold that did not
+    # name anyone cannot vouch for audience accuracy (any pred matches it via
+    # the wildcard rule). Denominator: matches whose GOLD names someone.
+    applies_excl = [m for m in matches if m.gold.applies_to]
+    applies_excl_ok = sum(1 for m in applies_excl if m.gold.applies_to == m.pred.applies_to)
+
     return EvalResult(
         gold_children=gold,
         pred_children=pred,
@@ -596,6 +604,8 @@ def evaluate(
         date_denominator=date_denominator,
         applies_ok=applies_ok,
         applies_pred_unknown=applies_pred_unknown,
+        applies_excl_gold_unknown_ok=applies_excl_ok,
+        applies_excl_gold_unknown_denominator=len(applies_excl),
         relations=relations,
         grounding=GroundStat(
             grounded=grounded,
@@ -664,11 +674,21 @@ def format_aggregate(result: EvalResult) -> str:
         else None
     )
     unknown_rate = result.applies_pred_unknown / tp if tp else None
+    excl_rate = (
+        result.applies_excl_gold_unknown_ok / result.applies_excl_gold_unknown_denominator
+        if result.applies_excl_gold_unknown_denominator
+        else None
+    )
     lines += [
         f"date_exact_match_rate: {_fmt(date_rate)}",
         f"applies_to_accuracy: {_fmt(applies_rate)}",
         f"applies_to_pred_unknown: {result.applies_pred_unknown}",
         f"applies_to_pred_unknown_rate: {_fmt(unknown_rate)}",
+        # Manager decision (23 Oct): applies_to is ALSO reported excluding gold
+        # {unknown} rows — a gold-unknown match says nothing about audience
+        # accuracy, it only rewards guessing. Raw stays for comparability.
+        f"applies_to_accuracy_excl_gold_unknown: {_fmt(excl_rate)}",
+        f"applies_to_excl_gold_unknown_denominator: {result.applies_excl_gold_unknown_denominator}",
         f"grounding_rate: {_fmt(grounding_rate)}",
         f"grounding_grounded: {result.grounding.grounded}",
         f"grounding_denominator: {result.grounding.denominator}",
