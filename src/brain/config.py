@@ -127,6 +127,9 @@ class Settings(BaseSettings):
     # selects the real LLM extractor. Activation = this + the worker switch,
     # never a code change. Literal validation rejects anything else.
     enrichment_extractor: Literal["stub", "llm"] = "stub"
+    # A2 wiring: the in-bot worker's tick interval. Only read when
+    # enrichment_worker_enabled is true (default OFF: nothing scheduled).
+    enrichment_worker_interval_s: int = 300
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
