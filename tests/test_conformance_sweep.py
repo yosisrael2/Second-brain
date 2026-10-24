@@ -23,6 +23,8 @@ that is the enforcement for every future adapter PR.
 from __future__ import annotations
 
 import importlib.util
+import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -118,18 +120,51 @@ def _product_names() -> list[str]:
     The registry is process-global and pytest imports every test module at
     collection, so test files that register scratch connectors (e.g.
     test_connectors_base's ``dummy``, registered at import for its
-    duplicate-guard test) land in it too. They are not product adapters:
-    their classes live under ``tests.``, real adapters under ``brain.`` —
-    the sweep covers every adapter merged into the product and ignores
-    test-only registrations.
+    duplicate-guard test) land in it too. The invariant this encodes:
+    PRODUCT ADAPTERS LIVE UNDER ``brain.`` (their classes come from
+    ``brain.connectors.*`` modules); a class registered from anywhere else
+    is a test fixture by construction and MUST NOT fail the sweep. Real
+    adapters merged later register from ``brain.connectors.*`` and are
+    covered automatically.
     """
     from brain.connectors import _REGISTRY
 
-    return sorted(
+    names = sorted(
         name
         for name, cls in _REGISTRY.items()
         if str(getattr(cls, "__module__", "")).startswith("brain.")
     )
+    # The invariant, asserted: everything the sweep will demand a donation
+    # file for is a product module — no test fixture leaks into the list.
+    assert all(_REGISTRY[name].__module__.startswith("brain.") for name in names)
+    return names
+
+
+def test_product_names_ignores_test_only_registrations(monkeypatch):
+    """A registry entry whose class lives OUTSIDE brain. is a test fixture —
+    ignored ON PURPOSE (the sweep never demands a donation file for it)."""
+    from brain.connectors import _REGISTRY, ensure_registered
+    from brain.connectors.base import Connector, FetchResult
+
+    ensure_registered()
+    product = next(
+        name
+        for name, cls in _REGISTRY.items()
+        if cls.__module__.startswith("brain.")
+    )
+
+    class _FixtureConnector(Connector):
+        name = "fixture"
+
+        def fetch(self, cursor: str | None, *, limit: int) -> FetchResult:
+            raise AssertionError("not used")
+
+    _FixtureConnector.__module__ = "tests.test_somewhere_else"
+    fake_registry = {product: _REGISTRY[product], "fixture": _FixtureConnector}
+    monkeypatch.setattr(
+        sys.modules["brain.connectors"], "_REGISTRY", fake_registry
+    )
+    assert _product_names() == [product]  # 'fixture' ignored: not a brain. module
 
 
 def test_sweep_every_registered_connector_passes_the_kit(kit_db):
@@ -158,10 +193,6 @@ def test_sweep_every_registered_connector_passes_the_kit(kit_db):
             build, _scenario(name), session=kit_db, immutable_source=immutable
         )
         variant = report.pop("change_variant")
-        print(
-            f"conformance[{name}]: change variant = {variant}; "
-            f"checks = {sorted(report)}"
-        )
         assert set(report) == {
             "termination",
             "termination_tie_group",
@@ -170,3 +201,11 @@ def test_sweep_every_registered_connector_passes_the_kit(kit_db):
             "delete",
             "reset",
         }, f"{name}: the kit did not run every check: {sorted(report)}"
+        # Visible in normal pytest output (no -s, no new dependency): the
+        # summary warnings section names the change variant per adapter, so
+        # an immutable pass is never mistaken for a skipped check.
+        warnings.warn(
+            f"conformance[{name}]: change variant = {variant} "
+            f"({'IMMUTABLE_SOURCE declared' if immutable else 'version-bump'})",
+            stacklevel=1,
+        )

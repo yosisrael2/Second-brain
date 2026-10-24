@@ -164,8 +164,16 @@ class _KitCollection:
 
 
 def build(api: Any) -> GTasksConnector:
-    """The registered gtasks connector on a fake service backed by ``api``."""
-    conn = object.__new__(GTasksConnector)
-    conn._lists_allowlist = ""  # no allowlist: every list (the kit's one list)
-    conn._service = lambda: KitTasksService(api)  # type: ignore[method-assign]
-    return conn
+    """The registered gtasks connector on a fake service backed by ``api``.
+
+    Built through the PUBLIC constructor with an injected 4-arg service
+    factory (no network) — the sweep exercises the real construction
+    (API_NAME/API_VERSION check, the allowlist seam): an empty allowlist
+    string pins "every list" (parse_list_allowlist('') = no entries), which
+    the adapter syncs wholesale — the kit's one list included.
+    """
+    return GTasksConnector(
+        token_loader=lambda: "refresh-token",
+        service_factory=lambda token, scopes, api_name, api_version: KitTasksService(api),
+        lists_allowlist="",
+    )
