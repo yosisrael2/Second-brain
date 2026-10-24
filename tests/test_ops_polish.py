@@ -147,7 +147,33 @@ class TestAskRecordOpsFlag:
         assert rows == 0, "diagnostics must not poison /ops/health's llm view"
 
     def test_default_still_records(self, ops_tables):
-        self._ask(record_ops=True)[1]
+        """Default record_ops=True still records — for a REAL (non-synthetic)
+        client. A FakeLLMClient (synthetic) never records: a verification run
+        must not poison live llm health (fix/fake-llm-health); the synthetic
+        behaviour is pinned by TestFakeLlmNeverFlipsLlmHealth in
+        test_ops_health.py."""
+        from tests.fakes import FakeRepository
+        from tests.test_ask_service import StubSearch, cite_every_source, make_hits
+
+        from brain.ai.ask import Completion
+        from brain.services.ask import AskService
+
+        class RealStubLLM:
+            """A client that is NOT synthetic: its events ARE evidence."""
+
+            synthetic = False
+
+            def complete(self, prompt: str) -> Completion:
+                return Completion(cite_every_source(prompt), model="real-stub")
+
+            def close(self) -> None:
+                pass
+
+        repo = FakeRepository()
+        hits = make_hits(repo, "The server runs on port 27800.")
+        service = AskService(StubSearch(hits), RealStubLLM())  # type: ignore[arg-type]
+        result = service.ask("what port?")
+        assert result.answer
         with ops._get_engine().connect() as conn:
             rows = conn.execute(
                 sa_text("SELECT count(*) FROM ops_events WHERE component = 'ask'")

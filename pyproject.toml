@@ -24,6 +24,10 @@ dependencies = [
     "pypdf>=5,<7",
     # Hebrew-calendar date conversion for extraction (delta item 2a).
     "pyluach>=2.0,<3",
+    # RRULE expansion for pasted recurring calendar events (P1; BSD-3,
+    # pure Python): one occurrence expander shared by the paste path and
+    # the gcal connector (#55).
+    "python-dateutil>=2.9,<3",
 ]
 
 [project.optional-dependencies]
