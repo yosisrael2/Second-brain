@@ -59,7 +59,7 @@ to its section or doc.
 
 **Ops**
 - 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
-- Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; each test session fails loudly if the live collection changes — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45)
+- Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; migrations refuse the live database the same way (alembic guard); each test session fails loudly if the live collection gains test-originated vectors — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45, #70, #74)
 - Tests isolated from live data: per-worker test databases reset (TRUNCATEd at session start) and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42, #62)
 
 **Evaluation**
@@ -78,21 +78,22 @@ to its section or doc.
 | Gmail label source + 24/7 email agent | **Done, opt-in** (needs Google consent) | #36, #43 |
 | Extraction data model + queue, LLM extractor (A2), proposal cards | **Done, inactive** (worker flag off) | #33, #41, #39 |
 | WhatsApp relevance triage (noise stays searchable, out of listings + enrichment) | **Done** | #49 |
-| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent) + setup docs | **Done** (connectors disabled by default) | #53, #58 |
-| Google Tasks connector (`gtasks`, read-only) | **Done, inactive** (disabled by default) | #56 |
+| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent) + setup docs | **Done** (connectors disabled by default) | #53, #58, #76 |
+| Google Calendar connector (`gcal`, read-only) | **Done, on main, inactive** (disabled by default) | #55 |
+| Google Tasks connector (`gtasks`, read-only) | **Done, on main, inactive** (disabled by default) | #56 |
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
-| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50 |
+| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50, #67 |
 | Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, relations inspector) | **Done** | #13, #29, #46, #54 |
-| Ops safety (test isolation + session-start reset, live-store guards, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62 |
+| Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown) | **Done** | #4, #5, #25, #39, #61 |
 
 **In progress** (work in progress, 24 Oct 2026)
 
-- Connectors: Google Calendar adapter — `gcal`, read-only (PR #55), Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
+- Connectors: Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
+- Connector adoption pass — turning Calendar/Tasks on needs one-time Google consent plus a one-time adoption step so already-pasted items are not duplicated (in progress)
 - Connector conformance kit — termination/idempotency/change/delete/reset scenarios every source must pass (PR #60)
-- Cockpit Sources panel — read-only connector status card (PR #64)
+- Cockpit Sources panel — read-only connector status card (PR #64 landed on a stale base; needs re-landing on main)
 - WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation
-- Alembic live guard (migrations must never run against the live database by accident)
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
 The live instance still runs `7936c55` — nothing has been deployed since.
