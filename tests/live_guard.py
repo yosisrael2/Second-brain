@@ -85,10 +85,19 @@ def count_delta_note(before: int | None, after: int | None) -> str | None:
     """Informational note for a LIVE count change; None when unremarkable.
 
     An external write (the live instance ingesting) changes the count but
-    carries no marker — that is normal operation, not test pollution.
+    carries no marker — that is normal operation, not test pollution. A
+    DECREASE is called out plainly (LIVE collection LOST N points): no test
+    should delete live data, so a drop is worth noticing even though it is
+    not a session failure under the marker-based guard.
     """
     if before is None or after is None or before == after:
         return None
+    if after < before:
+        return (
+            f"LIVE collection LOST {before - after} points during the test session "
+            f"({before} -> {after}) — no test-origin markers found; a test did "
+            f"not write, but check what deleted live data if the drop is unexpected"
+        )
     return (
         f"live collection points changed during the test session "
         f"({before} -> {after}) — no test-origin markers found; "

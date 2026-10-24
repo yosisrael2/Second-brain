@@ -133,6 +133,8 @@ class TestSessionTripwire:
         assert note is not None and "108" in note  # delta stays visible, informational
         assert lg.count_delta_note(before=50, after=50) is None
         assert lg.count_delta_note(before=None, after=51) is None  # qdrant was down
+        decrease = lg.count_delta_note(before=120, after=118)  # a DECREASE says so plainly
+        assert decrease is not None and "LOST 2 points" in decrease
 
     def test_test_origin_points_in_live_are_a_failure(self, monkeypatch) -> None:
         """The goal that must survive: a TEST writing into the live
