@@ -1114,12 +1114,18 @@ def _build_connector(name: str, session: Any = None) -> Any:
         "service_factory": default_service_factory,
     }
     if session is not None and name in ("email", "gmail"):
-        from brain.connectors.google.gmail import seed_connector_records_from_email_ledger
+        from brain.connectors.google.gmail import (
+            rfc_backstop_put,
+            seed_connector_records_from_email_ledger,
+        )
         from brain.connectors.state import ConnectorRecordRepo
 
         records = ConnectorRecordRepo(session)
         kwargs["legacy_seed"] = lambda: seed_connector_records_from_email_ledger(session)
         kwargs["is_known"] = lambda gmail_id: records.get("email", gmail_id) is not None
+        kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(
+            session, rfc, gmail_id
+        )
     return cls(**kwargs)
 
 

@@ -388,6 +388,31 @@ def _history_state() -> _ServiceState:
 
 
 class TestHistoryPath:
+    def test_messages_added_entry_uses_the_wrapped_payload(self):
+        """Gmail's History schema WRAPS every entry message in 'message'
+        (labelsAdded/labelsRemoved AND messagesAdded/messagesDeleted/
+        messagesTrashed). Reading m['id'] instead of m['message']['id']
+        would GET the literal id 'None' -> 404 -> a spurious full reset on
+        every real incremental delivery."""
+        state = _ServiceState()
+        state.profile_history_id = "9003"
+        state.history_pages = {"first": _fixture("history_message_added_page1.json")}
+        state.messages["m2"] = _msg_fixture("m2")
+        connector = _connector(state)
+        result = connector.fetch("9002", limit=200)
+        assert result.reset is False
+        assert [(r.external_id, r.deleted) for r in result.records] == [("m2", False)]
+
+    def test_messages_trashed_entry_marks_the_record_deleted(self):
+        state = _ServiceState()
+        state.profile_history_id = "9004"
+        state.history_pages = {"first": _fixture("history_message_trashed_page1.json")}
+        state.messages["m2"] = _msg_fixture("m2")
+        connector = _connector(state)
+        result = connector.fetch("9003", limit=200)
+        assert result.reset is False
+        assert [(r.external_id, r.deleted) for r in result.records] == [("m2", True)]
+
     def test_incremental_fetch_uses_the_saved_cursor_and_the_label(self):
         state = _history_state()
         state.messages["m2"] = _msg_fixture("m2")
@@ -963,7 +988,11 @@ class TestRunnerSemantics:
     def test_message_id_redelivered_under_a_new_gmail_id_dedupes(self, gmail_harness):
         """Manager condition 2: the same Message-ID re-delivered under a NEW
         gmail id still dedupes at ingest by the content fingerprint — one
-        item, and the new id lands in the ledger pointing at it."""
+        item, and the new id lands in the ledger pointing at it. The
+        re-delivery arrives through the REAL incremental path (a scripted
+        messagesAdded history entry): an unscripted history window returns
+        empty and the run would pass VACUOUSLY (found in the second-pass
+        review work)."""
         h = gmail_harness
         _queue_message(h._state_service, "m1", rfc="<same@msg>")
         first = h.runner.run()
@@ -974,10 +1003,60 @@ class TestRunnerSemantics:
             hh if hh["name"] != "Message-ID" else {"name": "Message-ID", "value": "<same@msg>"}
             for hh in h._state_service.messages["m2"]["payload"]["headers"]
         ]
+        h._state_service.history_pages = {
+            "first": _fixture("history_message_added_page1.json")
+        }
         second = h.runner.run()
-        assert second.created == 0  # dedupe hit: no second item
+        assert second.reset is False
+        # The fingerprint dedupe fires INSIDE ingest.create: the DB keeps ONE
+        # item and the ledger points the new id at it. (The summary's created
+        # counter counts create() CALLS — a dedupe hit returns the existing
+        # item, so it reads 1 here; the DB truth below is what matters.)
         items = h.repo.list(item_type=None, project=None, status=None, limit=50, offset=0)
         assert len([i for i in items if i.source == "email"]) == 1
+        ledger_m2 = h.records.get("email", "m2")
+        assert ledger_m2 is not None
+        assert str(ledger_m2.item_id) == str(h.item_for("m1").id)
+
+    def test_same_rfc_new_gmail_id_different_minute_needs_the_backstop(
+        self, gmail_harness
+    ):
+        """Second-pass review finding 2: the ingest fingerprint hashes the
+        occurred_at MINUTE, so the same Message-ID re-delivered under a NEW
+        gmail id with a slightly different internal_date escapes it. The
+        Message-ID backstop (rfc_backstop_put) must catch the re-delivery
+        BEFORE create: ledger put pointing at the existing item, zero new
+        items, and no spurious reset."""
+        from brain.connectors.google.gmail import rfc_backstop_put
+
+        h = gmail_harness
+        h.connector._rfc_backstop = lambda rfc, gid: rfc_backstop_put(
+            h.session, rfc, gid
+        )  # the production wiring (cli._build_connector)
+        _queue_message(h._state_service, "m1", rfc="<same@msg>")
+        first = h.runner.run()
+        assert first.created == 1
+        # Re-delivery: NEW gmail id, same Message-ID, internal_date 5 minutes
+        # later, and a DATE-FREE body so occurred_at tracks internal_date
+        # (the fixture body's own date phrase would pin occurred_at and mask
+        # the scenario).
+        _queue_message(h._state_service, "m2", rfc="<same@msg>")
+        raw = h._state_service.messages["m2"]
+        raw["internalDate"] = str(int(raw["internalDate"]) + 5 * 60 * 1000)
+        raw["payload"]["parts"][0]["body"]["data"] = _b64(
+            "Please label your child's jacket with their name."
+        )
+        h._state_service.history_pages = {
+            "first": _fixture("history_message_added_page1.json")
+        }
+        second = h.runner.run()
+        assert second.created == 0, "the Message-ID backstop must catch the re-delivery"
+        assert second.reset is False  # a clean incremental delivery, no fallback
+        items = h.repo.list(item_type=None, project=None, status=None, limit=50, offset=0)
+        assert len([i for i in items if i.source == "email"]) == 1
+        ledger_m2 = h.records.get("email", "m2")
+        assert ledger_m2 is not None and ledger_m2.item_id is not None
+        assert str(ledger_m2.item_id) == str(h.item_for("m1").id)
 
     def test_same_body_without_rfc_id_dedupes_by_fingerprint(self, gmail_harness):
         h = gmail_harness

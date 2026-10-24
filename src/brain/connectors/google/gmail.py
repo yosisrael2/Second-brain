@@ -139,6 +139,53 @@ def seed_connector_records_from_email_ledger(session: Any) -> int:
     return len(result.all())
 
 
+def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
+    """The Message-ID backstop (second-pass review, finding 2).
+
+    The ledger keys on gmail_id; the ingest fingerprint also hashes the
+    occurred_at MINUTE, so the same Message-ID re-delivered under a NEW
+    gmail id (Gmail re-delivers with a fresh id) escapes both when the
+    internal_date differs even slightly. Before create: when an existing
+    email item already carries this rfc_message_id, point the new gmail id
+    at that item in the ledger (idempotent put) and tell the caller to drop
+    the record. Returns True when the backstop caught the message.
+    """
+    from sqlalchemy import select
+
+    from brain.db.models import ConnectorRecord, MemoryItem
+
+    existing = (
+        session.execute(
+            select(MemoryItem)
+            .where(MemoryItem.source == "email")
+            .where(MemoryItem.meta["rfc_message_id"].as_string() == rfc_message_id)
+            .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+            .limit(1)
+        )
+        .scalars()
+        .first()
+    )
+    if existing is None:
+        return False
+    row = (
+        session.execute(
+            select(ConnectorRecord).where(
+                ConnectorRecord.source == "email",
+                ConnectorRecord.external_id == gmail_id,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        row = ConnectorRecord(source="email", external_id=gmail_id)
+        session.add(row)
+    row.version = None
+    row.item_id = existing.id
+    session.commit()
+    return True
+
+
 def heartbeat_email_summary(summary: Any) -> None:
     """Transitional cockpit heartbeat: the email panel reads component
     'email'; the runner writes 'connector:email'. One adapter here keeps the
@@ -183,10 +230,14 @@ class GmailConnector(GoogleConnector):
         settings: Any = None,
         legacy_seed: Callable[[], int] | None = None,
         is_known: Callable[[str], bool] | None = None,
+        rfc_backstop: Callable[[str, str], bool] | None = None,
     ) -> None:
         """``legacy_seed`` runs on every full resync (lazy ledger migration);
         ``is_known`` answers "is this gmail id already ledgered?" so the
-        query path can skip the GET for known ids (the old fast path)."""
+        query path can skip the GET for known ids (the old fast path);
+        ``rfc_backstop(rfc_message_id, gmail_id)`` is the Message-ID
+        backstop: True = the re-delivery was ledgered against the existing
+        item, drop the record (never a second item for one Message-ID)."""
         super().__init__(
             token_loader=token_loader, service_factory=service_factory, user_id=user_id
         )
@@ -195,6 +246,7 @@ class GmailConnector(GoogleConnector):
         self._settings: Any = settings or get_settings()
         self._legacy_seed = legacy_seed
         self._is_known = is_known
+        self._rfc_backstop = rfc_backstop
         self._client: RestGmailClient | None = None
 
     # --- plumbing -------------------------------------------------------------
@@ -282,13 +334,16 @@ class GmailConnector(GoogleConnector):
             if self._is_known is not None and self._is_known(stub.id):
                 continue  # fast path: the ledger knows this id — no GET
             try:
-                records.append(self._record(stub.id))
+                record = self._record(stub.id)
             except ConnectorError as exc:
                 if getattr(exc, "status", None) == 404:
                     # Listed then hard-deleted before the GET: gone is gone.
                     logger.info("connectors: email message %s vanished (404)", stub.id)
                     continue
                 raise
+            if self._backstop_catches(record):
+                continue  # re-delivery under a new id: ledgered, no new item
+            records.append(record)
         next_cursor: str | None = None
         if not truncated:
             # The whole listing fit: the current historyId is a safe resume point.
@@ -330,9 +385,14 @@ class GmailConnector(GoogleConnector):
                         pending.append((mid, False))
                 for _kind in ("messagesDeleted", "messagesTrashed"):
                     for m in entry.get(_kind) or []:
-                        pending.append((str((m or {}).get("id")), True))
+                        # Gmail's History schema WRAPS the message in
+                        # 'message' (same as labelsAdded/labelsRemoved):
+                        # {"messagesDeleted": [{"message": {"id": ...}}]}.
+                        wrapped = (m or {}).get("message") or {}
+                        pending.append((str(wrapped.get("id")), True))
                 for m in entry.get("messagesAdded") or []:
-                    pending.append((str((m or {}).get("id")), False))
+                    wrapped = (m or {}).get("message") or {}
+                    pending.append((str(wrapped.get("id")), False))
                 if entry.get("id"):
                     emitted_entry = str(entry.get("id"))
                 if len(pending) >= limit:
@@ -343,12 +403,45 @@ class GmailConnector(GoogleConnector):
         final: dict[str, bool] = {}
         for mid, deleted in pending:
             final[mid] = deleted
-        records = [self._record(mid, deleted=deleted) for mid, deleted in final.items()]
+        records = []
+        for mid, deleted in final.items():
+            record = self._record(mid, deleted=deleted)
+            if self._backstop_catches(record):
+                continue  # re-delivery under a new id: ledgered, no new item
+            records.append(record)
         return FetchResult(
             records=records,
             next_cursor=emitted_entry or start_history_id,
             reset=False,
         )
+
+    def _backstop_catches(self, record: Any) -> bool:
+        """True = the record is a Message-ID re-delivery the ledger now
+        covers; the record must NOT reach the runner (no second item).
+        Tombstones and rfc-less records pass through untouched; a backstop
+        failure is logged and swallowed — it must never kill the sync."""
+        if self._rfc_backstop is None or record.deleted:
+            return False
+        rfc = record.meta.get("rfc_message_id")
+        if not rfc:
+            return False
+        try:
+            caught = self._rfc_backstop(str(rfc), str(record.external_id))
+        except Exception as exc:  # noqa: BLE001 (backstop must never kill the sync)
+            logger.warning(
+                "connectors: email Message-ID backstop failed for %s (%s)",
+                record.external_id,
+                exc,
+            )
+            return False
+        if caught:
+            logger.info(
+                "connectors: email %s re-delivered under a new id with the same "
+                "Message-ID %s — ledgered against the existing item",
+                record.external_id,
+                rfc,
+            )
+        return caught
 
     # --- one message -> record ------------------------------------------------------
 
