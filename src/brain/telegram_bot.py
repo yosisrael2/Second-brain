@@ -1745,8 +1745,14 @@ async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
     stalled = getattr(core, "_enrich_stalled_task", None)
     if stalled is not None:
         if stalled.done():
-            # the old thread finished: the worker may run again
+            # the old thread finished: harvest it EXACTLY like a normal pass —
+            # its children still earned their proposal cards (B2: loop thread
+            # only); a failure is logged + ops-evented like any other
             core._enrich_stalled_task = None  # noqa: SLF001 (same module)
+            try:
+                core.proposals_changed(stalled.result())
+            except Exception as exc:  # noqa: BLE001 — the worker must never kill the bot
+                _record_pass_failure(exc)
             _worker_heartbeat("idle")
         else:
             return  # never a second concurrent pass (see docstring)

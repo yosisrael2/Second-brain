@@ -636,3 +636,52 @@ def test_health_enrichment_ok_without_a_worker_heartbeat(monkeypatch):
     entry = _health_enrichment_entry()
     assert entry["status"] == "ok"  # worker off (inert) stays the designed ok
     session.close()
+
+
+# --- (deadline) a finished STALLED pass still delivers its cards ---------------
+
+
+def test_finished_stalled_pass_still_delivers_its_cards(monkeypatch):
+    session = SessionLocal()
+    _wipe(session)
+    _wipe_deadline_state()
+    repo = ItemsRepository(session)
+    source = repo.add(MemoryItem(raw_text=SOURCE_BODY, source="email"))
+    repo.commit()
+    child = repo.add(
+        MemoryItem(raw_text="child x", source="email", child_state="proposed")
+    )
+    repo.commit()
+    session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
+    repo.commit()
+    fake = _BlockingEnrichment(outcomes=_outcomes_for(source))
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _timeout_settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        try:
+            tg1 = _Tg()
+            await asyncio.wait_for(_flush_bot_jobs(tg1, core), timeout=2.0)
+            await _await_started(fake)
+            await asyncio.wait_for(_flush_bot_jobs(tg1, core), timeout=2.0)  # deadline
+            assert tg1.sent == [] and len(_ops_events_of_kind("worker_pass_timeout")) == 1
+            fake.release.set()
+            while core._enrich_stalled_task is None or not core._enrich_stalled_task.done():  # noqa: SLF001
+                await asyncio.sleep(0.01)
+            tg2 = _Tg()
+            await _flush_bot_jobs(tg2, core)  # the stalled task's harvest + flush
+            # the pass ran past its deadline, but its changed source STILL
+            # gets exactly one proposal card
+            assert len(tg2.sent) == 1
+            assert "🧠 found" in tg2.sent[0]["text"]
+        finally:
+            fake.release.set()
+
+    asyncio.run(go())
+    _wipe(session)
+    session.close()
