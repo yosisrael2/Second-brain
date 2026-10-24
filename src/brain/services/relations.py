@@ -25,7 +25,10 @@ from sqlalchemy.orm import Session
 from brain.db.models import ItemRelation, MemoryItem
 from brain.db.session import SessionLocal
 
-KNOWN_KINDS = ("supersedes", "corrects", "derived_from", "same_as")
+KNOWN_KINDS = (
+    "supersedes", "corrects", "derived_from", "same_as",  # PR B
+    "details", "cancels", "conflicts",  # PR D-recon (item 37)
+)
 SUPERSEDE_STATES = ("applied", "proposed", "undone")
 # Item 21: cos >= 0.85 on the summary text; ±1h on the date.
 SIMILARITY_THRESHOLD = 0.85

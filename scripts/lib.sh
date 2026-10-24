@@ -50,7 +50,7 @@ load_env_file() {
 # this so start/stop never disagree (a mismatched 'down -v' deletes the
 # wrong project's volumes).
 resolve_compose_project() {
-  load_env_file
+  load_env_file "${BRAIN_ENV_FILE:-.env}"
   : "${COMPOSE_PROJECT_NAME:=second-brain-dev}"
   export COMPOSE_PROJECT_NAME
   printf '%s' "$COMPOSE_PROJECT_NAME"

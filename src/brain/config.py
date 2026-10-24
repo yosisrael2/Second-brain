@@ -94,6 +94,11 @@ class Settings(BaseSettings):
 
     # Local embeddings (used when embedder_provider="fastembed", the default)
     fastembed_model: str = DEFAULT_FASTEMBED_MODEL
+    # Round 5 (E1): the embedder used for RECONCILIATION matching only —
+    # a stronger multilingual model than the search one; search and Qdrant
+    # keep fastembed_model (no vector-dim change anywhere). Loaded lazily
+    # once per process on the first reconciled candidate.
+    recon_embed_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     # Ask context size for semantic search. Day/date questions bypass this via
     # temporal retrieval (they fetch every item in the resolved range).
     ask_top_k: int = 8
@@ -135,6 +140,11 @@ class Settings(BaseSettings):
     # A2 wiring: the in-bot worker's tick interval. Only read when
     # enrichment_worker_enabled is true (default OFF: nothing scheduled).
     enrichment_worker_interval_s: int = 300
+    # A2 wiring: per-pass deadline. A pass older than this is declared stalled
+    # (ops event enrichment/worker_pass_timeout, health degraded) and the
+    # worker stops waiting; a to_thread body cannot be killed, so no new pass
+    # starts until the stalled thread has actually finished.
+    enrichment_pass_timeout_s: int = 900
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
