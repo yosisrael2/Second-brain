@@ -115,6 +115,11 @@ class Settings(BaseSettings):
     # rerank. This caps how many extra candidates that leg may fetch —
     # a ceiling, never a floor (fewer matches -> fewer candidates).
     ask_kid_recall_limit: int = 16
+    # WA39 run 3: with a resolved date window, the kid-channel leg widens the
+    # window's START by this many days — the announcement about day D is
+    # usually SENT on D-1 (occurred_at is the sent time). A ceiling, never a
+    # floor; 0 keeps the strict window.
+    ask_kid_recall_lookback_days: int = 3
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
