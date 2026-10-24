@@ -16,6 +16,7 @@ from typing import Any
 
 from brain.db.models import Entity, EntityAlias, MemoryFact
 from brain.repositories.memory import MemoryRepository, utcnow
+from brain.services.triage import mentions_name
 
 # Hebrew-letter numerals used in school emails ("כיתות ה-ו" = grades 5-6).
 # Note ל=30 and מ=40 in real Hebrew numerals — they are NOT grades here.
@@ -247,6 +248,36 @@ class MemoryService:
             block = block[:BLOCK_MAX_CHARS].rsplit("\n", 1)[0] + "\n- (memory truncated)"
         return block
 
+    def default_audience_for_sender(self, sender: str | None) -> list[str] | None:
+        """Source-level default audience from the SENDER (rule R1, item 33/42).
+
+        A class teacher's update often never names the class in the body.
+        Memory holds each kid's confirmed ``teacher`` fact; when the source's
+        sender (email From display name / address, or a WhatsApp channel
+        name) matches a kid's teacher, that kid (or those kids) is the
+        DEFAULT audience for every child extracted from the source. The
+        item-level audience may only NARROW it, never widen it. ``None``
+        when there is no sender or no confirmed match (callers then keep the
+        item-level resolution untouched).
+        """
+        if not sender:
+            return None
+        matched: list[str] = []
+        for kid in self.kids():
+            teacher = kid.get("teacher")
+            if teacher is None or not str(teacher).strip():
+                continue
+            # review round 2, bug 2: the SHARED whole-word matcher, one
+            # direction only (does the sender mention the teacher?). Raw
+            # containment matched a same-first-name parent ('Rinat Levi'),
+            # a word containing the name ('Rinatech') and a short sender
+            # inside a long teacher name. A first-name-only teacher fact
+            # can still match a same-named parent — acceptable for now:
+            # the results are proposals (D2 Keep/Fix/Drop), not actions.
+            if mentions_name(str(teacher), sender):
+                matched.append(kid["name"])
+        return sorted(matched) or None
+
     # -- applies_to resolution (design item 17) -----------------------------------
 
     def resolve_applies_to(self, audience: dict[str, Any] | None) -> list[str]:
@@ -339,7 +370,7 @@ class MemoryService:
             kid_school = kid.get("school")
             if kid_school is None:
                 state = "unconfirmed"
-            elif kid_school != school:
+            elif _norm_label(kid_school) != _norm_label(school):
                 return "incompatible"
         cls = audience.get("class")
         grades = _parse_grades(audience.get("grades"))
@@ -353,7 +384,7 @@ class MemoryService:
             kid_class = kid.get("class")
             if kid_class is None:
                 state = "unconfirmed"
-            elif kid_class != cls:
+            elif _norm_label(kid_class) != _norm_label(cls):
                 return "incompatible"
             kid_grade = kid.get("grade")
             if grades and kid_grade is not None and str(kid_grade) not in grades:
@@ -617,3 +648,27 @@ def _hebrew_grade(text: str) -> int | None:
     if len(cleaned) == 2 and cleaned[0] in HEBREW_TENS and cleaned[1] in HEBREW_DIGITS:
         return HEBREW_TENS[cleaned[0]] + HEBREW_DIGITS[cleaned[1]]
     return None
+
+
+def _norm_label(value: Any) -> str:
+    """Comparable form of a class/school/teacher label (A2 run-#1 fix 1).
+
+    Both sides of every comparison go through this: textnorm.normalize
+    (geresh/gershayim, maqaf/dashes, nikud, bidi, whitespace, case) plus
+    label-specific folding — quote marks dropped (ה' -> ה), dashes to
+    spaces (ה-ספיר -> ה ספיר), and a leading כיתה/class word stripped
+    (כיתה ה' ספיר -> ה ספיר). Memory stores e.g. ה' ספיר while text or
+    the LLM may write ה׳ ספיר, ה ספיר, כיתה ה' ספיר or ה-ספיר.
+    """
+    import re as _re  # noqa: PLC0415
+
+    from brain.services.textnorm import normalize  # noqa: PLC0415
+
+    text = normalize(str(value))
+    text = _re.sub("['\"]", "", text)
+    text = _re.sub("[-]+", " ", text)
+    text = " ".join(text.split())
+    for prefix in ("כיתה", "class"):
+        if text.startswith(prefix + " "):
+            text = text[len(prefix) + 1 :]
+    return text.strip()
