@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
@@ -222,6 +222,54 @@ class ItemsRepository:
         )
         if not include_superseded:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+        return list(self._db.scalars(stmt))
+
+    def by_channels(
+        self,
+        channels: Sequence[str],
+        *,
+        limit: int,
+        ranges: Sequence[tuple[datetime, datetime]] | None = None,
+    ) -> Sequence[MemoryItem]:
+        """WhatsApp conversation items whose meta.channel is one of ``channels``.
+
+        Drives the kid-recall leg's STRUCTURED channel recall (WA39 run 1:
+        the raw-text needle missed items whose header did not carry the
+        exact seeded name, and the newest-first cap flooded the pool with
+        newer conversations). ``ranges`` (the question's resolved time
+        windows, the temporal leg's own parse) bound occurred_at — pass None
+        for the recent-N fallback. Noise-triaged conversations are excluded
+        exactly as from listings; dropped children and superseded items too.
+        """
+        if not channels:
+            return []
+        stmt = select(MemoryItem).where(
+            MemoryItem.source == SOURCE_WHATSAPP,
+            MemoryItem.meta["channel"].as_string().in_(list(channels)),
+            or_(
+                MemoryItem.child_state.is_(None),
+                MemoryItem.child_state != "dropped",
+            ),
+            MemoryItem.superseded_by.is_(None),
+            or_(
+                MemoryItem.triage_label.is_(None),
+                MemoryItem.triage_label != "noise",
+            ),
+        )
+        if ranges:
+            stmt = stmt.where(
+                or_(
+                    *[
+                        and_(MemoryItem.occurred_at >= start, MemoryItem.occurred_at < end)
+                        for start, end in ranges
+                    ]
+                )
+            )
+        stmt = stmt.order_by(
+            MemoryItem.occurred_at.desc().nullslast(),
+            MemoryItem.created_at.desc(),
+            MemoryItem.id.desc(),
+        ).limit(limit)
         return list(self._db.scalars(stmt))
 
     def children_of(self, item_id: uuid.UUID) -> Sequence[MemoryItem]:

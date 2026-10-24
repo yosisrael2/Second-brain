@@ -6,7 +6,7 @@ import argparse
 import logging
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -979,7 +979,12 @@ def _gmail_poll_cycle(indexer: Any, attachments: Any) -> Any:
     return summary
 
 
-def _gmail_poll(args: argparse.Namespace) -> int:
+def _gmail_poll(
+    args: argparse.Namespace,
+    *,
+    sleep: Callable[[float], None] | None = None,
+    max_cycles: int | None = None,
+) -> int:
     """The email source loop — the launchd agent path (com.secondbrain.email).
 
     C5: the F2 EmailPoller is DELETED; this drives the Gmail CONNECTOR through
@@ -1031,6 +1036,8 @@ def _gmail_poll(args: argparse.Namespace) -> int:
         return 0
 
     stall_pause_s = 300.0
+    do_sleep = sleep if sleep is not None else time.sleep
+    cycles = 0
     while True:
         try:
             summary = _gmail_poll_cycle(indexer, attachments)
@@ -1045,6 +1052,12 @@ def _gmail_poll(args: argparse.Namespace) -> int:
             attempt = ConnectorStateRepo(session).attempt("email")
         if summary.state == "ok":
             pause = float(settings.gmail_poll_interval_s)
+        elif summary.state == "backoff":
+            # The runner already enforced the persisted backoff (the fetch was
+            # skipped); re-applying backoff_seconds here would stack the waits
+            # when a clock-edge skip lands mid-window. Sleep the normal
+            # interval — the next cycle re-checks the window anyway.
+            pause = float(settings.gmail_poll_interval_s)
         elif summary.state == "auth_error":
             pause = stall_pause_s  # user must re-consent; polling cannot help
         else:
@@ -1058,7 +1071,10 @@ def _gmail_poll(args: argparse.Namespace) -> int:
             summary.errors,
             pause,
         )
-        time.sleep(pause)
+        do_sleep(pause)
+        cycles += 1
+        if max_cycles is not None and cycles >= max_cycles:
+            return 0  # test seam only (like run-connectors' PASSES); never set in production
 
 
 # --- connectors (connectors ticket) -------------------------------------------
