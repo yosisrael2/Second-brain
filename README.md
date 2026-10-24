@@ -507,7 +507,7 @@ when `BRAIN_CONNECTORS` contains a non-email connector):
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
 scripts/service.sh status      # per-agent state/pid/last-exit + sleep + docker notes
 scripts/service.sh restart     # kickstart -k installed agents (skips the rest)
-scripts/service.sh logs [api|telegram|email|whatsapp]
+scripts/service.sh logs [api|telegram|email|connectors|whatsapp]
 scripts/service.sh uninstall
 ```
 
