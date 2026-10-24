@@ -58,7 +58,7 @@ to its section or doc.
 - One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54)
 
 **Ops**
-- 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
+- 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent and an opt-in `com.secondbrain.connectors` scheduler), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
 - Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; each test session fails loudly if the live collection changes — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45)
 - Tests isolated from live data: per-worker test databases reset (TRUNCATEd at session start) and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42, #62)
 
@@ -487,10 +487,11 @@ are upserted as-is — deletions are never inferred from absent records.
 ## Background services (launchd, 24/7)
 
 `scripts/service.sh` installs per-user LaunchAgents that survive logins and
-reboots — API, Telegram bot, WhatsApp poller, and an opt-in Gmail agent
+reboots — API, Telegram bot, WhatsApp poller, an opt-in Gmail agent
 (installed only when `GMAIL_LABEL_ID` is set;
 [docs/email-setup.md](docs/email-setup.md); never run it in CI — it writes to
-`~/Library/LaunchAgents`):
+`~/Library/LaunchAgents`), and an opt-in connectors scheduler (installed only
+when `BRAIN_CONNECTORS` contains a non-email connector):
 
 ```bash
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
@@ -508,7 +509,13 @@ scripts/service.sh uninstall
   restart with backoff. The opt-in **com.secondbrain.email** runs
   `scripts/run-email.sh` (`brain gmail-poll`) with the same mapping
   (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting);
-  `install` skips it unless `GMAIL_LABEL_ID` is set.
+  `install` skips it unless `GMAIL_LABEL_ID` is set. The opt-in
+  **com.secondbrain.connectors** runs `scripts/run-connectors.sh`: one
+  `brain connectors sync <name>` cycle per non-email connector in
+  `BRAIN_CONNECTORS`, a `BRAIN_CONNECTORS_INTERVAL_S` (default 300) sleep
+  between passes, the same exit mapping at the pass level, and per-connector
+  failure isolation; `install` skips it unless `BRAIN_CONNECTORS` names a
+  non-email connector.
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
