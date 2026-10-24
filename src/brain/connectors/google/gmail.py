@@ -395,6 +395,7 @@ class GmailConnector(GoogleConnector):
         if close is not None:
             close()
         self._service_instance = None  # released: a later use rebuilds
+        self._client = None  # the wrapper held the closed service
 
 
 def _tombstone(message_id: str) -> Any:

@@ -208,6 +208,7 @@ class _FakeService:
         return _FakeUsers(self._state)
 
     def close(self) -> None:
+        self.closed = True
         self._state.calls.append(("service.close", {}))
 
 
@@ -580,13 +581,36 @@ class TestAttachments:
         RestGmailClient.close(), which does not exist — a real poll cycle
         would crash in the finally. close() must release THE cached google
         service (duck-typed; one service per connector, no double-close)."""
+        from brain.config import Settings
+        from brain.connectors.google.gmail import GmailConnector
+
         state = _ServiceState()
-        connector = _connector(state)
-        connector.fetch(None, limit=200)  # materializes the cached service
+        builds: list[_FakeService] = []
+
+        def factory(token: str, scopes: list[str], api_name: str, api_version: str) -> Any:
+            svc = _FakeService(state)
+            builds.append(svc)
+            return svc
+
+        connector = GmailConnector(
+            token_loader=lambda: "refresh-token",
+            service_factory=factory,
+            settings=Settings(
+                gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
+            ),
+        )
+        first_client = connector._gmail()
         connector.close()
         assert ("service.close", {}) in state.calls
-        connector.close()  # idempotent: already-released service is a no-op
-        assert state.calls.count(("service.close", {})) == 1
+        assert builds[0].closed is True
+        # After close() NOTHING cached may still hold the closed service: the
+        # next use must build a NEW client over a NEW service.
+        second_client = connector._gmail()
+        assert second_client is not first_client
+        assert len(builds) == 2
+        assert builds[1].closed is False
+        connector.close()  # idempotent per generation: releases the new one
+        assert state.calls.count(("service.close", {})) == 2
 
     def _capture_attachment_bytes(self, harness: Any, svc_env: Any) -> None:
         """Body shared by the DB-level capture test and the stray-row test:
