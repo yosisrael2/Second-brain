@@ -22,8 +22,9 @@ to its section or doc.
 - Jev auto-classification (type / importance / actionability / confidence, routed at >= 0.9) with exact-duplicate guard (content fingerprint) — [Dogfood checklist](#dogfood-checklist-live-run-without-api-keys)
 - `.ics` calendar files captured as calendar items — [Telegram bot](#telegram-bot)
 - **WhatsApp ingestion (24/7):** the `com.secondbrain.whatsapp` agent reads the local WhatsApp bridge store read-only, only for channels registered in memory, groups messages into conversations by time gap (60 min) and stores one searchable item per conversation, indexed immediately — `src/brain/services/whatsapp.py`, `scripts/run-whatsapp.sh` (PRs #37, #40, #47, #50)
+- **WhatsApp relevance triage:** every conversation is labeled `relevant | noise` — a confirmed kid's name decides deterministically (no model call), otherwise Jev, otherwise one strict LLM call; if both fail the item stays untriaged, never guessed. Noise stays stored and searchable but is hidden from the default listings and never spends the enrichment cap; an update can never downgrade `relevant` to `noise` — `src/brain/services/triage.py` (PR #49)
 - **Attachments:** photos and PDFs sent to the bot are stored once (sha256) outside the repo and read in the background — a PDF text layer locally, otherwise Claude in a single-file sandbox; 20 MB / 20 pages / 50 files per day; each attachment becomes its own searchable item. Email and WhatsApp attachment content is wired in the same pipeline — `src/brain/services/attachments.py` (PRs #38, #44)
-- **Gmail label source** *(inactive)*: read-only OAuth, one label, Message-ID dedupe, attachments via the attachment pipeline; activates after a one-time Google consent — [docs/email-setup.md](docs/email-setup.md) (PR #36)
+- **Gmail label source** *(inactive, opt-in)*: read-only OAuth, one label, Message-ID dedupe, attachments via the attachment pipeline; activates after a one-time Google consent, and can then run 24/7 as the `com.secondbrain.email` launchd agent (refresh token only in the login keychain, nothing in the plists) — [docs/email-setup.md](docs/email-setup.md) (PRs #36, #43)
 
 **Retrieval**
 - Multilingual embeddings (local `fastembed`, `minishlab/potion-multilingual-128M`, 256 dims — Hebrew + English), Postgres FTS over raw text, reciprocal-rank fusion of the two — [AI layer](#ai-layer-and-the-brain-cli)
@@ -42,20 +43,22 @@ to its section or doc.
 - REST `/memory` API, cockpit Memory tab, bot `/profile` and `/remember`, seed CLI (`brain memory seed-kid`, `seed-channel`) — [Memory layer API](#memory-layer-api)
 
 **Meaning extraction and relations**
-- Extraction data model + durable enrichment queue (daily cap, backfill budget, grounded quotes, Hebrew-calendar dates, weekday/date conflict flag, re-run diffing) with a stub extractor — *(inactive: the enrichment worker is off)* (PR #33)
+- Extraction data model + durable enrichment queue (daily cap, backfill budget, grounded quotes, Hebrew-calendar dates, weekday/date conflict flag, re-run diffing) — *(inactive: the enrichment worker is off)* (PR #33)
+- LLM meaning extractor (A2): one call per source through the local Claude login client, versioned prompt (v6, recorded in every child's meta), strict JSON parsing with one error-fed retry — no partial garbage is ever stored — deterministic date resolution (never the model) with a quote_time backstop, derived tasks, multiple verbatim quote rows per child; scored against the frozen gold set through five offline eval runs — *(inactive: worker flag off, pinned by a test)* — `src/brain/services/extraction/llm_extractor.py` (PR #39)
 - Bot proposal cards: one card per source with Keep / Fix / Drop and 48 h pings for due tasks and reminders — *(inactive until extraction runs)* (PR #41)
 - Relations between items (`supersedes`, `corrects`, `derived_from`, `same_as`): same-thread corrections applied visibly and undoably, cross-thread matches only proposed; superseded items are hidden from lists, search and ask but restorable; duplicate key never merges items for different people — `src/brain/services/relations.py` (PR #48)
+- Bot relation cards: superseded items render struck-through with a ♻️ Restore button; applied corrections show a ↩︎ replaced notice with ↩︎ Undo; proposed cross-thread matches show ✅ Confirm replace / ✖ Keep both — `src/brain/services/relations_view.py` (PR #51)
 
 **Cockpit**
-- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp (from the poller's heartbeat), attachments and extraction — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50)
+- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54)
 
 **Ops**
-- 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247)
+- 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
 - Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; each test session fails loudly if the live collection changes — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45)
-- Tests isolated from live data: per-worker test databases and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42)
+- Tests isolated from live data: per-worker test databases reset (TRUNCATEd at session start) and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42, #62)
 
 **Evaluation**
-- `brain eval-extraction`: gold-set scorer for extraction candidates (per-type P/R/F1, date accuracy, applies_to, quote grounding, relations, `date_conflict` recall) — [docs/eval-extraction.md](docs/eval-extraction.md)
+- `brain eval-extraction`: gold-set scorer for extraction candidates (per-type P/R/F1, date accuracy, applies_to reported twice — raw and excluding gold `{unknown}` rows, denominator printed — quote grounding, relations, `date_conflict` recall) — [docs/eval-extraction.md](docs/eval-extraction.md) (PRs #39, #61)
 
 ## Status and progress
 
@@ -67,21 +70,25 @@ to its section or doc.
 | Memory layer (entities, versioned facts, channels, ask block, API, UI) | **Done** | #26, #28, #30 |
 | WhatsApp ingestion (24/7 agent, conversations, indexing) | **Done, live** | #37, #40, #47, #50 |
 | Attachments (Telegram, email, WhatsApp media) | **Done** | #38, #44 |
-| Gmail label source | **Done, inactive** (needs Google consent) | #36 |
-| Extraction data model + queue, proposal cards | **Done, inactive** (worker off) | #33, #41 |
-| Relations + dedupe | **Done** | #48 |
+| Gmail label source + 24/7 email agent | **Done, opt-in** (needs Google consent) | #36, #43 |
+| Extraction data model + queue, LLM extractor (A2), proposal cards | **Done, inactive** (worker flag off) | #33, #41, #39 |
+| WhatsApp relevance triage (noise stays searchable, out of listings + enrichment) | **Done** | #49 |
+| Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
 | Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50 |
-| Cockpit (ops dashboard, restyle, health cards) | **Done** | #13, #29, #46 |
-| Ops safety (test isolation, live-store guards, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45 |
-| CI + extraction evaluation | **Done** | #4, #5, #25 |
+| Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, relations inspector) | **Done** | #13, #29, #46, #54 |
+| Ops safety (test isolation + session-start reset, live-store guards, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62 |
+| CI + extraction evaluation (incl. applies_to excl-gold-unknown) | **Done** | #4, #5, #25, #39, #61 |
 
-**In progress** (paused 23 Oct 2026)
+**In progress** (open PRs, 24 Oct 2026)
 
-- LLM extraction (PR #39, draft): scored against the frozen gold set; run 2 reached quote grounding 1.00, audience accuracy 0.68 (no unknowns) and caught the dated conflict, but recall, precision and date accuracy are still below the merge bar
-- WhatsApp relevance triage (PR #49): chatter stays searchable but out of lists and extraction
-- Bot Undo / confirm-replace / Restore for relations (PR #51, ready)
-- Gmail always-on agent (PR #43)
-- Cockpit view of WhatsApp sources and item relations
+- Connectors framework: base + Google OAuth/runner (PR #53) and adapters — Google Calendar (#55), Google Tasks (#56), Google Drive (#57), Gmail port (#59)
+- Connector conformance kit — termination/idempotency/change/delete/reset scenarios every source must pass (PR #60)
+- Cockpit Sources panel — read-only connector status card (PR #64)
+- Google setup + per-connector config docs (PR #58, draft until #53 merges)
+- One item per occurrence for a recurring ICS VEVENT (PR #65)
+- Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
+
+The live instance still runs `7936c55` — nothing has been deployed since.
 
 **Planned**
 
@@ -411,8 +418,10 @@ brain reindex [--batch-size 500]
 
 ## Background services (launchd, 24/7)
 
-`scripts/service.sh` installs two per-user LaunchAgents that survive logins
-and reboots (never run it in CI — it writes to `~/Library/LaunchAgents`):
+`scripts/service.sh` installs per-user LaunchAgents that survive logins and
+reboots — API, Telegram bot, WhatsApp poller, and an opt-in Gmail agent
+([docs/email-setup.md](docs/email-setup.md); never run it in CI — it writes to
+`~/Library/LaunchAgents`):
 
 ```bash
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
@@ -427,7 +436,9 @@ scripts/service.sh uninstall
   exit codes onto launchd's KeepAlive (`SuccessfulExit=false`): disabled (0)
   and permanent config errors (78, incl. a 409 conflict that outlasts the
   10-minute retry window) exit 0 → no restart; transient failures exit 1 →
-  restart with backoff.
+  restart with backoff. The opt-in **com.secondbrain.email** runs
+  `scripts/run-email.sh` (`brain gmail-poll`) with the same mapping
+  (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting).
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
