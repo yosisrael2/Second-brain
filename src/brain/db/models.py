@@ -31,6 +31,7 @@ from brain.db.enums import (
     FTS_LANGUAGE,
     IMPORTANCE_MAX,
     IMPORTANCE_MIN,
+    ITEM_SOURCE_DOMAIN,
     Actionability,
     ItemStatus,
     ItemType,
@@ -40,25 +41,6 @@ _TEXT_MAX_LENGTH = 10_000
 _SOURCE_MAX_LENGTH = 64
 _PROJECT_MAX_LENGTH = 128
 _ENUM_MAX_LENGTH = 32
-
-# The closed domain of ``memory_items.source`` (CHECK ``source``): capture
-# paths that exist today (manual default, paste kinds, telegram bot, email
-# poller) + the connector names this ticket introduces. The migration adds
-# it NOT VALID (the live table predates the constraint; new inserts are
-# checked). New sources widen the domain in a migration — never silently.
-ITEM_SOURCE_DOMAIN = (
-    "manual",
-    "note",
-    "calendar",
-    "email",
-    "outlook",
-    "whatsapp",
-    "telegram",
-    "gcal",
-    "gdrive",
-    "gtasks",
-)
-
 
 def _in_domain(column: str, values: Iterable[str]) -> str:
     """Build a CHECK expression restricting a column to the given values."""
