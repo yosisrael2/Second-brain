@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -128,6 +128,20 @@ class Settings(BaseSettings):
     # IANA zone used to interpret zone-less pasted times (Gmail, WhatsApp,
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
+
+    # P1: a pasted ICS VEVENT with an RRULE fans out into one item per
+    # occurrence within [paste time, paste time + paste_rrule_days], capped
+    # at paste_rrule_max_occurrences items per series.
+    paste_rrule_days: int = Field(
+        default=60,
+        validation_alias=AliasChoices("paste_rrule_days", "BRAIN_PASTE_RRULE_DAYS"),
+    )
+    paste_rrule_max_occurrences: int = Field(
+        default=60,
+        validation_alias=AliasChoices(
+            "paste_rrule_max_occurrences", "BRAIN_PASTE_RRULE_MAX_OCCURRENCES"
+        ),
+    )
 
     # WhatsApp bridge (PR D1). The poller reads the bridge's messages.db
     # READ-ONLY; an empty path disables the poller. The gap groups messages

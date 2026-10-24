@@ -133,16 +133,23 @@ def detect_kind(text: str, kind_hint: str = "auto") -> str:
 
 
 def parse(
-    text: str, kind_hint: str = "auto", split: bool = False, tz: ZoneInfo | None = None
+    text: str,
+    kind_hint: str = "auto",
+    split: bool = False,
+    tz: ZoneInfo | None = None,
+    now: datetime | None = None,
 ) -> ParsedPaste:
     """Detect the paste kind and return its chunks (``split`` fans out).
 
     ``tz`` is the IANA zone used to interpret zone-less times (defaults to
     the machine's local zone; the /capture route passes the ``TIMEZONE``
     setting). All ``occurred_at`` values are returned aware (UTC for
-    zone-less times, the explicit offset otherwise).
+    zone-less times, the explicit offset otherwise). ``now`` is the paste
+    instant (defaults to the real clock); a recurring ICS event fans out
+    into one item per occurrence within [now, now + BRAIN_PASTE_RRULE_DAYS].
     """
     zone = tz if tz is not None else ZoneInfo(local_timezone_name())
+    paste_time = now if now is not None else datetime.now(UTC)
     kind = detect_kind(text, kind_hint)
     if kind == KIND_WHATSAPP:
         return _parse_whatsapp(text, split=split, zone=zone)
@@ -150,8 +157,14 @@ def parse(
         KIND_EMAIL: _parse_email,
         KIND_CALENDAR: _parse_calendar,
         KIND_NOTE: _parse_note,
-    }[kind](text, split=split, zone=zone)
-    if not split and len(parsed.chunks) > 1:
+    }[kind](text, split=split, zone=zone, now=paste_time)
+    if (
+        not split
+        and len(parsed.chunks) > 1
+        and not (kind == KIND_CALENDAR and parsed.extracted.get("rrule_raw"))
+    ):
+        # thread pastes collapse into one item; an RRULE fan-out must NOT —
+        # its chunks are independent occurrences, not thread messages
         return _join_chunks(parsed)
     return parsed
 
@@ -214,7 +227,9 @@ def _join_chunks(parsed: ParsedPaste) -> ParsedPaste:
 # ---- email -------------------------------------------------------------------
 
 
-def _parse_email(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
+def _parse_email(
+    text: str, *, split: bool = False, zone: ZoneInfo, now: datetime | None = None
+) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     meta: dict[str, str] = {}
     lines = clean.splitlines()
@@ -383,7 +398,7 @@ def _wa_datetime(iso: str) -> datetime | None:
 
 
 def _parse_calendar(
-    text: str, *, split: bool = False, zone: ZoneInfo
+    text: str, *, split: bool = False, zone: ZoneInfo, now: datetime
 ) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     looks_like_ics = "begin:vevent" in clean.lower() or any(
@@ -391,7 +406,7 @@ def _parse_calendar(
         for line in clean.splitlines()
     )
     if looks_like_ics:
-        return _parse_ics(clean, zone=zone)
+        return _parse_ics(clean, zone=zone, now=now)
     return _parse_calendar_text(clean, zone=zone)
 
 
@@ -406,12 +421,15 @@ def _unfold(lines: list[str]) -> list[str]:
     return unfolded
 
 
-def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
+def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo, now: datetime) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     meta: dict[str, Any] = {"attendees": []}
     occurred_at: datetime | None = None
     date_only = False
     tzid = ""
+    uid = ""
+    rrule_text = ""
+    exdates: list[datetime] = []
     for raw_line in _unfold(clean.replace("\r\n", "\n").split("\n")):
         if ":" not in raw_line:
             continue
@@ -419,10 +437,24 @@ def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste
         name = left.split(";", 1)[0].strip().upper()
         if match := re.search(r"TZID=([^:;]+)", left):
             tzid = match.group(1).strip()
-        if name == "SUMMARY":
+        if name == "UID":
+            uid = value.strip()
+        elif name == "SUMMARY":
             meta["title"] = value.strip()
         elif name in ("LOCATION", "ORGANIZER"):
             meta[name.lower()] = value.strip()
+        elif name == "RRULE":
+            rrule_text = value.strip()
+        elif name == "EXDATE":
+            # may repeat; the values are a comma list; an EXDATE-specific
+            # TZID param wins over the line-level tzid picked up above
+            ex_tzid = tzid
+            if tz_match := re.search(r"TZID=([^:;]+)", left):
+                ex_tzid = tz_match.group(1).strip()
+            for part in value.split(","):
+                parsed_ex = _ics_datetime(part, ex_tzid, zone)
+                if parsed_ex is not None:
+                    exdates.append(parsed_ex)
         elif name in ("DTSTART", "DTEND"):
             parsed_at = _ics_datetime(value, tzid, zone)
             if parsed_at is not None:
@@ -438,6 +470,26 @@ def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste
                 meta["attendees"].append(email.group(0))
     meta = {key: value for key, value in meta.items() if value not in (None, [], "")}
     meta["ics_raw"] = clean  # the whole ICS: raw_text below becomes a one-liner
+    recurring = _recurring_chunks(
+        meta,
+        occurred_at,
+        date_only,
+        zone,
+        now,
+        uid=uid,
+        rrule_text=rrule_text,
+        exdates=exdates,
+    )
+    if recurring is not None:
+        return ParsedPaste(
+            kind=KIND_CALENDAR,
+            chunks=recurring,
+            extracted={
+                "series_uid": uid or None,
+                "rrule_raw": rrule_text,
+                "count": len(recurring),
+            },
+        )
     return ParsedPaste(
         kind=KIND_CALENDAR,
         chunks=[
@@ -450,6 +502,63 @@ def _parse_ics(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste
         ],
         extracted=dict(meta),
     )
+
+
+def _recurring_chunks(
+    meta: dict[str, Any],
+    occurred_at: datetime | None,
+    date_only: bool,
+    zone: ZoneInfo,
+    now: datetime,
+    *,
+    uid: str,
+    rrule_text: str,
+    exdates: list[datetime],
+) -> list[ParsedChunk] | None:
+    """One chunk per RRULE occurrence, or None when this paste is not a
+    recurring series (no/blank RRULE, no DTSTART, or an unparseable rule —
+    the caller keeps the single-item behaviour in every fallback case)."""
+    from brain.config import get_settings  # noqa: PLC0415 — cheap, local
+    from brain.services.recurrence import expand_occurrences  # noqa: PLC0415
+
+    if not rrule_text or occurred_at is None:
+        return None
+    settings = get_settings()
+    end = _meta_instant(meta.get("end"))
+    # the ANCHOR must be the parsed DTSTART (its tzinfo is the ICS-declared
+    # zone — ZoneInfo for TZID, UTC for Z), NOT the iso-re-parsed meta value
+    # (a fixed offset would freeze the UTC offset across DST changes)
+    duration = (end - occurred_at) if end is not None and end > occurred_at else None
+    occurrences = expand_occurrences(
+        dtstart=occurred_at,
+        rrule_text=rrule_text,
+        exdates=exdates,
+        window_start=now,
+        window_days=settings.paste_rrule_days,
+        cap=settings.paste_rrule_max_occurrences,
+    )
+    if occurrences is None:
+        return None  # unparseable rule: fall back to the single DTSTART item
+    drop = ("ics_raw", "start", "end", "start_raw", "end_raw")
+    shared = {k: v for k, v in meta.items() if k not in drop}
+    chunks: list[ParsedChunk] = []
+    for instant in occurrences:
+        occ_meta = dict(shared)
+        occ_meta["start"] = instant.isoformat()
+        if duration is not None:
+            occ_meta["end"] = (instant + duration).isoformat()
+        if uid:
+            occ_meta["series_uid"] = uid
+        occ_meta["rrule_raw"] = rrule_text
+        chunks.append(
+            _chunk(
+                _calendar_one_liner(occ_meta, zone, date_only=date_only),
+                instant,
+                occ_meta,
+                KIND_CALENDAR,
+            )
+        )
+    return chunks
 
 
 def _ics_datetime(value: str, tzid: str = "", zone: ZoneInfo | None = None) -> datetime | None:
@@ -653,7 +762,9 @@ def _date_with_time(
         return None
 
 
-def _parse_note(text: str, *, split: bool = False, zone: ZoneInfo) -> ParsedPaste:
+def _parse_note(
+    text: str, *, split: bool = False, zone: ZoneInfo, now: datetime | None = None
+) -> ParsedPaste:
     clean = _strip_rtl(text).strip()
     return ParsedPaste(
         kind=KIND_NOTE,
