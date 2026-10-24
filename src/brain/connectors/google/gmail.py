@@ -159,6 +159,24 @@ def _item_with_rfc(session: Any, rfc_message_id: str) -> Any:
     )
 
 
+def _ledger_row(session: Any, gmail_id: str) -> Any:
+    """The ledger row for this gmail id, or None."""
+    from sqlalchemy import select
+
+    from brain.db.models import ConnectorRecord
+
+    return (
+        session.execute(
+            select(ConnectorRecord).where(
+                ConnectorRecord.source == "email",
+                ConnectorRecord.external_id == gmail_id,
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
 def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
     """The Message-ID backstop (second-pass review, finding 2).
 
@@ -175,21 +193,10 @@ def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
     the backstop must never swallow a legitimate re-sync of an
     already-ledgered message.
     """
-    from sqlalchemy import select
 
     from brain.db.models import ConnectorRecord
 
-    ledgered = (
-        session.execute(
-            select(ConnectorRecord).where(
-                ConnectorRecord.source == "email",
-                ConnectorRecord.external_id == gmail_id,
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if ledgered is not None:
+    if _ledger_row(session, gmail_id) is not None:
         return False  # a known id: the runner owns it (updates/version)
     existing = _item_with_rfc(session, rfc_message_id)
     if existing is None:
@@ -206,7 +213,14 @@ def rfc_backstop_put(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
 def rfc_backstop_report(session: Any, rfc_message_id: str, gmail_id: str) -> bool:
     """READ-ONLY dry-run twin of :func:`rfc_backstop_put` (review B1):
     report what a real sync would ledger, write NOTHING, and never drop the
-    record — the dry-run listing must show every record the source yields."""
+    record — the dry-run listing must show every record the source yields.
+
+    Same ledger-row-first guard as the write twin (review follow-up 2): a
+    known id would be skipped by the real sync's ledger fast-path, so it
+    must never get a would-ledger line (noise implying pending work that
+    does not exist)."""
+    if _ledger_row(session, gmail_id) is not None:
+        return False
     existing = _item_with_rfc(session, rfc_message_id)
     if existing is None:
         return False
