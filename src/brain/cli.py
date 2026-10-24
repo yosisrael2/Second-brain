@@ -1174,7 +1174,10 @@ def _gmail_poll(
             raise
         except Exception as exc:  # noqa: BLE001 — one bad cycle never kills the agent
             logger.error("gmail-poll: cycle failed: %s", exc, exc_info=True)
-            time.sleep(stall_pause_s)
+            do_sleep(stall_pause_s)
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                return 0  # the test seam bounds this path too
             continue
         heartbeat_email_summary(summary)
         with SessionLocal() as session:
