@@ -14,6 +14,19 @@ CHILD_KINDS = ("event", "task", "reminder", "fact")
 
 
 @dataclass(frozen=True)
+class ReconHint:
+    """PR D-recon (item 37): the extractor's per-candidate reconciliation
+    hint. A HINT only helps select the matching window — it can never create
+    a match (type + applies_to + similarity are always code-checked) and it
+    can never silence one (every verdict is still a proposal, D2).
+    """
+
+    change: bool = False  # correction/update language or a stated field change
+    cancel: bool = False  # cancellation language
+    detail_only: bool = False  # pure addition (dress code, what to bring)
+
+
+@dataclass(frozen=True)
 class ChildCandidate:
     """A proposed child extracted from one source item.
 
@@ -33,6 +46,12 @@ class ChildCandidate:
     # pipeline can combine date + time deterministically).
     time_raw: str = ""
     all_day: bool = False
+    # PR D-recon (item 37, F2): where the event takes place, when the source
+    # states it for THIS child (feeds the reconciliation location diff).
+    location: str | None = None
+    # Round 5: the stated END time for THIS child ("עד 18:00", ICS DTEND
+    # style) — raw; resolved against the candidate's day in the pipeline.
+    end: str | None = None
     # Audience selector per item 17: keys from {school, grades, role, gender,
     # named_kids, channel}; resolved to applies_to by the pipeline (R1-R5).
     audience: dict[str, object] = field(default_factory=dict)
@@ -45,3 +64,6 @@ class ChildCandidate:
     # (they cite the fact they derive from); the pipeline skips their
     # grounding check and records the link in extraction_meta.
     derived_from: str | None = None
+    # PR D-recon (item 37): the reconciliation hint (see ReconHint). Absent
+    # on every pre-recon candidate; the pipeline treats None as "no signal".
+    recon: ReconHint | None = None

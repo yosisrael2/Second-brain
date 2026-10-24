@@ -118,6 +118,9 @@ def child_line(child: MemoryItem, tz_name: str) -> str:
     marker = superseded_marker(child)
     if marker:
         parts.append(marker)
+    recon = verdict_marker(child)
+    if recon:
+        parts.append(_esc(recon))
     return " · ".join(parts)
 
 
@@ -126,6 +129,26 @@ def superseded_marker(child: MemoryItem) -> str:
     meta = child.extraction_meta or {}
     if meta.get("superseded_by"):
         return "↩︎ superseded"
+    return ""
+
+
+def verdict_marker(child: MemoryItem) -> str:
+    """PR D-recon (item 37) rendering hook: one short line per non-NEW
+    verdict stored on the child (D-recon-1: text only; buttons in -2)."""
+    meta = child.extraction_meta or {}
+    verdict = meta.get("recon_verdict")
+    if not verdict:
+        return ""
+    fields = meta.get("recon_fields") or {}
+    if verdict == "update":
+        changes = "; ".join(f"{k}: {v[0]} → {v[1]}" for k, v in fields.items())
+        return f"↩︎ proposes: {changes}"
+    if verdict == "conflict":
+        return "⚠️ conflicts — both versions shown"
+    if verdict == "cancellation":
+        return "🗑 proposes cancelling"
+    if verdict == "more_detail":
+        return "➕ adds detail"
     return ""
 
 
