@@ -25,7 +25,7 @@ to its section or doc.
 - **WhatsApp relevance triage:** every conversation is labeled `relevant | noise` — a confirmed kid's name decides deterministically (no model call), otherwise Jev, otherwise one strict LLM call; if both fail the item stays untriaged, never guessed. Noise stays stored and searchable but is hidden from the default listings and never spends the enrichment cap; an update can never downgrade `relevant` to `noise` — `src/brain/services/triage.py` (PR #49)
 - **Attachments:** photos and PDFs sent to the bot are stored once (sha256) outside the repo and read in the background — a PDF text layer locally, otherwise Claude in a single-file sandbox; 20 MB / 20 pages / 50 files per day; each attachment becomes its own searchable item. Email and WhatsApp attachment content is wired in the same pipeline — `src/brain/services/attachments.py` (PRs #38, #44)
 - **Recurring calendar pastes:** a pasted ICS VEVENT with an RRULE fans out into one item per occurrence inside a bounded window (`BRAIN_PASTE_RRULE_DAYS`, default 60 days, capped at 60 items per series), with a DST-stable wall clock (DTSTART's zone rides every occurrence), EXDATE/COUNT/UNTIL honoured, and a malformed rule falling back to a single item — `src/brain/services/recurrence.py` (PR #65)
-- **Gmail label source** *(inactive, opt-in)*: read-only OAuth, one label, Message-ID dedupe, attachments via the attachment pipeline; activates after a one-time Google consent, and can then run 24/7 as the `com.secondbrain.email` launchd agent (refresh token only in the login keychain, nothing in the plists) — [docs/email-setup.md](docs/email-setup.md) (PRs #36, #43)
+- **Gmail source** *(inactive: disabled by default)*: read-only OAuth, one immutable label, Message-ID backstop, attachments via the attachment pipeline — now one live Gmail path: the connector runner owns capture/dedupe/deletes and the `com.secondbrain.email` launchd agent drives the same connector on a schedule (refresh token only in the login keychain, nothing in the plists) — [docs/email-setup.md](docs/email-setup.md) (PRs #36, #43, #59)
 
 **Retrieval**
 - Multilingual embeddings (local `fastembed`, `minishlab/potion-multilingual-128M`, 256 dims — Hebrew + English), Postgres FTS over raw text, reciprocal-rank fusion of the two — [AI layer](#ai-layer-and-the-brain-cli)
@@ -45,17 +45,18 @@ to its section or doc.
 
 **Meaning extraction and relations**
 - Extraction data model + durable enrichment queue (daily cap, backfill budget, grounded quotes, Hebrew-calendar dates, weekday/date conflict flag, re-run diffing) — *(inactive: the enrichment worker is off)* (PR #33)
-- LLM meaning extractor (A2): one call per source through the local Claude login client, versioned prompt (v6, recorded in every child's meta); the first pass parses strictly, the one error-fed retry parses leniently — valid candidates are kept, each invalid one is dropped with an `enrichment/candidate_invalid` ops event, and only a non-JSON reply or a missing candidates list fails the job; deterministic date resolution (never the model) with a quote_time backstop, derived tasks, multiple verbatim quote rows per child; scored against the frozen gold set through five offline eval runs — *(inactive: worker flag off, pinned by a test)* — `src/brain/services/extraction/llm_extractor.py` (PR #39)
+- LLM meaning extractor (A2): one call per source through the local Claude login client, versioned prompt (v6, recorded in every child's meta); the first pass parses strictly, the one error-fed retry parses leniently — valid candidates are kept, each invalid one is dropped with an `enrichment/candidate_invalid` ops event, and only a non-JSON reply or a missing candidates list fails the job; deterministic date resolution (never the model) with a quote_time backstop, derived tasks, multiple verbatim quote rows per child; scored against the frozen gold set through five offline eval runs — *(inactive: default stub extractor; `ENRICHMENT_EXTRACTOR=llm` + the worker flag activate it, pinned by a test)* — `src/brain/services/extraction/llm_extractor.py` (PRs #39, #68)
 - Bot proposal cards: one card per source with Keep / Fix / Drop and 48 h pings for due tasks and reminders — *(inactive until extraction runs)* (PR #41)
 - Relations between items (`supersedes`, `corrects`, `derived_from`, `same_as`): same-thread corrections applied visibly and undoably, cross-thread matches only proposed; superseded items are hidden from lists, search and ask but restorable; duplicate key never merges items for different people — `src/brain/services/relations.py` (PR #48)
 - Bot relation cards: superseded items render struck-through with a ♻️ Restore button; applied corrections show a ↩︎ replaced notice with ↩︎ Undo; proposed cross-thread matches show ✅ Confirm replace / ✖ Keep both — `src/brain/services/relations_view.py` (PR #51)
 
 **Connectors**
-- Pluggable source framework: adding a source = one subclass + one `@register` line, fed through a shared runner — idempotency ledger (the same external id never re-captures), cursor saved only after a whole batch succeeds, `deleted=True` hides the item (never erased) and a later un-delete restores it, user-deleted items are never re-captured, per-source ops heartbeat. **Every connector is disabled by default** (`BRAIN_CONNECTORS` empty = nothing syncs); Google sources need a one-time browser consent whose scopes are the UNION of the enabled connectors — `src/brain/connectors/`, setup walkthrough in [docs/connectors-setup.md](docs/connectors-setup.md) (PR #53)
-- **Google Tasks connector (`gtasks`)** *(inactive: disabled by default)*: read-only (`tasks.readonly`) sync of all — or an allowlisted subset of — task lists, incremental via an `updatedMin` watermark; deleted tasks hide their item while completed tasks stay as items; date-only dues anchor at local midnight; subtasks keep their parent — `src/brain/connectors/google/tasks.py` (PR #56)
+- Pluggable source framework: adding a source = one subclass + one `@register` line, fed through a shared runner — idempotency ledger (the same external id never re-captures), cursor saved only after a whole batch succeeds, `deleted=True` hides the item (never erased) and a later un-delete restores it, user-deleted items are never re-captured, per-source ops heartbeat; a content-fingerprint dedupe hit counts as `deduped`, not `created`; a failing `--dry-run` exits with the same error family as a real sync — `src/brain/connectors/`, setup walkthrough in [docs/connectors-setup.md](docs/connectors-setup.md) (PRs #53, #76, #83)
+- **Four Google connectors, all READ-ONLY and all disabled by default** (`BRAIN_CONNECTORS` empty = nothing syncs): **Google Tasks** (`gtasks`, `tasks.readonly` — list allowlist, `updatedMin` watermark, deleted tasks hide their item while completed tasks stay as items, date-only dues anchor at local midnight, subtasks keep their parent), **Google Calendar** (`gcal`, `calendar.readonly` — one item per occurrence via `singleEvents`, per-calendar sync tokens, past cutoff `BRAIN_GCAL_PAST_DAYS`), **Google Drive** (`gdrive`, `drive.readonly` — folder allowlist, depth-capped, Docs/Sheets/Slides text with a per-file cap, PDFs/images as attachments, `changes.list` incremental), **Gmail** (`email`, `gmail.readonly` — one label, `historyId` cursor, first sync seeds the ledger from the legacy seen-table) — `src/brain/connectors/google/` (PRs #55, #56, #57, #59)
+- **Enabling a connector** *(inactive until you opt in)*: add it to `BRAIN_CONNECTORS`, run the one-time browser consent (`brain connectors auth google`, scopes are the UNION of the enabled connectors), then — for Calendar and Gmail — a one-time `brain connectors adopt <name>` points the idempotency ledger at the items you already captured, so the first sync does not duplicate them (Tasks and Drive need consent only); until the background agent lands, enabled connectors sync when you run them by hand — the runbook with the exact order is [docs/connectors-enable.md](docs/connectors-enable.md) (PRs #79, #81, #85)
 
 **Cockpit**
-- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54)
+- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; a Connectors card (per-source status: enabled, last ok, cursor, `deduped` counter, last error); the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54, #80)
 
 **Ops**
 - 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent and an opt-in `com.secondbrain.connectors` scheduler), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
@@ -69,32 +70,32 @@ to its section or doc.
 
 | Area | Status | PRs |
 | --- | --- | --- |
-| Capture pipeline (items, paste parsing, Jev, dedupe, recurring ICS fan-out) | **Done** | #1, #7, #17, #19, #65 |
+| Capture pipeline (items, paste parsing, Jev, dedupe, recurring ICS fan-out, loud missing deps) | **Done** | #1, #7, #17, #19, #65, #77 |
 | Retrieval (embeddings, FTS fusion, temporal, recall pool, kid-aware recall) | **Done** | #20, #21, #24, #32, #42 |
 | Ask (citations, model config, conflict rule, one builder) | **Done** | #6, #27, #35 |
 | Memory layer (entities, versioned facts, channels, ask block, API, UI) | **Done** | #26, #28, #30 |
 | WhatsApp ingestion (24/7 agent, conversations, indexing) | **Done, live** | #37, #40, #47, #50 |
 | Attachments (Telegram, email, WhatsApp media) | **Done** | #38, #44 |
-| Gmail label source + 24/7 email agent | **Done, opt-in** (needs Google consent) | #36, #43 |
-| Extraction data model + queue, LLM extractor (A2), proposal cards | **Done, inactive** (worker flag off) | #33, #41, #39 |
+| Gmail connector (`email`) + 24/7 email agent — one live Gmail path through the runner | **Done, opt-in** (needs Google consent) | #36, #43, #59, #83 |
+| Extraction data model + queue, LLM extractor (A2), proposal cards, activation seam | **Done, inactive** (default stub; `ENRICHMENT_EXTRACTOR=llm` + the worker flag activate) | #33, #41, #39, #68 |
 | WhatsApp relevance triage (noise stays searchable, out of listings + enrichment) | **Done** | #49 |
-| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent) + setup docs | **Done** (connectors disabled by default) | #53, #58, #76 |
+| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent, dedupe counter, clean dry-run errors) + setup docs | **Done** (connectors disabled by default) | #53, #58, #76, #83 |
+| Enabling connectors: enable runbook, one-time `adopt` ledger pass | **Done** (runs once per connector, before its first sync) | #79, #81, #85 |
 | Google Calendar connector (`gcal`, read-only) | **Done, on main, inactive** (disabled by default) | #55 |
 | Google Tasks connector (`gtasks`, read-only) | **Done, on main, inactive** (disabled by default) | #56 |
+| Google Drive connector (`gdrive`, read-only) | **Done, on main, inactive** (disabled by default) | #57 |
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
 | Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50, #67 |
-| Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, relations inspector) | **Done** | #13, #29, #46, #54 |
+| Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, Connectors card, relations inspector) | **Done** | #13, #29, #46, #54, #80 |
 | Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown) | **Done** | #4, #5, #25, #39, #61 |
 
 **In progress** (work in progress, 24 Oct 2026)
 
-- Connectors: Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
-- Connector adoption pass — enabling Calendar or Gmail on live needs one-time Google consent plus a one-time adoption step so already-pasted items are not duplicated (Tasks and Drive need consent only)
-- Connectors background agent — runs the enabled Calendar/Tasks/Drive connectors on a schedule (until it lands, enabled connectors sync only when run by hand)
+- WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation (PR #73)
+- A2 in-bot enrichment worker wiring (PR #84, default OFF)
+- Connectors background agent — opt-in launchd scheduler so enabled connectors sync on a schedule (PR #82; until then they sync only when run by hand)
 - Connector conformance kit — termination/idempotency/change/delete/reset scenarios every source must pass (PR #60)
-- Cockpit Sources panel — read-only connector status card (PR #64 landed on a stale base; needs re-landing on main)
-- WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
 The live instance still runs `7936c55` — nothing has been deployed since.
@@ -438,23 +439,28 @@ write-back is a later stage.
 so nothing syncs until you explicitly enable sources (comma list, e.g.
 `BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"`), and each Google source needs
 a **one-time browser consent** (`brain connectors auth google`) before it can
-read anything. The full walkthrough — Google Cloud project, consent screen,
-the 7-day-Testing gotcha, per-connector allowlists, first sync — lives in
-[docs/connectors-setup.md](docs/connectors-setup.md).
+read anything. Two walkthroughs: [docs/connectors-setup.md](docs/connectors-setup.md)
+(Google Cloud project, consent screen, the 7-day-Testing gotcha, per-connector
+allowlists) and [docs/connectors-enable.md](docs/connectors-enable.md) — the
+runbook for turning a connector on for real: consent, then (Calendar and
+Gmail only) a one-time `brain connectors adopt <name>` that points the
+idempotency ledger at the items you already captured so the first sync does
+not duplicate them, then the first sync by hand (the background agent is a
+separate opt-in, not yet on main).
 
 One OAuth client + one refresh token (keychain item `second-brain-gmail`, the
 same one `brain gmail-auth` creates) serves every Google source: consent
 requests the UNION of enabled connectors' scopes, so re-running
 `brain connectors auth google` after enabling a source grants the extra
-scopes (never run consent from tests — the user does it once). On `main`
-today the registered connector is `gtasks` (PR #56); the Calendar, Drive and
-Gmail adapters land with their own PRs (#55, #57, #59) — a source that is
-enabled but not merged reports "not available" instead of syncing.
+scopes (never run consent from tests — the user does it once). All four
+connectors are registered on `main` (PRs #55, #56, #57, #59); a source that
+is enabled but not available reports "not available" instead of syncing.
 
 ```bash
 brain connectors list                    # name, enabled, last ok, cursor, last error
 brain connectors sync gtasks --dry-run   # print the records; write NOTHING
 brain connectors sync gtasks --limit 100 # one sync cycle through the runner
+brain connectors adopt gcal --dry-run    # what adopt would point at whom; writes NOTHING
 brain connectors auth google             # consent, union of enabled scopes
 ```
 
@@ -469,11 +475,14 @@ a whole batch succeeds; an auth error stops the connector (`state.last_error`
 says re-consent is needed), transient errors back off. `reset=True` batches
 are upserted as-is — deletions are never inferred from absent records.
 
-Shipped sources:
+Shipped sources (all READ-ONLY; all disabled until enabled):
 
 | name (items.source) | module | scope | cursor | notes |
 | --- | --- | --- | --- | --- |
 | `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner |
+| `gcal` | `connectors/google/calendar.py` | calendar.readonly | per-calendar `nextSyncToken` (JSON cursor with the frozen past cutoff) | `singleEvents`+`showDeleted` = one item per occurrence; `BRAIN_GCAL_CALENDARS` allowlist (default `primary`); past reach bounded by `BRAIN_GCAL_PAST_DAYS` (default 60, frozen in the cursor, no future cap); a moved occurrence arrives as cancelled-old + new id |
+| `gtasks` | `connectors/google/tasks.py` | tasks.readonly | `updatedMin` watermark across the allowlisted lists (`BRAIN_GTASKS_LISTS`) | deleted tasks hide their item, completed tasks stay as items; date-only dues anchor at local midnight; subtasks carry their parent |
+| `gdrive` | `connectors/google/drive.py` | drive.readonly | `changes.list` `startPageToken` -> `newStartPageToken`; unknown token (404) or truncated window (410) -> `reset=True` | folder allowlist `BRAIN_GDRIVE_FOLDERS` (empty = zero API calls), depth-capped BFS (`BRAIN_GDRIVE_DEPTH`, default 1); Docs/Sheets/Slides -> text with a per-file cap (`BRAIN_GDRIVE_TEXT_CAP`), PDFs/images -> attachments, other binaries -> metadata-only; trashed/moved-out -> `deleted=True` |
 
 ### How to add a new source (the recipe, ≤15 lines)
 
