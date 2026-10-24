@@ -8,8 +8,10 @@ import pytest
 from sqlalchemy import text
 
 from brain import ops
+from brain.ai.ask import Completion, FakeLLMClient
 from brain.db.session import engine
 from brain.ops import health as ops_health
+from brain.services.ask import AskService
 
 
 def _healthy_ctx() -> ops_health.HealthContext:
@@ -168,6 +170,87 @@ class TestProbes:
         client.post("/ops/probe/llm")
         recent = ops.recent_event("llm", ok=True)
         assert recent is not None and recent["kind"] == "probe"
+
+
+class _StubSearch:
+    """SearchService stand-in returning fixed hits (no ops recording)."""
+
+    def search(self, query: str, *, limit: int, offset: int = 0, extra_items=()):
+        return []
+
+    def by_occurrence(self, start, end, *, limit: int):
+        return []
+
+
+class TestFakeLlmNeverFlipsLlmHealth:
+    """A verification run must not poison live health.
+
+    Live checks exercise the ask path with a FAKE LLM against a DB that may
+    be the LIVE one; the recorded ask->llm ops event then flips /ops/health's
+    llm component (ok=False -> 'last call failed', ok=True -> spurious 'ok')
+    until the next real LLM call (seen 22:40Z 22 Oct after the A1 deploy
+    check). A synthetic (test) client must not write ops events at all —
+    llm health may only move on real-LLM evidence.
+    """
+
+    @staticmethod
+    def _ask_service(llm) -> AskService:
+        return AskService(_StubSearch(), llm)  # type: ignore[arg-type]
+
+    def test_failing_fake_llm_ask_records_nothing(self, client, ops_tables):
+        """RED: an ask that explodes inside a fake client recorded
+        ask->llm ok=False -> /ops/health llm read 'degraded'."""
+        from brain.ai.ask import LLMError
+
+        class ExplodingFake(FakeLLMClient):
+            def complete(self, prompt: str) -> Completion:
+                raise LLMError("boom from the fake")
+
+        service = self._ask_service(ExplodingFake())
+        with pytest.raises(LLMError):
+            service.ask("what is on friday?")
+        assert ops.recent_event("llm") is None
+        assert ops.recent_event(edge="ask->llm") is None
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        assert body["components"]["llm"]["status"] == "not probed"
+
+    def test_successful_fake_llm_ask_records_nothing(self, client, ops_tables):
+        """RED: a successful fake ask recorded ask->llm ok=True, which read
+        as REAL llm evidence ('ok' where 'not probed' was honest)."""
+        service = self._ask_service(FakeLLMClient(reply="nothing relevant"))
+        service.ask("what is on friday?")
+        assert ops.recent_event("llm") is None
+        assert ops.recent_event(edge="ask->llm") is None
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        assert body["components"]["llm"]["status"] == "not probed"
+
+    def test_real_client_failure_still_marks_llm_degraded(self, client, ops_tables):
+        """The goal that must survive: a REAL client's failure still lands
+        in ops and still degrades llm health (plain stub = not synthetic)."""
+        from brain.ai.ask import LLMError
+
+        class RealClientStub:
+            synthetic = False
+
+            def complete(self, prompt: str) -> Completion:
+                raise LLMError("real provider down")
+
+            def close(self) -> None:
+                pass
+
+        service = self._ask_service(RealClientStub())
+        with pytest.raises(LLMError):
+            service.ask("what is on friday?")
+        failed = ops.recent_event(edge="ask->llm", ok=False)
+        assert failed is not None
+        ops_health.reset_cache()
+        ops_health._default_context = lambda: _healthy_ctx()  # type: ignore[assignment]
+        body = client.get("/ops/health").json()
+        assert body["components"]["llm"]["status"] == "degraded"
 
 
 class TestNotProbed:

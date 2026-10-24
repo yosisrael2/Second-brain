@@ -1,0 +1,19 @@
+{
+  "kind": "calendar#event",
+  "etag": "\"34026ee1f0f61d0\"",
+  "id": "weekly-series-id-5678_20261104T170000Z",
+  "status": "confirmed",
+  "htmlLink": "https://www.google.com/calendar/event?eid=d2Vla2x5LXNlcmllcy1pZC01Njc4XzIwMjYxMTA0VDE3MDAwMFo",
+  "created": "2026-09-01T09:00:00.000Z",
+  "updated": "2026-09-01T09:00:00.000Z",
+  "summary": "חזרת תזמורת",
+  "location": "אולם המוזיקה",
+  "creator": {"email": "conductor@example.com", "displayName": "מירי שרון"},
+  "organizer": {"email": "conductor@example.com", "displayName": "מירי שרון"},
+  "start": {"dateTime": "2026-11-04T19:00:00+02:00", "timeZone": "Asia/Jerusalem"},
+  "end": {"dateTime": "2026-11-04T20:15:00+02:00", "timeZone": "Asia/Jerusalem"},
+  "recurringEventId": "weekly-series-id-5678",
+  "originalStartTime": {"dateTime": "2026-11-04T19:00:00+02:00", "timeZone": "Asia/Jerusalem"},
+  "iCalUID": "weekly-series-id-5678@google.com",
+  "eventType": "default"
+}

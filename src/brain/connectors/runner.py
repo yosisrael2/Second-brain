@@ -92,6 +92,11 @@ class SyncSummary:
     state: str = "ok"  # ok | auth_error | retry_error | error
     fetched: int = 0
     created: int = 0
+    # create() returned an EXISTING item via the content-fingerprint dedupe
+    # (ingest's deduplicated snapshot): the ledger points at the existing
+    # item, nothing new was captured. Counted separately so ops/cockpit
+    # captures are not overstated (worker_6 found the overcount on #59).
+    deduped: int = 0
     updated: int = 0
     deleted: int = 0
     skipped: int = 0
@@ -187,7 +192,7 @@ class ConnectorRunner:
         except ConnectorError as exc:
             return self._fail(name, "error", str(exc))
 
-        created = updated = deleted = skipped = errors = 0
+        created = updated = deleted = skipped = deduped = errors = 0
         for record in result.records:
             try:
                 outcome = self._handle(record)
@@ -235,6 +240,8 @@ class ConnectorRunner:
                 continue
             if outcome == "created":
                 created += 1
+            elif outcome == "deduped":
+                deduped += 1
             elif outcome == "updated":
                 updated += 1
             elif outcome == "deleted":
@@ -246,6 +253,7 @@ class ConnectorRunner:
             connector=name,
             fetched=len(result.records),
             created=created,
+            deduped=deduped,
             updated=updated,
             deleted=deleted,
             skipped=skipped,
@@ -269,7 +277,7 @@ class ConnectorRunner:
     # --- per-record semantics -------------------------------------------------
 
     def _handle(self, record: SourceRecord) -> str:
-        """Apply one record; returns created|updated|deleted|skipped."""
+        """Apply one record; returns created|deduped|updated|deleted|skipped."""
         name = self._connector.name
         row = self._records.get(name, record.external_id)
         item = self._repo.get(row.item_id) if row is not None and row.item_id else None
@@ -310,6 +318,12 @@ class ConnectorRunner:
             )
             self._capture_attachments(record, item)
             self._records.put(name, record.external_id, record.version, item.id)
+            if item.deduplicated:
+                # ingest's fingerprint dedupe returned the EXISTING item (the
+                # snapshot carries its id + the deduplicated flag): the ledger
+                # above already points at it. NOT a new capture — count it as
+                # its own outcome so created stays honest.
+                return "deduped"
             return "created"
 
         stored_meta = dict(item.meta or {})
@@ -508,6 +522,7 @@ class ConnectorRunner:
                 {
                     "state": summary.state,
                     "created": summary.created,
+                    "deduped": summary.deduped,
                     "updated": summary.updated,
                     "deleted": summary.deleted,
                     "skipped": summary.skipped,
