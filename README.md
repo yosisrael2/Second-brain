@@ -344,11 +344,13 @@ Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 | GET    | `/ops/trace/search?q=`| Search pipeline trace (before/after rerank, fallback decision)  |
 | POST   | `/ops/trace/ask`      | Ask trace — runs the real LLM (user-initiated)                  |
 
-Diagnostics note: live checks that exercise the ask path with a FAKE LLM must
-call `AskService.ask(..., record_ops=False)` — that skips the `ask→search` /
-`ask→llm` spans and the kid_recall event, so `/ops/health`'s llm component is
-not marked "last call failed" until the next real call. Real requests keep
-the default (`record_ops=True`); nothing else changes.
+Diagnostics note: live checks that exercise the ask path with a FAKE LLM are
+safe by default — `FakeLLMClient` is marked synthetic and NEVER records ops
+spans/events, so a verification run cannot flip `/ops/health`'s llm component
+('last call failed' / spurious 'ok'). Passing `record_ops=False` still skips
+the `ask→search` / `ask→llm` spans for any client (diagnostics runs); real
+requests keep the default (`record_ops=True`) and remain the only source of
+llm health evidence.
 
 Health components `attachments` (queue depth, read today / daily budget, last
 error) and `enrichment` (queue depth, cap used / limit, worker on/off — off is

@@ -121,13 +121,23 @@ class AskService:
         live checks that exercise the ask path with a fake LLM must pass it,
         otherwise /ops/health shows 'llm — last call failed' until the next
         real call. Real requests keep the default (True) — no change.
+
+        A SYNTHETIC client (FakeLLMClient and its subclasses) never records
+        ops regardless of ``record_ops``: the default True must stay safe
+        for verification runs against a live DB (they poison llm health
+        otherwise), so real-LLM evidence is the only thing /ops/health's
+        llm component reads.
         """
-        span_factory = ops.span if record_ops else _null_span
+        # Fail-safe default: a synthetic (test) client's events are not
+        # evidence of real llm health — write none at all (no partial
+        # ask->search spans either, so the run leaves zero ops rows).
+        recording = record_ops and not getattr(self._llm, "synthetic", False)
+        span_factory = ops.span if recording else _null_span
         with span_factory("ask", "search", edge="ask->search") as span:
             # rerank sees the whole pool; only the top_k best reach the prompt.
             # No kid named -> the call is EXACTLY the pre-0d one (byte-identical
             # pool; also keeps third-party search fakes without the kwarg working).
-            kid_items = self._kid_recall_items(question, record_ops=record_ops)
+            kid_items = self._kid_recall_items(question, record_ops=recording)
             if kid_items:
                 pool = self._search.search(
                     question,
