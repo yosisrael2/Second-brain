@@ -314,3 +314,142 @@ def test_by_text_any_excludes_dropped_children(clean_items, memory_db) -> None:
 
     assert len(hits) == 3, "the dropped child must not be recalled"
     assert all((hit.child_state or None) != "dropped" for hit in hits)
+
+
+# --- WA39 acceptance run 1 (24 Oct): the newest-N flood -----------------------
+
+_TEACHER = "ב' ברקת - הורים"
+
+
+def _whatsapp_item(
+    repo: ItemsRepository,
+    channel: str,
+    day: int,
+    hour: int,
+    text: str,
+    *,
+    captured: int = 23,
+) -> MemoryItem:
+    """A WhatsApp conversation item in the REAL capture shape: the channel is
+    in the raw_text header AND in meta.channel (services/whatsapp.py
+    render_conversation). ``captured`` pins created_at (the capture day) so
+    the newest-first pool order is deterministic — same-transaction inserts
+    would otherwise share one now()."""
+    return repo.add(
+        MemoryItem(
+            source="whatsapp",
+            raw_text=f"[2{day}/10/2026, {hour}:00] {channel} / מעין: {text}",
+            occurred_at=datetime(2026, 10, day, hour - 2, 0, tzinfo=UTC),
+            created_at=datetime(2026, 10, captured, 12, 0, tzinfo=UTC),
+            meta={
+                "kind": "whatsapp_conversation",
+                "channel": channel,
+                "count": 1,
+                "messages": [
+                    {
+                        "sender": f"{channel} / מעין",
+                        "at": f"2026-10-{day}T{hour - 2}:00:00+00:00",
+                        "at_raw": f"2{day}/10/2026, {hour}:00",
+                    }
+                ],
+            },
+        )
+    )
+
+
+def test_farm_conversation_recalled_despite_newer_flood(clean_items, memory_db) -> None:
+    """WA39 run-1 miss, red-first: a question that names a kid AND resolves a
+    date ('Wednesday 21.10') must recall the kid's-channel conversation from
+    THAT day even when 20 newer conversations in the same channels already
+    fill the newest-16 pool. The kid leg is bounded by the question's
+    resolved time window when one resolves (the temporal leg's own
+    resolution), else falls back to the newest-N cap — never all history."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    # the target: the teacher-channel conversation ABOUT the farm day —
+    # no kid name anywhere in its text (the semantic leg cannot find it)
+    farm = _whatsapp_item(
+        repo, _TEACHER, 21, 10, "מחר הכיתה בחווה החקלאית — צריך כובע ומים", captured=21
+    )
+    # the flood: 20 NEWER conversations in the kid's own channels (captured
+    # later, so the current newest-first cap serves them, not the farm item)
+    for n in range(20):
+        _whatsapp_item(
+            repo, _TEACHER, 23, 8 + n % 12, f"הודעה שנייה־עשרים מספר {n}"
+        )
+    rona_item = _whatsapp_item(
+        repo, "רונה כדורגל", 21, 9, "אימון הכדורגל של רונה מחר בשעה 15:15"
+    )
+    search = RecordingSearch([])  # semantic leg finds nothing (the failure mode)
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    recalled = [str(hit.item.id) for hit in result.sources]
+    assert str(farm.id) in recalled, (
+        "the kid's-channel conversation inside the question's resolved window "
+        "must join the recall pool even when newer items fill the newest-N cap"
+    )
+    assert str(rona_item.id) not in recalled, (
+        "another kid's channel must never be recalled for this kid's question"
+    )
+
+
+def test_kid_channel_recall_without_resolved_window_is_recent_n(clean_items, memory_db) -> None:
+    """No date in the question -> the kid leg falls back to the newest-N cap
+    (never all history) and still respects the overall pool cap."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    old = _whatsapp_item(repo, _TEACHER, 9, 10, "שיחה ישנה מתחילת החודש")
+    for n in range(20):
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה חדשה מספר {n}")
+    search = RecordingSearch([])
+    service = _service(memory, repo, search, kid_recall_limit=16)
+
+    service.ask("מה חדש אצל איתמר?", now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC))
+
+    extra_ids = [str(item.id) for item in search.seen_extra[0]]
+    assert len(extra_ids) == 16, "the pool cap holds"
+    assert str(old.id) not in extra_ids, "no window -> recent N, never all history"
+
+
+def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) -> None:
+    """No confirmed applies_to fact -> the structured channel leg adds
+    nothing (it must not guess); with the fact present the same question
+    recalls the channel item. The channel name here deliberately does NOT
+    contain the kid's class string, so the class text needle cannot
+    accidentally recall the item."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    memory.set_channel("קשר עם המחנך", kind="teacher", applies_to="Itamar")
+    item = _whatsapp_item(repo, "קשר עם המחנך", 21, 10, "מחר הכיתה בחווה החקלאית", captured=21)
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+    assert str(item.id) in [str(hit.item.id) for hit in result.sources], (
+        "the confirmed channel fact must recall the channel's conversation"
+    )
+
+    # the fact is withdrawn: the channel leg must stop guessing
+    for entity in memory.overview(status="confirmed", q=None):
+        if entity.get("kind") != "channel":
+            continue
+        for fact in entity.get("facts", []):
+            if fact.get("predicate") == "applies_to":
+                memory.delete_fact(fact["id"])
+    search2 = RecordingSearch([])
+    service2 = _service(memory, repo, search2)
+    service2.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+    assert all(str(item.id) != str(i.id) for i in search2.seen_extra[0]), (
+        "without confirmed channel facts the channel leg must not guess"
+    )
