@@ -15,6 +15,7 @@ from qdrant_client import QdrantClient
 from sqlalchemy import text
 from tests.fakes import StubClassifier
 
+from brain import schemas
 from brain.ai.classify import FALLBACK_CLASSIFICATION
 from brain.ai.embedder import FakeEmbedder
 from brain.ai.vectorstore import QdrantVectorStore
@@ -734,7 +735,11 @@ def test_cursor_advances_only_after_full_batch_success(runner_db):
     # The loop continues past a failed record, so r4/r5 were already written
     # in the first run; the retry finds them UNCHANGED (no duplicates),
     # writes the one record that failed, and only now moves the cursor.
-    assert retry.created == 1  # r3, the one that failed last time
+    # r3's ITEM already existed (run 1 created it, then its attachment
+    # capture failed): the retry's create returns ingest's dedupe snapshot —
+    # counted as deduped, not created (no second capture happened).
+    assert retry.created == 0
+    assert retry.deduped == 1  # r3, the one that failed last time
     assert retry.skipped == 4  # r1/r2/r4/r5: unchanged, NOT duplicated
     assert h.state.get("gcal").cursor == "c1"
     items = h.repo.list(item_type=None, project=None, status=None, limit=50, offset=0)
@@ -825,3 +830,39 @@ class _FailingEmbedder:
 class _PassThroughReranker:
     def rerank(self, question, candidates, top_n):
         return list(candidates)[:top_n]
+
+
+def test_deduped_create_counts_as_deduped_not_created(runner_db):
+    """A new external id whose content is IDENTICAL to an existing item is a
+    dedupe hit, not a capture (worker_6 found the overcount on #59: the DB
+    still held one item while summary.created said 1).
+
+    Ingest exposes the outcome without any semantics change: create() returns
+    a detached snapshot with deduplicated=True (ingest.py _dedupe_snapshot)
+    and the EXISTING id. The runner must count it as its own outcome, point
+    the ledger at the existing item, and never create a second item.
+    """
+    h = Harness(runner_db)
+    # The item the connector's record will collide with: same source, text,
+    # occurred_at minute -> identical content fingerprint.
+    existing = h.ingest.create(
+        schemas.ItemCreate(
+            raw_text="body of r1",
+            source="gcal",
+            occurred_at=datetime(2026, 10, 1, 9, 0, tzinfo=UTC),
+        )
+    )
+    assert existing.deduplicated is False  # a real create, not a snapshot
+
+    connector = FakeConnector(batches=[_batch(make_record(external_id="new-id"))])
+    summary = h.runner(connector).run()
+
+    assert summary.created == 0  # RED TODAY: 1 — the overstatement
+    assert summary.deduped == 1
+    # The ledger points the NEW external id at the EXISTING item …
+    row = h.records.get("gcal", "new-id")
+    assert row is not None and row.item_id == existing.id
+    assert h.item("new-id").id == existing.id
+    # … and no second item exists.
+    assert runner_db.query(MemoryItem).filter(MemoryItem.source == "gcal").count() == 1
+

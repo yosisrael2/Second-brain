@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import text
 
 from brain.db.models import MemoryItem
-from brain.services.extraction.service import EnrichmentService
+from brain.services.extraction.service import EnrichmentService, build_extractor
 from brain.services.memory import MemoryRepository, MemoryService
 
 logger = logging.getLogger(__name__)
@@ -143,7 +143,8 @@ def run_extraction_eval(
     input_path: Path,
     out_path: Path,
     session: Any,  # noqa: ANN001 — Session
-    extractor: Any,  # noqa: ANN001 — Extractor
+    extractor: Any | None = None,  # noqa: ANN001 — Extractor; None = the ONE
+    #   settings factory (build_extractor), same as every production site.
     *,
     tz: Any,
     memory_snapshot: Path | None = None,
@@ -163,6 +164,10 @@ def run_extraction_eval(
     """
     emails = split_emails(input_path.read_text(encoding="utf-8"))
     memory = MemoryService(MemoryRepository(session))
+    if extractor is None:
+        from brain.config import get_settings  # noqa: PLC0415 (cheap, local)
+
+        extractor = build_extractor(get_settings())
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415
 
     service = EnrichmentService(

@@ -24,8 +24,16 @@ class _StubGcal(FakeConnector):
 
 
 try:
+    # Merged adapters register first (#55): the real gcal connector
+    # must win the 'gcal' registry slot, with this stub only filling in when
+    # no adapter module provides it (plain main). Without this import the
+    # stub would win the slot at collection time and the REAL adapter's
+    # @register would raise on ensure_registered() inside every CLI command.
+    from brain.connectors import ensure_registered
+
+    ensure_registered()
     register(_StubGcal)
-except ValueError:  # already registered by an earlier import of this module
+except ValueError:  # 'gcal' already registered (real adapter or this stub)
     pass
 
 
@@ -222,7 +230,7 @@ def test_sync_dry_run_prints_records_and_writes_nothing(
             )
         ]
     )
-    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: connector)
 
     with SessionLocal() as session:
         before_items = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
@@ -254,7 +262,7 @@ def test_sync_runs_the_runner_end_to_end_with_a_registered_connector(
     from brain.db.session import SessionLocal
 
     connector = _StubGcal(batches=[FetchResult(records=[make_record()], next_cursor="c1")])
-    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: connector)
 
     assert cli.main(["connectors", "sync", "gcal"]) == 0
     out = capsys.readouterr().out
@@ -284,7 +292,7 @@ def test_sync_drain_loops_until_no_cursor_movement(settings_env, database, capsy
             FetchResult(records=[], next_cursor="c2"),  # drained: cursor stops
         ]
     )
-    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: connector)
 
     assert cli.main(["connectors", "sync", "gcal", "--drain"]) == 0
     out = capsys.readouterr().out
@@ -339,3 +347,85 @@ def test_auth_google_stores_only_the_refresh_token(
     assert set(flow.requested_scopes) == set(expected_scopes)  # union of enabled connectors
     assert "1//google-union-token" not in out  # the token is NEVER printed
     assert "second-brain-gmail" in out
+
+
+def test_email_dry_run_writes_nothing_even_when_seed_and_backstop_trigger(
+    database, capsys, monkeypatch
+):
+    """Review B1 (second pass): --dry-run writes NOTHING — no ledger seed,
+    no backstop ledger put, no cursor/state/items. The dry-run build wires
+    READ-ONLY seams: the backstop decision is still REPORTED (the whole
+    point of the pre-enable comparison is to see it), the seed simply does
+    not run. RED-FIRST: with the write seams wired (the pre-fix behaviour)
+    this dry-run inserted seed + backstop ledger rows."""
+    from sqlalchemy import text as sql_text
+    from tests.test_connectors_gmail import (
+        LABEL,
+        _FakeService,
+        _queue_message,
+        _ServiceState,
+    )
+
+    from brain.db.session import SessionLocal
+
+    state = _ServiceState()
+    state.profile_history_id = "9002"
+    _queue_message(state, "m2", rfc="<same@msg>")
+
+    monkeypatch.setenv("BRAIN_CONNECTORS", "email,gcal,gtasks")
+    monkeypatch.setenv("GMAIL_LABEL_ID", LABEL)
+    monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "brain.connectors.google.base.default_service_factory",
+        lambda token, scopes, api_name, api_version: _FakeService(state),
+    )
+    monkeypatch.setattr(
+        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
+    )
+
+    def _counts(session):
+        return {
+            table: session.execute(sql_text(f"SELECT count(*) FROM {table}")).scalar()
+            for table in (
+                "connector_records",
+                "connector_state",
+                "memory_items",
+                "email_messages",
+            )
+        }
+
+    with SessionLocal() as session:
+        from brain.db.models import EmailMessage, MemoryItem
+
+        # An already-captured email item carrying the Message-ID: the
+        # re-delivery of m2 under the same rfc must be REPORTED, not written.
+        session.add(
+            MemoryItem(
+                raw_text="the original paste",
+                source="email",
+                meta={"rfc_message_id": "<same@msg>"},
+            )
+        )
+        # A legacy seen-ledger row: a real first sync seeds it — dry-run must not.
+        session.add(
+            EmailMessage(
+                dedupe_id="<m1@x>",
+                gmail_id="m1",
+                rfc_message_id="<m1@x>",
+                item_id=None,
+            )
+        )
+        session.commit()
+        before = _counts(session)
+
+    assert cli.main(["connectors", "sync", "email", "--dry-run"]) == 0
+
+    with SessionLocal() as session:
+        after = _counts(session)
+    assert after == before, f"--dry-run wrote rows: {before} -> {after}"
+
+    out = capsys.readouterr().out
+    assert "dry-run: 1 record(s)" in out
+    assert "m2" in out
+    assert "would ledger m2" in out  # the decision is visible, nothing written

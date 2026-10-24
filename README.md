@@ -59,7 +59,7 @@ to its section or doc.
 
 **Ops**
 - 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
-- Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; each test session fails loudly if the live collection changes — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45)
+- Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; migrations refuse the live database the same way (alembic guard); each test session fails loudly if the live collection gains test-originated vectors — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45, #70, #74)
 - Tests isolated from live data: per-worker test databases reset (TRUNCATEd at session start) and per-worker vector collections; a per-test timeout and CI job timeouts — (PRs #22, #23, #38, #42, #62)
 
 **Evaluation**
@@ -78,21 +78,23 @@ to its section or doc.
 | Gmail label source + 24/7 email agent | **Done, opt-in** (needs Google consent) | #36, #43 |
 | Extraction data model + queue, LLM extractor (A2), proposal cards | **Done, inactive** (worker flag off) | #33, #41, #39 |
 | WhatsApp relevance triage (noise stays searchable, out of listings + enrichment) | **Done** | #49 |
-| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent) + setup docs | **Done** (connectors disabled by default) | #53, #58 |
-| Google Tasks connector (`gtasks`, read-only) | **Done, inactive** (disabled by default) | #56 |
+| Connectors framework (runner, idempotency ledger, state, Google OAuth union consent) + setup docs | **Done** (connectors disabled by default) | #53, #58, #76 |
+| Google Calendar connector (`gcal`, read-only) | **Done, on main, inactive** (disabled by default) | #55 |
+| Google Tasks connector (`gtasks`, read-only) | **Done, on main, inactive** (disabled by default) | #56 |
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
-| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50 |
+| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50, #67 |
 | Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, relations inspector) | **Done** | #13, #29, #46, #54 |
-| Ops safety (test isolation + session-start reset, live-store guards, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62 |
+| Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown) | **Done** | #4, #5, #25, #39, #61 |
 
 **In progress** (work in progress, 24 Oct 2026)
 
-- Connectors: Google Calendar adapter — `gcal`, read-only (PR #55), Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
+- Connectors: Google Drive adapter — `gdrive`, read-only (PR #57), Gmail port onto the connector runner (PR #59)
+- Connector adoption pass — enabling Calendar or Gmail on live needs one-time Google consent plus a one-time adoption step so already-pasted items are not duplicated (Tasks and Drive need consent only)
+- Connectors background agent — runs the enabled Calendar/Tasks/Drive connectors on a schedule (until it lands, enabled connectors sync only when run by hand)
 - Connector conformance kit — termination/idempotency/change/delete/reset scenarios every source must pass (PR #60)
-- Cockpit Sources panel — read-only connector status card (PR #64)
+- Cockpit Sources panel — read-only connector status card (PR #64 landed on a stale base; needs re-landing on main)
 - WhatsApp reconciliation: new / already known / update / more detail / conflict / cancellation
-- Alembic live guard (migrations must never run against the live database by accident)
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
 The live instance still runs `7936c55` — nothing has been deployed since.
@@ -467,6 +469,14 @@ a whole batch succeeds; an auth error stops the connector (`state.last_error`
 says re-consent is needed), transient errors back off. `reset=True` batches
 are upserted as-is — deletions are never inferred from absent records.
 
+Shipped sources:
+
+| name (items.source) | module | scope | cursor | notes |
+| --- | --- | --- | --- | --- |
+| `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner |
+
+### How to add a new source (the recipe, ≤15 lines)
+
 ### How to add a new source (the recipe, ≤15 lines)
 
 1. `src/brain/connectors/google/<name>.py`: `class MyConnector(GoogleConnector):`
@@ -495,25 +505,26 @@ reboots — API, Telegram bot, WhatsApp poller, and an opt-in Gmail agent
 ```bash
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
 scripts/service.sh status      # per-agent state/pid/last-exit + sleep + docker notes
-scripts/service.sh restart     # kickstart -k both agents
-scripts/service.sh logs [api|telegram]
+scripts/service.sh restart     # kickstart -k installed agents (skips the rest)
+scripts/service.sh logs [api|telegram|email|whatsapp]
 scripts/service.sh uninstall
 ```
 
 - **com.secondbrain.api** runs `scripts/run-server.sh` (foreground uvicorn);
-  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, which maps the bot's
-  exit codes onto launchd's KeepAlive (`SuccessfulExit=false`): disabled (0)
-  and permanent config errors (78, incl. a 409 conflict that outlasts the
-  10-minute retry window) exit 0 → no restart; transient failures exit 1 →
-  restart with backoff. The opt-in **com.secondbrain.email** runs
-  `scripts/run-email.sh` (`brain gmail-poll`) with the same mapping
-  (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting);
-  `install` skips it unless `GMAIL_LABEL_ID` is set.
+  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, **com.secondbrain.email**
+  runs `scripts/run-email.sh` (the Gmail connector loop — OPT-IN: installed only
+  when `GMAIL_LABEL_ID` is set, else install prints a skipped line and removes any
+  stale plist), and **com.secondbrain.whatsapp** runs `scripts/run-whatsapp.sh`.
+  All map their exit codes onto launchd's KeepAlive (`SuccessfulExit=false`):
+  disabled (0) and permanent config errors (78, incl. the bot's 409 conflict that
+  outlasts the 10-minute retry window) exit 0 → no restart; transient failures
+  exit 1 → restart with backoff. A needed re-auth pauses inside the email loop
+  instead of exiting.
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
   checkout exits 78 with `another bot instance is running (pid N)`.
-- Both agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
+- All agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
   the plists (the app reads `.env` itself via its working directory). Logs:
   `~/Library/Logs/second-brain/`.
 - Accepted deviation: the API launcher does NOT wait for docker and does NOT
@@ -736,6 +747,9 @@ pip install -e ".[dev]"
 
 # 3. Configuration
 cp .env.example .env    # adjust if needed; never commit .env
+#   WORKTREES (not your main checkout): point DATABASE_URL at a `*_test`
+#   dbname (e.g. .../brain_test) — the default in .env.example is the live
+#   service's database, and a bare `alembic` run from this directory uses it.
 
 # 4. Schema
 alembic upgrade head
