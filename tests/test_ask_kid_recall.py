@@ -575,3 +575,126 @@ def test_lookback_respects_its_days_bound(clean_items, memory_db) -> None:
     assert str(old.id) not in recalled, (
         "beyond the lookback days bound the kid-channel leg must not recall"
     )
+
+
+def _service2(
+    memory: MemoryService,
+    repo: ItemsRepository,
+    search: RecordingSearch,
+    *,
+    top_k: int = 8,
+    kid_reserved_slots: int = 3,
+) -> AskService:
+    return AskService(
+        search,
+        FakeLLMClient(reply=cite_every_source),  # type: ignore[arg-type]
+        memory=memory,
+        items_repo=repo,
+        top_k=top_k,
+        kid_reserved_slots=kid_reserved_slots,
+    )
+
+
+def _email(repo: ItemsRepository, n: int) -> MemoryItem:
+    """A high-scoring semantic item (school email) that outranks chat noise."""
+    return repo.add(
+        MemoryItem(
+            raw_text=f"מכתב מנהלת בית הספר בראשית — הודעה כללית מספר {n} על תשלומים",
+        )
+    )
+
+
+def test_kid_channel_item_survives_higher_ranked_flood(clean_items, memory_db) -> None:
+    """WA39 run-3 W4 miss, red-first: the rerank ranks 8+ emails above the one
+    kid-channel conversation that answers the question, and the top-8 cut
+    drops it even though the kid leg fetched it. The final context must
+    reserve up to ASK_KID_RESERVED_SLOTS of top_k for the best-ranked
+    kid-recall items (kid-channel conversations first)."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(10)]
+    kid_item = _whatsapp_item(repo, _TEACHER, 18, 15, "מי שרוצה להביא נעלי בית לכיתה, מוזמן")
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask(
+        "Is there anything optional Itamar can bring to class?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    assert str(kid_item.id) in ids, (
+        "the reranked-out kid-channel item must be reserved a slot in the "
+        "final context when the question names a confirmed kid"
+    )
+    email_ids = {str(e.id) for e in emails}
+    assert len(ids) == 8, "top_k stays 8"
+    assert len([i for i in ids if i in email_ids]) < 8, (
+        "reserved slot comes out of the general ranking — some email lost it"
+    )
+
+
+def test_reservation_caps_at_reserved_slots(clean_items, memory_db) -> None:
+    """More kid items than slots: only the best ASK_KID_RESERVED_SLOTS
+    (kid-channel conversations first) are reserved; the rest fall back to
+    the general ranking."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(10)]
+    kid_items = [
+        _whatsapp_item(repo, _TEACHER, 18, 15, "נעלי בית לכיתה — מי שרוצה מוזמן"),
+        _whatsapp_item(repo, _TEACHER, 19, 15, "מחר יום כיפות — להביא כיפה ממוספרת"),
+        _whatsapp_item(repo, _TEACHER, 19, 16, "מחר הכיתה בחווה החקלאית"),
+        _whatsapp_item(repo, _TEACHER, 20, 16, "היום סיום הסדרה עם פירות בתשלום"),
+    ]
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask(
+        "What should Itamar bring to class this week?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    kid_in = [i for i in ids if i in {str(k.id) for k in kid_items}]
+    assert len(kid_in) == 3, "at most ASK_KID_RESERVED_SLOTS kid items are reserved"
+    assert len(ids) == 8, "top_k unchanged"
+
+
+def test_no_kid_named_context_byte_identical(clean_items, memory_db) -> None:
+    """No kid named -> the context is exactly the general top_k, unchanged."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(10)]
+    _whatsapp_item(repo, _TEACHER, 18, 15, "נעלי בית לכיתה")  # never fetched
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask("מה קורה עם התשלומים?", now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC))
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    assert ids == [str(e.id) for e in emails[:8]], (
+        "no kid named -> the context is the untouched reranked top_k"
+    )
+
+
+def test_reservation_never_touches_other_kids_channels(clean_items, memory_db) -> None:
+    """An Itamar question reserves only Itamar-pool items: a Rona-channel
+    item ranked below the cut stays out even when slots go unused."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(10)]
+    rona_item = _whatsapp_item(repo, "רונה כדורגל", 18, 15, "אימון כדורגל מחר בבנימינה")
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails[:7]]
+                             + [SearchHit(item=rona_item, score=0.5)])
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask(
+        "What should Itamar bring to class tomorrow?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    assert str(rona_item.id) not in ids, (
+        "Rona's channel item is not in Itamar's kid pool -> never reserved"
+    )
