@@ -206,6 +206,89 @@ def test_non_recurring_ics_is_unchanged():
     assert "series_uid" not in parsed.chunks[0].meta
 
 
+def test_malformed_rrule_falls_back_to_the_single_item():
+    """A rule dateutil cannot parse never fails the paste: exactly ONE item
+    at DTSTART, identical to the non-recurring path ('a paste is never
+    lost')."""
+    parsed = _parse_ics(_ics_with_rrule("FREQ=SOMETIMES;BYDAY=XX"))
+
+    assert len(parsed.chunks) == 1
+    assert parsed.chunks[0].occurred_at == datetime(2026, 11, 1, 8, 0, tzinfo=UTC)
+    assert parsed.chunks[0].raw_text == "צופים רונה — Sun 1 Nov 10:00–11:15"
+    assert "series_uid" not in parsed.chunks[0].meta
+    assert "rrule_raw" not in parsed.chunks[0].meta
+
+
+def test_naive_until_without_leading_semicolon_never_raises_and_honours_until():
+    """A producer-bug naive UNTIL at RRULE position 0 (no leading ';') with a
+    TZID DTSTART is interpreted in the DTSTART's timezone — the same rule the
+    ';UNTIL=' form already follows — and never raises."""
+    parsed = _parse_ics(_ics_with_rrule("UNTIL=20261201T100000;FREQ=WEEKLY"))
+
+    starts = [c.occurred_at for c in parsed.chunks]
+    assert starts, "the paste is never lost"
+    # Sundays from 1 Nov through 29 Nov are <= 1 Dec 10:00 JLM (08:00Z);
+    # 6 Dec is out
+    assert len(starts) == 5
+    assert starts[-1] == datetime(2026, 11, 29, 8, 0, tzinfo=UTC)
+    assert datetime(2026, 12, 6, 8, 0, tzinfo=UTC) not in starts
+
+
+def test_zoneless_timed_rrule_keeps_the_wall_time_across_dst():
+    """Same anchor rule as TZID: a zone-less timed DTSTART is interpreted in
+    the app zone and the series keeps its wall time across the 25 Oct DST
+    change (a UTC-fixed anchor would drift 16:00 -> 17:00)."""
+    parsed = _parse_ics(
+        "BEGIN:VEVENT\n"
+        "UID:zoneless@example.com\n"
+        "SUMMARY:כדורגל איתמר\n"
+        "DTSTART:20261021T160000\n"
+        "DTEND:20261021T171500\n"
+        "RRULE:FREQ=WEEKLY\n"
+        "END:VEVENT",
+        now=datetime(2026, 10, 21, 6, 0, tzinfo=UTC),
+    )
+
+    assert [c.occurred_at for c in parsed.chunks][:2] == [
+        datetime(2026, 10, 21, 13, 0, tzinfo=UTC),  # 16:00 IDT (UTC+3)
+        datetime(2026, 10, 28, 14, 0, tzinfo=UTC),  # 16:00 IST (UTC+2)
+    ]
+    assert all("16:00" in c.raw_text for c in parsed.chunks[:2])
+
+
+def test_all_day_weekly_rrule_renders_one_date_only_item_per_occurrence():
+    """DTSTART;VALUE=DATE + RRULE weekly: one item per occurrence, each
+    rendered as an all-day one-liner (day, no times), dates correct across
+    the 25 Oct 2026 DST change (a midnight anchor keeps its wall date)."""
+    parsed = _parse_ics(
+        "BEGIN:VEVENT\n"
+        "UID:allday-series@example.com\n"
+        "SUMMARY:צופים רונה\n"
+        "DTSTART;VALUE=DATE:20261018\n"
+        "RRULE:FREQ=WEEKLY\n"
+        "END:VEVENT"
+    )
+
+    # Sundays 25 Oct .. 20 Dec (in-window); each at LOCAL midnight, so the
+    # UTC instant shifts an hour at the 25 Oct DST change while the wall
+    # date stays the calendar Sunday
+    assert [c.occurred_at for c in parsed.chunks] == [
+        datetime(2026, 10, 24, 21, 0, tzinfo=UTC),  # 25 Oct 00:00 IDT (UTC+3)
+        datetime(2026, 10, 31, 22, 0, tzinfo=UTC),  # 1 Nov 00:00 IST (UTC+2)
+        datetime(2026, 11, 7, 22, 0, tzinfo=UTC),
+        datetime(2026, 11, 14, 22, 0, tzinfo=UTC),
+        datetime(2026, 11, 21, 22, 0, tzinfo=UTC),
+        datetime(2026, 11, 28, 22, 0, tzinfo=UTC),
+        datetime(2026, 12, 5, 22, 0, tzinfo=UTC),
+        datetime(2026, 12, 12, 22, 0, tzinfo=UTC),
+        datetime(2026, 12, 19, 22, 0, tzinfo=UTC),
+    ]
+    assert parsed.chunks[0].raw_text == "צופים רונה — Sun 25 Oct"
+    assert parsed.chunks[1].raw_text == "צופים רונה — Sun 1 Nov"
+    assert all("–" not in c.raw_text for c in parsed.chunks), "no times on all-day items"
+    assert all(c.meta["series_uid"] == "allday-series@example.com" for c in parsed.chunks)
+
+
 # ---- persistence: idempotent re-paste + the real search path ---------------------
 
 

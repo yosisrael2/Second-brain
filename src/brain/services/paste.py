@@ -565,7 +565,9 @@ def _ics_datetime(value: str, tzid: str = "", zone: ZoneInfo | None = None) -> d
     """Parse an iCalendar date/date-time: with Z, with TZID, or date-only.
 
     Z and TZID values are honored as given (aware, original offset); the
-    date-only form is zone-less and is interpreted in ``zone`` (aware UTC).
+    zone-less forms (date-only, bare date-time) are interpreted in ``zone``
+    and KEEP that zone — the RRULE anchor must stay wall-clock stable (a
+    UTC-fixed anchor would drift the wall time across DST).
     """
     value = value.strip()
     fallback = zone if zone is not None else ZoneInfo(local_timezone_name())
@@ -577,11 +579,11 @@ def _ics_datetime(value: str, tzid: str = "", zone: ZoneInfo | None = None) -> d
             if tzid:
                 return naive.replace(tzinfo=ZoneInfo(tzid))
             if fallback is not None:
-                return naive.replace(tzinfo=fallback).astimezone(UTC)
+                return naive.replace(tzinfo=fallback)
             return naive
         if len(value) == 8 and value.isdigit():
             naive = datetime.strptime(value, "%Y%m%d")
-            return naive.replace(tzinfo=fallback).astimezone(UTC)
+            return naive.replace(tzinfo=fallback)
     except (ValueError, KeyError):
         return None
     return None

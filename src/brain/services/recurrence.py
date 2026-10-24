@@ -30,7 +30,7 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
-_UNTIL_RE = re.compile(r"(;UNTIL=)([^;]+)", re.IGNORECASE)
+_UNTIL_RE = re.compile(r"(^|;)UNTIL=([^;]+)", re.IGNORECASE)
 
 
 def expand_occurrences(
@@ -73,16 +73,17 @@ def _build_rule(dtstart: datetime, rrule_text: str):
     text = rrule_text.strip()
 
     def _until_naive(match: re.Match) -> str:
-        value = match.group(2)
+        prefix, value = match.group(1), match.group(2)
         if value.endswith("Z") or dtstart.tzinfo is None:
             return match.group(0)
         # producer bug (RFC requires UTC UNTIL with an aware DTSTART):
-        # interpret the naive UNTIL in the DTSTART's timezone
+        # interpret the naive UNTIL in the DTSTART's timezone — at any
+        # position in the value (leading UNTIL=... has no ';' prefix)
         try:
             aware = datetime.fromisoformat(value).replace(tzinfo=dtstart.tzinfo)
         except ValueError:
             return match.group(0)
-        return f"{match.group(1)}{aware.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        return f"{prefix}UNTIL={aware.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
 
     text = _UNTIL_RE.sub(_until_naive, text)
     return rrulestr(text, dtstart=dtstart)
