@@ -716,6 +716,9 @@ pip install -e ".[dev]"
 
 # 3. Configuration
 cp .env.example .env    # adjust if needed; never commit .env
+#   WORKTREES (not your main checkout): point DATABASE_URL at a `*_test`
+#   dbname (e.g. .../brain_test) — the default in .env.example is the live
+#   service's database, and a bare `alembic` run from this directory uses it.
 
 # 4. Schema
 alembic upgrade head
