@@ -14,6 +14,19 @@ CHILD_KINDS = ("event", "task", "reminder", "fact")
 
 
 @dataclass(frozen=True)
+class ReconHint:
+    """PR D-recon (item 37): the extractor's per-candidate reconciliation
+    hint. A HINT only helps select the matching window — it can never create
+    a match (type + applies_to + similarity are always code-checked) and it
+    can never silence one (every verdict is still a proposal, D2).
+    """
+
+    change: bool = False  # correction/update language or a stated field change
+    cancel: bool = False  # cancellation language
+    detail_only: bool = False  # pure addition (dress code, what to bring)
+
+
+@dataclass(frozen=True)
 class ChildCandidate:
     """A proposed child extracted from one source item.
 
@@ -45,3 +58,6 @@ class ChildCandidate:
     # (they cite the fact they derive from); the pipeline skips their
     # grounding check and records the link in extraction_meta.
     derived_from: str | None = None
+    # PR D-recon (item 37): the reconciliation hint (see ReconHint). Absent
+    # on every pre-recon candidate; the pipeline treats None as "no signal".
+    recon: ReconHint | None = None

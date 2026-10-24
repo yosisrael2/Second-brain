@@ -39,6 +39,13 @@ from brain.db.models import EnrichmentJob, ItemSource, MemoryItem
 from brain.services.extraction import dates as xdates
 from brain.services.extraction.base import Extractor, StubExtractor
 from brain.services.extraction.candidates import ChildCandidate
+from brain.services.extraction.reconciliation import (
+    ReconCandidate,
+    ReconciliationService,
+    ReconOutcome,
+    Verdict,
+    detect_signal,
+)
 from brain.services.items import ItemsRepositoryProto
 from brain.services.memory import MemoryService
 from brain.services.textnorm import quote_in_source, title_similarity
@@ -111,6 +118,8 @@ class RunReport:
     dropped_ungrounded: int = 0
     deferred_over_cap: int = 0
     failed: int = 0
+    # PR D-recon (item 37): verdict -> count for this run (NEW included).
+    recon_verdicts: dict[str, int] = field(default_factory=dict)
 
     def add(self, other: RunReport) -> RunReport:
         for name in (
@@ -123,6 +132,8 @@ class RunReport:
             "failed",
         ):
             setattr(self, name, getattr(self, name) + getattr(other, name))
+        for verdict, count in other.recon_verdicts.items():
+            self.recon_verdicts[verdict] = self.recon_verdicts.get(verdict, 0) + count
         return self
 
 
@@ -165,6 +176,9 @@ class EnrichmentService:
 
             timezone = get_settings().timezone
         self._tz_name = timezone
+        # PR D-recon (item 37): the reconciliation service shares this
+        # session; exposed for the bot's verdict buttons (D-recon-2) and ops.
+        self.recon = ReconciliationService(session, repo, tz_name=self._tz_name)
 
     # --- queue ---------------------------------------------------------
 
@@ -329,6 +343,9 @@ class EnrichmentService:
                 report.children_created += 1
             elif outcome == "updated":
                 report.children_updated += 1
+            elif isinstance(outcome, ReconOutcome):
+                verdict = outcome.verdict.value
+                report.recon_verdicts[verdict] = report.recon_verdicts.get(verdict, 0) + 1
         if report.children_created or report.children_updated:
             # the completion hook only hears about sources whose children CHANGED
             outcomes.append(
@@ -639,11 +656,12 @@ class EnrichmentService:
         - a kept child is IMMUTABLE (item 18): the user approved it as-is;
         - a dropped child SUPPRESSES the matching candidate (item 30);
         - an untouched proposed child may be updated in place.
-        Returns 'created' | 'updated' | 'skipped'.
+        Returns 'created' | 'updated' | 'skipped' | a ReconOutcome (a non-NEW
+        reconciliation verdict — PR D-recon item 37; the verdict owns its own
+        storage and never falls through to a plain create).
         """
         candidate = resolved.candidate
         moment = resolved.start or resolved.due
-        kind = ItemType(candidate.kind)  # validated child kind (spec section 2)
         matches = [
             child
             for child in existing_children.values()
@@ -664,6 +682,30 @@ class EnrichmentService:
             self._apply_candidate_to_item(best, resolved, source, run_id)
             self._repo.commit()
             return "updated"
+        # PR D-recon (item 37): no same-source match — classify against ALL
+        # existing items before anything becomes a proposal. NEW falls
+        # through to the plain create (byte-identical to pre-recon).
+        recon_token = self._reconcile_child(resolved, source, existing_children, run_id, now)
+        if recon_token is not None:
+            return recon_token
+        self._create_child(resolved, source, existing_children, run_id, now, extra_meta={})
+        return "created"
+
+    def _create_child(
+        self,
+        resolved: _ResolvedChild,
+        source: MemoryItem,
+        existing_children: dict[uuid.UUID, MemoryItem],
+        run_id: uuid.UUID,
+        now: datetime,
+        *,
+        extra_meta: dict[str, Any],
+    ) -> MemoryItem:
+        """The one place a NEW proposed child is stored (pre-recon path +
+        the verdict children — every verdict is still a proposal, D2)."""
+        candidate = resolved.candidate
+        moment = resolved.start or resolved.due
+        kind = ItemType(candidate.kind)  # validated child kind (spec section 2)
         child = MemoryItem(
             raw_text=candidate.title,
             source=source.source,
@@ -679,7 +721,7 @@ class EnrichmentService:
             child_state="proposed",
             applies_to=resolved.applies_to,
             date_conflict=resolved.date_conflict,
-            extraction_meta={**resolved.meta, "run_id": str(run_id)},
+            extraction_meta={**resolved.meta, "run_id": str(run_id), **extra_meta},
         )
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
@@ -687,7 +729,99 @@ class EnrichmentService:
         existing_children[child.id] = child  # visible to later candidates this run
         self._repo.commit()
         self._index_child(child)
-        return "created"
+        return child
+
+    def _reconcile_child(
+        self,
+        resolved: _ResolvedChild,
+        source: MemoryItem,
+        existing_children: dict[uuid.UUID, MemoryItem],
+        run_id: uuid.UUID,
+        now: datetime,
+    ) -> str | None:
+        """Item 37: classify one candidate against existing items (any source).
+
+        Returns None when the verdict is NEW (the caller creates normally) or
+        a ReconOutcome for every non-NEW verdict (the caller counts it; the
+        verdict's own storage already happened). The same-source children are
+        excluded — the A1 diff above owns them (immutability + suppression,
+        items 18/30); dropped children are outside the universe everywhere
+        (decision 5); an ambiguous multi-match is NEW + an ops event, never a
+        silent pick (decision 7).
+        """
+        candidate = resolved.candidate
+        hint = candidate.recon
+        signal = detect_signal(
+            source.raw_text,
+            hint_change=hint.change if hint else False,
+            hint_cancel=hint.cancel if hint else False,
+        )
+        recon = self.recon
+        recon_candidate = ReconCandidate(
+            kind=candidate.kind,
+            title=candidate.title,
+            start=resolved.start or resolved.due,
+            applies_to=tuple(resolved.applies_to),
+        )
+        result = recon.classify_universe(
+            recon_candidate,
+            exclude_ids=set(existing_children.keys()) | {source.id},
+            now=now,
+            signal=signal,
+        )
+        if result.ambiguous:
+            ops.record_event(
+                "enrichment",
+                "recon_ambiguous",
+                ok=True,
+                detail={
+                    "item_id": str(source.id),
+                    "candidate": candidate.title[:60],
+                    "candidates": [result.matched_id, result.runner_up_id],
+                },
+            )
+            return None  # a plain NEW — never pick silently (decision 7)
+        if result.verdict is Verdict.NEW:
+            return None
+        if result.verdict is Verdict.ALREADY_KNOWN:
+            matched = uuid.UUID(str(result.matched_id))
+            self._link_existing_quote(matched, source, resolved)
+            recon.record_already_known(matched, source.id)
+            return ReconOutcome(verdict=Verdict.ALREADY_KNOWN, matched_id=matched)
+        verdict_child = self._create_child(
+            resolved,
+            source,
+            existing_children,
+            run_id,
+            now,
+            extra_meta={
+                "recon_verdict": result.verdict.value,
+                "recon_fields": {k: list(v) for k, v in result.fields.items()},
+                "recon_matched_id": result.matched_id,
+            },
+        )
+        recon.write(result, source=source, child=verdict_child)
+        return ReconOutcome(
+            verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id))
+        )
+
+    def _link_existing_quote(
+        self, matched_id: uuid.UUID, source: MemoryItem, resolved: _ResolvedChild
+    ) -> None:
+        """ALREADY KNOWN evidence: the source becomes an extra source of the
+        existing item (item 7 many-to-many; the quote row dedupes itself)."""
+        existing_quotes = {
+            row.quote
+            for row in self._session.query(ItemSource).filter_by(
+                child_id=matched_id, source_id=source.id
+            )
+        }
+        for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
+            if quote and quote not in existing_quotes:
+                self._session.add(
+                    ItemSource(child_id=matched_id, source_id=source.id, quote=quote)
+                )
+        self._repo.commit()
 
     def _index_child(self, child: MemoryItem) -> None:
         """Best-effort vector indexing for a new child (never fails the run)."""

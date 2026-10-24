@@ -98,6 +98,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     enrich.add_argument(
         "--budget", type=int, default=None, help="Override the cap for this run"
     )
+    recon_eval = subparsers.add_parser(
+        "recon-eval",
+        help="Score reconciliation verdicts against a cases jsonl (offline, no DB/LLM)",
+    )
+    recon_eval.add_argument("--cases", required=True, help="Cases jsonl (schema: recon-plan)")
+    recon_eval.add_argument(
+        "--tz", default=None, help="Timezone for local-day windows (default Settings.timezone)"
+    )
     extract_eval = subparsers.add_parser(
         "extract-eval",
         help="Run the LLM extractor over an emails file -> pred.jsonl (offline)",
@@ -254,6 +262,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _normalize_calendar()
     if args.command == "enrich":
         return _enrich(since=args.since, limit=args.limit, budget=args.budget)
+    if args.command == "recon-eval":
+        return _recon_eval(cases=args.cases, tz_name=args.tz)
     if args.command == "extract-eval":
         return _extract_eval(
             input_path=args.input,
@@ -363,6 +373,110 @@ def _extract_eval(
         if close is not None:
             close()
     print(f"extract-eval: {len(rows)} children -> {out_path}")
+    return 0
+
+
+def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
+    """Score reconciliation verdicts against a cases jsonl (offline).
+
+    One case per line: {case_id, existing_items: [{id, type, title, start,
+    applies_to, location}], new_text_quote, candidate: {kind, title, start,
+    applies_to, location}, verdict}. The signal comes from new_text_quote
+    (code-detected phrases; the same rules the pipeline uses). Returns
+    per-verdict precision/recall (tp/fp/fn) and the confusion matrix
+    (expected -> computed). NO DB, NO network, NO LLM (D-recon-1).
+    """
+    import json  # noqa: PLC0415
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from brain.config import get_settings  # noqa: PLC0415
+    from brain.services.extraction.reconciliation import (  # noqa: PLC0415
+        ExistingItem,
+        ReconCandidate,
+        classify,
+        detect_signal,
+    )
+    from brain.services.relations import similarity_ratio  # noqa: PLC0415
+
+    tz_name = tz_name or get_settings().timezone
+    now = now or datetime.now(tz=UTC)
+    per_verdict: dict[str, dict[str, int]] = {}
+    confusion: dict[str, dict[str, int]] = {}
+    total = 0
+    with open(cases_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            case = json.loads(line)
+            total += 1
+            existing = [
+                ExistingItem(
+                    id=str(row["id"]),
+                    type=str(row["type"]),
+                    title=str(row.get("title", "")),
+                    start=_parse_eval_dt(row.get("start")),
+                    applies_to=tuple(row.get("applies_to") or ()),
+                    location=row.get("location"),
+                )
+                for row in case.get("existing_items", [])
+            ]
+            cand = case["candidate"]
+            candidate = ReconCandidate(
+                kind=str(cand["kind"]),
+                title=str(cand.get("title", "")),
+                start=_parse_eval_dt(cand.get("start")),
+                applies_to=tuple(cand.get("applies_to") or ()),
+                location=cand.get("location"),
+            )
+            signal = detect_signal(str(case.get("new_text_quote", "")))
+            computed = classify(
+                candidate,
+                existing,
+                similarity=similarity_ratio,
+                now=now,
+                tz_name=tz_name,
+                signal=signal,
+            ).verdict.value
+            expected = str(case["verdict"])
+            stats = per_verdict.setdefault(expected, {"tp": 0, "fp": 0, "fn": 0})
+            if computed == expected:
+                stats["tp"] += 1
+            else:
+                stats["fn"] += 1
+                per_verdict.setdefault(computed, {"tp": 0, "fp": 0, "fn": 0})["fp"] += 1
+            confusion.setdefault(expected, {}).setdefault(computed, 0)
+            confusion[expected][computed] += 1
+    return {"cases": total, "per_verdict": per_verdict, "confusion": confusion}
+
+
+def _parse_eval_dt(value):
+    if not value:
+        return None
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    return _dt.fromisoformat(str(value))
+
+
+def _recon_eval(*, cases: str, tz_name: str | None) -> int:
+    """Offline recon scoring (D-recon-1): prints per-verdict P/R + matrix."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    from brain.config import get_settings  # noqa: PLC0415
+
+    tz = ZoneInfo(tz_name or get_settings().timezone)
+    report = run_recon_eval(cases, now=datetime.now(tz=UTC), tz_name=tz.key)
+    print(f"cases: {report['cases']}")
+    for verdict, stats in sorted(report["per_verdict"].items()):
+        tp, fp, fn = stats["tp"], stats["fp"], stats["fn"]
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        print(f"{verdict}: tp={tp} fp={fp} fn={fn} P={precision:.4f} R={recall:.4f}")
+    print("confusion (expected -> computed):")
+    for expected, row in sorted(report["confusion"].items()):
+        cells = ", ".join(f"{k}={v}" for k, v in sorted(row.items()))
+        print(f"  {expected}: {cells}")
     return 0
 
 

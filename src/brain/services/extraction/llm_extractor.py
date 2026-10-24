@@ -20,13 +20,13 @@ from brain.ai.ask import LLMClient
 from brain.config import get_settings
 from brain.db.models import MemoryItem
 from brain.services.extraction.base import MemoryContext
-from brain.services.extraction.candidates import CHILD_KINDS, ChildCandidate
+from brain.services.extraction.candidates import CHILD_KINDS, ChildCandidate, ReconHint
 
 logger = logging.getLogger(__name__)
 
 # Versioned prompt (recorded in extraction_meta for every child it produces;
 # iterating the prompt bumps this version, so eval runs are comparable).
-EXTRACTION_PROMPT_VERSION = "v6"
+EXTRACTION_PROMPT_VERSION = "v7"
 
 # Injection defense: the source text is DATA (docs/ai-layer.md rationale).
 _PROMPT_TEMPLATE = """You extract structured children from one message.
@@ -41,6 +41,7 @@ Return STRICT JSON only — no markdown, no commentary. Schema:
     "all_day": false,
     "due": false,
     "derived_from": null,
+    "recon": {{"change": false, "cancel": false, "detail_only": false}},
     "audience": {{"school": "", "grades": "", "role": "", "gender": "",
                   "named_kids": [], "channel": ""}},
     "importance": 1-5 or null,
@@ -81,12 +82,15 @@ Rules (labeling rules from the design spec, plain words):
   links come later; do not mark anything superseded.
 - DERIVED tasks (item 22): when a FACT in the message combined with the
   memory context below implies a CONCRETE task for one of the kids (for
-  example: a schedule change that changes a pickup time -> a task to pick
-  that kid up at the new time), you may add a derived child: kind = task,
   derived_from = the 0-based index of THAT FACT in your list, quote = "",
   due = true, when_raw = the date the action applies (exactly as the
   message writes it), and an audience naming the kid. Only when the memory
   context makes it concrete — never speculative.
+- recon: set a flag ONLY when the message states it about THIS child:
+  change = it corrects/updates something already announced ("תיקון",
+  "עדכון", "שינוי", "correction", a new time/place for it); cancel = it
+  cancels something ("בוטל", "מבוטל", "cancelled"); detail_only = it only
+  adds detail (what to bring, a dress code). Absent/false otherwise.
 - Dates — this is a MUST, not a style preference: copy the COMPLETE date
   phrase EXACTLY as the message writes it into when_raw, weekday name AND
   clock time INCLUDED, never just the numeric part. "the meeting is on
@@ -294,6 +298,16 @@ class LLMExtractor:
         actionability = raw.get("actionability")
         if actionability is not None and str(actionability) not in ("now", "later", "none"):
             raise ExtractionError(f"candidate {index}: bad actionability {actionability!r}")
+        recon_raw = raw.get("recon")
+        recon: ReconHint | None = None
+        if recon_raw is not None:
+            if not isinstance(recon_raw, dict):
+                raise ExtractionError(f"candidate {index}: recon is not an object")
+            recon = ReconHint(
+                change=bool(recon_raw.get("change", False)),
+                cancel=bool(recon_raw.get("cancel", False)),
+                detail_only=bool(recon_raw.get("detail_only", False)),
+            )
         return ChildCandidate(
             kind=kind,
             title=title,
@@ -306,6 +320,7 @@ class LLMExtractor:
             importance=importance,
             actionability=str(actionability) if actionability is not None else None,
             derived_from=derived_from,
+            recon=recon,
         )
 
 
