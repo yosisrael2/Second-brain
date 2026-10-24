@@ -12,7 +12,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
-from brain.db.models import MemoryItem
+from brain.db.models import ItemSource, MemoryItem
 
 SOURCE_WHATSAPP = "whatsapp"
 
@@ -222,6 +222,21 @@ class ItemsRepository:
         )
         if not include_superseded:
             stmt = stmt.where(MemoryItem.superseded_by.is_(None))
+        return list(self._db.scalars(stmt))
+
+    def children_of(self, item_id: uuid.UUID) -> Sequence[MemoryItem]:
+        """Extraction children quoting this item as a source (item_sources).
+
+        Used by the connector runner: when a source deletes a parent, its
+        proposed children must hide with it (review bug 4). Oldest first for
+        deterministic order.
+        """
+        stmt = (
+            select(MemoryItem)
+            .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+            .where(ItemSource.source_id == item_id)
+            .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+        )
         return list(self._db.scalars(stmt))
 
     def delete(self, item: MemoryItem) -> None:

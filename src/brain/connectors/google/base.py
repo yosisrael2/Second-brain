@@ -56,7 +56,9 @@ def scopes_for(enabled: Sequence[str]) -> list[str]:
     return scopes
 
 
-def default_service_factory(refresh_token: str, scopes: list[str]) -> Any:
+def default_service_factory(
+    refresh_token: str, scopes: list[str], api_name: str, api_version: str
+) -> Any:
     """Production service factory: the ONLY place google libs are imported.
 
     Same client-secret file and keychain token as the email source (one OAuth
@@ -108,7 +110,9 @@ def default_service_factory(refresh_token: str, scopes: list[str]) -> Any:
         token_uri=token_uri,
         scopes=list(scopes),
     )
-    return discovery.build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    return discovery.build(
+        api_name, api_version, credentials=credentials, cache_discovery=False
+    )
 
 
 _RATE_LIMIT_REASONS = frozenset(
@@ -173,16 +177,32 @@ class GoogleConnector(Connector):
     # the base declaration.
     SCOPES: ClassVar[tuple[str, ...]] = ()
 
+    # WHICH Google API this connector talks to — the default service factory
+    # passes them straight into discovery.build. Empty on the base on
+    # purpose: a subclass that forgets them fails at construction (with a
+    # named error), never as a mystery AttributeError on the first sync
+    # (review round 4: the factory used to hardcode gmail/v1, so every
+    # non-gmail adapter would have gotten a Gmail service).
+    API_NAME: ClassVar[str] = ""
+    API_VERSION: ClassVar[str] = ""
+
     def __init__(
         self,
         *,
         token_loader: Callable[[], str],
-        service_factory: Callable[[str, list[str]], Any] = default_service_factory,
+        service_factory: Callable[[str, list[str], str, str], Any] = default_service_factory,
         user_id: str = "me",
     ) -> None:
         """``token_loader`` returns the keychain refresh token (empty = none);
         ``service_factory`` builds a service-like object for
-        (refresh_token, scopes). Both injectable — tests pass fakes."""
+        (refresh_token, scopes, api_name, api_version). Both injectable —
+        tests pass fakes."""
+        if not self.API_NAME or not self.API_VERSION:
+            raise ConnectorError(
+                f"{type(self).__name__} must declare API_NAME and API_VERSION "
+                "ClassVars (e.g. 'calendar'/'v3') — the service factory builds "
+                "exactly that API"
+            )
         self._token_loader = token_loader
         self._service_factory = service_factory
         self._user_id = user_id
@@ -196,7 +216,9 @@ class GoogleConnector(Connector):
                 raise ConnectorAuthError(
                     "no refresh token in the keychain — run `brain connectors auth google`"
                 )
-            self._service_instance = self._service_factory(token, self.scopes())
+            self._service_instance = self._service_factory(
+                token, self.scopes(), self.API_NAME, self.API_VERSION
+            )
         return self._service_instance
 
     @property

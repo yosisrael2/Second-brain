@@ -308,3 +308,87 @@ def test_all_day_inferred_from_effective_field_only():
     out = agg([gold], [pred])
     assert "matched: 1" in out
     assert "date_exact_match_rate: 1.0" in out  # both timed, same minute
+
+
+def test_applies_to_accuracy_excl_gold_unknown_is_reported_and_correct():
+    """Manager decision (23 Oct): applies_to is reported TWICE — raw, and
+    excluding gold {unknown} rows (they only reward guessing)."""
+    gold = [
+        row(child_id="g1"),  # ok, gold-specific
+        row(child_id="g2", applies_to="unknown"),  # wildcard match — EXCLUDED
+        # dateless match, gold-specific, WRONG:
+        row(child_id="g3", applies_to="rona", start=None, due=None),
+    ]
+    pred = [
+        row(child_id="p1"),
+        row(child_id="p2", applies_to="itamar"),
+        row(child_id="p3", applies_to="me", start=None, due=None),
+    ]
+    out = agg(gold, pred)
+    assert "applies_to_accuracy: 0.3333" in out  # raw, unchanged
+    assert "applies_to_accuracy_excl_gold_unknown: 0.5" in out
+    assert "applies_to_excl_gold_unknown_denominator: 2" in out
+
+
+def test_applies_to_excl_gold_unknown_is_n_a_when_no_gold_specific_match():
+    out = agg([row(applies_to="unknown")], [row(child_id="p1", applies_to="rona")])
+    assert "applies_to_accuracy_excl_gold_unknown: n/a" in out
+    assert "applies_to_excl_gold_unknown_denominator: 0" in out
+
+
+def test_existing_aggregate_fields_are_byte_identical_on_a_mixed_fixture():
+    """The new metric must ADD lines, never alter an existing field:value."""
+    gold = [
+        row(child_id="g1"),
+        row(child_id="g2", applies_to="unknown"),
+        row(child_id="g3", applies_to="rona", start=None, due=None),
+        row(child_id="g4", title="unrelated delta epsilon"),
+    ]
+    pred = [
+        row(child_id="p1"),
+        row(child_id="p2", applies_to="itamar", title="alpha beta gamma"),
+        row(child_id="p3", applies_to="me", start=None, due=None),
+        row(child_id="p4", title="alpha beta gamma"),
+    ]
+    expected = [
+        "gold_children: 4",
+        "pred_children: 4",
+        "matched: 3",
+        "unmatched_gold: 1",
+        "unmatched_pred: 1",
+        "precision: 0.75",
+        "recall: 0.75",
+        "f1: 0.75",
+        "type_event_gold: 4",
+        "type_event_pred: 4",
+        "type_event_matched: 3",
+        "type_event_precision: 0.75",
+        "type_event_recall: 0.75",
+        "type_event_f1: 0.75",
+        "date_exact_match_rate: 1.0",
+        "applies_to_accuracy: 0.3333",
+        "applies_to_pred_unknown: 0",
+        "applies_to_pred_unknown_rate: 0.0",
+        "grounding_rate: n/a",
+        "grounding_grounded: 0",
+        "grounding_denominator: 0",
+        "grounding_unverifiable: 4",
+        "grounding_derived: 0",
+        "date_conflict_gold: 0",
+        "date_conflict_reproduced: 0",
+        "date_conflict_recall: n/a",
+    ]
+    fields = [line for line in agg(gold, pred).splitlines()]
+    new_fields = {
+        "applies_to_accuracy_excl_gold_unknown",
+        "applies_to_excl_gold_unknown_denominator",
+    }
+    # every OLD field keeps its exact position and value
+    old_in_output = [line for line in fields if line.split(":")[0] not in new_fields]
+    assert old_in_output == expected
+    # the new fields sit inside the applies block, nothing else moved
+    idx = fields.index("applies_to_pred_unknown_rate: 0.0")
+    assert fields[idx + 1 : idx + 3] == [
+        "applies_to_accuracy_excl_gold_unknown: 0.5",
+        "applies_to_excl_gold_unknown_denominator: 2",
+    ]

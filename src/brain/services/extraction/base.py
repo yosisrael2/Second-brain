@@ -42,6 +42,7 @@ class StubExtractor:
     """
 
     name = "stub-v0"  # provenance marker in extraction_meta
+    prompt_version = None  # the stub has no prompt
 
     _MIN_CHARS = 8
     _MAX_CHARS = 200
