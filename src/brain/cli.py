@@ -434,6 +434,7 @@ def run_recon_eval(
     now: datetime | None = None,
     tz_name: str | None = None,
     embedder: Any | None = None,
+    judge: Any | None = None,
 ) -> dict[str, Any]:
     """Score reconciliation verdicts against a cases jsonl (offline).
 
