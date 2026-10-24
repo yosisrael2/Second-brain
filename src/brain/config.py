@@ -125,6 +125,12 @@ class Settings(BaseSettings):
     # usually SENT on D-1 (occurred_at is the sent time). A ceiling, never a
     # floor; 0 keeps the strict window.
     ask_kid_recall_lookback_days: int = 3
+    # WA39 run 3 part 2: when a question names a confirmed kid, the final
+    # context reserves up to this many top_k slots for the best-ranked
+    # kid-recall items (kid-channel conversations first) — the rerank can
+    # otherwise drop them below the cut. Unused reserved slots go back to
+    # the general ranking; 0 disables.
+    ask_kid_reserved_slots: int = 3
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
