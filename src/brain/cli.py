@@ -84,7 +84,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "normalize-calendar",
         help="Rewrite legacy calendar items to the human one-liner raw_text",
     )
-    enrich = subparsers.add_parser("enrich", help="Drain the enrichment queue (extraction PR A1)")
+    enrich = subparsers.add_parser(
+        "enrich",
+        help="Drain the enrichment queue (extraction PR A1); manual — does "
+        "not send proposal cards (the in-bot worker does)",
+    )
     enrich.add_argument(
         "--since",
         default=None,
