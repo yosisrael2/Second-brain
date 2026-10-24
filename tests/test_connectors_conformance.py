@@ -130,10 +130,28 @@ def test_kit_passes_a_well_behaved_connector(kit_db):
         "change",
         "delete",
         "reset",
+        "change_variant",
     }
     assert report["termination"]["syncs"] <= 8  # 3 pages + drain, not N-syncs
     assert report["termination"]["ingested"] == 7
     assert report["termination_tie_group"]["ingested"] == 7  # ties drained too
+
+
+def test_kit_immutable_change_variant_passes_a_well_behaved_connector(kit_db):
+    """The IMMUTABLE-source change variant (declared via
+    ``IMMUTABLE_SOURCE = True`` in a donation module, passed here explicitly):
+    a NEW record added upstream is ingested exactly once; the SAME id
+    re-delivered upstream is skipped (no second item, no update). The report
+    names the variant so an immutable pass is never mistaken for a skip."""
+    report = assert_conforms(
+        _reference_factory, _scenario(), session=kit_db, immutable_source=True
+    )
+    assert report["change_variant"] == "immutable-new-record"
+    assert report["change"] == {
+        "created_records": 1,
+        "redelivered_updates": 0,
+        "variant": "immutable-new-record",
+    }
 
 
 def test_kit_fails_a_livelocked_connector_on_termination(kit_db):

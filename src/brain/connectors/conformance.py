@@ -187,6 +187,14 @@ class FakeSourceAPI:
                 return
         raise KeyError(external_id)
 
+    def add(self, record: Any) -> None:
+        """Add one record upstream (IMMUTABLE-source CHANGE check).
+
+        A new upstream record exists; adding a record whose id is ALREADY in
+        the dataset models the source RE-DELIVERING that id (e.g. a label
+        re-add) — the adapter must skip it, never create a second item."""
+        self.records.append(record)
+
     def mark_deleted(self, external_id: str) -> None:
         """Flag one record deleted (the DELETE check)."""
         self.bump(external_id, version="deleted", deleted=True)
@@ -275,6 +283,7 @@ def assert_conforms(
     session: Session,
     limit: int = 3,
     max_fetches: int | None = None,
+    immutable_source: bool = False,
 ) -> dict[str, Any]:
     """Run the five conformance checks against the REAL ConnectorRunner.
 
@@ -282,6 +291,13 @@ def assert_conforms(
     builds one per sync); the kit calls it once per sync. Returns a report
     dict (one entry per check) on success; raises :class:`ConformanceFailure`
     on the first violated check.
+
+    ``immutable_source`` (declared by a donation module as
+    ``IMMUTABLE_SOURCE = True``) switches the CHANGE check to the domain-true
+    variant for sources whose records cannot change under the same id
+    (Gmail: messages are immutable; changes are new ids + re-deliveries).
+    The report names which variant ran (``change_variant``) so an immutable
+    pass is never mistaken for a skipped check.
     """
     api = FakeSourceAPI(scenario, page_size=limit)
     n = len(api.records)
@@ -313,10 +329,16 @@ def assert_conforms(
             check="termination_tie_group",
         ),
         "idempotency": _check_idempotency(harness, connector_for, api, limit=limit),
-        "change": _check_change(harness, connector_for, api, scenario, limit=limit),
+        "change": _check_change(
+            harness, connector_for, api, scenario, limit=limit,
+            immutable_source=immutable_source,
+        ),
         "delete": _check_delete(harness, connector_for, api, scenario, limit=limit),
         "reset": _check_reset(harness, connector_for, api, scenario, limit=limit),
     }
+    report["change_variant"] = (
+        "immutable-new-record" if immutable_source else "version-bump"
+    )
     return report
 
 
@@ -396,28 +418,148 @@ def _check_change(
     scenario: ConformanceScenario,
     *,
     limit: int,
+    immutable_source: bool = False,
 ) -> dict[str, int]:
-    """One version bump -> exactly one update, and the item takes the text."""
+    """One upstream change -> exactly one ingested change, and the item takes
+    the text the ADAPTER emitted for the new state.
+
+    Rendering adapters produce their own item text (a gtasks task is not its
+    notes string), so the kit compares the item against the emitted
+    SourceRecord — passed through the runner's ONE clamp site, never a
+    second rule — not against the raw scenario record.
+
+    Two variants:
+
+    - ``version-bump`` (default): the record's version moves under the same
+      id and the runner must update the item.
+    - ``immutable-new-record`` (the donation module declares
+      ``IMMUTABLE_SOURCE = True`` — e.g. Gmail, whose messages cannot change
+      under the same id): (1) a NEW record added upstream is ingested
+      exactly once; (2) the SAME id re-delivered upstream is skipped — no
+      second item, no update, no delete.
+    """
+    if immutable_source:
+        return _check_change_immutable(
+            harness, connector_for, api, scenario, limit=limit
+        )
     bumped = scenario.records[0].external_id
     new_text = f"body of {bumped}, SECOND VERSION"
     api.bump(bumped, version="conformance-v2", text=new_text)
     harness.reset_cursor(api.name)
+
+    captured: dict[str, Any] = {}
+
+    def capturing_connector() -> Connector:
+        conn = connector_for()
+        original_fetch = conn.fetch
+
+        def fetch(cursor: str | None, *, limit: int) -> FetchResult:
+            result = original_fetch(cursor, limit=limit)
+            for record in result.records:
+                if record.external_id == bumped:
+                    captured["record"] = record
+            return result
+
+        conn.fetch = fetch  # type: ignore[method-assign]
+        return conn
+
     updated = _sync_totals(
-        harness, connector_for, api, limit=limit, check="change"
+        harness, capturing_connector, api, limit=limit, check="change"
     )["updated"]
     if updated != 1:
         raise ConformanceFailure(
             "change",
             f"change: one version bump produced {updated} updates (expected exactly 1)",
         )
+    if "record" not in captured:
+        raise ConformanceFailure(
+            "change",
+            f"change: the adapter never re-emitted the changed record {bumped!r}",
+        )
+    # The runner's own clamp (no second rule): the item gets the clamped text.
+    clamped_record, _truncated = harness.runner(
+        connector_for()
+    )._clamp_text(captured["record"])
     item = harness.item(api.name, bumped)
-    if item is None or item.raw_text != new_text:
+    if item is None or item.raw_text != clamped_record.text:
         got = None if item is None else item.raw_text
         raise ConformanceFailure(
             "change",
-            f"change: the bumped record's item did not take the new text (got {got!r})",
+            f"change: the bumped record's item did not take the emitted text "
+            f"(expected {clamped_record.text!r}, got {got!r})",
         )
-    return {"updated_records": updated}
+    return {
+        "updated_records": updated,
+        "variant": "version-bump",
+    }
+
+
+def _check_change_immutable(
+    harness: _KitHarness,
+    connector_for: Callable[[], Connector],
+    api: FakeSourceAPI,
+    scenario: ConformanceScenario,
+    *,
+    limit: int,
+) -> dict[str, int]:
+    """The CHANGE check for sources whose records never change under an id.
+
+    (1) A NEW record added upstream is ingested exactly once. (2) The SAME
+    id re-delivered upstream is skipped: no second item, no update, no
+    delete — a re-delivery is never a change.
+    """
+    template = scenario.records[0]
+    new_id = f"added-{template.external_id}"
+    # A genuinely NEW record: distinct text AND instant, so the ingest
+    # fingerprint cannot collide with the template's item (a fingerprint
+    # dedupe would make the new record a dedup, not a creation).
+    fresh_fields = {
+        **template.__dict__,
+        "external_id": new_id,
+        "text": f"{template.text} (freshly arrived)",
+    }
+    if template.occurred_at is not None:
+        from datetime import timedelta  # noqa: PLC0415
+
+        fresh_fields["occurred_at"] = template.occurred_at + timedelta(hours=1)
+    api.add(template.__class__(**fresh_fields))
+    harness.reset_cursor(api.name)
+    totals = _sync_totals(harness, connector_for, api, limit=limit, check="change")
+    if totals["created"] != 1:
+        raise ConformanceFailure(
+            "change",
+            f"change (immutable): a NEW upstream record produced "
+            f"{totals['created']} creations (expected exactly 1)",
+        )
+    item = harness.item(api.name, new_id)
+    if item is None:
+        raise ConformanceFailure(
+            "change", "change (immutable): the new record's item is missing"
+        )
+    # (2) The same id re-delivered upstream: skipped, never a second item.
+    api.add(template.__class__(**{**template.__dict__, "external_id": new_id}))
+    redelivered = _sync_totals(
+        harness, connector_for, api, limit=limit, check="change"
+    )
+    if redelivered["created"] or redelivered["updated"] or redelivered["deleted"]:
+        raise ConformanceFailure(
+            "change",
+            f"change (immutable): re-delivering the same id created "
+            f"{redelivered['created']}, updated {redelivered['updated']}, "
+            f"deleted {redelivered['deleted']} — a re-delivery is never a change",
+        )
+    again = harness.item(api.name, new_id)
+    if again is None or again.id != item.id:
+        raise ConformanceFailure(
+            "change",
+            "change (immutable): the re-delivery produced a second item for "
+            f"{new_id!r}",
+        )
+    return {
+        "created_records": 1,
+        "redelivered_updates": 0,
+        "variant": "immutable-new-record",
+    }
 
 
 def _check_delete(
@@ -504,10 +646,19 @@ def _sync_totals(
     limit: int,
     check: str,
 ) -> dict[str, int]:
-    """Sync until the API serves an empty page (or a bounded sync count);
-    return summed created/updated/deleted/fetched across those syncs."""
-    cap = (len(api.records) // limit + 1) + 1
+    """Sync until the source goes quiet; sum created/updated/deleted/fetched.
+
+    The real sequence is 'resync, then incrementals' — one empty sync does
+    NOT mean the source is done (a listing fast path over a ledger emits
+    nothing on the resync, then the incremental channel delivers the
+    changes). Stop when the CURSOR STOPS MOVING (a sync saved the cursor the
+    previous sync saved) or after 2 consecutive empty syncs — always under a
+    hard sync bound so a broken adapter still terminates.
+    """
+    cap = 2 * (len(api.records) // limit + 1) + 3
     totals = {"created": 0, "updated": 0, "deleted": 0, "fetched": 0}
+    prev_cursor: Any = object()  # sentinel: no sync has run yet
+    empty_streak = 0
     for _sync_number in range(cap):
         summary = _one_sync(harness, connector_for(), api, limit=limit)
         if summary.errors:
@@ -517,6 +668,10 @@ def _sync_totals(
             )
         for key in totals:
             totals[key] += getattr(summary, key)
-        if summary.fetched == 0:
+        empty = summary.fetched == 0
+        empty_streak = empty_streak + 1 if empty else 0
+        cursor = harness.state.get_or_create(api.name).cursor
+        if cursor == prev_cursor or empty_streak >= 2:
             break
+        prev_cursor = cursor
     return totals
