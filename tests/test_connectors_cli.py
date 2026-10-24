@@ -2,6 +2,7 @@
 auth google (fake flow + fake keychain — no network, no real keychain).
 """
 
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -131,6 +132,25 @@ def test_list_shows_persisted_state(settings_env, database, capsys):
             session.commit()
 
 
+def test_list_shows_quarantined_count(settings_env, database, capsys):
+    """Review round 2 A: quarantined poison records are visible per source."""
+    from brain.connectors.state import ConnectorRecordRepo
+    from brain.db.session import SessionLocal
+
+    with SessionLocal() as session:
+        for _ in range(3):  # three strikes -> quarantined
+            ConnectorRecordRepo(session).mark_failure(
+                "gcal", "bad-1", "v9", "RuntimeError: poison"
+            )
+
+    assert cli.main(["connectors", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "quarantined" in out
+    # the gcal row carries the quarantined count
+    gcal_row = next(line for line in out.splitlines() if line.startswith("gcal"))
+    assert re.search(r"\b1\b", gcal_row)
+
+
 def test_sync_refuses_unknown_disabled_and_unavailable(settings_env, capsys):
     # A name that is neither known nor enabled -> refused as not enabled.
     assert cli.main(["connectors", "sync", "nosuch"]) == 78
@@ -201,6 +221,35 @@ def test_sync_runs_the_runner_end_to_end_with_a_registered_connector(
     assert cursor == "c1"
 
 
+def test_sync_drain_loops_until_no_cursor_movement(settings_env, database, capsys, monkeypatch):
+    """--drain keeps fetching batches while the cursor moves (a first sync of
+    a large source); a batch that leaves the cursor unchanged ends the drain."""
+    from sqlalchemy import text as sql_text
+
+    from brain.db.session import SessionLocal
+
+    connector = _StubGcal(
+        batches=[
+            FetchResult(
+                records=[make_record(external_id="f1", text="body f1")], next_cursor="c1"
+            ),
+            FetchResult(
+                records=[make_record(external_id="f2", text="body f2")], next_cursor="c2"
+            ),
+            FetchResult(records=[], next_cursor="c2"),  # drained: cursor stops
+        ]
+    )
+    monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+
+    assert cli.main(["connectors", "sync", "gcal", "--drain"]) == 0
+    out = capsys.readouterr().out
+    assert "created=2" in out  # both batches applied in one invocation
+    assert connector.cursors == [None, "c1", "c2"]  # three fetches, then stop
+    with SessionLocal() as session:
+        count = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
+    assert count == 2
+
+
 def test_auth_google_requires_enabled_connectors(settings_env, monkeypatch, capsys):
     monkeypatch.setenv("BRAIN_CONNECTORS", "")
     get_settings.cache_clear()
@@ -229,7 +278,9 @@ def test_auth_google_stores_only_the_refresh_token(
         "_build_connectors_oauth_flow",
         lambda path, scopes: flow.from_client_secret_file(path, scopes),
     )
-    monkeypatch.setattr(cli, "Keychain", lambda: FakeKeychain())
+    # The handler imports Keychain from the service module at call time, so
+    # the seam is the module attribute (CI has no `security` binary).
+    monkeypatch.setattr("brain.services.keychain.Keychain", lambda: FakeKeychain())
 
     assert cli.main(["connectors", "auth", "google", "--client-secret", str(secret)]) == 0
     out = capsys.readouterr().out

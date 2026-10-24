@@ -31,6 +31,7 @@ from brain.db.enums import (
     FTS_LANGUAGE,
     IMPORTANCE_MAX,
     IMPORTANCE_MIN,
+    ITEM_SOURCE_DOMAIN,
     Actionability,
     ItemStatus,
     ItemType,
@@ -40,25 +41,6 @@ _TEXT_MAX_LENGTH = 10_000
 _SOURCE_MAX_LENGTH = 64
 _PROJECT_MAX_LENGTH = 128
 _ENUM_MAX_LENGTH = 32
-
-# The closed domain of ``memory_items.source`` (CHECK ``source``): capture
-# paths that exist today (manual default, paste kinds, telegram bot, email
-# poller) + the connector names this ticket introduces. The migration adds
-# it NOT VALID (the live table predates the constraint; new inserts are
-# checked). New sources widen the domain in a migration — never silently.
-ITEM_SOURCE_DOMAIN = (
-    "manual",
-    "note",
-    "calendar",
-    "email",
-    "outlook",
-    "whatsapp",
-    "telegram",
-    "gcal",
-    "gdrive",
-    "gtasks",
-)
-
 
 def _in_domain(column: str, values: Iterable[str]) -> str:
     """Build a CHECK expression restricting a column to the given values."""
@@ -164,6 +146,21 @@ class MemoryItem(Base):
     # extraction_meta: provenance for extracted children (item 7): model,
     # prompt_version, run_id, extracted_at, date-resolution notes.
     extraction_meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # --- WhatsApp relevance triage (D2a; design delta item 36) ------------
+    # triage_label: 'relevant' | 'noise' for conversation items (source
+    # 'whatsapp'); NULL = not triaged yet (always listed). Columns, not
+    # meta: the /recent filter is a WHERE on every listing (indexable,
+    # same style as the A1 child_state columns) and re-triage overwrites
+    # typed values instead of parsing JSON. Noise stays stored and
+    # searchable but is hidden from default listings and never enqueued
+    # for enrichment; triage never deletes anything.
+    triage_label: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    triage_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # triage_method: 'jev' | 'llm' | 'kid_named' — the deterministic kid
+    # override first (v3), Jev's typed choice next, the LLM only below the
+    # confidence band; triage_version pins the prompt version.
+    triage_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    triage_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # PR B (item 20/D4): when this item is superseded by a newer version
     # (relation kind 'supersedes'/'corrects', applied), it stays in the DB
     # with strike-through semantics: hidden by default from /recent, /review
@@ -442,11 +439,15 @@ class ItemSource(Base):
 
     __tablename__ = "item_sources"
     __table_args__ = (
-        # UNIQUE(child_id, source_id): one link per child-source pair; the
-        # quote (possibly very long) stays OUT of the btree index — a long
-        # TEXT in the UNIQUE index fails with 'index row size exceeds
-        # maximum'. Extra quotes live in extraction_meta.extra_quotes.
-        UniqueConstraint("child_id", "source_id"),
+        # Item 7, many-to-many WITHOUT a uniqueness cap: one pair may carry
+        # SEVERAL quote rows (a deduped near-duplicate's quote, or a re-run
+        # that grounded the same child through different spans). No UNIQUE
+        # (child_id, source_id): the quote is a long TEXT and a UNIQUE btree
+        # over it fails with 'index row size exceeds maximum' (reproduced
+        # with a 5,000-char incompressible quote); plain indexes serve the
+        # lookups. Historical: the constraint existed until
+        # drop_item_sources_unique (this branch).
+        Index("ix_item_sources_child_id", "child_id"),
         Index("ix_item_sources_source_id", "source_id"),
     )
 
@@ -589,3 +590,15 @@ class ConnectorRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Poison-record quarantine (review round 2): consecutive record-level
+    # failures. 3 in a row -> status 'failed' and the runner stops retrying
+    # that record (the batch no longer counts it as an error, so the cursor
+    # can advance) until the source bumps the version. A successful sync
+    # resets all three (ConnectorRecordRepo.put).
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="synced", server_default="synced"
+    )
+    fail_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

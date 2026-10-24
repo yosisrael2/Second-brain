@@ -67,6 +67,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Run ONE poll cycle and exit 0 (test seam; also useful to drain once)",
     )
+    whatsapp_triage = subparsers.add_parser(
+        "whatsapp-triage",
+        help="Backfill relevance triage for untriaged WhatsApp conversations (D2a)",
+    )
+    whatsapp_triage.add_argument(
+        "--limit", type=int, default=500, help="Max conversations to triage this run"
+    )
     whatsapp.add_argument(
         "--since",
         type=str,
@@ -85,8 +92,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Backfill mode: enqueue every qualifying capture created since "
         "this ISO date (D6: its own budget, does not consume today's cap)",
     )
-    enrich.add_argument("--limit", type=int, default=20, help="Max parents to process this run")
-    enrich.add_argument("--budget", type=int, default=None, help="Override the cap for this run")
+    enrich.add_argument(
+        "--limit", type=int, default=20, help="Max parents to process this run"
+    )
+    enrich.add_argument(
+        "--budget", type=int, default=None, help="Override the cap for this run"
+    )
+    extract_eval = subparsers.add_parser(
+        "extract-eval",
+        help="Run the LLM extractor over an emails file -> pred.jsonl (offline)",
+    )
+    extract_eval.add_argument("--input", required=True, help="Emails file (split on =====)")
+    extract_eval.add_argument("--out", required=True, help="Output pred.jsonl path")
+    extract_eval.add_argument(
+        "--limit", type=int, default=None, help="Only the first N emails (smoke runs)"
+    )
+    extract_eval.add_argument(
+        "--memory",
+        default=None,
+        help="Read-only LIVE memory export (entities+facts JSON) to import "
+        "into the TEST DB before running (audience resolution needs it)",
+    )
     memory = subparsers.add_parser("memory", help="Memory layer commands")
     memory_sub = memory.add_subparsers(dest="memory_command", required=True)
     seed_kid = memory_sub.add_parser(
@@ -196,6 +222,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     connectors_sync.add_argument(
         "--limit", type=int, default=200, help="Max records per batch (default 200)"
     )
+    connectors_sync.add_argument(
+        "--drain",
+        action="store_true",
+        help="Loop batch after batch until the source is drained (or a batch "
+        "makes no progress). Caps at 500 batches as a runaway guard.",
+    )
     connectors_auth = connectors_sub.add_parser(
         "auth",
         help="Google OAuth consent for the enabled connectors (stores ONLY the "
@@ -216,10 +248,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _telegram(whoami_hint=args.whoami_hint)
     if args.command == "whatsapp":
         return _whatsapp(interval_s=args.interval, since=args.since, once=args.once)
+    if args.command == "whatsapp-triage":
+        return _whatsapp_triage(limit=args.limit)
     if args.command == "normalize-calendar":
         return _normalize_calendar()
     if args.command == "enrich":
         return _enrich(since=args.since, limit=args.limit, budget=args.budget)
+    if args.command == "extract-eval":
+        return _extract_eval(
+            input_path=args.input,
+            out_path=args.out,
+            limit=args.limit,
+            memory_snapshot=args.memory,
+        )
     if args.command == "memory":
         if args.memory_command == "seed-kid":
             return _memory_seed_kid(
@@ -264,6 +305,65 @@ How to find your Telegram user id (for TELEGRAM_ALLOWED_USER_IDS):
   5. Add that id to TELEGRAM_ALLOWED_USER_IDS (comma-separated for several
      people) and restart. Only those ids are ever answered.
 """
+
+
+def _extract_eval(
+    *,
+    input_path: str,
+    out_path: str,
+    limit: int | None,
+    memory_snapshot: str | None,
+) -> int:
+    """Offline extraction-eval runner: emails file -> pred.jsonl (never live)."""
+    import os  # noqa: PLC0415
+    from zoneinfo import ZoneInfo  # noqa: PLC0415
+
+    from brain.api.deps import get_llm_client  # noqa: PLC0415
+    from brain.config import assert_not_live_store, get_settings  # noqa: PLC0415
+    from brain.services.extraction.eval_runner import run_extraction_eval  # noqa: PLC0415
+    from brain.services.extraction.llm_extractor import (  # noqa: PLC0415
+        LLMExtractor,
+    )
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    if limit is not None:
+        # --limit: build a truncated copy of the emails file first
+        out_dir = Path(out_path).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        chunks = [
+            c
+            for c in Path(input_path).read_text(encoding="utf-8").split("=====")
+            if c.strip()
+        ]
+        temp = out_dir / f".eval-input-{Path(out_path).stem}.txt"
+        temp.write_text("=====".join(chunks[:limit]), encoding="utf-8")
+        input_path = str(temp)
+
+    llm = get_llm_client()
+    try:
+        extractor = LLMExtractor(llm)
+        with SessionLocal() as session:
+            rows = run_extraction_eval(
+                Path(input_path),
+                Path(out_path),
+                session,
+                extractor,
+                tz=ZoneInfo(settings.timezone),
+                memory_snapshot=Path(memory_snapshot) if memory_snapshot else None,
+            )
+    finally:
+        close = getattr(llm, "close", None)
+        if close is not None:
+            close()
+    print(f"extract-eval: {len(rows)} children -> {out_path}")
+    return 0
 
 
 def _enrich(*, since: str | None, limit: int, budget: int | None) -> int:
@@ -439,6 +539,67 @@ def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
     )
 
 
+def _build_trier(session):
+    """The real triage callable: kid override, then Jev, then the LLM (D2a)."""
+    from brain.api import deps  # noqa: PLC0415
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+    from brain.services.triage import (  # noqa: PLC0415
+        confirmed_kid_names,
+        triage_conversation,
+    )
+
+    jev = deps.get_jev_client()
+    llm = deps.get_llm_client()
+    kid_names = confirmed_kid_names(
+        MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
+    )
+
+    def trier(item):
+        return triage_conversation(
+            item.raw_text, jev=jev, llm=llm, kid_names=kid_names
+        )
+
+    return trier
+
+
+def _whatsapp_triage(*, limit: int) -> int:
+    """Backfill relevance triage for untriaged WhatsApp conversations (D2a).
+
+    Guarded like every live-touching command (BRAIN_ALLOW_LIVE=1 explicitly).
+    Only UNTRIAGED conversations are triaged — re-triage happens through the
+    update path. Triage never deletes anything; failures are recorded (ops)
+    and the backfill continues.
+    """
+    import os  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store  # noqa: PLC0415
+    from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    decided = 0
+    failed = 0
+    with SessionLocal() as session:
+        trier = _build_trier(session)
+        repo = ItemsRepository(session)
+        items = repo.untriaged_whatsapp(limit=limit)
+        for item in items:
+            result = trier(item)
+            if result is None:
+                failed += 1
+                continue
+            repo.apply_triage(item, result)
+            decided += 1
+        session.commit()
+    print(f"whatsapp-triage: decided {decided}, failed {failed} of limit {limit}")
+    return 0
+
+
 def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -> int:
     """Run the WhatsApp poller: bridge store -> per-conversation source items.
 
@@ -514,6 +675,7 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
             items=ItemsRepository(session),
             memory=MemoryRepository(session),
             indexer=indexer,  # side processes index like the API does (best-effort)
+            trier=_build_trier(session),  # D2a: relevance triage on create + update
             zone_name=settings.timezone,
             gap_minutes=settings.whatsapp_gap_minutes,
             overlap_minutes=settings.whatsapp_overlap_minutes,
@@ -677,7 +839,10 @@ def _normalize_calendar(
     normalized = 0
     offset = 0
     while True:
-        batch = repo.list(item_type=None, project=None, status=None, limit=_PAGE, offset=offset)
+        batch = repo.list(
+            item_type=None, project=None, status=None, limit=_PAGE, offset=offset,
+            include_noise=True,  # maintenance passes see EVERY row
+        )
         if not batch:
             break
         for item in batch:
@@ -821,10 +986,14 @@ def _connectors_list() -> int:
     enabled = set(settings.connectors_enabled)
     ensure_registered()
     names = sorted(set(all_names()) | {"email", "gcal", "gdrive", "gtasks"})
-    print(f"{'name':<8}  {'enabled':<7}  {'registered':<10}  {'last ok':<20}  cursor  last error")
+    print(
+        f"{'name':<8}  {'enabled':<7}  {'registered':<10}  {'last ok':<20}  cursor  "
+        "quarantined  last error"
+    )
     with SessionLocal() as session:
         states = {row.name: row for row in ConnectorStateRepo(session).all()}
         counts = ConnectorRecordRepo(session).counts()
+        quarantined = ConnectorRecordRepo(session).quarantined_counts()
         for name in names:
             state = states.get(name)
             try:
@@ -836,9 +1005,10 @@ def _connectors_list() -> int:
             last_ok = last_ok_at.strftime("%Y-%m-%d %H:%M") if last_ok_at else "never"
             has_cursor = "yes" if state and state.cursor else "no"
             last_error = (state.last_error if state else "") or ""
+            quarantined_n = quarantined.get(name, 0)
             print(
                 f"{name:<8}  {'yes' if name in enabled else 'no':<8}  {registered:<10}  "
-                f"{last_ok:<16}  {has_cursor:<6}  {last_error[:60]}"
+                f"{last_ok:<16}  {has_cursor:<6}  {quarantined_n:<11}  {last_error[:60]}"
             )
     records = counts
     if records:
@@ -927,14 +1097,31 @@ def _connectors_sync(args: argparse.Namespace) -> int:
             deps.get_item_indexer(),
         )
         connector = _build_connector(args.name)
+        state_repo = ConnectorStateRepo(session)
         runner = ConnectorRunner(
             connector,
             ingest=ingest,
             repo=ItemsRepository(session),
-            state=ConnectorStateRepo(session),
+            state=state_repo,
             records=ConnectorRecordRepo(session),
         )
         summary = runner.run(limit=args.limit)
+        if args.drain:
+            # First sync of a large source (e.g. 3,000 Drive files) needs more
+            # than one batch: loop while the cursor keeps moving. A batch that
+            # leaves the cursor unchanged means drained (or stuck); a failed/
+            # re-authing batch stops the drain. 500 batches is a runaway
+            # guard, not a knob.
+            batches = 1
+            previous_cursor = _cursor_of(state_repo, summary.connector)
+            while summary.state == "ok" and summary.cursor_saved and batches < 500:
+                nxt = runner.run(limit=args.limit)
+                summary = _merge_summary(summary, nxt)
+                batches += 1
+                current_cursor = _cursor_of(state_repo, summary.connector)
+                if current_cursor == previous_cursor:
+                    break  # no cursor movement: drained
+                previous_cursor = current_cursor
         connector.close()
     print(
         f"connectors sync {summary.connector}: state={summary.state} "
@@ -944,6 +1131,31 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         + (f" error={summary.error}" if summary.error else "")
     )
     return {"ok": 0, "retry_error": 1, "auth_error": 78}.get(summary.state, 1)
+
+
+def _cursor_of(state_repo: Any, connector: str) -> str | None:
+    """The persisted cursor for a connector (None when it never synced)."""
+    state = state_repo.get(connector)
+    return state.cursor if state else None
+
+
+def _merge_summary(acc: Any, nxt: Any) -> Any:
+    """Accumulate one more drained batch into the running summary (--drain)."""
+    from brain.connectors.runner import SyncSummary
+
+    return SyncSummary(
+        connector=nxt.connector,
+        state=nxt.state,
+        fetched=acc.fetched + nxt.fetched,
+        created=acc.created + nxt.created,
+        updated=acc.updated + nxt.updated,
+        deleted=acc.deleted + nxt.deleted,
+        skipped=acc.skipped + nxt.skipped,
+        errors=acc.errors + nxt.errors,
+        reset=nxt.reset,
+        cursor_saved=nxt.cursor_saved,
+        error=nxt.error,
+    )
 
 
 # pragma: no cover - needs google libs

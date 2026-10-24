@@ -103,6 +103,37 @@ def client_fixture(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     get_settings.cache_clear()
 
 
+# --- session-start DB reset (T1) ----------------------------------------------
+# The *_test database persists across pytest sessions; an interrupted run (a
+# test killed mid-flight, before its per-test teardown) leaves rows behind
+# that leak into the NEXT session. Truncate the app tables after migrations
+# so every session starts empty. Guarded like every destructive fixture, so
+# it can never touch a non-test database; connector tables are included only
+# when present (they arrive with the connectors migration).
+_RESET_TABLES = (
+    "memory_items",  # CASCADE: attachments, item_sources, item_relations, ... hang off it
+    "attachments",
+    "item_relations",
+    "connector_state",
+    "connector_records",
+    "ops_events",
+)
+
+
+def _reset_test_tables() -> None:
+    assert_test_database(_database_url())
+    with engine.begin() as conn:
+        present = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            )
+        }
+        for name in _RESET_TABLES:
+            if name in present:
+                conn.execute(text(f'TRUNCATE TABLE "{name}" CASCADE'))
+
+
 @pytest.fixture(scope="session", name="database")
 def database_fixture() -> Iterator[None]:
     """Point the suite at the *_test database and migrate it; skip without Postgres."""
@@ -115,6 +146,7 @@ def database_fixture() -> Iterator[None]:
     assert_test_database(_database_url())
     _ensure_test_database()
     _run_migrations()
+    _reset_test_tables()  # T1: a session never inherits an interrupted one's rows
     yield
 
 

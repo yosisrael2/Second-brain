@@ -26,15 +26,15 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from brain import ops
-from brain.db.enums import ItemStatus, ItemType
+from brain.db.enums import Actionability, ItemStatus, ItemType
 from brain.db.models import EnrichmentJob, ItemSource, MemoryItem
 from brain.services.extraction import dates as xdates
 from brain.services.extraction.base import Extractor, StubExtractor
@@ -73,7 +73,14 @@ def _dateish_expressions(text: str) -> int:
 
 
 def qualifies(item: MemoryItem) -> bool:
-    """D1(b): which captures get the extraction pass."""
+    """D1(b): which captures get the extraction pass.
+
+    D2a (item 36): triaged-NOISE WhatsApp conversations are NEVER enqueued —
+    they are stored and searchable, but the daily extraction cap is not
+    spent on them. Untriaged items behave exactly as before.
+    """
+    if item.source == "whatsapp" and item.triage_label == "noise":
+        return False
     if item.source in _EMAIL_SOURCES:
         return True
     if len(item.raw_text) > _LONG_TEXT_CHARS:
@@ -100,6 +107,7 @@ class RunReport:
     processed: int = 0
     children_created: int = 0
     children_updated: int = 0
+    deduped_removed: int = 0
     dropped_ungrounded: int = 0
     deferred_over_cap: int = 0
     failed: int = 0
@@ -109,6 +117,7 @@ class RunReport:
             "processed",
             "children_created",
             "children_updated",
+            "deduped_removed",
             "dropped_ungrounded",
             "deferred_over_cap",
             "failed",
@@ -305,11 +314,16 @@ class EnrichmentService:
             return report
         run_id = uuid.uuid4()
         existing_children = self._children_of(source.id)
+        resolved_list: list[_ResolvedChild] = []
         for candidate in candidates:
             resolved = self._validate(candidate, source, now)
             if resolved is None:
                 report.dropped_ungrounded += 1
                 continue
+            resolved_list.append(resolved)
+        resolved_list, deduped = self._dedupe_pass(resolved_list, source)
+        report.deduped_removed += deduped
+        for resolved in resolved_list:
             outcome = self._store_child(resolved, source, existing_children, run_id, now)
             if outcome == "created":
                 report.children_created += 1
@@ -343,13 +357,138 @@ class EnrichmentService:
 
     # --- validation pipeline ---------------------------------------------
 
+    def _dedupe_pass(
+        self, resolved: list[_ResolvedChild], source: MemoryItem
+    ) -> tuple[list[_ResolvedChild], int]:
+        """Drop within-pass near-duplicates BEFORE storing (A2 run-#1 fix 4).
+
+        One real-world thing extracted twice in the same reply (e.g. once as
+        a reminder and once as an event) must not become two children. Uses
+        A1's identity logic INSIDE the pass: same kind + same resolved local
+        day (both dateless counts as the same day) + the SAME resolved
+        applies_to (one-per-class children are different things) +
+        title_similarity >= _CHILD_IDENTITY_THRESHOLD. The FIRST candidate
+        wins. Returns the kept list and how many were removed.
+        """
+        kept: list[_ResolvedChild] = []
+        removed = 0
+        for child in resolved:
+            day = self._local_day(child)
+            dup = False
+            for prior in kept:
+                if prior.candidate.kind != child.candidate.kind:
+                    continue
+                if prior.applies_to != child.applies_to:
+                    continue
+                if self._local_day(prior) != day:
+                    continue
+                if (
+                    title_similarity(prior.candidate.title, child.candidate.title)
+                    >= _CHILD_IDENTITY_THRESHOLD
+                ):
+                    dup = True
+                    break
+            if dup:
+                removed += 1
+                # Item 7 (many-to-many): the dropped duplicate's verbatim
+                # quote is EVIDENCE — it becomes an ADDITIONAL item_sources
+                # row of the kept child at storage time, never meta.
+                quote = child.candidate.quote
+                if quote and quote != prior.candidate.quote:
+                    if quote not in prior.extra_quotes:
+                        prior.extra_quotes.append(quote)
+                continue
+            kept.append(child)
+        if removed:
+            ops.record_event(
+                "enrichment",
+                "children_deduped",
+                ok=True,
+                detail={"item_id": str(source.id), "removed": removed},
+            )
+        return kept, removed
+
+    def _local_day(self, child: _ResolvedChild) -> date | None:
+        """The child's resolved LOCAL day (None when dateless)."""
+        moment = child.start or child.due
+        if moment is None:
+            return None
+        return moment.astimezone(self._tz).date()
+
+    def _source_default_audience(self, source: MemoryItem) -> list[str] | None:
+        """R1 source default: the sender's confirmed teacher->kid mapping."""
+        if self._memory is None:
+            return None
+        meta = source.meta if isinstance(source.meta, dict) else {}
+        sender = meta.get("sender")
+        try:
+            return self._memory.default_audience_for_sender(
+                sender if isinstance(sender, str) else None
+            )
+        except Exception:  # noqa: BLE001 — a memory hiccup must not break extraction
+            logger.exception("enrichment: sender default lookup failed")
+            return None
+
+    @staticmethod
+    def _narrow_audience(
+        default: list[str] | None, item_level: list[str]
+    ) -> list[str]:
+        """The item-level audience may only NARROW the source default (R1).
+
+        - no default (no sender / no teacher match): item resolution stands.
+        - item resolves to 'unknown': take the default when there is one.
+        - item resolves to 'nobody' (an explicit incompatibility, e.g.
+          girls-only in a boy's class): nobody — narrowing may exclude
+          everyone, it may never add anyone back.
+        - both kid sets: their intersection; empty -> nobody.
+        - item resolves only to 'me': me (role-based, compatible with any
+          kid-set default — the update is still about my kids).
+        """
+        if default is None:
+            return item_level
+        if item_level == ["unknown"]:
+            return list(default)
+        if item_level == ["nobody"]:
+            return ["nobody"]
+        item_kids = {name for name in item_level if name != "me"}
+        if not item_kids:
+            return item_level
+        overlap = item_kids & set(default)
+        if not overlap:
+            # review round 2, bug 1: nothing of the kid-set survives the
+            # narrowing — but the reader's own half ("me", role-based) is
+            # never narrowed by a kid-set default
+            return ["me"] if "me" in item_level else ["nobody"]
+        kept = sorted(overlap)
+        return kept + ["me"] if "me" in item_level else kept
+
     def _validate(
         self, candidate: ChildCandidate, source: MemoryItem, now: datetime
     ) -> _ResolvedChild | None:
-        """Grounding guard first (item 8); then dates (2b/41); then applies_to (42)."""
-        if not quote_in_source(candidate.quote, source.raw_text):
+        """Grounding guard first (item 8); then dates (2b/41); then applies_to (42).
+
+        Derived children (item 22) cite the fact they derive from, not the
+        source: an EMPTY quote is allowed only for them and skips the
+        grounding guard; a NON-derived empty quote is still dropped, and a
+        derived child WITH a quote is verified normally (eval doc).
+        """
+        if candidate.quote:
+            if not quote_in_source(candidate.quote, source.raw_text):
+                logger.info(
+                    "enrichment: dropped ungrounded candidate %r from %s",
+                    candidate.title[:60],
+                    source.id,
+                )
+                ops.record_event(
+                    "enrichment",
+                    "ungrounded_dropped",
+                    ok=True,
+                    detail={"item_id": str(source.id)},
+                )
+                return None
+        elif candidate.derived_from is None:
             logger.info(
-                "enrichment: dropped ungrounded candidate %r from %s",
+                "enrichment: dropped empty-quote non-derived candidate %r from %s",
                 candidate.title[:60],
                 source.id,
             )
@@ -364,11 +503,18 @@ class EnrichmentService:
         due: datetime | None = None
         date_conflict = False
         conflict_note = None
+        meta_time_source: str | None = None
         if candidate.when_raw:
             sent_local = self._source_sent_local(source)
             resolved = xdates.resolve_when(candidate.when_raw, sent_local, self._tz)
             if resolved is not None:
                 clock = xdates.extract_clock(candidate.when_raw)
+                if clock is None:
+                    # v4 backstop: the model dropped the time from when_raw;
+                    # use the quote's adjacent clock time when unambiguous
+                    clock = xdates.quote_clock(candidate.quote, candidate.when_raw)
+                    if clock is not None:
+                        meta_time_source = "quote_time"
                 moment = xdates.combine_local(resolved.day, clock, self._tz)
                 date_conflict = resolved.date_conflict
                 conflict_note = resolved.conflict_note
@@ -376,18 +522,42 @@ class EnrichmentService:
                     due = moment
                 else:
                     start = moment
-        applies_to = (
+        item_level = (
             self._memory.resolve_applies_to(dict(candidate.audience))
             if self._memory is not None
             else ["unknown"]
         )
+        scope = candidate.audience.get("scope")
+        if scope in ("school", "community"):
+            # R3 (item 42): a WHOLE-SCHOOL/COMMUNITY event or break covers
+            # EVERY kid it names — the sender default (a class teacher's
+            # email) must NOT narrow an explicitly wide audience. This is
+            # the ONLY widening allowed past the source default.
+            applies_to = item_level
+        else:
+            applies_to = self._narrow_audience(
+                self._source_default_audience(source), item_level
+            )
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,
             "model": getattr(self._extractor, "name", "stub"),
+            "prompt_version": getattr(
+                self._extractor, "prompt_version", None
+            ),
             "run_id": None,  # set at storage time
         }
+        if candidate.derived_from is not None:
+            # item 22: interim link until PR B's item_relations table.
+            # EXACT SHAPE: meta["derived_from"] is the 0-based INDEX of the
+            # source candidate WITHIN THIS EXTRACTION PASS's candidate list
+            # (the LLM's own numbering — stable only within the pass, not a
+            # child id). PR B (worker_3) will convert this write path to a
+            # real relation row keyed by child id.
+            meta["derived_from"] = candidate.derived_from
         if conflict_note:
             meta["date_conflict_note"] = conflict_note  # both readings survive (item 2b)
+        if meta_time_source:
+            meta["time_source"] = meta_time_source
         return _ResolvedChild(
             candidate=candidate,
             start=start,
@@ -499,6 +669,12 @@ class EnrichmentService:
             source=source.source,
             type=kind,  # the candidate's kind survives (review round 1, defect 1)
             occurred_at=moment,
+            importance=candidate.importance,
+            actionability=(
+                Actionability(candidate.actionability)
+                if candidate.actionability is not None
+                else None
+            ),
             status=ItemStatus.NEEDS_REVIEW if resolved.date_conflict else ItemStatus.INBOX,
             child_state="proposed",
             applies_to=resolved.applies_to,
@@ -507,9 +683,7 @@ class EnrichmentService:
         )
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
-        self._session.add(
-            ItemSource(child_id=child.id, source_id=source.id, quote=candidate.quote)
-        )
+        self._add_quote_links(child, source, resolved)
         existing_children[child.id] = child  # visible to later candidates this run
         self._repo.commit()
         self._index_child(child)
@@ -534,24 +708,49 @@ class EnrichmentService:
         candidate = resolved.candidate
         child.raw_text = candidate.title
         child.occurred_at = resolved.start or resolved.due
+        child.importance = resolved.candidate.importance
+        child.actionability = (
+            Actionability(resolved.candidate.actionability)
+            if resolved.candidate.actionability is not None
+            else None
+        )
         child.applies_to = resolved.applies_to
         child.date_conflict = resolved.date_conflict
         child.status = ItemStatus.NEEDS_REVIEW if resolved.date_conflict else child.status
         child.extraction_meta = {**resolved.meta, "run_id": str(run_id)}
-        # one link per (child, source): a DIFFERENT quote of the same pair is
-        # an extra quote, not a second link row (UNIQUE(child_id, source_id))
-        link = (
-            self._session.query(ItemSource)
+        # Item 7 (many-to-many): one quote per link ROW. A DIFFERENT verbatim
+        # span for the same (child, source) pair is an additional row, not an
+        # overwrite — but never a duplicate of a quote already linked.
+        existing_quotes = {
+            row.quote
+            for row in self._session.query(ItemSource)
             .filter(
                 ItemSource.child_id == child.id, ItemSource.source_id == source.id
             )
-            .one_or_none()
-        )
-        if link is not None and link.quote != resolved.candidate.quote:
-            extras = list(child.extraction_meta.get("extra_quotes", []))
-            if resolved.candidate.quote not in extras:
-                extras.append(resolved.candidate.quote)
-            child.extraction_meta["extra_quotes"] = extras
+            .all()
+        }
+        self._add_quote_links(child, source, resolved, skip_quotes=existing_quotes)
+
+    def _add_quote_links(
+        self,
+        child: MemoryItem,
+        source: MemoryItem,
+        resolved: _ResolvedChild,
+        *,
+        skip_quotes: set[str] | None = None,
+    ) -> None:
+        """The ONE place that writes quote links (item 7, many-to-many).
+
+        The primary quote leads; merged dedupe quotes follow. Empty quotes
+        (derived children) never link. ``skip_quotes`` dedupes against rows
+        already in the table (the update path); a fresh child has none.
+        """
+        for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
+            if not quote or (skip_quotes and quote in skip_quotes):
+                continue
+            self._session.add(
+                ItemSource(child_id=child.id, source_id=source.id, quote=quote)
+            )
 
 
 @dataclass(frozen=True)
@@ -564,3 +763,4 @@ class _ResolvedChild:
     applies_to: list[str]
     date_conflict: bool
     meta: dict[str, Any]
+    extra_quotes: list[str] = field(default_factory=list)
