@@ -191,7 +191,7 @@ def make_connector(
     service = FakeDriveService(files, changes)
     connector = DriveConnector(
         token_loader=lambda: "refresh-token",
-        service_factory=lambda token, scopes: service,
+        service_factory=lambda token, scopes, api_name, api_version: service,
         folders=folders,
         text_cap=text_cap,
         max_depth=max_depth,
@@ -294,6 +294,22 @@ class TestRegistry:
         assert get_connector("gdrive") is DriveConnector
         assert DriveConnector.name == "gdrive"
         assert GDRIVE_SCOPE == "https://www.googleapis.com/auth/drive.readonly"
+
+    def test_connector_builds_the_drive_v3_service(self):
+        """The ClassVars must reach the service factory: a forgotten/typoed
+        API_NAME/API_VERSION would build the wrong API (review round 4)."""
+        seen: dict[str, str] = {}
+
+        def factory(token: str, scopes: list[str], api_name: str, api_version: str) -> object:
+            seen["api_name"] = api_name
+            seen["api_version"] = api_version
+            return object()  # never used
+
+        connector = DriveConnector(
+            token_loader=lambda: "refresh-token", service_factory=factory
+        )
+        connector._service()
+        assert seen == {"api_name": "drive", "api_version": "v3"}
 
 
 # --- full-sync walk ------------------------------------------------------------

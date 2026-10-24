@@ -76,6 +76,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from collections.abc import Callable
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
@@ -456,12 +457,17 @@ class DriveConnector(GoogleConnector):
 
     name: ClassVar[str] = SOURCE_NAME
     SCOPES: ClassVar[tuple[str, ...]] = (GDRIVE_SCOPE,)
+    # Which Google API the default service factory builds for this adapter
+    # (review round 4: the factory takes (refresh_token, scopes, api_name,
+    # api_version); a subclass that forgets these fails at construction).
+    API_NAME: ClassVar[str] = "drive"
+    API_VERSION: ClassVar[str] = "v3"
 
     def __init__(
         self,
         *,
         token_loader: Any,
-        service_factory: Any = default_service_factory,
+        service_factory: Callable[[str, list[str], str, str], Any] = default_service_factory,
         folders: tuple[str, ...] = (),
         text_cap: int = DEFAULT_TEXT_CAP,
         max_depth: int = DEFAULT_DEPTH,
