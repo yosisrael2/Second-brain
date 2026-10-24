@@ -10,8 +10,8 @@ Current state on main:
 | --- | --- | --- | --- |
 | Google Calendar | `gcal` | yes — pasted `calendar` items | now |
 | Google Tasks | `gtasks` | none (nothing to adopt) | now |
-| Google Drive | `gdrive` | none | after PR #57 |
-| Gmail | `email` (alias `gmail`) | yes — bot-captured `email` items | after PR #59 |
+| Google Drive | `gdrive` | none | now |
+| Gmail | `email` (alias `gmail`) | yes — bot-captured `email` items | now |
 
 All connector scopes are READ-ONLY. Enabling never lets a connector write to
 Google. Sync is manual (you run `brain connectors sync`); only the Gmail
@@ -265,24 +265,31 @@ from the cursor (tasks updated while off are picked up by `updatedMin`).
 
 ---
 
-## gdrive — Google Drive (available after PR #57)
-
-This section is written now so the steps are ready; the connector itself
-lands with PR #57. Until it merges, `gdrive` is not a valid
-`BRAIN_CONNECTORS` value (the enable switch fails fast on it).
+## gdrive — Google Drive
 
 ### 1. Prerequisites
 
-Deploy including PR #57; setup + consent done (the one-time consent covers
-all four sources — the scopes are the union of ENABLED connectors, so Drive
-scope is requested only once gdrive is enabled); no `gdrive` cursor yet.
+Deploy done (the running code contains the connectors framework and the
+gdrive adapter); setup + consent done (the one-time consent covers all four
+sources — the scopes are the union of ENABLED connectors, so Drive scope is
+requested only once gdrive is enabled); no `gdrive` cursor yet.
 
 ### 2. Enable
 
 Add `gdrive` to `BRAIN_CONNECTORS` in the live `.env` plus the Drive
-allowlist setting (its exact name and semantics land with #57 — check the
-connectors table in the README or `docs/connectors-setup.md` after it
-merges). Restart: `scripts/service.sh restart`.
+allowlist settings:
+
+```bash
+BRAIN_CONNECTORS=gdrive     # or extend the existing list, e.g. gcal,gdrive
+BRAIN_GDRIVE_FOLDERS=       # comma-separated immutable Drive folder ids;
+                            # EMPTY (default) = the connector fetches nothing
+BRAIN_GDRIVE_DEPTH=1        # folder levels below the allowlisted folders the
+                            # first sync walks (hard cap 5)
+BRAIN_GDRIVE_TEXT_CAP=10000 # max chars of exported text per file (truncation
+                            # is flagged in the record's meta)
+```
+
+Restart: `scripts/service.sh restart`.
 
 ### 3. Adopt — not applicable
 
@@ -324,15 +331,12 @@ made while off are picked up on the next sync).
 
 ---
 
-## email — Gmail label (available after PR #59)
-
-This section is ready to go; the connector port lands with PR #59. Until
-then the Gmail source is not part of the connectors framework (the standalone
-poller era runs on `docs/email-setup.md`).
+## email — Gmail label
 
 ### 1. Prerequisites
 
-Deploy including PR #59; `docs/connectors-setup.md` consent done (Gmail
+Deploy done (the running code contains the connectors framework and the
+email adapter); `docs/connectors-setup.md` consent done (Gmail
 scope is part of the union consent); `GMAIL_LABEL_ID` set in the live `.env`
 (the id, never the display name); the keychain holds the Google refresh
 token (`brain gmail-auth` / `brain connectors auth google`).
@@ -405,7 +409,7 @@ historyId cursor stay; re-enabling later resumes from the cursor.
 
 ## Quick reference
 
-| Step | gcal | gtasks | gdrive (#57) | email (#59) |
+| Step | gcal | gtasks | gdrive | email |
 | --- | --- | --- | --- | --- |
 | Enable switch | `BRAIN_CONNECTORS=gcal` + `BRAIN_GCAL_CALENDARS` | `BRAIN_CONNECTORS=gtasks` (+ `GTASKS_LISTS`) | `BRAIN_CONNECTORS=gdrive` + allowlist | `BRAIN_CONNECTORS=email` + `GMAIL_LABEL_ID` |
 | Adopt first? | **yes** (pasted calendar items) | no (nothing to adopt) | no | **yes** (bot-captured email) |
