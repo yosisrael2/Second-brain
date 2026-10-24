@@ -455,6 +455,65 @@ def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) ->
     )
 
 
+def test_by_channels_hides_confirmed_cancellation_until_restored(clean_items) -> None:
+    """Follow-up (3): by_channels routes through default_hidden_conditions —
+    a confirmed-cancelled channel conversation is NOT recalled; the restore
+    path (ReconciliationService.restore_cancellation) brings it back. One
+    hiding predicate everywhere (B3), no by_channels-specific holes."""
+    from brain.db.models import ItemRelation
+    from brain.services.extraction.reconciliation import ReconciliationService
+
+    _wipe_items()
+    session = SessionLocal()
+    _LEAKED.append(session)
+    repo = ItemsRepository(session)
+    normal = repo.add(
+        MemoryItem(
+            raw_text="[21/10/2026, 18:20] ב' ברקת - הורים / מעין: מחר ספרייה",
+            source="whatsapp",
+            meta={"channel": "ב' ברקת - הורים"},
+            occurred_at=datetime(2026, 10, 21, 15, 20, tzinfo=UTC),
+        )
+    )
+    cancelled = repo.add(
+        MemoryItem(
+            raw_text="[21/10/2026, 19:00] ב' ברקת - הורים / מעין: בוטל הטיול",
+            source="whatsapp",
+            meta={"channel": "ב' ברקת - הורים"},
+            occurred_at=datetime(2026, 10, 21, 16, 0, tzinfo=UTC),
+        )
+    )
+    session.commit()
+    # the cancellation is CONFIRMED the way the pipeline stamps it: a
+    # cancels relation + the cancelled dict citing it
+    rel = ItemRelation(
+        kind="cancels", from_id=normal.id, to_id=cancelled.id,
+        provenance={"state": "applied"},
+    )
+    session.add(rel)
+    session.commit()
+    stamped = session.get(MemoryItem, cancelled.id)
+    stamped.extraction_meta = {
+        **(stamped.extraction_meta or {}),
+        "cancelled": {"relation_id": str(rel.id)},
+    }
+    session.commit()
+
+    def _ids() -> set[str]:
+        return {
+            str(item.id)
+            for item in repo.by_channels(["ב' ברקת - הורים"], limit=10)
+        }
+
+    # RED: today by_channels still returns the confirmed-cancelled row
+    assert str(normal.id) in _ids()
+    assert str(cancelled.id) not in _ids()
+
+    # the real restore path re-shows it
+    service = ReconciliationService(session, repo, tz_name="Asia/Jerusalem")
+    service.restore_cancellation(rel.id)
+    assert str(cancelled.id) in _ids()
+
 def test_announcement_sent_before_the_window_is_recalled_via_lookback(
     clean_items, memory_db
 ) -> None:
