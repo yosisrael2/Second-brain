@@ -74,9 +74,9 @@ inject a fake service — no test touches the network.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from collections.abc import Callable
 from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
