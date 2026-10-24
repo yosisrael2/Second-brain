@@ -402,7 +402,13 @@ def _extract_eval(
     return 0
 
 
-def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict:
+def run_recon_eval(
+    cases_path: Path | str,
+    *,
+    now: datetime | None = None,
+    tz_name: str | None = None,
+    embedder: Any | None = None,
+) -> dict[str, Any]:
     """Score reconciliation verdicts against a cases jsonl (offline).
 
     One case per line: {case_id, existing_items: [{id, type, title, start,
@@ -415,19 +421,19 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
     import json  # noqa: PLC0415
     from datetime import UTC, datetime  # noqa: PLC0415
 
-    # E1 (round 5): the eval matches with the SAME embedding callable as
-    # production — the local embedder (offline); tests inject a fake.
-    from brain.ai.embedder import FastEmbedEmbedder  # noqa: PLC0415
+    # B1 (final check): the eval matches with the SAME builder as
+    # production — no separate construction. Tests inject the embedder.
     from brain.config import get_settings  # noqa: PLC0415
     from brain.services.extraction.reconciliation import (  # noqa: PLC0415
         ExistingItem,
         ReconCandidate,
         classify,
-        embedder_similarity,
+        recon_similarity_from_settings,
         signal_for,
     )
 
-    embedder = embedder or FastEmbedEmbedder(get_settings().recon_embed_model)
+    similarity = recon_similarity_from_settings(get_settings(), embedder=embedder)
+    tz_name = tz_name or get_settings().timezone
     now = now or datetime.now(tz=UTC)
     per_verdict: dict[str, dict[str, int]] = {}
     confusion: dict[str, dict[str, int]] = {}
@@ -445,6 +451,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
                     type=str(row["type"]),
                     title=str(row.get("title", "")),
                     start=_parse_eval_dt(row.get("start")),
+                    end=_parse_eval_dt(row.get("end")),
                     applies_to=tuple(row.get("applies_to") or ()),
                     location=row.get("location"),
                 )
@@ -468,7 +475,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
             computed = classify(
                 candidate,
                 existing,
-                similarity=embedder_similarity(embedder),
+                similarity=similarity,
                 now=case_now,
                 tz_name=tz_name,
                 signal=signal,
@@ -485,12 +492,11 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict
     return {"cases": total, "per_verdict": per_verdict, "confusion": confusion}
 
 
-def _parse_eval_dt(value):
+def _parse_eval_dt(value: Any) -> datetime | None:
     if not value:
         return None
-    from datetime import datetime as _dt  # noqa: PLC0415
 
-    return _dt.fromisoformat(str(value))
+    return datetime.fromisoformat(str(value))
 
 
 def _recon_eval(*, cases: str, tz_name: str | None) -> int:

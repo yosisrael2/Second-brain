@@ -176,6 +176,7 @@ class EnrichmentService:
         indexer: Any | None = None,
         daily_cap: int = 100,
         timezone: str | None = None,
+        similarity_factory: Callable[[], Any] | None = None,
         on_children_changed: Callable[[list[SourceOutcome]], None] | None = None,
     ) -> None:
         """``session`` is the runner's DB session (same one behind ``repo``).
@@ -211,12 +212,15 @@ class EnrichmentService:
         self._tz_name = timezone
         # PR D-recon (item 37): the reconciliation service shares this
         # session; exposed for the bot's verdict buttons (D-recon-2) and ops.
-        # E1: matching embeds with the LOCAL embedder, built lazily on the
-        # first reconciled candidate (health/ops constructions never pay)
-        # and reused afterwards — one model in the process, never two.
+        # B1: the match callable comes from the ONE shared builder
+        # (recon_similarity_from_settings), built lazily on the first
+        # reconciled candidate and reused afterwards — production and
+        # recon-eval cannot drift. Health/ops constructions never pay.
         self.recon = ReconciliationService(
             session, repo, tz_name=self._tz_name,
-            embedder_factory=self._build_recon_embedder,
+            # B1: tests may inject a hermetic factory; production gets the
+            # ONE shared builder.
+            similarity_factory=similarity_factory or self._build_recon_similarity,
         )
 
     # --- queue ---------------------------------------------------------
@@ -806,13 +810,15 @@ class EnrichmentService:
             self._index_child(child)
         return child
 
-    def _build_recon_embedder(self) -> Any:
-        # Round 5: recon matches with the RECON_EMBED_MODEL (a stronger
-        # multilingual embedder); search/Qdrant keep FASTEMBED_MODEL.
-        from brain.ai.embedder import FastEmbedEmbedder  # noqa: PLC0415
+    def _build_recon_similarity(self) -> Any:
+        # B1: the ONE shared builder — recon matches with RECON_EMBED_MODEL
+        # (a stronger multilingual embedder); search/Qdrant keep FASTEMBED_MODEL.
         from brain.config import get_settings  # noqa: PLC0415
+        from brain.services.extraction.reconciliation import (  # noqa: PLC0415
+            recon_similarity_from_settings,
+        )
 
-        return FastEmbedEmbedder(get_settings().recon_embed_model)
+        return recon_similarity_from_settings(get_settings())
 
     def _reconcile_child(
         self,

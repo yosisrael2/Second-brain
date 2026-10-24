@@ -502,10 +502,59 @@ def _candidate_child(
     )
 
 
+class TrigramEmbedder:
+    """A hermetic stand-in for the recon embedder: deterministic character
+    3-gram TF vectors over the WHOLE string (Unicode-aware, so Hebrew
+    behaves like the real multilingual model: near-identical strings score
+    high, distinct activities low). Not a quality claim — a wiring fake."""
+
+    def embed(self, text: str) -> list[float]:
+        grams: dict[str, int] = {}
+        t = text.casefold()
+        for i in range(max(0, len(t) - 2)):
+            grams[t[i : i + 3]] = grams.get(t[i : i + 3], 0) + 1
+        if not grams:
+            return [0.0]
+        return _trigram_vec(text)
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(t) for t in texts]
+
+
+_TRIGRAM_VOCAB: list[str] = []
+
+
+def _trigram_vec(text: str) -> list[float]:
+    """Sparse-in-dense: vector over the UNION of both strings' 3-grams is
+    impossible for a single-call embedder, so TrigramEmbedder embeds into a
+    GLOBAL vocab built lazily per process from every string it has seen."""
+    t = text.casefold()
+    for i in range(max(0, len(t) - 2)):
+        g = t[i : i + 3]
+        if g not in _TRIGRAM_INDEX:
+            _TRIGRAM_INDEX[g] = len(_TRIGRAM_INDEX)
+    vec = [0.0] * len(_TRIGRAM_INDEX)
+    for i in range(max(0, len(t) - 2)):
+        vec[_TRIGRAM_INDEX[t[i : i + 3]]] += 1.0
+    norm = sum(v * v for v in vec) ** 0.5 or 1.0
+    return [v / norm for v in vec]
+
+
+_TRIGRAM_INDEX: dict[str, int] = {}
+
+
 def _service(session, source: MemoryItem, *, tz_name: str = "Asia/Jerusalem") -> EnrichmentService:
+    """EnrichmentService bound to the shared session (the REAL production
+    construction path — the similarity factory is a hermetic fake, so the
+    B1 lazy build actually runs without loading a model)."""
+    from brain.services.extraction.reconciliation import embedder_similarity
+
     repo = ItemsRepository(session)
-    return EnrichmentService(repo, session, extractor=None, memory=None,
-                             daily_cap=100, timezone=tz_name)
+    return EnrichmentService(
+        repo, session, extractor=None, memory=None, daily_cap=100,
+        timezone=tz_name,
+        similarity_factory=lambda: embedder_similarity(TrigramEmbedder()),
+    )
 
 
 def test_update_verdict_proposes_change_never_applies(db):
@@ -1262,9 +1311,16 @@ def test_recon_uses_the_mini_lm_model_and_the_0_80_threshold():
     assert s.recon_embed_model.endswith("MiniLM-L12-v2")
     import inspect
 
+    from brain.services.extraction.reconciliation import (
+        recon_similarity_from_settings,
+    )
     from brain.services.extraction.service import EnrichmentService
-    src = inspect.getsource(EnrichmentService._build_recon_embedder)
-    assert "recon_embed_model" in src
+    # the ONE builder reads RECON_EMBED_MODEL; production reaches it through
+    # EnrichmentService._build_recon_similarity — no separate construction
+    assert "recon_embed_model" in inspect.getsource(recon_similarity_from_settings)
+    assert "recon_similarity_from_settings" in inspect.getsource(
+        EnrichmentService._build_recon_similarity
+    )
     # the callable: a 0.9x lexical near-identity pair must NOT fast-accept
     # (a Hebrew trap — the fake embedder gives it cosine ~0, so any score
     # the callable returns below 0.95 proves lexical did not fire)
@@ -1275,3 +1331,96 @@ def test_recon_uses_the_mini_lm_model_and_the_0_80_threshold():
     assert similarity_ratio(a.casefold(), b.casefold()) >= 0.9  # a lexical trap
     sim = embedder_similarity(FakeEmbedder())
     assert sim(a, b) < RECON_LEXICAL_FAST_ACCEPT
+
+
+def test_production_similarity_factory_is_called_without_attach(db):
+    """B1 (final check): EnrichmentService constructed EXACTLY as production
+    does — no attach_embedder anywhere — must call the similarity factory on
+    the first reconciled candidate and match a paraphrase pair through the
+    EMBEDDING callable. Fails while _ensure_embedder is dead code."""
+    from brain.ai.embedder import FakeEmbedder
+    from brain.services.extraction.reconciliation import embedder_similarity
+    from brain.services.extraction.service import EnrichmentService
+
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        return embedder_similarity(FakeEmbedder())
+
+    # lexical 0.564 < 0.85; FakeEmbedder cosine 0.882 >= 0.80: only the
+    # embedding callable can see these as the same activity
+    _make_existing_event(db, start=_jlm(10, 16, 0), title="annual park trip")
+    source = _make_source(db, text="annual trip to the park")
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None,
+        daily_cap=100, timezone="Asia/Jerusalem", similarity_factory=factory,
+    )
+    resolved = service._validate(
+        _candidate_child(title="annual trip to the park", when_raw="10.11 16:00",
+                         quote="annual trip to the park"), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert calls["n"] == 1  # the factory IS the production path
+    assert outcome.verdict is Verdict.ALREADY_KNOWN
+
+
+def test_embedder_load_failure_degrades_to_lexical(db):
+    """B2 (final check): the recon embedder failing to LOAD must not kill the
+    enrichment pass — lexical verdicts continue, ONE ops event
+    enrichment/recon_embedder_unavailable is recorded, no exception escapes,
+    and the failed load is not retried within the process."""
+    from brain.ai.embedder import EmbedderError
+    from brain.services.extraction.service import EnrichmentService
+
+    calls = {"n": 0}
+
+    def broken_factory():
+        calls["n"] += 1
+        raise EmbedderError("model download failed (offline)")
+
+    _make_existing_event(db, start=_jlm(10, 16, 0), title=BASE)
+    source = _make_source(db, text=BASE)
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None,
+        daily_cap=100, timezone="Asia/Jerusalem", similarity_factory=broken_factory,
+    )
+    resolved = service._validate(
+        _candidate_child(title=BASE, when_raw="10.11 16:00",
+                         quote=BASE), source, NOW
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)  # no raise
+    assert outcome.verdict is Verdict.ALREADY_KNOWN  # lexical verdict produced
+    assert calls["n"] == 1  # the failed load is NOT retried in this process
+    row = db.query(OpsEvent).filter_by(
+        component="enrichment", kind="recon_embedder_unavailable"
+    ).one()
+    assert "EmbedderError" in json.dumps(row.detail)
+
+
+def test_recon_eval_carries_end_through_to_the_diff(tmp_path):
+    """NIT (final check): eval cases may state `end` on the existing item and
+    the candidate so the end branches are exercisable from the gold."""
+    from brain.cli import run_recon_eval
+
+    case = {
+        "case_id": "end-diff-1",
+        "now": _jlm(10, 12, 0).isoformat(),
+        "existing_items": [{"id": "e1", "type": "event",
+                            "title": CAL_BASE,
+                            "start": _jlm(10, 16, 0).isoformat(),
+                            "end": _jlm(10, 17, 0).isoformat(),
+                            "applies_to": ["unknown"]}],
+        "new_text_quote": "שינוי: " + CAL_BASE + " עד 19:00",
+        "candidate": {"type": "event", "title": CAL_BASE,
+                      "start": _jlm(10, 16, 0).isoformat(),
+                      "end": _jlm(10, 19, 0).isoformat(),
+                      "applies_to": ["unknown"]},
+        "verdict": "update",
+    }
+    path = tmp_path / "cases.jsonl"
+    path.write_text(json.dumps(case), encoding="utf-8")
+    from brain.ai.embedder import FakeEmbedder
+    report = run_recon_eval(path, tz_name="Asia/Jerusalem",
+                            embedder=FakeEmbedder())
+    assert report["per_verdict"]["update"]["tp"] == 1

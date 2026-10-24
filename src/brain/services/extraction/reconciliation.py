@@ -49,6 +49,7 @@ runner-up; otherwise NEW + an ops event (never pick silently).
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from collections.abc import Callable, Iterable
@@ -62,6 +63,8 @@ from sqlalchemy import or_, select
 
 from brain import ops
 from brain.services.relations import similarity_ratio
+
+logger = logging.getLogger(__name__)
 
 # Item 20a/30 signals, code-detected (the LLM only narrows, never creates).
 # Substrings, casefolded; Hebrew morphological families share the root.
@@ -115,6 +118,20 @@ def _cosine(a: list[float], b: list[float]) -> float:
     if not na or not nb:
         return 0.0
     return dot / (na * nb)
+
+
+def recon_similarity_from_settings(
+    settings: Any, embedder: Any | None = None
+) -> Callable[[str, str], float]:
+    """THE one builder for the recon match callable — production and
+    recon-eval both construct their matcher HERE and nowhere else
+    (RECON_EMBED_MODEL embedder -> embedder_similarity with the 0.95
+    lexical fast-accept and the 0.80 threshold). Tests inject `embedder`."""
+    if embedder is None:
+        from brain.ai.embedder import FastEmbedEmbedder  # noqa: PLC0415
+
+        embedder = FastEmbedEmbedder(settings.recon_embed_model)
+    return embedder_similarity(embedder)
 
 
 def embedder_similarity(
@@ -436,10 +453,15 @@ class ReconciliationService:
     def __init__(
         self, session: Any, repo: Any, *, tz_name: str,
         similarity: Callable[[str, str], float] | None = None,
-        embedder_factory: Callable[[], Any] | None = None,
+        similarity_factory: Callable[[], Any] | None = None,
     ) -> None:
-        self._similarity = similarity or similarity_ratio
-        self._embedder_factory = embedder_factory
+        # B1 (final check): None means "not built yet" — the factory (the
+        # ONE shared builder, via EnrichmentService) runs lazily on the
+        # first reconciled candidate. A bare service with neither similarity
+        # nor factory falls back to lexical (unit tests only).
+        self._similarity = similarity
+        self._similarity_factory = similarity_factory
+        self._embedder_failed = False
         self._session = session
         self._repo = repo
         self._tz_name = tz_name
@@ -597,10 +619,25 @@ class ReconciliationService:
         self._similarity = embedder_similarity(embedder)
 
     def _ensure_embedder(self) -> None:
-        """E1: first reconciled candidate builds the local embedder once
-        (health/ops constructions never pay; tests inject a fake factory)."""
-        if self._similarity is None and self._embedder_factory is not None:
-            self.attach_embedder(self._embedder_factory())
+        """B1: first reconciled candidate builds the match callable through
+        the shared factory (health/ops constructions never pay). B2: a load
+        failure degrades ONCE to the lexical matcher for the rest of the
+        process — ops event + one log line, no exception escapes, no retry
+        until the next process start."""
+        if self._similarity is None and self._similarity_factory is not None:
+            try:
+                self._similarity = self._similarity_factory()
+            except Exception as exc:  # noqa: BLE001 — degrade, never kill the pass
+                self._similarity = similarity_ratio
+                self._embedder_failed = True
+                ops.record_event(
+                    "enrichment", "recon_embedder_unavailable", ok=False,
+                    detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                )
+                logger.warning(
+                    "recon embedder unavailable; matching falls back to "
+                    "lexical for this process (%s)", exc,
+                )
 
     def _record_target_unapproved(self, candidate: ReconCandidate,
                                   result: ReconResult) -> None:
