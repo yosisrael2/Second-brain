@@ -5,6 +5,7 @@ forced to a ``*_test`` database (created on demand); any non-test URL fails
 fast, and the destructive fixtures double-check the engine URL before deleting.
 """
 
+import hashlib
 import os
 
 from brain.config import test_collection_for
@@ -247,11 +248,30 @@ from tests.live_guard import (  # noqa: E402
     live_point_count,
 )
 
+# --- repo .env tripwire (session level) --------------------------------------
+# 24 Oct incident: worker worktrees kept re-acquiring a live-pointing .env
+# (byte-identical to .env.example; the live dbname default). Culprit (bisected):
+# test_dev_start_stops_a_never_healthy_server runs the REAL dev-start.sh, whose
+# check_env_file does `cp .env.example .env` when .env is missing — so any full
+# suite in a provisioned worktree without .env recreated it. No test may create
+# or modify files in the repo root: .env is snapshotted here (existence +
+# sha256) and the session fails loudly on any change. dev-start's developer
+# behavior (create when missing) is untouched — real-script tests point it at a
+# temp env file via BRAIN_ENV_FILE instead.
+
+
+def _repo_env_state() -> tuple[bool, str | None]:
+    env_file = _REPO_ROOT / ".env"
+    if not env_file.exists():
+        return (False, None)
+    return (True, hashlib.sha256(env_file.read_bytes()).hexdigest())
+
 
 def pytest_sessionstart(session: pytest.Session) -> None:
     session.config._live_points_before = live_point_count(  # type: ignore[attr-defined]
         os.environ.get("QDRANT_URL", "http://localhost:27333")
     )
+    session.config._repo_env_before = _repo_env_state()  # type: ignore[attr-defined]
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -266,6 +286,18 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     note = count_delta_note(before, after)
     if note:
         print(f"\nNOTE: {note}")
+    env_before = getattr(session.config, "_repo_env_before", None)
+    if env_before is not None and _repo_env_state() != env_before:
+        # testsfailed is already computed into the exit status by the time
+        # sessionfinish runs — the loud exit needs the exit hook escape.
+        from pytest import exit as pytest_exit  # noqa: PLC0415
+
+        pytest_exit(
+            "REPO_ROOT/.env was created or modified during this test session "
+            "— no test may write to the repo root. Real-script tests must "
+            "point the env-file seam (BRAIN_ENV_FILE) at a temp file.",
+            returncode=101,
+        )
 
 
 @pytest.fixture(autouse=True)
