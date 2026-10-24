@@ -207,8 +207,11 @@ def proposal_keyboard(
     matched_title): the verdict owns that child's row — UPDATE proposes
     ✅ Confirm update / ✖ Keep both (or ↩︎ Undo once auto-applied), CONFLICT
     asks ✅ keep existing / ✅ keep new, CANCELLATION offers ✅ Confirm
-    cancellation / ✖ Not cancelled. MORE_DETAIL children keep the default
-    row (the 🔔 line lives on the matched item's card, with no buttons)."""
+    cancellation / ✖ Not cancelled. The verdict rows carry the RELATION ID
+    (never a position), so a mixed card cannot misalign plain and verdict
+    rows; callback data stays < 64 bytes (prefix + token + uuid). MORE_DETAIL
+    children keep the default row (the 🔔 line lives on the matched item's
+    card, with no buttons)."""
     from brain.services.relations_view import (  # noqa: PLC0415
         CB_RECON_DISCARD,
         CB_REL_CONFIRM,
@@ -224,24 +227,24 @@ def proposal_keyboard(
             verdict, rel, _matched_title = entry
             state = (rel.provenance or {}).get("state")
             if verdict == "update" and state == "applied":
-                rows.append([("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{index}")])
+                rows.append([("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{rel.id}")])
                 continue
             if verdict == "update":
                 rows.append([
-                    ("✅ Confirm update", f"{CB_REL_CONFIRM}:{token}:{index}"),
-                    ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{index}"),
+                    ("✅ Confirm update", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{rel.id}"),
                 ])
                 continue
             if verdict == "conflict":
                 rows.append([
-                    ("✅ keep existing", f"{CB_RECON_DISCARD}:{token}:{index}"),
-                    ("✅ keep new", f"{CB_REL_CONFIRM}:{token}:{index}"),
+                    ("✅ keep existing", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
+                    ("✅ keep new", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
                 ])
                 continue
             if verdict == "cancellation":
                 rows.append([
-                    ("✅ Confirm cancellation", f"{CB_REL_CONFIRM}:{token}:{index}"),
-                    ("✖ Not cancelled", f"{CB_RECON_DISCARD}:{token}:{index}"),
+                    ("✅ Confirm cancellation", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    ("✖ Not cancelled", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
                 ])
                 continue
         rows.append(

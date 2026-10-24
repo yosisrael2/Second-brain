@@ -279,9 +279,6 @@ class Pending:
     # PR C proposal cards: what the token refers to + the fix-flow step
     kind: str = "capture"  # "capture" | "proposal" | "fix"
     step: str | None = None  # fix flow: "title" | "date"
-    # D-recon-2a: a proposal card's verdict relations, parked ALIGNED with
-    # ids[1:] (rel_ids[i] is the recon relation of child ids[i + 1]).
-    rel_ids: tuple = ()
 
 
 class PendingRegistry:
@@ -1016,17 +1013,17 @@ class TelegramBot:
         return queued
 
     def _recon_payload(self, session, children):
-        """(recon, blocks, rel_ids) for a proposal card: the verdict rows,
-        the CONFLICT both-versions blocks, and the relation ids to park
-        (aligned with children — D-recon-2a)."""
+        """(recon, blocks) for a proposal card: the verdict rows and the
+        CONFLICT both-versions blocks (D-recon-2a). The verdict rows carry
+        the relation ID in the callback data — nothing positional to
+        misalign."""
         recon = self._recon_rows(session, children)
         blocks = [
             conflict_notice(session, rel)
             for verdict, rel, _title in recon.values()
             if verdict == "conflict"
         ]
-        rel_ids = tuple(rel.id for _verdict, rel, _title in recon.values())
-        return recon, blocks, rel_ids
+        return recon, blocks
 
     def _proposal_reply_for(self, source, *, notice: str | None = None) -> Reply | None:
         """Render the source's proposal card (None when nothing is proposed).
@@ -1042,13 +1039,9 @@ class TelegramBot:
             children = proposed_children_of(session, source.id)
             if not children:
                 return None
-            recon, blocks, rel_ids = self._recon_payload(session, children)
+            recon, blocks = self._recon_payload(session, children)
             token = self.registry.put(
-                Pending(
-                    ids=(source.id, *(c.id for c in children)),
-                    kind="proposal",
-                    rel_ids=rel_ids,
-                )
+                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
             parts = [part for part in (
                 notice,
@@ -1148,13 +1141,9 @@ class TelegramBot:
             ]
             if source is None or not children:
                 return Reply(f"{notice}\n ✓ all done here.", edit=True)
-            recon, blocks, rel_ids = self._recon_payload(session, children)
+            recon, blocks = self._recon_payload(session, children)
             token = self.registry.put(
-                Pending(
-                    ids=(source.id, *(c.id for c in children)),
-                    kind="proposal",
-                    rel_ids=rel_ids,
-                )
+                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
             parts = [part for part in (
                 notice,
@@ -1171,13 +1160,17 @@ class TelegramBot:
 
     # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
 
-    def _relation_transition(self, prefix: str, pending: Pending, index: int) -> Reply:
+    def _relation_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
         """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b);
         a proposal card's verdict rows route to the D-recon-2a handler."""
         if pending.kind == "proposal":
-            return self._recon_transition(prefix, pending, index)
+            return self._recon_transition(prefix, pending, arg)
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
 
+        try:
+            index = int(arg)
+        except ValueError:
+            return Reply("Unknown action — the button is stale or invalid.")
         rel_ids = list(pending.ids[1:])
         if not 0 <= index < len(rel_ids):
             return Reply("⌛ That button expired — the card moved on.", edit=True)
@@ -1196,12 +1189,14 @@ class TelegramBot:
             return Reply(f"⌛ {_esc(str(exc))}", edit=True)
         return self._card_reply(pending, notice=notice)
 
-    def _recon_transition(self, prefix: str, pending: Pending, index: int) -> Reply:
+    def _recon_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
         """Verdict rows on a proposal card (D-recon-2a): ✅ confirm update /
         keep new / confirm cancellation, ✖ keep both, ✅ keep existing /
-        ✖ not cancelled, ↩︎ undo. Nothing ever applies without a tap, and a
-        stale callback after the relation changed answers "already
-        handled" — every action re-checks the parked relation's state."""
+        ✖ not cancelled, ↩︎ undo. The callback carries the RELATION ID (not
+        a position), so a mixed card cannot misalign plain and verdict
+        rows; nothing ever applies without a tap, and a stale callback
+        after the relation changed answers "already handled" — every
+        action re-checks the relation's state."""
         from brain.db.models import ItemRelation  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
         from brain.services.extraction.reconciliation import (  # noqa: PLC0415
@@ -1209,17 +1204,17 @@ class TelegramBot:
         )
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
 
-        child_ids = list(pending.ids[1:])
-        rel_ids = list(pending.rel_ids)
-        if not 0 <= index < len(rel_ids) or not 0 <= index < len(child_ids):
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
-        rel_id, child_id = rel_ids[index], child_ids[index]
+        try:
+            rel_id = uuid_mod.UUID(str(arg))
+        except ValueError:
+            return Reply("Unknown action — the button is stale or invalid.")
         already = "⌛ already handled — the card moved on."
         notice = None
         with SessionLocal() as session:
             rel = session.get(ItemRelation, rel_id)
             if rel is None:
                 return Reply(already, edit=True)
+            child_id = rel.from_id  # the verdict child owns the relation
             state = (rel.provenance or {}).get("state")
             service = ReconciliationService(
                 session, _repo_of(session), tz_name=self._timezone.key,
@@ -1487,10 +1482,6 @@ class TelegramBot:
                 CB_PROPOSED_KEEP,
                 CB_PROPOSED_FIX,
                 CB_PROPOSED_DROP,
-                CB_REL_UNDO,
-                CB_REL_CONFIRM,
-                CB_REL_KEEP_BOTH,
-                CB_RECON_DISCARD,
             ):
                 index = int(arg)
         except ValueError:
@@ -1524,7 +1515,7 @@ class TelegramBot:
         if prefix == CB_PROPOSED_KEEP_ALL:
             return self._proposal_keep_all(pending)
         if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD):
-            return self._relation_transition(prefix, pending, index)
+            return self._relation_transition(prefix, pending, arg)
         if prefix == CB_REL_RESTORE:
             return self._relation_restore(pending)
         if prefix == CB_UNDO:

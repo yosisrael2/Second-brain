@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from brain.db.models import ItemRelation, ItemSource, MemoryItem
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository, default_hidden_conditions
+from brain.services.proposals import CB_PROPOSED_DROP, CB_PROPOSED_FIX
 from brain.services.relations_view import (
     CB_RECON_DISCARD,
     CB_REL_CONFIRM,
@@ -271,6 +272,108 @@ class TestUpdateCards:
         assert "↩️" in tapped.text
 
 
+class TestMixedCardTaps:
+    """Taps through a MIXED card (plain + verdict children) — the review's
+    blocker: a compacted rel_ids parking misaligned plain and verdict rows,
+    so A's Confirm applied B's relation. The callback must carry the
+    RELATION ID, never a position."""
+
+    def test_tap_applies_the_relation_of_the_tapped_row(self, world):
+        """[plain(0), recon(1)]: the recon row's Confirm applies THAT relation."""
+        repo, session = world
+        source = _capture(repo, "email: plans")
+        old = _capture(repo, "family dinner on Friday")
+        plain = repo.add(MemoryItem(raw_text="buy wine", child_state="proposed"))
+        session.add(ItemSource(child_id=plain.id, source_id=source.id, quote="buy wine"))
+        repo.commit()
+        recon_child = _recon_child(repo, session, source=source, matched=old,
+                                   verdict="update", text="family dinner moved to Saturday")
+        bot, _ = _bot(world)
+        reply = bot._proposal_reply_for(source)
+
+        data = _find(reply, CB_REL_CONFIRM)
+        tapped = bot.handle_callback(data, 7)
+        session.expire_all()
+        assert session.get(MemoryItem, old.id).superseded_by == recon_child.id
+        rel = session.query(ItemRelation).filter_by(from_id=recon_child.id).one()
+        assert (rel.provenance or {}).get("state") == "applied"
+        assert "✅" in tapped.text
+
+    def test_tap_applies_only_the_tapped_row_on_a_three_child_card(self, world):
+        """[plain(0), recon_A(1), recon_B(2)]: A's Confirm applies A only;
+        B stays untouched and still appliable from its own row."""
+        repo, session = world
+        source = _capture(repo, "email: plans")
+        old_a = _capture(repo, "family dinner on Friday")
+        old_b = _capture(repo, "gym on Thursday")
+        plain = repo.add(MemoryItem(raw_text="buy wine", child_state="proposed"))
+        session.add(ItemSource(child_id=plain.id, source_id=source.id, quote="buy wine"))
+        repo.commit()
+        child_a = _recon_child(repo, session, source=source, matched=old_a,
+                               verdict="update", text="family dinner moved to Saturday")
+        child_b = _recon_child(repo, session, source=source, matched=old_b,
+                               verdict="update", text="gym moved to Friday")
+        bot, _ = _bot(world)
+        reply = bot._proposal_reply_for(source)
+
+        # A's row: the Confirm whose callback names A's RELATION id
+        rel_a = session.query(ItemRelation).filter_by(from_id=child_a.id).one()
+        a_data = next(
+            data
+            for row in reply.keyboard or []
+            for _label, data in row
+            if data.startswith(f"{CB_REL_CONFIRM}:") and str(rel_a.id)[:12] in data
+        )
+        bot.handle_callback(a_data, 7)
+        session.expire_all()
+        assert session.get(MemoryItem, old_a.id).superseded_by == child_a.id
+        rel_b = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
+        assert (rel_b.provenance or {}).get("state") == "proposed"  # B untouched
+        assert session.get(MemoryItem, old_b.id).superseded_by is None
+
+        # B is still appliable from its own row (the re-rendered card)
+        re_reply = bot._proposal_reply_for(source)
+        b_data = next(
+            data
+            for row in re_reply.keyboard or []
+            for _label, data in row
+            if data.startswith(f"{CB_REL_CONFIRM}:") and str(rel_b.id)[:12] in data
+        )
+        bot.handle_callback(b_data, 7)
+        session.expire_all()
+        assert session.get(MemoryItem, old_b.id).superseded_by == child_b.id
+
+    def test_plain_child_row_tap_never_touches_a_relation(self, world):
+        """[plain(0), recon(1)]: dropping the PLAIN child touches no relation."""
+        repo, session = world
+        source = _capture(repo, "email: plans")
+        old = _capture(repo, "family dinner on Friday")
+        plain = repo.add(MemoryItem(raw_text="buy wine", child_state="proposed"))
+        session.add(ItemSource(child_id=plain.id, source_id=source.id, quote="buy wine"))
+        repo.commit()
+        recon_child = _recon_child(repo, session, source=source, matched=old,
+                                   verdict="update", text="family dinner moved to Saturday")
+        bot, _ = _bot(world)
+        reply = bot._proposal_reply_for(source)
+
+        # the plain child's index is the one whose row carries a Fix button
+        # (default rows only) — positions are not assumed further
+        fix_data = next(
+            data
+            for row in reply.keyboard or []
+            for _label, data in row
+            if data.startswith(f"{CB_PROPOSED_FIX}:")
+        )
+        token, _, index = fix_data.partition(":")[2].partition(":")
+        drop = f"{CB_PROPOSED_DROP}:{token}:{index}"
+        bot.handle_callback(drop, 7)
+        session.expire_all()
+        rel = session.query(ItemRelation).filter_by(from_id=recon_child.id).one()
+        assert (rel.provenance or {}).get("state") == "proposed"  # untouched
+        assert session.get(MemoryItem, old.id).superseded_by is None
+        assert session.get(MemoryItem, plain.id).child_state == "dropped"
+
+
 class TestConflictCards:
     def test_conflict_card_shows_both_versions_and_question(self, world):
         repo, session = world
@@ -504,10 +607,10 @@ class TestStaleGuard:
         bot, _ = _bot(world)
         reply = bot._proposal_reply_for(source)
         confirm = _find(reply, CB_REL_CONFIRM)
-        token = confirm.split(":")[1]
+        keep_both = _find(reply, CB_REL_KEEP_BOTH)
 
         bot.handle_callback(confirm, 7)
-        stale = bot.handle_callback(f"{CB_REL_KEEP_BOTH}:{token}:0", 7)
+        stale = bot.handle_callback(keep_both, 7)
         assert "already handled" in stale.text
         session.expire_all()
         rel = session.query(ItemRelation).one()
