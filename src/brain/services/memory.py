@@ -94,6 +94,37 @@ class MemoryService:
             kids.append(kid)
         return kids
 
+    def channel_names_for_kid(self, kid: str) -> list[str]:
+        """Confirmed channel names that apply to ONE kid (the ask kid-recall
+        leg is the caller; THE one channel->kid mapping in the codebase).
+
+        A channel applies to ``kid`` when its current confirmed 'applies_to'
+        fact names the kid, or 'family' (a family channel belongs to every
+        confirmed kid — the same query-time resolution _resolve_channel gives
+        audience resolution). Names are the exact stored entity names — the
+        same strings WhatsApp captures keep in meta.channel — so callers can
+        match items structurally instead of by raw-text substring.
+        """
+        if not kid:
+            return []
+        channels = self._repo.list_entities(kinds=["channel"])
+        if not channels:
+            return []
+        facts = self._repo.current_facts(
+            subject_ids=[c.id for c in channels], status="confirmed"
+        )
+        applies: dict[uuid.UUID, list[str]] = {}
+        for fact in facts:
+            if fact.predicate == "applies_to" and fact.value is not None:
+                applies.setdefault(fact.subject_id, []).append(fact.value)
+        kid_names = {k["name"] for k in self.kids()}
+        return sorted(
+            c.name
+            for c in channels
+            if kid in applies.get(c.id, [])
+            or ("family" in applies.get(c.id, []) and kid in kid_names)
+        )
+
     def set_kid(
         self,
         name: str,
