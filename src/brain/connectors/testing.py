@@ -20,6 +20,12 @@ from brain.connectors.base import (
     FetchResult,
     SourceRecord,
 )
+from brain.connectors.conformance import (  # noqa: F401 — re-exported kit API
+    ConformanceFailure,
+    ConformanceScenario,
+    FakeSourceAPI,
+    assert_conforms,
+)
 
 
 class FakeConnector(Connector):

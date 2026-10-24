@@ -1,0 +1,38 @@
+{
+  "kind": "drive#changeList",
+  "newStartPageToken": "90210",
+  "changes": [
+    {
+      "fileId": "1M0v3dO0tM0ck456789abcdefghijklmnopqrs",
+      "file": {
+        "kind": "drive#file",
+        "id": "1M0v3dO0tM0ck456789abcdefghijklmnopqrs",
+        "name": "Moved away",
+        "mimeType": "application/vnd.google-apps.document",
+        "version": "12",
+        "modifiedTime": "2026-10-22T09:00:00.000Z",
+        "webViewLink": "https://docs.google.com/document/d/1M0v3dO0tM0ck456789abcdefghijklmnopqrs/edit",
+        "parents": ["1F0ld3rN0tAll0w3d000000000000000003"],
+        "trashed": false
+      }
+    },
+    {
+      "fileId": "1Tr4sh3dM0ck456789abcdefghijklmnopqrstu",
+      "file": {
+        "kind": "drive#file",
+        "id": "1Tr4sh3dM0ck456789abcdefghijklmnopqrstu",
+        "name": "Old draft",
+        "mimeType": "application/vnd.google-apps.document",
+        "version": "51",
+        "modifiedTime": "2026-08-01T00:00:00.000Z",
+        "webViewLink": "https://docs.google.com/document/d/1Tr4sh3dM0ck456789abcdefghijklmnopqrstu/edit",
+        "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+        "trashed": true
+      }
+    },
+    {
+      "fileId": "1P3rmA0n3ntlyG0n3456789abcdefghijkl",
+      "removed": true
+    }
+  ]
+}

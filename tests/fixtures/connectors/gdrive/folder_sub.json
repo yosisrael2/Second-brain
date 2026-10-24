@@ -1,0 +1,12 @@
+{
+  "kind": "drive#file",
+  "id": "1F0ldSubN3stEd000000000000000000002",
+  "name": "ארכיון / Archive",
+  "mimeType": "application/vnd.google-apps.folder",
+  "version": "4",
+  "createdTime": "2026-01-05T00:00:00.000Z",
+  "modifiedTime": "2026-10-10T12:00:00.000Z",
+  "webViewLink": "https://drive.google.com/drive/folders/1F0ldSubN3stEd000000000000000000002",
+  "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+  "trashed": false
+}
