@@ -826,6 +826,100 @@ class ReconciliationService:
         rel.provenance = {**rel.provenance, "state": "undone"}
         self._session.commit()
 
+    def resolve_conflict(self, relation_id: uuid.UUID, *, keep: str) -> None:
+        """The CONFLICT card's resolution (D-recon-2a).
+
+        keep='new': the new child wins — the target is struck (D4) and the
+        conflicts relation is applied. keep='existing': the proposal goes
+        away (relation deleted) and the verdict child is dropped (the A1
+        re-run diff never re-proposes it) + an ops event for the audit.
+        Both outcomes keep the standing rules: nothing is deleted but the
+        proposal row, and the target item is never modified on
+        keep='existing'.
+        """
+        from brain.db.models import ItemRelation, MemoryItem  # noqa: PLC0415
+
+        rel = self._session.get(ItemRelation, relation_id)
+        if rel is None or rel.kind != "conflicts":
+            raise ValueError(f"not a conflict relation: {relation_id}")
+        state = (rel.provenance or {}).get("state")  # missing = proposed (#73)
+        if keep == "new":
+            if state == "applied":
+                raise ValueError("already resolved — the new version is applied")
+            if state not in (None, "proposed"):
+                raise ValueError("conflict was undone — propose it again")
+            target = self._session.get(MemoryItem, rel.to_id)
+            target.superseded_by = rel.from_id
+            rel.provenance = {**rel.provenance, "state": "applied"}
+            self._session.get(MemoryItem, rel.from_id).child_state = "kept"
+            self._session.commit()
+            return
+        if keep != "existing":
+            raise ValueError(f"unknown keep: {keep}")
+        if state not in (None, "proposed"):
+            raise ValueError("already resolved")
+        self._discard_verdict_child(rel, event="recon_conflict_resolved")
+
+    def undo_resolution(self, relation_id: uuid.UUID) -> None:
+        """♻️ Restore after a CONFLICT was resolved keep-new (D-recon-2a):
+        the old item becomes current again (D4), the relation stays for
+        audit with provenance.state='undone'."""
+        from brain.db.models import ItemRelation, MemoryItem  # noqa: PLC0415
+
+        rel = self._session.get(ItemRelation, relation_id)
+        if rel is None or rel.kind != "conflicts":
+            raise ValueError(f"not a conflict relation: {relation_id}")
+        state = (rel.provenance or {}).get("state")
+        if state == "undone":
+            return  # double restore: no-op
+        if state != "applied":
+            raise ValueError("not applied yet — nothing to restore")
+        target = self._session.get(MemoryItem, rel.to_id)
+        if target is not None and target.superseded_by == rel.from_id:
+            target.superseded_by = None
+        rel.provenance = {**rel.provenance, "state": "undone"}
+        self._session.commit()
+
+    def discard_cancellation(self, relation_id: uuid.UUID) -> None:
+        """✖ Not cancelled (D-recon-2a): the proposal goes away — relation
+        deleted, verdict child dropped (never re-proposed). An APPLIED
+        cancellation is refused: undo it with restore instead."""
+        from brain.db.models import ItemRelation  # noqa: PLC0415
+
+        rel = self._session.get(ItemRelation, relation_id)
+        if rel is None or rel.kind != "cancels":
+            raise ValueError(f"not a cancellation relation: {relation_id}")
+        state = (rel.provenance or {}).get("state")
+        if state == "applied":
+            raise ValueError("already applied — restore it instead")
+        if state != "proposed":
+            raise ValueError("already discarded")
+        self._discard_verdict_child(rel, event="recon_cancellation_discarded")
+
+    def _discard_verdict_child(self, rel: Any, *, event: str) -> None:
+        """One transaction: delete the proposal, drop its verdict child
+        (the A1 re-run diff remembers it), record the ops event."""
+        from datetime import UTC  # noqa: PLC0415
+
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+
+        child = self._session.get(MemoryItem, rel.from_id)
+        if child is not None:
+            meta = dict(child.extraction_meta or {})
+            meta["dropped_at"] = datetime.now(tz=UTC).isoformat()
+            child.extraction_meta = meta
+            child.child_state = "dropped"
+        self._session.delete(rel)
+        self._session.commit()
+        self._record_custom(event, {
+            "child_id": str(rel.from_id), "matched_id": str(rel.to_id),
+        })
+
+    def _record_custom(self, event: str, detail: dict[str, Any]) -> None:
+        from brain import ops  # noqa: PLC0415
+
+        ops.record_event("enrichment", event, ok=True, detail=detail)
+
     def _record(self, verdict: Verdict, detail: dict[str, Any]) -> None:
         from brain import ops  # noqa: PLC0415
 
