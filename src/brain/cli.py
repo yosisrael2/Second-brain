@@ -1148,6 +1148,7 @@ def _connectors_sync(args: argparse.Namespace) -> int:
     from brain.config import assert_not_live_store, get_settings
     from brain.connectors import all_names, ensure_registered
     from brain.connectors import get as get_connector
+    from brain.connectors.base import ConnectorError
     from brain.connectors.runner import ConnectorRunner
     from brain.connectors.state import ConnectorRecordRepo, ConnectorStateRepo
 
@@ -1182,7 +1183,22 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         if args.dry_run:
             connector = _build_connector(args.name, session=session, dry_run=True)
             state = ConnectorStateRepo(session).get(connector.name)
-            result = connector.fetch(state.cursor if state else None, limit=args.limit)
+            try:
+                result = connector.fetch(
+                    state.cursor if state else None, limit=args.limit
+                )
+            except ConnectorError as exc:
+                # The dry-run path has no runner to map connector failures;
+                # map them exactly like the sync path's exit codes: auth and
+                # not-configured refuse with 78, transient exits 1 — one
+                # stderr line, never a traceback (review follow-up 1).
+                code, message = _dry_run_failure(args.name, exc)
+                print(message, file=sys.stderr)
+                try:
+                    connector.close()
+                except Exception:  # noqa: BLE001 — never mask the fetch failure
+                    pass
+                return code
             print(
                 f"dry-run: {len(result.records)} record(s), next_cursor={result.next_cursor!r}, "
                 f"reset={result.reset} (nothing written)"
@@ -1237,6 +1253,27 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         + (f" error={summary.error}" if summary.error else "")
     )
     return {"ok": 0, "retry_error": 1, "auth_error": 78}.get(summary.state, 1)
+
+
+def _dry_run_failure(name: str, exc: Exception) -> tuple[int, str]:
+    """Map a dry-run fetch failure to (exit code, one stderr line).
+
+    Mirrors the sync path's summary-based codes: auth -> the re-auth
+    message, 78; transient (retryable) -> 1; any other connector error is
+    a not-configured/misconfigured refusal -> 78 (same family as the
+    missing-token and not-registered refusals above).
+    """
+    from brain.connectors.base import ConnectorAuthError, ConnectorRetryableError
+
+    if isinstance(exc, ConnectorAuthError):
+        return (
+            78,
+            f"connectors: {name}: auth (needs re-consent): {exc} — run "
+            f"`brain connectors auth google` first",
+        )
+    if isinstance(exc, ConnectorRetryableError):
+        return (1, f"connectors: {name}: retryable: {exc}")
+    return (78, f"connectors: {name}: {exc}")
 
 
 def _cursor_of(state_repo: Any, connector: str) -> str | None:
