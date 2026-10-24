@@ -477,6 +477,7 @@ def _candidate_child(
     quote: str = "הטיול יוצא ב-18:00",
     recon: ReconHint | None = None,
     location: str | None = None,
+    end: str | None = None,
 ) -> ChildCandidate:
     return ChildCandidate(
         kind="event",
@@ -484,6 +485,7 @@ def _candidate_child(
         quote=quote,
         when_raw=when_raw,
         location=location,
+        end=end,
         recon=recon,
     )
 
@@ -1042,3 +1044,151 @@ def test_recon_eval_accepts_spec_shape(tmp_path):
     assert report["cases"] == 2
     assert report["per_verdict"]["update"]["tp"] == 1
     assert report["per_verdict"]["cancellation"]["tp"] == 1
+
+
+def test_similarity_uses_the_embedder_for_paraphrases(db):
+    """E1 (round 5): matching runs on EMBEDDING cosine (the local embedder),
+    with the lexical ratio only as a fast accept >= 0.85. A paraphrase pair
+    (lexical far below 0.85, embedding-close) MATCHES; the pure classify
+    gets the embedding callable through ReconciliationService. Deterministic
+    FakeEmbedder (English) proves the wiring; the dev set uses the real
+    local model."""
+    from brain.ai.embedder import FakeEmbedder
+
+    source_row = _make_source(db, text="x")  # any session-bound row
+    service = _service(db, source_row)
+    service.recon.attach_embedder(FakeEmbedder())
+    # lexical 0.564 < 0.85; FakeEmbedder cosine 0.882 >= 0.85: only the
+    # EMBEDDING callable can see these as the same activity
+    existing_row = _make_existing_event(
+        db, start=_jlm(10, 16, 0), title="annual park trip"
+    )
+    candidate = ReconCandidate(
+        kind="event", title="annual trip to the park",
+        start=_jlm(10, 16, 0), applies_to=("unknown",),
+    )
+    result = service.recon.classify_universe(
+        candidate, exclude_ids={source_row.id}, now=NOW, signal=ReconSignal()
+    )
+    from brain.services.relations import similarity_ratio as _lex
+    assert _lex(candidate.title, existing_row.raw_text) < 0.85
+    assert result.verdict is Verdict.ALREADY_KNOWN
+
+
+def test_unknown_audience_never_matches_a_known_kid(db):
+    """E1 point 3 (round 5): NULL/unknown matches unknown ONLY. A cancellation
+    for one kid's activity must never strike an unscoped (NULL-audience)
+    pasted item that is really another kid's."""
+    source = _make_source(db, text="בוטל: " + BASE)
+    _make_calendar_item(db, title=BASE, location=None, start=_jlm(10, 16, 0))
+    # force the pasted item's audience to a KNOWN kid (not NULL/unknown)
+    from sqlalchemy import update as sa_update
+    db.execute(sa_update(MemoryItem).where(MemoryItem.raw_text.like(
+        "%" + BASE[:12] + "%")).values(applies_to=["Noa"]))
+    db.commit()
+    service = _service(db, source)
+    resolved = service._validate(
+        ChildCandidate(kind="event", title="בוטל: " + BASE,
+                       quote="בוטל: " + BASE, when_raw=""),
+        source, NOW,
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome is None  # no match across unknown->known: plain NEW
+
+
+def test_recon_eval_uses_the_embedding_callable(tmp_path):
+    """E1: recon-eval matches through the SAME embedding callable as
+    production (built from the local embedder; injectable for tests)."""
+    from brain.cli import run_recon_eval
+
+    cases = [{
+        "case_id": "para-1",
+        # lexical 0.564 < 0.85; FakeEmbedder cosine 0.882: only the
+        # embedding callable sees these as the same activity
+        "now": _jlm(10, 12, 0).isoformat(),  # judged in its own local day
+        "existing_items": [{"id": "e1", "type": "event",
+                            "title": "annual park trip",
+                            "start": _jlm(10, 16, 0).isoformat(),
+                            "applies_to": ["Rona"]}],
+        "new_text_quote": "לזכור: הטיול",
+        "candidate": {"type": "event", "title": "annual trip to the park",
+                      "start": _jlm(10, 16, 0).isoformat(),
+                      "applies_to": ["Rona"]},
+        "verdict": "already_known",
+    }]
+    path = tmp_path / "cases.jsonl"
+    path.write_text(json.dumps(cases[0]), encoding="utf-8")
+    from brain.ai.embedder import FakeEmbedder
+    report = run_recon_eval(path, tz_name="Asia/Jerusalem",
+                            embedder=FakeEmbedder())
+    assert report["per_verdict"]["already_known"]["tp"] == 1
+
+
+def test_end_flows_to_diff_and_persists_on_the_child(db):
+    """Round-5 addition: the candidate's END reaches the diff (UPDATE) and
+    the stored child carries end+location in extraction_meta, so a LATER
+    run's reconciliation can compare against children too."""
+    # no LOCATION in the fixture: with the hermetic fake embedder the
+    # oneliner title must stay within the lexical fast-accept of CAL_BASE
+    # (the "@ location" suffix drops it to 0.849; the real model rescues it
+    # via cosine — the fake cannot, so keep the fixture lean)
+    _make_calendar_item(
+        db, title=CAL_BASE, location=None,
+        start=_jlm(10, 16, 0), end=_jlm(10, 17, 0),
+    )
+    source = _make_source(db, text="שינוי: " + CAL_BASE + " עד 19:00")
+    service = _service(db, source)
+    resolved = service._validate(
+        _candidate_child(title=CAL_BASE, when_raw="10.11 16:00",
+                         quote="שינוי: " + CAL_BASE + " עד 19:00",
+                         location="פארק השרון", end="19:00",
+                         recon=ReconHint(change=True)), source, NOW
+    )
+    assert resolved is not None and resolved.end is not None
+    assert resolved.end.astimezone(JLM).hour == 19  # local wall time
+    outcome = service._reconcile_child(resolved, source, {}, uuid.uuid4(), NOW)
+    assert outcome.verdict is Verdict.UPDATE
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    fields = (rel.provenance or {}).get("fields", {})
+    assert fields.get("end") == ["17:00", "19:00"]  # beyond the +-1h identity
+    # the verdict child persists end + location for later runs
+    child = db.get(MemoryItem, rel.from_id)
+    meta = child.extraction_meta or {}
+    assert meta.get("end") == "2026-11-10T17:00:00+00:00"  # 19:00 JLM as UTC iso
+    assert meta.get("location") == "פארק השרון"
+
+
+def test_matchable_items_sql_windows_across_the_dst_change(db):
+    """Round-5 addition: the SQL window legs are DAY-based through the 25 Oct
+    DST fold — a same-local-day item matches, the previous day's 23:50 does
+    not, and the extended window edge behaves the same way."""
+    from brain.services.extraction.reconciliation import ReconSignal
+
+    # Sun 25 Oct 2026: IDT->IST fold at 02:00; a 01:30 local item is ambiguous
+    item_fold = _make_existing_event(db, start=datetime(2026, 10, 25, 1, 30, tzinfo=JLM),
+                                     title=BASE)
+    item_prev = _make_existing_event(
+        db, start=datetime(2026, 10, 24, 23, 50, tzinfo=JLM), title=BASE + " א"
+    )
+    service = _service(db, _make_source(db, text="טיול שנתי"))
+    cand = ReconCandidate(kind="event", title=BASE,
+                          start=datetime(2026, 10, 25, 1, 30, tzinfo=JLM, fold=0),
+                          applies_to=("unknown",))
+    matches = service.recon.matchable_items(
+        "event", set(), candidate=cand, now=NOW, signal=ReconSignal()
+    )
+    ids = [pair[1].id for pair in matches]
+    assert item_fold.id in ids      # same local day through the fold
+    assert item_prev.id not in ids  # the 24th's 23:50 is another local day
+    # extended edge: a signal candidate sees a +30d item, not a +31d one
+    item_edge_in = _make_existing_event(db, start=_jlm(24, 16, 0), title=BASE + " ב")
+    item_edge_out = _make_existing_event(
+        db, start=datetime(2026, 12, 3, 12, 0, tzinfo=JLM), title=BASE + " ג"
+    )
+    matches_signal = service.recon.matchable_items(
+        "event", set(), candidate=cand, now=NOW,
+        signal=ReconSignal(change=True),
+    )
+    ids_signal = [pair[1].id for pair in matches_signal]
+    assert item_edge_in.id in ids_signal   # 24 Nov = today+29d (in)
+    assert item_edge_out.id not in ids_signal  # 3 Dec = today+31d (out)

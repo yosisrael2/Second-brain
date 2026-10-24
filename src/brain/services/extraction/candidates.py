@@ -49,6 +49,9 @@ class ChildCandidate:
     # PR D-recon (item 37, F2): where the event takes place, when the source
     # states it for THIS child (feeds the reconciliation location diff).
     location: str | None = None
+    # Round 5: the stated END time for THIS child ("עד 18:00", ICS DTEND
+    # style) — raw; resolved against the candidate's day in the pipeline.
+    end: str | None = None
     # Audience selector per item 17: keys from {school, grades, role, gender,
     # named_kids, channel}; resolved to applies_to by the pipeline (R1-R5).
     audience: dict[str, object] = field(default_factory=dict)

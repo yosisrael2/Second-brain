@@ -375,7 +375,7 @@ def _extract_eval(
     return 0
 
 
-def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
+def run_recon_eval(cases_path, *, now=None, tz_name=None, embedder=None) -> dict:
     """Score reconciliation verdicts against a cases jsonl (offline).
 
     One case per line: {case_id, existing_items: [{id, type, title, start,
@@ -389,15 +389,18 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
     from datetime import UTC, datetime  # noqa: PLC0415
 
     from brain.config import get_settings  # noqa: PLC0415
-    from brain.services.extraction.reconciliation import (  # noqa: PLC0415
+    from brain.factories import build_embedder  # noqa: PLC0415
+    from brain.services.extraction.reconciliation import (  # noqa: PLC0415  # noqa: PLC0415
         ExistingItem,
         ReconCandidate,
         classify,
+        embedder_similarity,
         signal_for,
     )
-    from brain.services.relations import similarity_ratio  # noqa: PLC0415
 
-    tz_name = tz_name or get_settings().timezone
+    # E1 (round 5): the eval matches with the SAME embedding callable as
+    # production — the local embedder (offline); tests inject a fake.
+    embedder = embedder or build_embedder(get_settings())
     now = now or datetime.now(tz=UTC)
     per_verdict: dict[str, dict[str, int]] = {}
     confusion: dict[str, dict[str, int]] = {}
@@ -429,6 +432,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
                 start=_parse_eval_dt(cand.get("start")),
                 applies_to=tuple(cand.get("applies_to") or ()),
                 location=cand.get("location"),
+                end=_parse_eval_dt(cand.get("end")),
             )
             signal = signal_for([str(case.get("new_text_quote", ""))])
             # E5: a dated correction is judged inside ITS OWN window — the
@@ -437,7 +441,7 @@ def run_recon_eval(cases_path, *, now=None, tz_name=None) -> dict:
             computed = classify(
                 candidate,
                 existing,
-                similarity=similarity_ratio,
+                similarity=embedder_similarity(embedder),
                 now=case_now,
                 tz_name=tz_name,
                 signal=signal,

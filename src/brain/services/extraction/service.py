@@ -211,7 +211,13 @@ class EnrichmentService:
         self._tz_name = timezone
         # PR D-recon (item 37): the reconciliation service shares this
         # session; exposed for the bot's verdict buttons (D-recon-2) and ops.
-        self.recon = ReconciliationService(session, repo, tz_name=self._tz_name)
+        # E1: matching embeds with the LOCAL embedder, built lazily on the
+        # first reconciled candidate (health/ops constructions never pay)
+        # and reused afterwards — one model in the process, never two.
+        self.recon = ReconciliationService(
+            session, repo, tz_name=self._tz_name,
+            embedder_factory=self._build_recon_embedder,
+        )
 
     # --- queue ---------------------------------------------------------
 
@@ -551,6 +557,7 @@ class EnrichmentService:
             return None
         start: datetime | None = None
         due: datetime | None = None
+        resolved_end: datetime | None = None
         date_conflict = False
         conflict_note = None
         meta_time_source: str | None = None
@@ -572,6 +579,9 @@ class EnrichmentService:
                     due = moment
                 else:
                     start = moment
+                # round 5: the stated END resolves against the same day
+                if candidate.end:
+                    resolved_end = self._resolve_end(candidate.end, resolved.day)
         item_level = (
             self._memory.resolve_applies_to(dict(candidate.audience))
             if self._memory is not None
@@ -616,7 +626,23 @@ class EnrichmentService:
             date_conflict=date_conflict,
             meta=meta,
             location=candidate.location,
+            end=resolved_end,
         )
+
+    def _resolve_end(self, raw: str, day: date | None) -> datetime | None:
+        """Round 5: the candidate's stated end — "HH:MM" on the resolved day,
+        or a full ISO stamp. Unparseable ends are dropped (never fail a run)."""
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            pass
+        clock = xdates.extract_clock(raw)
+        if clock is None or day is None:
+            return None
+        return xdates.combine_local(day, clock, self._tz)
 
     def _source_sent_local(self, source: MemoryItem) -> datetime:
         """The source's sent time in the user's timezone (item 41).
@@ -763,6 +789,14 @@ class EnrichmentService:
             date_conflict=resolved.date_conflict,
             extraction_meta={**resolved.meta, "run_id": str(run_id), **extra_meta},
         )
+        # F2 + round 5: end/location persist so a LATER run's reconciliation
+        # can compare against children, not only pasted items
+        child_meta = child.extraction_meta or {}
+        if resolved.location:
+            child_meta["location"] = resolved.location
+        if resolved.end is not None:
+            child_meta["end"] = resolved.end.isoformat()
+        child.extraction_meta = child_meta
         self._repo.add(child)
         self._session.flush()  # assign child.id before linking
         self._add_quote_links(child, source, resolved)
@@ -771,6 +805,12 @@ class EnrichmentService:
             self._repo.commit()
             self._index_child(child)
         return child
+
+    def _build_recon_embedder(self) -> Any:
+        from brain.config import get_settings  # noqa: PLC0415
+        from brain.factories import build_embedder  # noqa: PLC0415
+
+        return build_embedder(get_settings())
 
     def _reconcile_child(
         self,
@@ -800,12 +840,14 @@ class EnrichmentService:
             hint_cancel=hint.cancel if hint else False,
         )
         recon = self.recon
+        recon._ensure_embedder()
         recon_candidate = ReconCandidate(
             kind=candidate.kind,
             title=candidate.title,
             start=resolved.start or resolved.due,
             applies_to=tuple(resolved.applies_to),
             location=resolved.location,
+            end=resolved.end,
         )
         result = recon.classify_universe(
             recon_candidate,
@@ -945,3 +987,4 @@ class _ResolvedChild:
     meta: dict[str, Any]
     extra_quotes: list[str] = field(default_factory=list)
     location: str | None = None
+    end: datetime | None = None

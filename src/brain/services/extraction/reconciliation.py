@@ -101,6 +101,44 @@ class ReconSignal:
         return self.change or self.cancel
 
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine of two (already L2-normalized or not) vectors; 0 on zero vecs."""
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(x * x for x in b) ** 0.5
+    if not na or not nb:
+        return 0.0
+    return dot / (na * nb)
+
+
+def embedder_similarity(
+    embedder: Any, *, cache: dict[str, list[float]] | None = None
+) -> Callable[[str, str], float]:
+    """E1 (round 5): THE match callable — embedding cosine against the local
+    embedder (the same fastembed model search uses; offline, no API), with
+    the lexical ratio as a fast accept when it already clears the threshold.
+    Production (ReconciliationService) and recon-eval build their callable
+    from THIS factory so the two can never drift. Vectors are cached per
+    normalized title within the callable (one embed per distinct title).
+    """
+    store: dict[str, list[float]] = cache if cache is not None else {}
+
+    def similarity(a: str, b: str) -> float:
+        na, nb = _norm(a), _norm(b)
+        if not na or not nb:
+            return 0.0
+        lexical = similarity_ratio(na, nb)
+        if lexical >= SIMILARITY_THRESHOLD:
+            return lexical  # fast accept: no embedding call needed
+        for key, text in ((na, a), (nb, b)):
+            if key not in store:
+                store[key] = embedder.embed(text)
+        va, vb = store[na], store[nb]
+        return _cosine(va, vb)
+
+    return similarity
+
+
 def _meta_instant(value: Any) -> datetime | None:
     """Parse an iso meta instant (paste 'end', extraction_meta 'end')."""
     if not value:
@@ -387,7 +425,13 @@ class ReconciliationService:
     applied silently, user-acted items immutable, rows never deleted.
     """
 
-    def __init__(self, session: Any, repo: Any, *, tz_name: str) -> None:
+    def __init__(
+        self, session: Any, repo: Any, *, tz_name: str,
+        similarity: Callable[[str, str], float] | None = None,
+        embedder_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        self._similarity = similarity or similarity_ratio
+        self._embedder_factory = embedder_factory
         self._session = session
         self._repo = repo
         self._tz_name = tz_name
@@ -520,7 +564,7 @@ class ReconciliationService:
         result = classify(
             candidate,
             [pair[0] for pair in matches],
-            similarity=similarity_ratio,
+            similarity=self._similarity,
             now=now,
             tz_name=self._tz_name,
             signal=signal or ReconSignal(),
@@ -538,6 +582,17 @@ class ReconciliationService:
                 self._record_target_unapproved(candidate, result)
                 return ReconResult(verdict=Verdict.NEW)
         return result
+
+    def attach_embedder(self, embedder: Any) -> None:
+        """E1: switch matching to embedding cosine (production + eval use the
+        same callable built by embedder_similarity)."""
+        self._similarity = embedder_similarity(embedder)
+
+    def _ensure_embedder(self) -> None:
+        """E1: first reconciled candidate builds the local embedder once
+        (health/ops constructions never pay; tests inject a fake factory)."""
+        if self._similarity is None and self._embedder_factory is not None:
+            self.attach_embedder(self._embedder_factory())
 
     def _record_target_unapproved(self, candidate: ReconCandidate,
                                   result: ReconResult) -> None:
