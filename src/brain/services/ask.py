@@ -6,7 +6,7 @@ import hashlib
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -35,6 +35,19 @@ TEMPORAL_FETCH_CAP = 30
 # that kid's channels/class join the recall pool before the rerank. Default
 # cap for the leg (Settings.ask_kid_recall_limit overrides).
 DEFAULT_KID_RECALL_LIMIT = 16
+# WA39 run 3: the answer to a question about day D is often an announcement
+# SENT on D-1 ('tomorrow the class is at the farm') — the kid-channel leg
+# bounds by occurred_at (the SENT time), so it widens the resolved window's
+# START by this many days. Settings.ask_kid_recall_lookback_days overrides.
+DEFAULT_KID_RECALL_LOOKBACK_DAYS = 3
+# WA39 run 3, part 2: the rerank can rank school emails above the one
+# kid-channel conversation that answers the question, and the top_k cut
+# drops it even though the kid leg fetched it (the slippers case). When a
+# question names a confirmed kid, the final context reserves up to this
+# many top_k slots for the best-ranked kid-recall items (kid-channel
+# conversations first); unused reserved slots go back to the general
+# ranking. Settings.ask_kid_reserved_slots overrides; 0 disables.
+DEFAULT_KID_RESERVED_SLOTS = 3
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,8 @@ class AskService:
         memory: MemoryServiceProtocol | None = None,
         items_repo: KidRecallRepoProto | None = None,
         kid_recall_limit: int = DEFAULT_KID_RECALL_LIMIT,
+        kid_recall_lookback_days: int = DEFAULT_KID_RECALL_LOOKBACK_DAYS,
+        kid_reserved_slots: int = DEFAULT_KID_RESERVED_SLOTS,
     ) -> None:
         self._search = search
         self._llm = llm
@@ -108,6 +123,8 @@ class AskService:
         self._memory = memory
         self._items_repo = items_repo
         self._kid_recall_limit = kid_recall_limit
+        self._kid_recall_lookback_days = kid_recall_lookback_days
+        self._kid_reserved_slots = kid_reserved_slots
 
     def ask(
         self, question: str, *, now: datetime | None = None, record_ops: bool = True
@@ -149,7 +166,11 @@ class AskService:
                 )
             else:
                 pool = self._search.search(question, limit=self._recall_pool)
-            hits = pool[: self._top_k]
+            if kid_items:
+                hits = self._top_k_with_reserved_slots(pool, kid_items)
+            else:
+                # no kid named -> byte-identical to the pre-reservation cut
+                hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
             span.detail = {
                 "kid_leg_fired": bool(kid_items),
@@ -184,6 +205,37 @@ class AskService:
             model=result["model"],
         )
 
+    def _top_k_with_reserved_slots(
+        self, pool: list[SearchHit], kid_items: list[MemoryItem]
+    ) -> list[SearchHit]:
+        """The top_k cut with kid-recall reservation (WA39 run 3 part 2).
+
+        Up to ``ask_kid_reserved_slots`` of top_k are reserved for the
+        best-ranked kid-recall items — kid-channel conversations first (they
+        carry the structured meta.channel), then the leg's other items — in
+        the rerank's own order. The reserved slot comes out of the general
+        ranking (top_k is unchanged); unused reserved slots go back to it.
+        The final context keeps the rerank's order: reservation changes WHO
+        is in, not the order they appear in.
+        """
+        if self._kid_reserved_slots <= 0 or not kid_items:
+            return pool[: self._top_k]
+        kid_ids = {i.id for i in kid_items}
+        ranked_kid = [h for h in pool if h.item.id in kid_ids]
+        kid_channel = [h for h in ranked_kid if (h.item.meta or {}).get("channel")]
+        kid_other = [h for h in ranked_kid if h.item.id not in {x.item.id for x in kid_channel}]
+        reserved = (kid_channel + kid_other)[: self._kid_reserved_slots]
+        if not reserved:
+            return pool[: self._top_k]
+        reserved_ids = {h.item.id for h in reserved}
+        rest = [
+            h for h in pool if h.item.id not in reserved_ids
+        ][: self._top_k - len(reserved)]
+        position = {h.item.id: idx for idx, h in enumerate(pool)}
+        selected = reserved + rest
+        selected.sort(key=lambda h: position[h.item.id])
+        return selected
+
     def _kid_recall_items(
         self,
         question: str,
@@ -201,10 +253,13 @@ class AskService:
         ``family``). Those channels' WhatsApp conversations join the pool TWICE
         over: by their STRUCTURED meta.channel (bounded by the question's
         resolved time window when one resolves — the SAME parse the temporal
-        leg runs; WA39 run 1: a mid-week question must not drown under the
-        newest items of the same channels — else the newest-N cap, never all
-        history) and by the channel NAME as a text needle (captures predating
-        meta.channel keep the chat name only in their raw_text header). The
+        leg runs — widened at its START by ask_kid_recall_lookback_days,
+        since the announcement about day D is usually SENT on D-1 and
+        occurred_at is the sent time; WA39 run 1: a mid-week question must
+        not drown under the newest items of the same channels — else the
+        newest-N cap, never all history) and by the channel NAME as a text
+        needle (captures predating meta.channel keep the chat name only in
+        their raw_text header). The
         kid's class name stays a text needle too (a class is not a channel;
         nothing structured carries it). Noise-triaged conversations are
         excluded, exactly as from listings. No kid named ->
@@ -255,33 +310,58 @@ class AskService:
             ):
                 items[item.id] = item
         window_ids: set[uuid.UUID] = set()
+        lookback_ids: set[uuid.UUID] = set()
         if kid_channels:
             # The SAME date resolution the temporal leg runs: with a resolved
-            # window the channel leg is bounded BY the window (a mid-week
-            # question must not drown under the newest items of the same
-            # channels — WA39 run 1); without one it falls back to newest-N,
-            # never all history.
+            # window the channel leg is bounded BY the window widened at its
+            # START by lookback days — the announcement about day D is usually
+            # SENT on D-1 (WA39 run 3; occurred_at is the SENT time), while a
+            # mid-week question must still not drown under the newest items
+            # of the same channels (WA39 run 1). Without a resolved window it
+            # falls back to newest-N, never all history.
             ranges = parse_question_ranges(
                 question, self._tz, now or datetime.now(UTC)
             )
-            for item in self._items_repo.by_channels(
-                kid_channels,
-                limit=self._kid_recall_limit,
-                ranges=ranges or None,
-            ):
-                items.setdefault(item.id, item)
-                if ranges:
-                    window_ids.add(item.id)
+            if ranges:
+                lookback = timedelta(days=max(self._kid_recall_lookback_days, 0))
+                for start, end in ranges:
+                    for item in self._items_repo.by_channels(
+                        kid_channels, limit=self._kid_recall_limit,
+                        ranges=[(start, end)],
+                    ):
+                        items.setdefault(item.id, item)
+                        window_ids.add(item.id)
+                    if lookback:
+                        for item in self._items_repo.by_channels(
+                            kid_channels, limit=self._kid_recall_limit,
+                            ranges=[(start - lookback, start)],
+                        ):
+                            items.setdefault(item.id, item)
+                            lookback_ids.add(item.id)
+            else:
+                for item in self._items_repo.by_channels(
+                    kid_channels,
+                    limit=self._kid_recall_limit,
+                    ranges=None,
+                ):
+                    items.setdefault(item.id, item)
         if not items:
             return []
-        # The overall extra pool still respects the kid-recall cap. When the
-        # question resolved a window, the in-window channel items ARE what
-        # the question is about: they keep their slots and the newest
-        # text-needle items fill the rest — the newest flood must not crowd
-        # them out (WA39 run 1). Without a window everything competes by
-        # recency.
+        # The overall extra pool still respects the kid-recall cap, with slot
+        # priority: in-window channel items (what the question is about —
+        # WA39 run 1), then lookback items (the announcements SENT before the
+        # window opens — WA39 run 3), then the newest text-needle items. The
+        # newest flood must not crowd the earlier buckets out. Without a
+        # resolved window everything competes by recency.
         window_items = [i for i in items.values() if i.id in window_ids]
-        rest = [i for i in items.values() if i.id not in window_ids]
+        lookback_items = [
+            i for i in items.values()
+            if i.id in lookback_ids and i.id not in window_ids
+        ]
+        rest = [
+            i for i in items.values()
+            if i.id not in window_ids and i.id not in lookback_ids
+        ]
         rest.sort(
             key=lambda i: (
                 i.occurred_at or datetime.min.replace(tzinfo=UTC),
@@ -289,7 +369,7 @@ class AskService:
             ),
             reverse=True,
         )
-        pool = (window_items + rest)[: self._kid_recall_limit]
+        pool = (window_items + lookback_items + rest)[: self._kid_recall_limit]
         if record_ops:
             ops.record_event(
                 "ask",
