@@ -429,3 +429,116 @@ def test_email_dry_run_writes_nothing_even_when_seed_and_backstop_trigger(
     assert "dry-run: 1 record(s)" in out
     assert "m2" in out
     assert "would ledger m2" in out  # the decision is visible, nothing written
+
+
+def test_email_dry_run_config_error_fails_cleanly(database, capsys, monkeypatch):
+    """Review follow-up 1: the dry-run path calls connector.fetch DIRECTLY,
+    so a ConnectorError (GMAIL_LABEL_ID unset) escaped as a raw traceback,
+    exit 1. It must fail like the sync path does: one stderr line, exit 78
+    (a not-configured refusal, same family as missing token/registration)."""
+    from tests.test_connectors_gmail import (
+        _FakeService,
+        _ServiceState,
+    )
+
+    monkeypatch.setenv("BRAIN_CONNECTORS", "email,gcal,gtasks")
+    monkeypatch.delenv("GMAIL_LABEL_ID", raising=False)
+    monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "brain.connectors.google.base.default_service_factory",
+        lambda token, scopes, api_name, api_version: _FakeService(_ServiceState()),
+    )
+    monkeypatch.setattr(
+        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
+    )
+
+    code = cli.main(["connectors", "sync", "email", "--dry-run"])
+    captured = capsys.readouterr()
+    assert code == 78
+    assert "GMAIL_LABEL_ID" in captured.err
+    assert captured.err.count("\n") == 1, f"expected one line, got: {captured.err!r}"
+    assert "Traceback" not in captured.err
+
+
+def test_dry_run_auth_error_maps_to_the_re_auth_refusal(database, capsys, monkeypatch):
+    """The dry-run error mapping is connector-agnostic: an auth failure from
+    ANY connector's fetch gets the re-auth message and exit 78, never a
+    traceback."""
+    from brain.connectors.base import ConnectorAuthError
+
+    failing = FakeConnector(name="gtasks", errors=[ConnectorAuthError("token expired")])
+    monkeypatch.setattr(
+        cli, "_build_connector", lambda name, session=None, **kwargs: failing
+    )
+    monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks")
+    get_settings.cache_clear()
+
+    code = cli.main(["connectors", "sync", "gtasks", "--dry-run"])
+    captured = capsys.readouterr()
+    assert code == 78
+    assert "auth (needs re-consent)" in captured.err
+    assert "auth google" in captured.err  # the re-auth hint
+    assert captured.err.count("\n") == 1
+
+
+def test_email_dry_run_backstop_report_silent_for_known_ids(
+    database, capsys, monkeypatch
+):
+    """Review follow-up 2: rfc_backstop_report lacks the ledger-row-first
+    guard its write twin (rfc_backstop_put) has — on a connector that ALREADY
+    synced, a dry-run printed 'would ledger <id> -> existing item' for every
+    known id (noise implying pending work that does not exist)."""
+    from sqlalchemy import text as sql_text
+    from tests.test_connectors_gmail import (
+        LABEL,
+        _FakeService,
+        _queue_message,
+        _ServiceState,
+    )
+
+    from brain.db.models import ConnectorRecord, MemoryItem
+    from brain.db.session import SessionLocal
+
+    state = _ServiceState()
+    state.profile_history_id = "9002"
+    _queue_message(state, "m1", rfc="<same@msg>")
+
+    monkeypatch.setenv("BRAIN_CONNECTORS", "email,gcal,gtasks")
+    monkeypatch.setenv("GMAIL_LABEL_ID", LABEL)
+    monkeypatch.setenv("GMAIL_CREDENTIALS_PATH", "")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        "brain.connectors.google.base.default_service_factory",
+        lambda token, scopes, api_name, api_version: _FakeService(state),
+    )
+    monkeypatch.setattr(
+        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
+    )
+
+    with SessionLocal() as session:
+        item = MemoryItem(
+            raw_text="School trip tomorrow",
+            source="email",
+            meta={"rfc_message_id": "<same@msg>"},
+        )
+        session.add(item)
+        session.flush()
+        # m1 is already ledgered: a real sync would never re-ingest it, so a
+        # dry-run must not report a would-be ledger action for it either.
+        session.add(
+            ConnectorRecord(
+                source="email", external_id="m1", version=None, item_id=item.id
+            )
+        )
+        session.commit()
+
+    assert cli.main(["connectors", "sync", "email", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "m1" in out  # the record is still listed
+    assert "would ledger" not in out
+    with SessionLocal() as session:
+        assert (
+            session.execute(sql_text("SELECT count(*) FROM connector_records")).scalar()
+            == 1
+        )

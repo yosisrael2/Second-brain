@@ -1,0 +1,43 @@
+{
+  "kind": "drive#fileList",
+  "nextPageToken": "tok-files-page-2",
+  "files": [
+    {
+      "kind": "drive#file",
+      "id": "1A2b3C4d5E6f7G8h9I0jK1L2mN3oP4qR5sT6uV7w",
+      "name": "רשימת קניות / Shopping list",
+      "mimeType": "application/vnd.google-apps.document",
+      "version": "18432",
+      "createdTime": "2026-03-02T18:40:00.000Z",
+      "modifiedTime": "2026-10-21T09:24:15.123Z",
+      "webViewLink": "https://docs.google.com/document/d/1A2b3C4d5E6f7G8h9I0jK1L2mN3oP4qR5sT6uV7w/edit",
+      "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+      "trashed": false
+    },
+    {
+      "kind": "drive#file",
+      "id": "1F0ldSubN3stEd000000000000000000002",
+      "name": "ארכיון / Archive",
+      "mimeType": "application/vnd.google-apps.folder",
+      "version": "4",
+      "createdTime": "2026-01-05T00:00:00.000Z",
+      "modifiedTime": "2026-10-10T12:00:00.000Z",
+      "webViewLink": "https://drive.google.com/drive/folders/1F0ldSubN3stEd000000000000000000002",
+      "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+      "trashed": false
+    },
+    {
+      "kind": "drive#file",
+      "id": "1PdFfM0ck456789abcdefghijklmnopqrstuvw",
+      "name": "contract.pdf",
+      "mimeType": "application/pdf",
+      "version": "412",
+      "createdTime": "2026-04-01T09:00:00.000Z",
+      "modifiedTime": "2026-10-15T11:00:00.000Z",
+      "webViewLink": "https://drive.google.com/file/d/1PdFfM0ck456789abcdefghijklmnopqrstuvw/view",
+      "parents": ["1F0ldR00tAll0wListEd00000000000000001"],
+      "trashed": false,
+      "size": "845312"
+    }
+  ]
+}
