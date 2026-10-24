@@ -453,3 +453,125 @@ def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) ->
     assert all(str(item.id) != str(i.id) for i in search2.seen_extra[0]), (
         "without confirmed channel facts the channel leg must not guess"
     )
+
+
+def test_by_channels_hides_confirmed_cancellation_until_restored(clean_items) -> None:
+    """Follow-up (3): by_channels routes through default_hidden_conditions —
+    a confirmed-cancelled channel conversation is NOT recalled; the restore
+    path (ReconciliationService.restore_cancellation) brings it back. One
+    hiding predicate everywhere (B3), no by_channels-specific holes."""
+    from brain.db.models import ItemRelation
+    from brain.services.extraction.reconciliation import ReconciliationService
+
+    _wipe_items()
+    session = SessionLocal()
+    _LEAKED.append(session)
+    repo = ItemsRepository(session)
+    normal = repo.add(
+        MemoryItem(
+            raw_text="[21/10/2026, 18:20] ב' ברקת - הורים / מעין: מחר ספרייה",
+            source="whatsapp",
+            meta={"channel": "ב' ברקת - הורים"},
+            occurred_at=datetime(2026, 10, 21, 15, 20, tzinfo=UTC),
+        )
+    )
+    cancelled = repo.add(
+        MemoryItem(
+            raw_text="[21/10/2026, 19:00] ב' ברקת - הורים / מעין: בוטל הטיול",
+            source="whatsapp",
+            meta={"channel": "ב' ברקת - הורים"},
+            occurred_at=datetime(2026, 10, 21, 16, 0, tzinfo=UTC),
+        )
+    )
+    session.commit()
+    # the cancellation is CONFIRMED the way the pipeline stamps it: a
+    # cancels relation + the cancelled dict citing it
+    rel = ItemRelation(
+        kind="cancels", from_id=normal.id, to_id=cancelled.id,
+        provenance={"state": "applied"},
+    )
+    session.add(rel)
+    session.commit()
+    stamped = session.get(MemoryItem, cancelled.id)
+    stamped.extraction_meta = {
+        **(stamped.extraction_meta or {}),
+        "cancelled": {"relation_id": str(rel.id)},
+    }
+    session.commit()
+
+    def _ids() -> set[str]:
+        return {
+            str(item.id)
+            for item in repo.by_channels(["ב' ברקת - הורים"], limit=10)
+        }
+
+    # RED: today by_channels still returns the confirmed-cancelled row
+    assert str(normal.id) in _ids()
+    assert str(cancelled.id) not in _ids()
+
+    # the real restore path re-shows it
+    service = ReconciliationService(session, repo, tz_name="Asia/Jerusalem")
+    service.restore_cancellation(rel.id)
+    assert str(cancelled.id) in _ids()
+
+def test_announcement_sent_before_the_window_is_recalled_via_lookback(
+    clean_items, memory_db
+) -> None:
+    """WA39 run-3 miss, red-first: the answer to a question about day D is
+    often an announcement SENT on D-1 ('tomorrow the class is at the farm').
+    The kid-channel leg bounds by occurred_at = the SENT time, so a strict
+    [window_start, window_end) bound drops the announcement that arrived the
+    evening before. With a resolved window the leg must widen its start by
+    KID_RECALL_LOOKBACK_DAYS (default 3) — and slot priority is in-window >
+    lookback > newest flood."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    # the announcement: sent Tue 20.10 evening (18:00 UTC = 21:00 Jerusalem),
+    # one hour BEFORE the 'Wednesday 21.10' window opens at 20.10 21:00 UTC —
+    # no kid name in its text (the semantic leg cannot find it)
+    announce = _whatsapp_item(
+        repo, _TEACHER, 20, 18, "מחר (יום ד') הכיתה בחווה החקלאית — צריך כובע ומים",
+        captured=20,
+    )
+    # the flood: 16 newer same-channel conversations fill the whole cap
+    for n in range(16):
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה מספר {n}")
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    recalled = [str(hit.item.id) for hit in result.sources]
+    assert str(announce.id) in recalled, (
+        "a kid's-channel announcement sent just before the resolved window "
+        "(lookback days) must be recalled for the question about day D"
+    )
+
+
+def test_lookback_respects_its_days_bound(clean_items, memory_db) -> None:
+    """The lookback is bounded: a conversation sent more than
+    KID_RECALL_LOOKBACK_DAYS before the window opens stays out of the pool
+    (never all history)."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    old = _whatsapp_item(
+        repo, _TEACHER, 16, 10, "שיעור בחווה החקלאית ביום ד' הקרוב", captured=16
+    )
+    # flood to fill the cap so only the lookback/structured legs could add it
+    for n in range(16):
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה מספר {n}")
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    recalled = [str(hit.item.id) for hit in result.sources]
+    assert str(old.id) not in recalled, (
+        "beyond the lookback days bound the kid-channel leg must not recall"
+    )

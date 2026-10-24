@@ -314,7 +314,9 @@ class ItemsRepository:
         newer conversations). ``ranges`` (the question's resolved time
         windows, the temporal leg's own parse) bound occurred_at — pass None
         for the recent-N fallback. Noise-triaged conversations are excluded
-        exactly as from listings; dropped children and superseded items too.
+        exactly as from listings; dropped children too; superseded AND
+        confirmed-cancelled items go through the ONE shared predicate
+        (default_hidden_conditions) like every other SQL leg.
         """
         if not channels:
             return []
@@ -325,7 +327,7 @@ class ItemsRepository:
                 MemoryItem.child_state.is_(None),
                 MemoryItem.child_state != "dropped",
             ),
-            MemoryItem.superseded_by.is_(None),
+            *default_hidden_conditions(),
             or_(
                 MemoryItem.triage_label.is_(None),
                 MemoryItem.triage_label != "noise",
