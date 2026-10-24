@@ -615,18 +615,19 @@ def test_adopt_undo_refuses_rows_a_sync_touched(adopt_db):
 # --- CLI wiring -----------------------------------------------------------------
 
 
+def _stub_registry(monkeypatch: pytest.MonkeyPatch, name: str, cls: type) -> None:
+    """Hermetic registry entry: setitem (auto-restored) + no-op
+    ensure_registered. The CLI tests never import the real Google adapters —
+    a module-level register here would beat the REAL adapter's @register in
+    CI's alphabetical collection order and crash test_gcal_connector."""
+    import brain.connectors as registry
+
+    monkeypatch.setattr(registry, "ensure_registered", lambda: None)
+    monkeypatch.setitem(registry._REGISTRY, name, cls)
+
+
 class _StubGcal(FakeConnector):
-    """Registered gcal for CLI wiring tests (same pattern as the CLI suite)."""
-
     name = "gcal"
-
-
-try:
-    from brain.connectors import register
-
-    register(_StubGcal)
-except ValueError:  # already registered by test_connectors_cli or a re-import
-    pass
 
 
 @pytest.fixture(name="adopt_env")
@@ -660,6 +661,7 @@ def test_cli_adopt_dry_run_prints_report_and_writes_nothing(
     )
     connector = FakeConnector(name="gcal", batches=[_batch(record)])
     monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    _stub_registry(monkeypatch, "gcal", _StubGcal)
 
     assert cli.main(["connectors", "adopt", "gcal", "--dry-run"]) == 0
     out = capsys.readouterr().out
@@ -689,6 +691,7 @@ def test_cli_adopt_real_run_writes_rows_and_undo_removes_them(
     )
     connector = FakeConnector(name="gcal", batches=[_batch(record)])
     monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    _stub_registry(monkeypatch, "gcal", _StubGcal)
 
     assert cli.main(["connectors", "adopt", "gcal"]) == 0
     out = capsys.readouterr().out
@@ -723,6 +726,7 @@ def test_cli_adopt_refuses_when_cursor_exists(adopt_db, adopt_env, capsys, monke
     )
     connector = FakeConnector(name="gcal")
     monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
+    _stub_registry(monkeypatch, "gcal", _StubGcal)
 
     assert cli.main(["connectors", "adopt", "gcal"]) == 78
     out = capsys.readouterr().out
@@ -734,7 +738,6 @@ def test_cli_adopt_gdrive_nothing_to_adopt_never_fetches(adopt_db, capsys, monke
     import brain.cli as cli
 
     monkeypatch.setenv("BRAIN_CONNECTORS", "gdrive")
-    import brain.connectors as registry
     from brain.config import get_settings
 
     get_settings.cache_clear()
@@ -742,9 +745,9 @@ def test_cli_adopt_gdrive_nothing_to_adopt_never_fetches(adopt_db, capsys, monke
     class _StubGdrive(FakeConnector):
         name = "gdrive"
 
-    # setitem: auto-restored, no global-registry pollution (same pattern as
-    # the CLI suite's adapterless-gdrive test)
-    monkeypatch.setitem(registry._REGISTRY, "gdrive", _StubGdrive)
+    # setitem: auto-restored, no global-registry pollution; the no-op
+    # ensure_registered keeps the real Google adapters out of this test
+    _stub_registry(monkeypatch, "gdrive", _StubGdrive)
     connector = _StubGdrive()
     monkeypatch.setattr(cli, "_build_connector", lambda name: connector)
     try:
