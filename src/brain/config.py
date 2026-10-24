@@ -219,6 +219,16 @@ class Settings(BaseSettings):
                 enabled.append(canonical)
         return tuple(enabled)
 
+    # Google Calendar connector (connectors ticket): comma-separated calendar
+    # ids to sync (allowlist, order preserved). 'primary' is the authenticated
+    # user's main calendar; an empty value syncs nothing.
+    brain_gcal_calendars: str = "primary"
+    # How far back the first gcal full sync reaches (instances that ENDED more
+    # than this many days ago are never fetched; the cutoff is frozen at the
+    # first sync and persisted in the connector cursor). There is NO future
+    # cap: a dropped future instance would never be re-delivered.
+    brain_gcal_past_days: int = 60
+
     # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
     # of task lists to sync, comma-separated list IDs or titles (titles matched
     # case-insensitively); empty = sync every list. IDs are stable while titles
@@ -258,6 +268,11 @@ class Settings(BaseSettings):
             for part in self.telegram_allowed_user_ids.split(",")
             if part.strip()
         )
+
+    @property
+    def gcal_calendar_ids(self) -> tuple[str, ...]:
+        """The calendar allowlist in order; empty means the gcal connector syncs nothing."""
+        return tuple(part.strip() for part in self.brain_gcal_calendars.split(",") if part.strip())
 
     @field_validator("timezone")
     @classmethod
@@ -305,7 +320,11 @@ def _is_live_database_url(url: str) -> bool:
     """True when `url` points at the live database.
 
     Either the exact default URL, or any driver scheme pointing at database
-    name 'brain' on localhost:27432 (the live service's port).
+    name 'brain' on localhost:27432 (the live service's port), or a
+    unix-socket connection (no netloc host/port) to the live dbname — this
+    host's default-cluster 'brain' database can only be the live one, and
+    the compose stack publishes no host unix socket, so such a URL is both
+    live-classified and structurally unreachable (guard tests rely on that).
     """
     if url == LIVE_DATABASE_URL:
         return True
@@ -317,6 +336,8 @@ def _is_live_database_url(url: str) -> bool:
         return False
     host = (parsed.host or "").lower()
     name = (parsed.database or "").lstrip("/")
+    if name == "brain" and parsed.host is None and parsed.port is None:
+        return True  # unix-socket connection to the live-named database
     return name == "brain" and parsed.port == 27432 and host in {"localhost", "127.0.0.1", "::1"}
 
 
