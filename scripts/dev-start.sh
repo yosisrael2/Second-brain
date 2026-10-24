@@ -54,13 +54,32 @@ check_python_env() {
 }
 
 check_env_file() {
-  if [ ! -f .env ]; then
-    cp .env.example .env
-    say "env: created .env from .env.example — fill in what you need (JEV_API_KEY for classification; nothing required for LLM/embeddings). Values are never printed by this script."
+  # BRAIN_ENV_FILE: the tests' seam (like load_env_file's optional path) —
+  # a test run points it at a temp file so no test ever creates or modifies
+  # the repo checkout's .env (a live-pointing .env kept reappearing in
+  # worker worktrees; the culprit was this function via a real-script test).
+  local env_file="${BRAIN_ENV_FILE:-.env}"
+  if [ ! -f "$env_file" ]; then
+    cp .env.example "$env_file"
+    say "env: created $env_file from .env.example — fill in what you need (JEV_API_KEY for classification; nothing required for LLM/embeddings). Values are never printed by this script."
+    # The example defaults to the LIVE database name. Never print the URL or
+    # any value — only the bare dbname comparison below.
+    local url db q
+    url="$(grep -E '^DATABASE_URL=' "$env_file" | head -1 | cut -d= -f2- || true)"
+    q="'"
+    url="${url%\"}"
+    url="${url#\"}"
+    url="${url%"$q"}"
+    url="${url#"$q"}"
+    db="${url##*/}"
+    db="${db%%\?*}"
+    if [ "$db" = "brain" ]; then
+      say "env: WARNING: the created env file points at database 'brain' (the live database) — in a git worktree set a *_test dbname before running anything against it"
+    fi
   fi
-  load_env_file
+  load_env_file "$env_file"
   warn_if_legacy_ports
-  if grep -q '^JEV_API_KEY=..*' .env; then
+  if grep -q '^JEV_API_KEY=..*' "$env_file"; then
     say "jev: API key set"
   else
     say "jev: API key NOT set (items stay in inbox; search skips rerank)"

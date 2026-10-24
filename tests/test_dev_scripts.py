@@ -257,6 +257,13 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
     env["DATABASE_URL"] = os.environ["DATABASE_URL"]
     env["PORT"] = str(port)
     env["HEALTH_TIMEOUT_S"] = "2"
+    # The env-file seam (like lib.sh's load_env_file arg): the real script
+    # may create .env when missing — a test run points it at a temp file so
+    # the repo checkout NEVER gains a live-pointing .env (the 24 Oct
+    # incident: this very test recreated .env.example's live default in
+    # worker worktrees on every suite run).
+    env_file = tmp_path / "env"
+    env["BRAIN_ENV_FILE"] = str(env_file)
     # Throwaway compose project + isolated .dev state: a test run must never
     # see (or stop) the real project or pid file.
     env["COMPOSE_PROJECT_NAME"] = f"second-brain-ci-{os.getpid()}"
@@ -272,6 +279,10 @@ def test_dev_start_stops_a_never_healthy_server(tmp_path):
 
     assert result.returncode != 0
     assert "did not become healthy" in result.stderr
+    # The env file was created AT THE SEAM; the repo root's .env state is
+    # enforced session-wide by the conftest tripwire (created-or-changed ->
+    # the session fails loudly).
+    assert env_file.exists()
     # The half-started server must be gone (real curl, shim only in that run).
     probe_code = (
         "import urllib.request; "
@@ -411,3 +422,51 @@ def test_stop_uvicorn_app_kills_our_cwd_instance_and_honors_pid_file(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "foreign-alive" in result.stdout  # stale pid file for a foreign cwd: ignored
+
+
+def _run_check_env_file(
+    tmp_path, pre_create: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the REAL check_env_file from dev-start.sh against a temp env file
+    (the function text is extracted verbatim from the script so this test
+    dies if the function is renamed or the seam moves). pre_create=None
+    exercises the CREATE path (the script copies .env.example); a body
+    exercises the already-exists path."""
+    env_file = tmp_path / "env"
+    pre = ""
+    if pre_create is not None:
+        pre = f'printf {pre_create!r} > "$BRAIN_ENV_FILE" && '
+    code = (
+        'set -euo pipefail; '
+        f'source {SCRIPTS}/lib.sh && '
+        'eval "$(sed -n "/^check_env_file()/,/^}/p" '
+        f'{SCRIPTS}/dev-start.sh)" && '
+        'say() { echo "SAY: $*"; }; '
+        'warn_if_legacy_ports() { :; }; '
+        + pre +
+        'BRAIN_ENV_FILE="$BRAIN_ENV_FILE" check_env_file'
+    )
+    return _bash_snippet(code, env={"BRAIN_ENV_FILE": str(env_file)})
+
+
+def test_created_env_pointing_at_the_live_db_warns(tmp_path):
+    """dev-start still creates the env file for a real developer (cp from
+    .env.example, whose DATABASE_URL default is the live dbname), but now
+    WARNS about it — a fresh worktree must switch to a *_test database
+    before running anything against it. Values are never printed."""
+    result = _run_check_env_file(tmp_path, pre_create=None)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "env").exists()  # the create happened, at the seam
+    assert "WARNING" in result.stdout
+    # values are never printed: no full URL in the output
+    assert "postgresql://" not in result.stdout
+    assert "psycopg://" not in result.stdout
+
+
+def test_existing_env_pointing_at_a_test_db_does_not_warn(tmp_path):
+    result = _run_check_env_file(
+        tmp_path,
+        pre_create="DATABASE_URL=postgresql+psycopg://brain:brain@localhost:27432/brain_w6_test\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" not in result.stdout
