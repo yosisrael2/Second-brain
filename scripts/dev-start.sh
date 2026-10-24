@@ -64,12 +64,13 @@ check_env_file() {
     say "env: created $env_file from .env.example — fill in what you need (JEV_API_KEY for classification; nothing required for LLM/embeddings). Values are never printed by this script."
     # The example defaults to the LIVE database name. Never print the URL or
     # any value — only the bare dbname comparison below.
-    local url db
+    local url db q
     url="$(grep -E '^DATABASE_URL=' "$env_file" | head -1 | cut -d= -f2- || true)"
+    q="'"
     url="${url%\"}"
     url="${url#\"}"
-    url="${url%'}"
-    url="${url#'}"
+    url="${url%$q}"
+    url="${url#$q}"
     db="${url##*/}"
     db="${db%%\?*}"
     if [ "$db" = "brain" ]; then
