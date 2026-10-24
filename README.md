@@ -420,7 +420,8 @@ brain reindex [--batch-size 500]
 
 `scripts/service.sh` installs per-user LaunchAgents that survive logins and
 reboots — API, Telegram bot, WhatsApp poller, and an opt-in Gmail agent
-([docs/email-setup.md](docs/email-setup.md); never run it in CI — it writes to
+(installed only when `GMAIL_LABEL_ID` is set;
+[docs/email-setup.md](docs/email-setup.md); never run it in CI — it writes to
 `~/Library/LaunchAgents`):
 
 ```bash
@@ -438,7 +439,8 @@ scripts/service.sh uninstall
   10-minute retry window) exit 0 → no restart; transient failures exit 1 →
   restart with backoff. The opt-in **com.secondbrain.email** runs
   `scripts/run-email.sh` (`brain gmail-poll`) with the same mapping
-  (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting).
+  (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting);
+  `install` skips it unless `GMAIL_LABEL_ID` is set.
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
