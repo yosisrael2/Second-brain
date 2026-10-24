@@ -1655,17 +1655,6 @@ def _repo_of(session):
     return ItemsRepository(session)
 
 
-def _record_pass_failure(exc: BaseException) -> None:
-    """One ops event per failed pass: error type + message, truncated."""
-    record_event(
-        "enrichment",
-        "worker_pass_failed",
-        ok=False,
-        detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
-    )
-    logger.exception("telegram: enrichment worker pass failed")
-
-
 def _build_pass_service(settings: Any, session: Any) -> Any:
     """The pass's own EnrichmentService — built ONCE PER PASS, never per
     update (the per-update factory stays exactly as it was). Same seams as
