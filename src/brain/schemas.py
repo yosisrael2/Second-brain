@@ -63,6 +63,12 @@ class ItemUpdate(BaseModel):
 
     raw_text: str | None = Field(default=None, min_length=1, max_length=RAW_TEXT_MAX_LENGTH)
     source: str | None = Field(default=None, min_length=1, max_length=SOURCE_MAX_LENGTH)
+    type: ItemType | None = None
+    project: str | None = Field(default=None, min_length=1, max_length=PROJECT_MAX_LENGTH)
+    importance: int | None = Field(default=None, ge=IMPORTANCE_MIN, le=IMPORTANCE_MAX)
+    actionability: Actionability | None = None
+    confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
+    status: ItemStatus | None = None
 
     @field_validator("source")
     @classmethod
@@ -73,12 +79,6 @@ class ItemUpdate(BaseModel):
                 f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}"
             )
         return value
-    type: ItemType | None = None
-    project: str | None = Field(default=None, min_length=1, max_length=PROJECT_MAX_LENGTH)
-    importance: int | None = Field(default=None, ge=IMPORTANCE_MIN, le=IMPORTANCE_MAX)
-    actionability: Actionability | None = None
-    confidence: float | None = Field(default=None, ge=CONFIDENCE_MIN, le=CONFIDENCE_MAX)
-    status: ItemStatus | None = None
 
 
 class ItemRead(BaseModel):
