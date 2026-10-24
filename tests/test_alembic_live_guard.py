@@ -13,14 +13,14 @@ The guard must hold in BOTH alembic modes:
 ``BRAIN_ALLOW_LIVE=1`` is the explicit deploy-path opt-in (same var the
 run-*.sh launchd scripts already export).
 
-Safety of these tests on the live machine: every live-shaped URL uses a
-WRONG password — if the guard ever regressed, the connection dies at
-password auth and no SQL can run (the test then fails loudly, exactly what
-a guard regression test must do). The offline tests never open a connection
-at all. (Note: offline ``--sql`` over the whole chain is independently
-broken on main — the datetime-repair migration d2f6a9c4e7b1 calls
-op.get_bind() at upgrade time — which is why the opt-in and test-url cases
-below run ONLINE instead.)
+Safety of these tests on the live machine: the live-shaped URL is a unix-
+socket connection to a socket path that does not exist — live-classified by
+the guard (dbname 'brain', no host/port) yet structurally UNREACHABLE: a
+regression can only fail with 'connection failed', never touch the real
+server. The offline tests never open a connection at all. (Note: offline
+``--sql`` over the whole chain is independently broken on main — the
+datetime-repair migration d2f6a9c4e7b1 calls op.get_bind() at upgrade time —
+which is why the opt-in and test-url cases below run ONLINE instead.)
 """
 
 from __future__ import annotations
@@ -30,12 +30,20 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# Live-shaped on purpose: same host/port/dbname as the real service. The
-# password is deliberately WRONG so that a guard regression fails at auth
-# instead of ever reaching a migration. NEVER put the real password here.
-_LIVE_SHAPED_URL = "postgresql+psycopg://brain:guard-red-herring@localhost:27432/brain"
+# Live TO THE GUARD, unreachable BY CONSTRUCTION: dbname 'brain' over a unix
+# socket that does not exist. The widened predicate classifies it live (a
+# socket connection to the live-named database on this host), yet no server
+# can ever be reached through /nonexistent-alembic-guard-sock — the tests
+# below can never aim at the real live server (host is None, port is None,
+# never the live 127.0.0.1:27432). The pin test below enforces that nobody
+# 'fixes' the URL back to the real server.
+_LIVE_SHAPED_URL = (
+    "postgresql+psycopg://brain@/brain?host=/nonexistent-alembic-guard-sock"
+)
 
 
 def _run_alembic(*args: str, env_overrides: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -58,6 +66,24 @@ def _run_alembic(*args: str, env_overrides: dict[str, str]) -> subprocess.Comple
         env=env,
         timeout=120,
     )
+
+
+def test_the_live_shaped_url_is_live_to_the_guard_but_unreachable() -> None:
+    """Pin the test-URL contract itself (review round 2 on PR #70).
+
+    The URL must stay live-classified (so the refusal tests exercise the
+    real predicate) yet structurally unable to reach the configured live
+    server: no netloc host, no port — hence NEVER localhost:27432/brain,
+    no matter who 'fixes' it back.
+    """
+    from sqlalchemy.engine import make_url
+
+    from brain.config import assert_not_live_database
+
+    parsed = make_url(_LIVE_SHAPED_URL)
+    assert parsed.host is None and parsed.port != 27432
+    with pytest.raises(RuntimeError, match="refusing to start against the LIVE store"):
+        assert_not_live_database(_LIVE_SHAPED_URL)
 
 
 def test_alembic_offline_refuses_the_live_database_url() -> None:
@@ -112,11 +138,12 @@ def test_alembic_online_allow_live_opt_in_still_reaches_the_database() -> None:
     )
     assert result.returncode != 0  # it DID try to connect (and failed somewhere)
     # The guard must NOT have refused. The failure mode is environment-
-    # specific (local: auth failure against the real server; CI: connection
-    # refused — no live Postgres there), so assert only what both share:
-    # a psycopg connection error, never the guard message.
+    # specific (local: missing unix socket; CI: TCP connection refused — no
+    # live Postgres there; a real server: auth failure), so assert only what
+    # all of them share: a psycopg connection-level error, never the guard
+    # message.
     assert "refusing to start against the LIVE store" not in result.stderr
-    assert "connection failed" in result.stderr
+    assert "psycopg.OperationalError" in result.stderr
 
 
 def test_alembic_online_test_database_url_still_works() -> None:
