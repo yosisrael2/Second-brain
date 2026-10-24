@@ -69,8 +69,8 @@ check_env_file() {
     q="'"
     url="${url%\"}"
     url="${url#\"}"
-    url="${url%$q}"
-    url="${url#$q}"
+    url="${url%\"$q\"}"
+    url="${url#\"$q\"}"
     db="${url##*/}"
     db="${db%%\?*}"
     if [ "$db" = "brain" ]; then
