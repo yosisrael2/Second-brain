@@ -1,0 +1,31 @@
+{
+  "kind": "tasks#tasks",
+  "etag": "W/\"tasks-home-page-1\"",
+  "items": [
+    {
+      "kind": "tasks#task",
+      "id": "task-home-tap",
+      "etag": "W/\"task-home-tap-2\"",
+      "title": "לתקן את ברז המטבח",
+      "updated": "2026-03-06T06:30:00.000Z",
+      "notes": "להזמין שירות. טלפון 02-555-1234.",
+      "status": "needsAction"
+    },
+    {
+      "kind": "tasks#task",
+      "id": "task-home-shed",
+      "etag": "W/\"task-home-shed-5\"",
+      "title": "לסדר את המחסן",
+      "updated": "2026-03-04T15:20:00.000Z",
+      "status": "completed",
+      "completed": "2026-03-04T15:00:00.000Z",
+      "hidden": true,
+      "links": [
+        {
+          "type": "related",
+          "link": "https://example.com/shelves/ikea-bror"
+        }
+      ]
+    }
+  ]
+}

@@ -44,3 +44,24 @@ class ItemStatus(enum.StrEnum):
     INBOX = "inbox"
     FILED = "filed"
     NEEDS_REVIEW = "needs_review"
+
+
+# The closed domain of ``memory_items.source`` (CHECK ``source``): capture
+# paths that exist today (manual default, paste kinds, telegram bot, email
+# poller) + the connector names the connectors ticket introduces. The
+# migration adds it NOT VALID (the live table predates the constraint; new
+# inserts are checked). New sources widen the domain in a migration — never
+# silently. Lived in db/models.py until the API schemas needed it too
+# (PR #53 review: POST/PATCH /items could send a source outside the domain).
+ITEM_SOURCE_DOMAIN = (
+    "manual",
+    "note",
+    "calendar",
+    "email",
+    "outlook",
+    "whatsapp",
+    "telegram",
+    "gcal",
+    "gdrive",
+    "gtasks",
+)

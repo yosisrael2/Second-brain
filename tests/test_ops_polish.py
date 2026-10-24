@@ -4,7 +4,8 @@
    default) and only heartbeats on SUCCESS, so a quiet chat or a retry loop
    legitimately pushes the heartbeat age past the old fixed 60s threshold.
    The threshold now follows the bot's actual getUpdates timeout
-   (settings.telegram_poll_timeout_s + margin), and the bot heartbeats on
+   (2x settings.telegram_poll_timeout_s — a healthy cycle is one full poll
+   window plus post-poll work), and the bot heartbeats on
    the retry paths too (honest liveness, tested in test_telegram_bot.py).
 2. /ops/health gains read-only 'attachments' and 'enrichment' components
    (the cockpit renders every component automatically).
@@ -39,7 +40,7 @@ def _telegram_raw(age: float, *, poll_timeout_s: int = 50) -> dict:
         "allowlist_set": True,
         "heartbeat_age_s": age,
         "poll_timeout_s": poll_timeout_s,
-        "degraded_after_s": poll_timeout_s + 30,
+        "degraded_after_s": poll_timeout_s * 2,
     }
 
 
@@ -49,11 +50,11 @@ class TestTelegramThresholdFollowsPollTimeout:
         assert entry["status"] == "ok"
 
     def test_age_just_under_threshold_is_ok(self):
-        entry = ops_health._derive_status("telegram", _telegram_raw(79.0))
+        entry = ops_health._derive_status("telegram", _telegram_raw(99.0))
         assert entry["status"] == "ok"
 
     def test_age_just_over_threshold_is_degraded(self):
-        entry = ops_health._derive_status("telegram", _telegram_raw(81.0))
+        entry = ops_health._derive_status("telegram", _telegram_raw(101.0))
         assert entry["status"] == "degraded"
 
     def test_age_over_1800_is_down(self):
@@ -61,7 +62,7 @@ class TestTelegramThresholdFollowsPollTimeout:
         assert entry["status"] == "down"
 
     def test_check_derives_threshold_from_settings(self, monkeypatch):
-        """_telegram_check reads settings.telegram_poll_timeout_s (50 -> 80)."""
+        """_telegram_check reads settings.telegram_poll_timeout_s (50 -> 100)."""
         from brain.config import Settings
 
         monkeypatch.setattr(
@@ -76,7 +77,55 @@ class TestTelegramThresholdFollowsPollTimeout:
         )
         raw = ops_health._telegram_check()
         assert raw["poll_timeout_s"] == 50
-        assert raw["degraded_after_s"] == 80
+        assert raw["degraded_after_s"] == 100
+
+
+class TestTelegramHealthyPollNeverDegraded:
+    """Red (telegram flap, 2026-10-24): the live bot showed heartbeat age 89s
+    right after a restart with the default 50s long-poll and went 'degraded'.
+    A healthy cycle legitimately spans one full long-poll window PLUS the
+    post-poll work (update batch processing, network overhead), so a threshold
+    of timeout + 30s sits INSIDE the healthy range. The threshold must be
+    derived from the poll timeout with real headroom (2x), one source of
+    truth, while age > 1800s stays 'down'."""
+
+    def test_observed_flap_age_89s_is_ok_with_default_timeout(self):
+        entry = ops_health._derive_status("telegram", _telegram_raw(89.0))
+        assert entry["status"] == "ok"
+
+    @pytest.mark.parametrize("poll_timeout_s", [0, 5])
+    def test_zero_or_tiny_timeout_gets_a_60s_floor(self, monkeypatch, poll_timeout_s):
+        """telegram_poll_timeout_s is an unbounded int: with short polling (0)
+        or a tiny timeout, 2x would make degraded_after_s 0/tiny and the card
+        permanently degraded. The threshold must never drop below a 60s floor
+        (review of PR #67)."""
+        from brain.config import Settings
+
+        monkeypatch.setattr(
+            ops_health,
+            "get_settings",
+            lambda: Settings(
+                telegram_bot_token="1234:abc",
+                telegram_allowed_user_ids="1",
+                telegram_poll_timeout_s=poll_timeout_s,
+                _env_file=None,
+            ),
+        )
+        raw = ops_health._telegram_check()
+        assert raw["degraded_after_s"] == 60
+
+    def test_with_floor_age_30s_is_ok_and_61s_is_degraded(self):
+        """Card behaviour at the floor threshold (short-polling bot)."""
+        raw = {
+            "token_set": True,
+            "allowlist_set": True,
+            "heartbeat_age_s": 30.0,
+            "poll_timeout_s": 0,
+            "degraded_after_s": 60,
+        }
+        assert ops_health._derive_status("telegram", raw)["status"] == "ok"
+        raw["heartbeat_age_s"] = 61.0
+        assert ops_health._derive_status("telegram", raw)["status"] == "degraded"
 
 
 class TestAttachmentsComponent:
@@ -147,7 +196,33 @@ class TestAskRecordOpsFlag:
         assert rows == 0, "diagnostics must not poison /ops/health's llm view"
 
     def test_default_still_records(self, ops_tables):
-        self._ask(record_ops=True)[1]
+        """Default record_ops=True still records — for a REAL (non-synthetic)
+        client. A FakeLLMClient (synthetic) never records: a verification run
+        must not poison live llm health (fix/fake-llm-health); the synthetic
+        behaviour is pinned by TestFakeLlmNeverFlipsLlmHealth in
+        test_ops_health.py."""
+        from tests.fakes import FakeRepository
+        from tests.test_ask_service import StubSearch, cite_every_source, make_hits
+
+        from brain.ai.ask import Completion
+        from brain.services.ask import AskService
+
+        class RealStubLLM:
+            """A client that is NOT synthetic: its events ARE evidence."""
+
+            synthetic = False
+
+            def complete(self, prompt: str) -> Completion:
+                return Completion(cite_every_source(prompt), model="real-stub")
+
+            def close(self) -> None:
+                pass
+
+        repo = FakeRepository()
+        hits = make_hits(repo, "The server runs on port 27800.")
+        service = AskService(StubSearch(hits), RealStubLLM())  # type: ignore[arg-type]
+        result = service.ask("what port?")
+        assert result.answer
         with ops._get_engine().connect() as conn:
             rows = conn.execute(
                 sa_text("SELECT count(*) FROM ops_events WHERE component = 'ask'")

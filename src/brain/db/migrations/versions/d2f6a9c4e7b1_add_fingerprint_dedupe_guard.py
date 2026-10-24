@@ -21,7 +21,7 @@ Two changes:
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 
 from brain.services.dedupe import content_fingerprint
 
@@ -34,10 +34,21 @@ _BATCH = 500
 
 
 def upgrade() -> None:
-    _repair_occurred_at_type()
+    if context.is_offline_mode():
+        # Offline --sql renders SQL without a connection: op.get_bind() is
+        # None, so the data repairs below cannot run. Render a comment telling
+        # the operator they need an ONLINE run; the schema DDL still renders.
+        op.execute(
+            "-- d2f6a9c4e7b1: the occurred_at type repair and the fingerprint"
+            " backfill read/repair DATA and only run ONLINE; this script"
+            " carries the schema DDL only."
+        )
+    else:
+        _repair_occurred_at_type()
     op.add_column("memory_items", sa.Column("fingerprint", sa.String(64), nullable=True))
     op.create_index("ix_memory_items_fingerprint", "memory_items", ["fingerprint"])
-    _backfill_fingerprints()
+    if not context.is_offline_mode():
+        _backfill_fingerprints()
 
 
 def _repair_occurred_at_type() -> None:

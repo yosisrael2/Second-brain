@@ -455,7 +455,17 @@ def _llm_check() -> dict[str, Any]:
     return {"provider": settings.llm_provider, "model": model or None}
 
 
-TELEGRAM_HEARTBEAT_MARGIN_S = 30
+# A healthy poll cycle spans one full long-poll window (poll_timeout_s) PLUS
+# post-poll work (update batch processing, network overhead) — observed 89s
+# against a timeout+30s threshold = 80s on 2026-10-24. The degraded threshold
+# is therefore 2x the poll timeout: it scales with the configured timeout
+# (one source of truth, no absolute constant) and leaves headroom over the
+# worst observed healthy cycle; a truly stalled bot still crosses it and then
+# the unchanged 1800s down rule. The timeout setting is unbounded, so the
+# result is floored at 60s — with short polling (0) or a tiny timeout, 2x
+# alone would make the card permanently degraded.
+TELEGRAM_DEGRADED_FACTOR = 2
+TELEGRAM_DEGRADED_FLOOR_S = 60
 
 
 def _email_check() -> dict[str, Any]:
@@ -512,7 +522,9 @@ def _telegram_check() -> dict[str, Any]:
         "allowlist_set": allowlist_set,
         "heartbeat_age_s": age,
         "poll_timeout_s": poll_timeout_s,
-        "degraded_after_s": poll_timeout_s + TELEGRAM_HEARTBEAT_MARGIN_S,
+        "degraded_after_s": max(
+            poll_timeout_s * TELEGRAM_DEGRADED_FACTOR, TELEGRAM_DEGRADED_FLOOR_S
+        ),
     }
     last_error = ops.latest_event("telegram", ok=False)
     if last_error:
@@ -838,6 +850,11 @@ def _triage_check() -> dict[str, Any]:
 
     Reads today's ops_events rows (component='triage', kind='decided') —
     the same rows the triage service writes per decision. Counts only.
+
+    'noise' counts only APPLIED decisions: the trier records 'decided'
+    before the poller's keep-relevant guard rejects a downgrade, and every
+    blocked pass also records exactly one 'downgrade_blocked' — so the
+    blocked passes are decided(noise) minus downgrade_blocked (1:1).
     """
     from datetime import UTC, datetime, time  # noqa: PLC0415
 
@@ -855,12 +872,23 @@ def _triage_check() -> dict[str, Any]:
             ),
             {"day": day_start},
         ).fetchall()
+        blocked = session.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component = 'triage' AND kind = 'downgrade_blocked' "
+                "AND ok AND ts >= :day"
+            ),
+            {"day": day_start},
+        ).scalar_one()
     counts = {row.label: row.n for row in rows}
     relevant = counts.get("relevant", 0)
+    # every blocked downgrade produced exactly one decided(noise) that was
+    # NOT applied — subtract it (see docstring; 1:1 by construction)
+    noise = max(counts.get("noise", 0) - blocked, 0)
     return {
         "relevant_today": relevant,
-        "noise_today": counts.get("noise", 0),
-        "summary": f"relevant {relevant} / noise {counts.get('noise', 0)} today",
+        "noise_today": noise,
+        "summary": f"relevant {relevant} / noise {noise} today",
     }
 
 
