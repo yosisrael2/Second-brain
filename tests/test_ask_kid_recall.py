@@ -453,3 +453,66 @@ def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) ->
     assert all(str(item.id) != str(i.id) for i in search2.seen_extra[0]), (
         "without confirmed channel facts the channel leg must not guess"
     )
+
+
+def test_announcement_sent_before_the_window_is_recalled_via_lookback(
+    clean_items, memory_db
+) -> None:
+    """WA39 run-3 miss, red-first: the answer to a question about day D is
+    often an announcement SENT on D-1 ('tomorrow the class is at the farm').
+    The kid-channel leg bounds by occurred_at = the SENT time, so a strict
+    [window_start, window_end) bound drops the announcement that arrived the
+    evening before. With a resolved window the leg must widen its start by
+    KID_RECALL_LOOKBACK_DAYS (default 3) — and slot priority is in-window >
+    lookback > newest flood."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    # the announcement: sent Tue 20.10 evening (18:00 UTC = 21:00 Jerusalem),
+    # one hour BEFORE the 'Wednesday 21.10' window opens at 20.10 21:00 UTC —
+    # no kid name in its text (the semantic leg cannot find it)
+    announce = _whatsapp_item(
+        repo, _TEACHER, 20, 18, "מחר (יום ד') הכיתה בחווה החקלאית — צריך כובע ומים",
+        captured=20,
+    )
+    # the flood: 16 newer same-channel conversations fill the whole cap
+    for n in range(16):
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה מספר {n}")
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    recalled = [str(hit.item.id) for hit in result.sources]
+    assert str(announce.id) in recalled, (
+        "a kid's-channel announcement sent just before the resolved window "
+        "(lookback days) must be recalled for the question about day D"
+    )
+
+
+def test_lookback_respects_its_days_bound(clean_items, memory_db) -> None:
+    """The lookback is bounded: a conversation sent more than
+    KID_RECALL_LOOKBACK_DAYS before the window opens stays out of the pool
+    (never all history)."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    old = _whatsapp_item(
+        repo, _TEACHER, 16, 10, "שיעור בחווה החקלאית ביום ד' הקרוב", captured=16
+    )
+    # flood to fill the cap so only the lookback/structured legs could add it
+    for n in range(16):
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה מספר {n}")
+    search = RecordingSearch([])
+    service = _service(memory, repo, search)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    recalled = [str(hit.item.id) for hit in result.sources]
+    assert str(old.id) not in recalled, (
+        "beyond the lookback days bound the kid-channel leg must not recall"
+    )

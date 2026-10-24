@@ -222,6 +222,7 @@ def build_ask_service(
         memory=memory,
         items_repo=items_repo,
         kid_recall_limit=settings.ask_kid_recall_limit,
+        kid_recall_lookback_days=settings.ask_kid_recall_lookback_days,
     )
 
 
