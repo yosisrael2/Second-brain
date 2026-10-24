@@ -1,0 +1,68 @@
+{
+  "kind": "tasks#tasks",
+  "etag": "W/\"tasks-personal-page-1\"",
+  "nextPageToken": "tasks-personal-page-token-2",
+  "items": [
+    {
+      "kind": "tasks#task",
+      "id": "task-order-cake",
+      "etag": "W/\"task-order-cake-3\"",
+      "title": "Order birthday cake",
+      "updated": "2026-03-10T09:30:00.000Z",
+      "selfLink": "https://www.googleapis.com/tasks/v1/lists/MDAwMDAwMDAwMDAwMDAwMDAwMDA6MDow/tasks/task-order-cake",
+      "webViewLink": "https://tasks.google.com/task/task-order-cake",
+      "notes": "Chocolate, feeds 12.\nPickup before 16:00.",
+      "status": "needsAction",
+      "due": "2026-03-15T00:00:00.000Z",
+      "links": [
+        {
+          "type": "related",
+          "description": "Bakery order",
+          "link": "https://example.com/bakery/order/123"
+        }
+      ]
+    },
+    {
+      "kind": "tasks#task",
+      "id": "task-gifts",
+      "etag": "W/\"task-gifts-2\"",
+      "title": "לקנות מתנות ליום ההולדת",
+      "updated": "2026-03-09T18:45:00.000Z",
+      "notes": "ספר ומשחק. תקציב: 200 ש\"ח.",
+      "status": "completed",
+      "due": "2026-03-12T00:00:00.000Z",
+      "completed": "2026-03-11T14:05:00.000Z",
+      "hidden": false,
+      "deleted": false
+    },
+    {
+      "kind": "tasks#task",
+      "id": "task-parent-school",
+      "etag": "W/\"task-parent-school-1\"",
+      "title": "School week prep",
+      "updated": "2026-03-08T07:00:00.000Z",
+      "status": "needsAction"
+    },
+    {
+      "kind": "tasks#task",
+      "id": "task-sub-signup",
+      "etag": "W/\"task-sub-signup-4\"",
+      "title": "הרשמה לחוג כדורסל",
+      "updated": "2026-03-08T07:05:00.000Z",
+      "parent": "task-parent-school",
+      "notes": "לשלם עד יום חמישי",
+      "status": "needsAction",
+      "due": "2026-03-12T00:00:00.000Z"
+    },
+    {
+      "kind": "tasks#task",
+      "id": "task-deleted-old",
+      "etag": "W/\"task-deleted-old-9\"",
+      "title": "Old removed task",
+      "updated": "2026-03-07T12:00:00.000Z",
+      "status": "needsAction",
+      "deleted": true,
+      "hidden": true
+    }
+  ]
+}

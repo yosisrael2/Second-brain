@@ -837,6 +837,11 @@ def _triage_check() -> dict[str, Any]:
 
     Reads today's ops_events rows (component='triage', kind='decided') —
     the same rows the triage service writes per decision. Counts only.
+
+    'noise' counts only APPLIED decisions: the trier records 'decided'
+    before the poller's keep-relevant guard rejects a downgrade, and every
+    blocked pass also records exactly one 'downgrade_blocked' — so the
+    blocked passes are decided(noise) minus downgrade_blocked (1:1).
     """
     from datetime import UTC, datetime, time  # noqa: PLC0415
 
@@ -854,12 +859,23 @@ def _triage_check() -> dict[str, Any]:
             ),
             {"day": day_start},
         ).fetchall()
+        blocked = session.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component = 'triage' AND kind = 'downgrade_blocked' "
+                "AND ok AND ts >= :day"
+            ),
+            {"day": day_start},
+        ).scalar_one()
     counts = {row.label: row.n for row in rows}
     relevant = counts.get("relevant", 0)
+    # every blocked downgrade produced exactly one decided(noise) that was
+    # NOT applied — subtract it (see docstring; 1:1 by construction)
+    noise = max(counts.get("noise", 0) - blocked, 0)
     return {
         "relevant_today": relevant,
-        "noise_today": counts.get("noise", 0),
-        "summary": f"relevant {relevant} / noise {counts.get('noise', 0)} today",
+        "noise_today": noise,
+        "summary": f"relevant {relevant} / noise {noise} today",
     }
 
 

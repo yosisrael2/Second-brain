@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -31,6 +31,12 @@ DEFAULT_JEV_MODEL = "jev-latest"
 DEFAULT_JEV_TIMEOUT_S = 5.0
 DEFAULT_QDRANT_COLLECTION = "brain_items"
 DEFAULT_QDRANT_TIMEOUT_S = 10  # seconds; QdrantClient takes int|None
+
+
+# Connectors (connectors ticket): canonical source names. The Gmail adapter
+# registers under "email" (items.source compatibility with existing data);
+# "gmail" resolves to it as a registry alias at sync time.
+KNOWN_CONNECTOR_NAMES = frozenset({"email", "gcal", "gdrive", "gtasks"})
 
 
 def unwrap_secret(value: SecretStr | None) -> str | None:
@@ -129,6 +135,20 @@ class Settings(BaseSettings):
     # copied calendar text) before storing them as aware UTC.
     timezone: str = Field(default_factory=local_timezone_name)
 
+    # P1: a pasted ICS VEVENT with an RRULE fans out into one item per
+    # occurrence within [paste time, paste time + paste_rrule_days], capped
+    # at paste_rrule_max_occurrences items per series.
+    paste_rrule_days: int = Field(
+        default=60,
+        validation_alias=AliasChoices("paste_rrule_days", "BRAIN_PASTE_RRULE_DAYS"),
+    )
+    paste_rrule_max_occurrences: int = Field(
+        default=60,
+        validation_alias=AliasChoices(
+            "paste_rrule_max_occurrences", "BRAIN_PASTE_RRULE_MAX_OCCURRENCES"
+        ),
+    )
+
     # WhatsApp bridge (PR D1). The poller reads the bridge's messages.db
     # READ-ONLY; an empty path disables the poller. The gap groups messages
     # into conversations (item 35); the overlap window (must stay smaller
@@ -159,6 +179,55 @@ class Settings(BaseSettings):
     gmail_query: str = ""
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
+
+    # Connectors (connectors ticket): the enabled data sources, comma
+    # separated (BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"). Default empty
+    # = none enabled; `brain connectors sync` refuses disabled names and
+    # `brain connectors auth google` requests the union of their scopes.
+    # Field name mirrors the env var (pydantic-settings convention).
+    brain_connectors: str = ""
+
+    @field_validator("brain_connectors")
+    @classmethod
+    def _validate_connectors(cls, value: str) -> str:
+        """Fail fast on unknown connector names (a typo must not disable a
+        source silently). Canonical names only; 'gmail' is accepted too and
+        means 'email'."""
+        for part in value.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            if name == "gmail":
+                name = "email"
+            if name not in KNOWN_CONNECTOR_NAMES:
+                raise ValueError(
+                    f"BRAIN_CONNECTORS: unknown connector {part.strip()!r} "
+                    f"(known: {', '.join(sorted(KNOWN_CONNECTOR_NAMES))})"
+                )
+        return value
+
+    @property
+    def connectors_enabled(self) -> tuple[str, ...]:
+        """The enabled connector names (canonical, deduped, order kept)."""
+        enabled: list[str] = []
+        for part in self.brain_connectors.split(","):
+            name = part.strip().lower()
+            if not name:
+                continue
+            canonical = "email" if name == "gmail" else name
+            if canonical not in enabled:
+                enabled.append(canonical)
+        return tuple(enabled)
+
+    # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
+    # of task lists to sync, comma-separated list IDs or titles (titles matched
+    # case-insensitively); empty = sync every list. IDs are stable while titles
+    # can be renamed, so prefer IDs; an allowlist change invalidates the sync
+    # cursor (full resync) so old tasks of newly-allowed lists are picked up.
+    gtasks_lists: str = Field(
+        default="",
+        validation_alias=AliasChoices("BRAIN_GTASKS_LISTS", "GTASKS_LISTS"),
+    )
 
     @field_validator("telegram_allowed_user_ids")
     @classmethod
