@@ -221,13 +221,24 @@ def build_prompt(
     if memory_block:
         lines += ["", memory_block]
     lines += ["", "Sources:"]
-    lines += [
-        f"- [{item['id']}] (When: {item['when']}) {item_text(item)}"
-        if item.get("when")
-        else f"- [{item['id']}] {item_text(item)}"
-        for item in context_items
-        if item.get("id")
-    ]
+    for item in context_items:
+        if not item.get("id"):
+            continue
+        when = item.get("when")
+        lines.append(
+            f"- [{item['id']}] (When: {when}) {item_text(item)}"
+            if when
+            else f"- [{item['id']}] {item_text(item)}"
+        )
+        # PR-b: a conflicts relation inside the context renders a marker
+        # under BOTH sides so the answer quotes both versions and cites
+        # both ids (never picks the newer, never invents a resolution).
+        conflict_with = item.get("conflict_with") or []
+        if conflict_with:
+            lines.append(
+                "  ⚠️ conflicts with: "
+                + " ".join(f"[{cid}]" for cid in conflict_with)
+            )
     lines += ["", CITATION_RULES, "", CONFLICT_RULES]
     return "\n".join(lines)
 

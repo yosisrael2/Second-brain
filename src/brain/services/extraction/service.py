@@ -828,6 +828,11 @@ class EnrichmentService:
 
         return recon_similarity_from_settings(get_settings())
 
+    def answer_series_scope(self, relation_id: uuid.UUID, scope: str) -> list[Any]:
+        """PR-b: the card's answer to the series scope question (delegate to
+        the reconciliation service; see ReconciliationService.answer_series_scope)."""
+        return self.recon.answer_series_scope(relation_id, scope)
+
     def _reconcile_child(
         self,
         resolved: _ResolvedChild,
@@ -905,7 +910,12 @@ class EnrichmentService:
             },
             commit=False,  # F1: write() below owns the single commit
         )
-        recon.write(result, source=source, child=verdict_child)
+        recon.write(
+            result,
+            source=source,
+            child=verdict_child,
+            quotes=[candidate.quote, *resolved.extra_quotes],
+        )
         return ReconOutcome(
             verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id))
         )
