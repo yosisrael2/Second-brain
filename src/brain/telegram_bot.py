@@ -347,12 +347,6 @@ def _live_services_factory() -> ServicesFactory:
             from brain.services.memory import MemoryService  # noqa: PLC0415
 
             memory = MemoryService(MemoryRepository(session))
-            from brain.config import get_settings  # noqa: PLC0415
-            from brain.services.extraction.service import (  # noqa: PLC0415
-                EnrichmentService,
-            )
-
-            settings = get_settings()
             yield BotServices(
                 ingest=IngestService(repo, deps.get_classifier(), deps.get_item_indexer()),
                 items=ItemsService(repo, deps.get_item_indexer()),
@@ -365,14 +359,6 @@ def _live_services_factory() -> ServicesFactory:
                     items_repo=repo,
                 ),
                 memory=memory,
-                enrichment=EnrichmentService(
-                    repo,
-                    session,
-                    memory=memory,
-                    indexer=deps.get_item_indexer(),
-                    daily_cap=settings.enrichment_daily_cap,
-                    timezone=settings.timezone,
-                ),
             )
         finally:
             session.close()
@@ -441,9 +427,11 @@ class TelegramBot:
         self._fix_flow: dict[int, str] = {}
         self._outbound: list[tuple[int, Reply]] = []
         self._last_ping_check = 0.0
-        # A2 enrichment worker: last-run marker (monotonic) + overlap guard
+        # A2 enrichment worker: last-run marker (monotonic) + the in-flight
+        # pass task — kept referenced so it is not garbage-collected (a
+        # shutdown path can await/cancel it)
         self._enrich_last_run = 0.0
-        self._enrich_running = False
+        self._enrich_task: Any = None
 
     def is_allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self._allowed_ids
@@ -1665,59 +1653,100 @@ def _repo_of(session):
     return ItemsRepository(session)
 
 
-def _run_enrichment_pass(core: TelegramBot) -> int:
+def _enrich_pass(service: Any) -> list:
+    """One ``run_once`` pass with a LOCAL completion collector (B2).
+
+    The hook appends to a plain local list — core state is NEVER touched from
+    the worker thread; the outcomes return to the loop thread, which alone
+    turns them into proposal cards.
+    """
+    outcomes: list = []
+    service.on_children_changed = outcomes.extend  # hook delivers a LIST per call
+    service.run_once(datetime.now(tz=UTC), limit=20)
+    return outcomes
+
+
+def _run_enrichment_pass(core: TelegramBot) -> list:
     """One synchronous enrichment pass (A2 worker; runs in a worker thread).
 
-    Reuses the per-update service factory (fresh session); the completion hook
-    is the SAME ``on_children_changed`` the PR C tests wire, so every changed
-    source queues its proposal card. Returns the children the pass created.
+    B3: builds its OWN session + service here — the per-update factory stays
+    exactly as it was (the service is constructed once per pass, never per
+    update). A factory-provided ``enrichment`` service (tests inject fakes
+    there) wins. Returns the changed-source outcomes (possibly empty).
     """
     with core._services_factory() as services:  # noqa: SLF001 (same module)
         service = services.enrichment
-        if service is None:
-            return 0
-        service.on_children_changed = core.proposals_changed
-        report = service.run_once(datetime.now(tz=UTC), limit=20)
-        return int(report.children_created)
+        if service is not None:
+            return _enrich_pass(service)
+    from brain.config import get_settings  # noqa: PLC0415
+
+    settings = get_settings()
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    session = SessionLocal()
+    try:
+        from brain.api import deps  # noqa: PLC0415
+        from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+        from brain.repositories.memory import (  # noqa: PLC0415
+            MemoryRepository,
+            MemoryService,
+        )
+        from brain.services.extraction.service import (  # noqa: PLC0415
+            EnrichmentService,
+        )
+
+        service = EnrichmentService(
+            ItemsRepository(session),
+            session,
+            memory=MemoryService(MemoryRepository(session)),
+            indexer=deps.get_item_indexer(),
+            daily_cap=settings.enrichment_daily_cap,
+            timezone=settings.timezone,
+        )
+        return _enrich_pass(service)
+    finally:
+        session.close()
 
 
 async def _enrichment_tick(tg: Any, core: TelegramBot) -> None:
     """The scheduled enrichment pass (A2 wiring; ENRICHMENT_WORKER_ENABLED).
 
     Off by default: when the switch is false nothing is scheduled and nothing
-    changes. When true: one ``run_once`` pass per interval, run in a worker
-    thread (LLM calls are slow; polling must stay responsive), never
-    overlapping the previous pass, errors logged + ops events — the bot keeps
-    running. Proposal cards queued by the pass are flushed here.
+    changes. When true: one ``run_once`` pass per interval, STARTED here as a
+    background task (B1: the poll loop never waits for a pass — LLM calls are
+    slow) and never overlapping the previous one (guard: the task's done()).
+    A finished pass is harvested first: its outcomes become proposal cards on
+    the LOOP thread (B2), its exception becomes log + ops event — the bot
+    keeps running either way.
     """
     from brain.config import get_settings  # noqa: PLC0415
 
+    task = core._enrich_task  # noqa: SLF001 (same module)
+    if task is not None and task.done():
+        core._enrich_task = None  # noqa: SLF001 (same module)
+        try:
+            outcomes = task.result()
+            core.proposals_changed(outcomes)
+        except Exception:  # noqa: BLE001 — the worker must never kill the bot
+            record_event(
+                "enrichment",
+                "worker_pass_failed",
+                ok=False,
+                detail={"error": "enrichment worker pass failed"},
+            )
+            logger.exception("telegram: enrichment worker pass failed")
     settings = get_settings()
     if not settings.enrichment_worker_enabled:
         return
-    now = time.monotonic()
-    if core._enrich_running:  # noqa: SLF001 (same module)
+    if core._enrich_task is not None and not core._enrich_task.done():  # noqa: SLF001
         return  # a pass never overlaps the previous one
-    if now - core._enrich_last_run < settings.enrichment_worker_interval_s:
+    now = time.monotonic()
+    if now - core._enrich_last_run < settings.enrichment_worker_interval_s:  # noqa: SLF001
         return
-    core._enrich_running = True
-    core._enrich_last_run = now
-    try:
-        created = await asyncio.to_thread(_run_enrichment_pass, core)
-        if created:
-            logger.info("telegram: enrichment pass created %d child(ren)", created)
-        for chat_id, reply in core.drain_outbound():
-            await _send(tg, chat_id, reply)
-    except Exception:  # noqa: BLE001 — the worker must never kill the bot
-        record_event(
-            "enrichment",
-            "worker_pass_failed",
-            ok=False,
-            detail={"error": "enrichment worker pass failed"},
-        )
-        logger.exception("telegram: enrichment worker pass failed")
-    finally:
-        core._enrich_running = False
+    core._enrich_last_run = now  # noqa: SLF001 (same module)
+    core._enrich_task = asyncio.create_task(  # noqa: SLF001 (same module)
+        asyncio.to_thread(_run_enrichment_pass, core)
+    )
 
 
 async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
@@ -1725,8 +1754,9 @@ async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
     import time as _time  # noqa: PLC0415
 
     try:
-        for chat_id, reply in core.drain_outbound():
-            await _send(tg, chat_id, reply)
+        await _enrichment_tick(tg, core)  # starts/harvests the pass FIRST...
+        for chat_id, reply in core.drain_outbound():  # ...so its cards go out
+            await _send(tg, chat_id, reply)  # in THIS flush
         now = _time.monotonic()
         if now - core._last_ping_check >= 60.0:  # noqa: SLF001 (same module)
             core._last_ping_check = now
