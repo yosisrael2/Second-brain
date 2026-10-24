@@ -231,11 +231,21 @@ def _drop_test_database() -> None:
 
 # --- live-collection tripwire (session level) ---------------------------------
 # The PR #42 incident: a test vector landed in the LIVE qdrant collection and
-# nothing noticed. These two hooks snapshot the LIVE collection's point count
-# before and after the whole run and fail loudly on any change. Read-only
-# (one REST GET each); when qdrant is unreachable the tripwire stays silent.
+# nothing noticed. REFINED 24 Oct (false positive: the live instance ingested
+# a real note mid-suite and the raw count delta failed the run): the guard now
+# detects TEST-originated points — every vector a test writes carries a
+# test-origin payload marker, and the session guard asserts the LIVE
+# collection holds zero of them. The raw count delta is informational only.
+# Read-only (one REST GET + one count POST); qdrant unreachable stays silent.
 
-from tests.live_guard import assert_points_stable, live_point_count  # noqa: E402
+from tests.live_guard import (  # noqa: E402
+    TEST_ORIGIN_KEY,
+    TEST_ORIGIN_VALUE,
+    assert_no_test_points_in_live,
+    count_delta_note,
+    live_marker_point_count,
+    live_point_count,
+)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -245,15 +255,39 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    before = getattr(session.config, "_live_points_before", None)
-    if before is None:
-        return
-    after = live_point_count(os.environ.get("QDRANT_URL", "http://localhost:27333"))
+    qdrant_url = os.environ.get("QDRANT_URL", "http://localhost:27333")
     try:
-        assert_points_stable(before, after)
+        assert_no_test_points_in_live(live_marker_point_count(qdrant_url))
     except AssertionError as exc:
         print(f"\nERROR: {exc}")
         session.testsfailed = max(session.testsfailed or 0, 1)
+    before = getattr(session.config, "_live_points_before", None)
+    after = live_point_count(qdrant_url)
+    note = count_delta_note(before, after)
+    if note:
+        print(f"\nNOTE: {note}")
+
+
+@pytest.fixture(autouse=True)
+def _tag_test_vector_writes(monkeypatch: pytest.MonkeyPatch):
+    """Every vector a TEST writes through the real store carries the
+    test-origin marker in its payload — the live guard counts those markers
+    instead of raw point counts (an external live write then cannot fail a
+    session, while a test writing into the live collection still is caught).
+    Test-side only: the production upsert path is untouched (the fixture
+    wraps QdrantVectorStore.upsert_many for the duration of each test)."""
+    from brain.ai.vectorstore import QdrantVectorStore
+
+    real_upsert_many = QdrantVectorStore.upsert_many
+
+    def tagged_upsert_many(self, points):
+        tagged = [
+            (item_id, vector, {**dict(payload), TEST_ORIGIN_KEY: TEST_ORIGIN_VALUE})
+            for item_id, vector, payload in points
+        ]
+        return real_upsert_many(self, tagged)
+
+    monkeypatch.setattr(QdrantVectorStore, "upsert_many", tagged_upsert_many)
 
 # F3: the attachments-core fixture (tests/test_attachments.py) shared with the
 # poller test modules. Module-level alias — pytest collects fixture objects by

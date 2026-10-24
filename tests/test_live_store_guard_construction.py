@@ -13,7 +13,6 @@ from urllib.error import URLError
 
 import pytest
 from sqlalchemy import text
-from tests.live_guard import assert_points_stable, live_point_count
 
 from brain.ai.vectorstore import QdrantVectorStore
 from brain.config import (
@@ -111,7 +110,7 @@ class TestSessionTripwire:
         import tests.live_guard as lg
 
         monkeypatch.setattr(lg, "urlopen", lambda *a, **k: _FakeResponse())
-        assert live_point_count("http://127.0.0.1:27333") == 50
+        assert lg.live_point_count("http://127.0.0.1:27333") == 50
 
     def test_unreachable_qdrant_returns_none(self, monkeypatch) -> None:
         import tests.live_guard as lg
@@ -120,15 +119,93 @@ class TestSessionTripwire:
             raise URLError("refused")
 
         monkeypatch.setattr(lg, "urlopen", _boom)
-        assert live_point_count("http://127.0.0.1:1") is None
+        assert lg.live_point_count("http://127.0.0.1:1") is None
 
-    def test_tripwire_fails_when_the_live_count_changed(self) -> None:
-        with pytest.raises(AssertionError, match="LIVE"):
-            assert_points_stable(before=50, after=51)
+    def test_external_live_write_is_not_a_failure(self) -> None:
+        """RED (false positive, 07:17Z 24 Oct): the LIVE instance ingested a
+        real note mid-suite (108 -> 109) and the count-delta guard failed the
+        whole session. An external write is not test pollution — the guard
+        must pass it (delta informational only)."""
+        import tests.live_guard as lg
 
-    def test_tripwire_passes_when_stable_or_unknown(self) -> None:
-        assert_points_stable(before=50, after=50)
-        assert_points_stable(before=None, after=51)  # qdrant was unreachable
+        lg.assert_no_test_points_in_live(marker_count=0)  # no markers: no failure
+        note = lg.count_delta_note(before=108, after=109)
+        assert note is not None and "108" in note  # delta stays visible, informational
+        assert lg.count_delta_note(before=50, after=50) is None
+        assert lg.count_delta_note(before=None, after=51) is None  # qdrant was down
+        decrease = lg.count_delta_note(before=120, after=118)  # a DECREASE says so plainly
+        assert decrease is not None and "LOST 2 points" in decrease
+
+    def test_test_origin_points_in_live_are_a_failure(self, monkeypatch) -> None:
+        """The goal that must survive: a TEST writing into the live
+        collection is caught — via the test-origin marker its payload
+        carries, independent of the count."""
+        import tests.live_guard as lg
+
+        with pytest.raises(AssertionError, match="test-origin"):
+            lg.assert_no_test_points_in_live(marker_count=1)
+        lg.assert_no_test_points_in_live(marker_count=0)
+        lg.assert_no_test_points_in_live(marker_count=None)  # qdrant unreachable
+
+    def test_marker_count_parses_qdrant_count_rest(self, monkeypatch) -> None:
+        """The marker count queries the LIVE collection with a payload filter
+        (read-only POST /points/count) and parses result.count."""
+        import tests.live_guard as lg
+
+        captured = {}
+
+        class _FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"result": {"count": 3}}).encode()
+
+        def _fake_urlopen(request, *a, **k):
+            captured["url"] = request.full_url
+            captured["body"] = request.data
+            return _FakeResponse()
+
+        monkeypatch.setattr(lg, "urlopen", _fake_urlopen)
+        assert lg.live_marker_point_count("http://127.0.0.1:27333") == 3
+        assert captured["url"].endswith("/collections/brain_items/points/count")
+        filter_body = json.loads(captured["body"])
+        must = filter_body["filter"]["must"][0]
+        assert must["key"] == lg.TEST_ORIGIN_KEY
+        assert must["match"]["value"] == lg.TEST_ORIGIN_VALUE
+
+    def test_marker_count_unreachable_qdrant_returns_none(self, monkeypatch) -> None:
+        import tests.live_guard as lg
+
+        def _boom(*a, **k):
+            raise URLError("refused")
+
+        monkeypatch.setattr(lg, "urlopen", _boom)
+        assert lg.live_marker_point_count("http://127.0.0.1:1") is None
+
+    def test_test_writes_carry_the_origin_marker(self) -> None:
+        """Every vector a TEST writes through the real store carries the
+        test-origin marker in its payload — that is what the live guard
+        counts. A production write (no fixture) must stay marker-free."""
+        from qdrant_client import QdrantClient
+
+        from brain.ai.vectorstore import QdrantVectorStore
+
+        store = QdrantVectorStore(
+            client=QdrantClient(":memory:"), collection="brain_items_marker_test"
+        )
+        store.ensure_collection(dim=4)
+        store.upsert("item-1", [0.1, 0.2, 0.3, 0.4], {"text": "hello"})
+        points, _ = store._client.scroll(
+            collection_name="brain_items_marker_test", with_payload=True
+        )
+        assert points, "the point must exist"
+        import tests.live_guard as lg
+
+        assert points[0].payload[lg.TEST_ORIGIN_KEY] == lg.TEST_ORIGIN_VALUE
 
 
 class TestLazyEngine:
