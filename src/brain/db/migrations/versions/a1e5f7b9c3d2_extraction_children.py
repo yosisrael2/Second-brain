@@ -14,7 +14,7 @@ under a daily LLM cap (D5/D6) and survive restarts.
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a1e5f7b9c3d2"
@@ -158,19 +158,29 @@ def downgrade() -> None:
     # reminder/fact rows first.
     import sqlalchemy as sa  # noqa: PLC0415
 
-    conn = op.get_bind()
-    in_use = conn.execute(
-        sa.text(
-            "SELECT count(*) FROM memory_items "
-            "WHERE type IN ('reminder', 'fact')"
+    if context.is_offline_mode():
+        # Offline --sql has no connection (op.get_bind() is None): the row
+        # guard cannot run. Render a comment telling the operator to check
+        # the rows by hand before applying the rendered script.
+        op.execute(
+            "-- a1e5f7b9c3d2 offline: the reminder/fact row guard only runs"
+            " ONLINE; before applying this script verify no memory_items rows"
+            " use type 'reminder'/'fact' (this script narrows the type domain)."
         )
-    ).scalar_one()
-    if in_use:
-        raise RuntimeError(
-            f"cannot downgrade {revision!r}: {in_use} memory_items row(s) use "
-            "type 'reminder'/'fact' (introduced by this migration). Re-classify "
-            "or delete them first."
-        )
+    else:
+        conn = op.get_bind()
+        in_use = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM memory_items "
+                "WHERE type IN ('reminder', 'fact')"
+            )
+        ).scalar_one()
+        if in_use:
+            raise RuntimeError(
+                f"cannot downgrade {revision!r}: {in_use} memory_items row(s) use "
+                "type 'reminder'/'fact' (introduced by this migration). Re-classify "
+                "or delete them first."
+            )
     op.drop_constraint(op.f("ck_memory_items_type"), "memory_items", type_="check")
     op.create_check_constraint(
         op.f("ck_memory_items_type"),
