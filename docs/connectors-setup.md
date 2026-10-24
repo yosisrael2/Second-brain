@@ -6,15 +6,15 @@ askable — deduped by a stable external id, incremental via each source's
 native cursor. **One Google Cloud project, one OAuth client, one consent, one
 refresh token** covers all four sources, because the consent always requests
 the UNION of the enabled connectors' scopes (`scopes_for()` in
-`src/brain/connectors/google/base.py:41`, scope table at
-`src/brain/connectors/google/base.py:32`).
+`src/brain/connectors/google/base.py`, scope table in the same file's
+`SCOPE_BY_CONNECTOR`).
 
 Everything here is READ-ONLY (`*.readonly` scopes only); write-back is a later
 stage. The token is stored ONLY in the macOS login keychain (service
-`second-brain-gmail`, account `default` — `src/brain/services/keychain.py:18`;
-the same item `brain gmail-auth` uses) — never in the repo, never in `.env`.
-For the standalone Gmail label poller (an older path that shares the keychain
-item), see `docs/email-setup.md`.
+`second-brain-gmail`, account `default`, defined in
+`src/brain/services/keychain.py`; the same item `brain gmail-auth` uses) —
+never in the repo, never in `.env`. For the standalone Gmail label poller (an
+older path that shares the keychain item), see `docs/email-setup.md`.
 
 ## One-time Google Cloud setup (all four sources at once)
 
@@ -80,15 +80,16 @@ their definitions:
 
 ```bash
 # Which connectors run (comma-separated, canonical names; "gmail" is accepted
-# as an alias for "email" — google/base.py:38 and the registry alias map in
-# connectors/__init__.py). Default empty = none enabled (config.py:174);
-# unknown names fail fast at startup (config.py:176 validator) instead of
-# silently disabling a source.
+# as an alias for "email" — the alias lives in google/base.py's
+# _CONNECTOR_ALIASES and in the registry alias map in connectors/__init__.py).
+# Default empty = none enabled (Settings.brain_connectors in config.py);
+# unknown names fail fast at startup (the brain_connectors field validator in
+# config.py) instead of silently disabling a source.
 BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"
 
 # The Desktop OAuth client secret from step 4 (outside the repo). Reads as
-# GMAIL_CREDENTIALS_PATH -> settings.gmail_credentials_path (config.py:167);
-# read by gmail-auth, the poller and `brain connectors auth` (cli.py:1195).
+# GMAIL_CREDENTIALS_PATH -> Settings.gmail_credentials_path in config.py;
+# read by gmail-auth, the poller and `brain connectors auth`.
 GMAIL_CREDENTIALS_PATH=~/.config/second-brain/gmail-client-secret.json
 ```
 
@@ -97,13 +98,13 @@ added to `src/brain/config.py` by that PR; none of them resolve on main
 alone):
 
 ```bash
-# Calendar (PR: worker_9): comma-separated calendar ids (allowlist).
+# Calendar (PR #55): comma-separated calendar ids (allowlist).
 # "primary" = the main calendar of the authenticated account. An empty value
 # syncs nothing. Find a calendar id: Google Calendar → settings → the
 # calendar → "Integrate calendar" → Calendar ID.
 BRAIN_GCAL_CALENDARS="primary"
 
-# Drive (PR: worker_10): comma-separated immutable folder ids. EMPTY (default)
+# Drive (PR #57): comma-separated immutable folder ids. EMPTY (default)
 # = the Drive connector makes no calls at all. The id is the string after
 # /folders/ in the folder's URL (display names are not ids). Two optional
 # knobs arrive with the same PR: BRAIN_GDRIVE_DEPTH (subfolder levels walked,
@@ -111,7 +112,7 @@ BRAIN_GCAL_CALENDARS="primary"
 # chars, default 50000).
 BRAIN_GDRIVE_FOLDERS="1a2B3c4D5e6F7g8H9i0J"
 
-# Tasks (PR: worker_11): optional allowlist of task lists — ids or titles
+# Tasks (PR #56): optional allowlist of task lists — ids or titles
 # (titles matched case-insensitively). EMPTY = every list. Prefer ids (titles
 # can be renamed); an allowlist change invalidates the sync cursor (full
 # resync).
@@ -119,25 +120,27 @@ BRAIN_GTASKS_LISTS=""
 ```
 
 Availability proof for what is on main now: `BRAIN_CONNECTORS` →
-`src/brain/config.py:170-176` (field + fail-fast validator) and
-`src/brain/config.py:39` (`KNOWN_CONNECTOR_NAMES`); the `gmail` alias →
-`src/brain/connectors/google/base.py:38` + `src/brain/connectors/__init__.py`
-(`alias()`); the scope union → `src/brain/connectors/google/base.py:41-56`;
-keychain service/account → `src/brain/services/keychain.py:18-20`. The base
+`Settings.brain_connectors` + its fail-fast field validator and
+`KNOWN_CONNECTOR_NAMES` (all in `src/brain/config.py`); the `gmail` alias →
+`_CONNECTOR_ALIASES` in `src/brain/connectors/google/base.py` + `alias()` in
+`src/brain/connectors/__init__.py`; the scope union → `scopes_for()` in
+`src/brain/connectors/google/base.py`; keychain service/account →
+`src/brain/services/keychain.py`. The base
 framework registers **no Google connector by itself** —
 `src/brain/connectors/__init__.py` skips the four adapter modules until they
 merge — so on main alone `brain connectors list` shows an empty registry and
 `brain connectors sync <name>` exits 78 with "enabled but not available on
-this install" (`src/brain/cli.py:1064-1072`). Each connector ships in its own
-PR: Gmail (C5, worker_6), Calendar (C2, worker_9), Drive (C3, worker_10),
-Tasks (C4, worker_11) — together with the per-connector settings above. Every
-setting name in this file will exist in code on the branch that ships it; the
-PR description carries the file:line grep proof per branch.
+this install" (the not-available branch of the sync command in
+`src/brain/cli.py`). Each connector ships in its own
+PR: Gmail #59, Calendar #55, Drive #57, Tasks #56 — together with the
+per-connector settings above. Every setting name in this file will exist in
+code on the branch that ships it; the PR description carries the file:line
+grep proof per branch.
 
 ## First run (order matters)
 
 ```bash
-pip install -e '.[gmail]'                      # google libs (one extra; pyproject.toml:34)
+pip install -e '.[gmail]'                      # google libs (the gmail extra in pyproject.toml)
 ```
 
 Works on main **today** (the consent is scope-only — it does not need the
@@ -145,20 +148,22 @@ adapters registered):
 
 ```bash
 # 1. consent — opens a browser; requests the UNION of enabled scopes and
-#    stores ONLY the refresh token in the login keychain (cli.py:1174):
+#    stores ONLY the refresh token in the login keychain:
 brain connectors auth google --client-secret ~/.config/second-brain/gmail-client-secret.json
 
 # state of every connector: enabled, last ok, cursor present, last error:
 brain connectors list
 ```
 
-`auth` refuses to run until `BRAIN_CONNECTORS` is set (cli.py:1187-1192) and
-needs the client secret (cli.py:1195-1205). Requires
+`auth` refuses to run until `BRAIN_CONNECTORS` is set (the "no connectors
+enabled" branch of `brain connectors auth` in `src/brain/cli.py`) and needs
+the client secret (the "no client secret" branch right below it). Requires
 `BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"` in `.env` so the union covers
 all four sources in one consent.
 
 These become usable as each connector's PR merges (on main alone they exit 78
-with "enabled but not available on this install", cli.py:1064-1072):
+with "enabled but not available on this install" — the not-available branch of
+`brain connectors sync` in `src/brain/cli.py`):
 
 ```bash
 # 2. rehearsal — prints what a sync WOULD capture; writes nothing at all
