@@ -31,6 +31,22 @@ def normalize_text(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+def match_key(raw_text: str, occurred_at: datetime | None) -> tuple[str, str]:
+    """(normalized text, occurred_at as UTC minute) — the SOURCE-BLIND key.
+
+    ``content_fingerprint`` deliberately includes the source, so it can never
+    match a pasted item against a connector record (different source). The
+    adopt step (connectors/adopt.py) needs exactly that source-blind
+    comparison: same normalization, same minute bucketing, no sha256 (the
+    key is compared, not stored).
+    """
+    minute = ""
+    if occurred_at is not None:
+        aware = occurred_at if occurred_at.tzinfo is not None else occurred_at.replace(tzinfo=UTC)
+        minute = aware.astimezone(UTC).strftime("%Y%m%dT%H%M")
+    return normalize_text(raw_text), minute
+
+
 def content_fingerprint(raw_text: str, occurred_at: datetime | None, source: str) -> str:
     """sha256 of (normalized text, occurred_at as UTC minute, source kind).
 

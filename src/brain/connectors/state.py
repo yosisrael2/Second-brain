@@ -50,9 +50,7 @@ class ConnectorStateRepo:
         """Every connector's state row, alphabetical (CLI listing)."""
         return list(self._session.scalars(select(ConnectorState).order_by(ConnectorState.name)))
 
-    def record_success(
-        self, name: str, *, cursor: str | None, at: datetime
-    ) -> None:
+    def record_success(self, name: str, *, cursor: str | None, at: datetime) -> None:
         """Persist the cursor + heartbeat fields after a fully successful batch."""
         row = self.get_or_create(name)
         row.cursor = cursor
@@ -62,9 +60,7 @@ class ConnectorStateRepo:
         row.counters = {**(row.counters or {}), "attempt": 0}  # backoff resets
         self._session.commit()
 
-    def record_error(
-        self, name: str, *, error: str, at: datetime, retryable: bool
-    ) -> None:
+    def record_error(self, name: str, *, error: str, at: datetime, retryable: bool) -> None:
         """Record a failure; only retryable failures grow the backoff counter.
 
         The cursor is deliberately untouched: the next run re-fetches the
@@ -113,9 +109,7 @@ class ConnectorRecordRepo:
         row.last_error = None
         self._session.commit()
 
-    def mark_failure(
-        self, source: str, external_id: str, version: str | None, error: str
-    ) -> bool:
+    def mark_failure(self, source: str, external_id: str, version: str | None, error: str) -> bool:
         """Count one more consecutive failure for this record.
 
         The failing record may have poisoned the SHARED session (a real DB
@@ -157,6 +151,19 @@ class ConnectorRecordRepo:
             row.fail_count = 0
             row.last_error = None
             self._session.commit()
+
+    def delete(self, source: str, external_id: str) -> bool:
+        """Remove ONE ledger row (adopt --undo only). True when a row went.
+
+        The caller decides the safety conditions (undo_adopt refuses rows a
+        sync touched or a user deleted through); the repo just deletes.
+        """
+        row = self.get(source, external_id)
+        if row is None:
+            return False
+        self._session.delete(row)
+        self._session.commit()
+        return True
 
     def quarantined_counts(self) -> dict[str, int]:
         """Quarantined (status 'failed') rows per source (CLI listing)."""
