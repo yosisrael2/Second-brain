@@ -89,7 +89,7 @@ class SyncSummary:
     """One run's outcome (also the ops heartbeat payload)."""
 
     connector: str
-    state: str = "ok"  # ok | auth_error | retry_error | error
+    state: str = "ok"  # ok | auth_error | retry_error | error | backoff
     fetched: int = 0
     created: int = 0
     # create() returned an EXISTING item via the content-fingerprint dedupe
@@ -104,6 +104,10 @@ class SyncSummary:
     reset: bool = False
     cursor_saved: bool = False
     error: str | None = None
+    # state == "backoff" only: seconds until the persisted backoff window
+    # (backoff_seconds(attempt) since the last retryable error) lets the
+    # connector fetch again. None for every other state.
+    retry_in_s: float | None = None
 
 
 class _IngestProto(Protocol):
@@ -123,11 +127,14 @@ class _ItemsRepoProto(Protocol):
 class _StateRepoProto(Protocol):
     def get_or_create(self, name: str) -> Any: ...
 
+    def attempt(self, name: str) -> int:
+        """The persisted consecutive-retryable-failure counter."""
+
+        ...
+
     def record_success(self, name: str, *, cursor: str | None, at: datetime) -> None: ...
 
-    def record_error(
-        self, name: str, *, error: str, at: datetime, retryable: bool
-    ) -> None: ...
+    def record_error(self, name: str, *, error: str, at: datetime, retryable: bool) -> None: ...
 
 
 class _RecordRepoProto(Protocol):
@@ -183,6 +190,30 @@ class ConnectorRunner:
     def run(self, *, limit: int = 200) -> SyncSummary:
         name = self._connector.name
         state = self._state.get_or_create(name)
+        # Enforce the PERSISTED backoff (the counter record_error/record_success
+        # already maintain): a connector still inside its retryable-failure
+        # window is not fetched at all — the pass just reports the skip and
+        # moves on. Without this, every scheduler pass (launchd agent, --drain,
+        # a loop) re-polls a sick source at full rate no matter how often it
+        # has just failed. The window only DELAYS: past it, the run proceeds.
+        attempt = self._state.attempt(name)
+        if attempt > 0 and state.last_error is not None and state.last_run_at is not None:
+            now = self._now()
+            window = backoff_seconds(attempt)
+            remaining = window - (now - state.last_run_at).total_seconds()
+            if remaining > 0:
+                logger.info(
+                    "connector %s: backing off %.1fs more (attempt %d, last error: %s)",
+                    name,
+                    remaining,
+                    attempt,
+                    state.last_error,
+                )
+                return SyncSummary(
+                    connector=name,
+                    state="backoff",
+                    retry_in_s=remaining,
+                )
         try:
             result = self._connector.fetch(state.cursor, limit=limit)
         except ConnectorAuthError as exc:
@@ -198,9 +229,7 @@ class ConnectorRunner:
                 outcome = self._handle(record)
             except Exception as exc:  # noqa: BLE001 — one bad record holds the cursor
                 detail = f"{type(exc).__name__}: {exc}"[:200]
-                if self._records.mark_failure(
-                    name, record.external_id, record.version, detail
-                ):
+                if self._records.mark_failure(name, record.external_id, record.version, detail):
                     # 3rd consecutive failure: QUARANTINED. Not an error any
                     # more — the batch's cursor may advance past it; the
                     # record stays in the ledger until the version bumps.
@@ -361,9 +390,7 @@ class ConnectorRunner:
         if not user_edited:
             item.raw_text = record.text
             item.occurred_at = record.occurred_at
-            item.fingerprint = content_fingerprint(
-                item.raw_text, item.occurred_at, item.source
-            )
+            item.fingerprint = content_fingerprint(item.raw_text, item.occurred_at, item.source)
         self._repo.commit()
         self._repo.refresh(item)
         self._records.put(name, record.external_id, record.version, item.id)
@@ -375,9 +402,7 @@ class ConnectorRunner:
             return "updated"
         return "skipped"
 
-    def _apply_deletion(
-        self, record: SourceRecord, item: MemoryItem, row: Any
-    ) -> str:
+    def _apply_deletion(self, record: SourceRecord, item: MemoryItem, row: Any) -> str:
         """Mark ONE record deleted: meta mark + hide + ledger version. Nothing
         else — no content write, no re-index, no enrichment.
 
@@ -506,9 +531,7 @@ class ConnectorRunner:
 
     # --- failure + ops ---------------------------------------------------------
 
-    def _fail(
-        self, name: str, state: str, message: str, *, retryable: bool = False
-    ) -> SyncSummary:
+    def _fail(self, name: str, state: str, message: str, *, retryable: bool = False) -> SyncSummary:
         self._state.record_error(name, error=message, at=self._now(), retryable=retryable)
         summary = SyncSummary(connector=name, state=state, error=message)
         self._heartbeat(summary)
@@ -553,6 +576,4 @@ class ConnectorRunner:
         try:
             self._enrichment.enqueue(item)
         except Exception as exc:  # noqa: BLE001 — never fail the run on enrichment
-            logger.warning(
-                "connectors: enrichment enqueue failed for item %s (%s)", item.id, exc
-            )
+            logger.warning("connectors: enrichment enqueue failed for item %s (%s)", item.id, exc)

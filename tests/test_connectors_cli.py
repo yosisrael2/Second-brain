@@ -152,9 +152,7 @@ def test_list_shows_quarantined_count(settings_env, database, capsys):
 
     with SessionLocal() as session:
         for _ in range(3):  # three strikes -> quarantined
-            ConnectorRecordRepo(session).mark_failure(
-                "gcal", "bad-1", "v9", "RuntimeError: poison"
-            )
+            ConnectorRecordRepo(session).mark_failure("gcal", "bad-1", "v9", "RuntimeError: poison")
 
     assert cli.main(["connectors", "list"]) == 0
     out = capsys.readouterr().out
@@ -234,9 +232,7 @@ def test_sync_dry_run_prints_records_and_writes_nothing(
 
     with SessionLocal() as session:
         before_items = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
-        before_state = session.execute(
-            sql_text("SELECT count(*) FROM connector_state")
-        ).scalar()
+        before_state = session.execute(sql_text("SELECT count(*) FROM connector_state")).scalar()
 
     exit_code = cli.main(["connectors", "sync", "gcal", "--dry-run"])
 
@@ -283,12 +279,8 @@ def test_sync_drain_loops_until_no_cursor_movement(settings_env, database, capsy
 
     connector = _StubGcal(
         batches=[
-            FetchResult(
-                records=[make_record(external_id="f1", text="body f1")], next_cursor="c1"
-            ),
-            FetchResult(
-                records=[make_record(external_id="f2", text="body f2")], next_cursor="c2"
-            ),
+            FetchResult(records=[make_record(external_id="f1", text="body f1")], next_cursor="c1"),
+            FetchResult(records=[make_record(external_id="f2", text="body f2")], next_cursor="c2"),
             FetchResult(records=[], next_cursor="c2"),  # drained: cursor stops
         ]
     )
@@ -301,6 +293,28 @@ def test_sync_drain_loops_until_no_cursor_movement(settings_env, database, capsy
     with SessionLocal() as session:
         count = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
     assert count == 2
+
+
+def test_sync_inside_backoff_window_skips_fetch_and_exits_0(
+    settings_env, database, capsys, monkeypatch
+):
+    """The persisted backoff is honoured at the CLI boundary: an immediate
+    re-sync after a transient failure does NOT fetch — it prints
+    state=backoff (with the seconds remaining) and exits 0, because a skip
+    is the scheduler working as designed, not a failure."""
+
+    from brain.connectors.base import ConnectorRetryableError
+
+    connector = _StubGcal(errors=[ConnectorRetryableError("http 500")])
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: connector)
+
+    assert cli.main(["connectors", "sync", "gcal"]) == 1  # first: transient failure
+    second = cli.main(["connectors", "sync", "gcal"])
+    assert second == 0, "a backoff skip must not be a failure"
+    out = capsys.readouterr().out
+    assert "state=backoff" in out
+    assert "retry_in_s=" in out
+    assert connector.cursors == [None]  # the second invocation never fetched
 
 
 def test_auth_google_requires_enabled_connectors(settings_env, monkeypatch, capsys):
@@ -318,9 +332,7 @@ def test_auth_google_requires_a_client_secret(settings_env, monkeypatch, capsys)
     assert "not found" in capsys.readouterr().err
 
 
-def test_auth_google_stores_only_the_refresh_token(
-    settings_env, monkeypatch, tmp_path, capsys
-):
+def test_auth_google_stores_only_the_refresh_token(settings_env, monkeypatch, tmp_path, capsys):
     from brain.connectors.google.base import SCOPE_BY_CONNECTOR
 
     secret = tmp_path / "client_secret.json"
@@ -380,9 +392,7 @@ def test_email_dry_run_writes_nothing_even_when_seed_and_backstop_trigger(
         "brain.connectors.google.base.default_service_factory",
         lambda token, scopes, api_name, api_version: _FakeService(state),
     )
-    monkeypatch.setattr(
-        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
-    )
+    monkeypatch.setattr("brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token"))
 
     def _counts(session):
         return {
@@ -449,9 +459,7 @@ def test_email_dry_run_config_error_fails_cleanly(database, capsys, monkeypatch)
         "brain.connectors.google.base.default_service_factory",
         lambda token, scopes, api_name, api_version: _FakeService(_ServiceState()),
     )
-    monkeypatch.setattr(
-        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
-    )
+    monkeypatch.setattr("brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token"))
 
     code = cli.main(["connectors", "sync", "email", "--dry-run"])
     captured = capsys.readouterr()
@@ -468,9 +476,7 @@ def test_dry_run_auth_error_maps_to_the_re_auth_refusal(database, capsys, monkey
     from brain.connectors.base import ConnectorAuthError
 
     failing = FakeConnector(name="gtasks", errors=[ConnectorAuthError("token expired")])
-    monkeypatch.setattr(
-        cli, "_build_connector", lambda name, session=None, **kwargs: failing
-    )
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: failing)
     monkeypatch.setenv("BRAIN_CONNECTORS", "gcal,gtasks")
     get_settings.cache_clear()
 
@@ -482,9 +488,7 @@ def test_dry_run_auth_error_maps_to_the_re_auth_refusal(database, capsys, monkey
     assert captured.err.count("\n") == 1
 
 
-def test_email_dry_run_backstop_report_silent_for_known_ids(
-    database, capsys, monkeypatch
-):
+def test_email_dry_run_backstop_report_silent_for_known_ids(database, capsys, monkeypatch):
     """Review follow-up 2: rfc_backstop_report lacks the ledger-row-first
     guard its write twin (rfc_backstop_put) has — on a connector that ALREADY
     synced, a dry-run printed 'would ledger <id> -> existing item' for every
@@ -512,9 +516,7 @@ def test_email_dry_run_backstop_report_silent_for_known_ids(
         "brain.connectors.google.base.default_service_factory",
         lambda token, scopes, api_name, api_version: _FakeService(state),
     )
-    monkeypatch.setattr(
-        "brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token")
-    )
+    monkeypatch.setattr("brain.services.keychain.Keychain", lambda: FakeKeychain("refresh-token"))
 
     with SessionLocal() as session:
         item = MemoryItem(
@@ -527,9 +529,7 @@ def test_email_dry_run_backstop_report_silent_for_known_ids(
         # m1 is already ledgered: a real sync would never re-ingest it, so a
         # dry-run must not report a would-be ledger action for it either.
         session.add(
-            ConnectorRecord(
-                source="email", external_id="m1", version=None, item_id=item.id
-            )
+            ConnectorRecord(source="email", external_id="m1", version=None, item_id=item.id)
         )
         session.commit()
 
@@ -538,7 +538,4 @@ def test_email_dry_run_backstop_report_silent_for_known_ids(
     assert "m1" in out  # the record is still listed
     assert "would ledger" not in out
     with SessionLocal() as session:
-        assert (
-            session.execute(sql_text("SELECT count(*) FROM connector_records")).scalar()
-            == 1
-        )
+        assert session.execute(sql_text("SELECT count(*) FROM connector_records")).scalar() == 1

@@ -95,12 +95,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Backfill mode: enqueue every qualifying capture created since "
         "this ISO date (D6: its own budget, does not consume today's cap)",
     )
-    enrich.add_argument(
-        "--limit", type=int, default=20, help="Max parents to process this run"
-    )
-    enrich.add_argument(
-        "--budget", type=int, default=None, help="Override the cap for this run"
-    )
+    enrich.add_argument("--limit", type=int, default=20, help="Max parents to process this run")
+    enrich.add_argument("--budget", type=int, default=None, help="Override the cap for this run")
     extract_eval = subparsers.add_parser(
         "extract-eval",
         help="Run the LLM extractor over an emails file -> pred.jsonl (offline)",
@@ -364,9 +360,7 @@ def _extract_eval(
         out_dir = Path(out_path).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         chunks = [
-            c
-            for c in Path(input_path).read_text(encoding="utf-8").split("=====")
-            if c.strip()
+            c for c in Path(input_path).read_text(encoding="utf-8").split("=====") if c.strip()
         ]
         temp = out_dir / f".eval-input-{Path(out_path).stem}.txt"
         temp.write_text("=====".join(chunks[:limit]), encoding="utf-8")
@@ -582,9 +576,7 @@ def _build_trier(session):
     )
 
     def trier(item):
-        return triage_conversation(
-            item.raw_text, jev=jev, llm=llm, kid_names=kid_names
-        )
+        return triage_conversation(item.raw_text, jev=jev, llm=llm, kid_names=kid_names)
 
     return trier
 
@@ -866,7 +858,11 @@ def _normalize_calendar(
     offset = 0
     while True:
         batch = repo.list(
-            item_type=None, project=None, status=None, limit=_PAGE, offset=offset,
+            item_type=None,
+            project=None,
+            status=None,
+            limit=_PAGE,
+            offset=offset,
             include_noise=True,  # maintenance passes see EVERY row
         )
         if not batch:
@@ -1149,6 +1145,7 @@ def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -
         if dry_run:
             # --dry-run writes NOTHING: no seed; the backstop only reports.
             from brain.connectors.google.gmail import rfc_backstop_report
+
             kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_report(
                 session, rfc, gmail_id
             )
@@ -1162,9 +1159,7 @@ def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -
             records = ConnectorRecordRepo(session)
             kwargs["legacy_seed"] = lambda: seed_connector_records_from_email_ledger(session)
             kwargs["is_known"] = lambda gmail_id: records.get("email", gmail_id) is not None
-            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(
-                session, rfc, gmail_id
-            )
+            kwargs["rfc_backstop"] = lambda rfc, gmail_id: rfc_backstop_put(session, rfc, gmail_id)
     return cls(**kwargs)
 
 
@@ -1211,9 +1206,7 @@ def _connectors_sync(args: argparse.Namespace) -> int:
             connector = _build_connector(args.name, session=session, dry_run=True)
             state = ConnectorStateRepo(session).get(connector.name)
             try:
-                result = connector.fetch(
-                    state.cursor if state else None, limit=args.limit
-                )
+                result = connector.fetch(state.cursor if state else None, limit=args.limit)
             except ConnectorError as exc:
                 # The dry-run path has no runner to map connector failures;
                 # map them exactly like the sync path's exit codes: auth and
@@ -1277,9 +1270,12 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         f"deleted={summary.deleted} "
         f"skipped={summary.skipped} errors={summary.errors} "
         f"cursor_saved={summary.cursor_saved}"
+        + (f" retry_in_s={summary.retry_in_s:.0f}" if summary.state == "backoff" else "")
         + (f" error={summary.error}" if summary.error else "")
     )
-    return {"ok": 0, "retry_error": 1, "auth_error": 78}.get(summary.state, 1)
+    # backoff = the persisted per-connector backoff doing its job (the fetch
+    # was deliberately skipped) — success for the scheduler, not a failure.
+    return {"ok": 0, "retry_error": 1, "auth_error": 78, "backoff": 0}.get(summary.state, 1)
 
 
 def _dry_run_failure(name: str, exc: Exception) -> tuple[int, str]:
@@ -1326,6 +1322,7 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
         reset=nxt.reset,
         cursor_saved=nxt.cursor_saved,
         error=nxt.error,
+        retry_in_s=nxt.retry_in_s,
     )
 
 
@@ -1380,9 +1377,7 @@ def _connectors_adopt(args: argparse.Namespace) -> int:
     connector = _build_connector(args.name)  # SystemExit(78) without a token
     try:
         with SessionLocal() as session:
-            report = adopt_connector(
-                connector, session, dry_run=args.dry_run, limit=args.limit
-            )
+            report = adopt_connector(connector, session, dry_run=args.dry_run, limit=args.limit)
     except ConnectorAuthError as exc:
         print(
             f"connectors adopt: re-consent needed — run `brain connectors auth google` ({exc})",
