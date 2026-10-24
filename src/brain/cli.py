@@ -1125,7 +1125,8 @@ def _connectors_sync(args: argparse.Namespace) -> int:
         connector.close()
     print(
         f"connectors sync {summary.connector}: state={summary.state} "
-        f"created={summary.created} updated={summary.updated} deleted={summary.deleted} "
+        f"created={summary.created} deduped={summary.deduped} updated={summary.updated} "
+        f"deleted={summary.deleted} "
         f"skipped={summary.skipped} errors={summary.errors} "
         f"cursor_saved={summary.cursor_saved}"
         + (f" error={summary.error}" if summary.error else "")
@@ -1148,6 +1149,7 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
         state=nxt.state,
         fetched=acc.fetched + nxt.fetched,
         created=acc.created + nxt.created,
+        deduped=acc.deduped + nxt.deduped,
         updated=acc.updated + nxt.updated,
         deleted=acc.deleted + nxt.deleted,
         skipped=acc.skipped + nxt.skipped,
