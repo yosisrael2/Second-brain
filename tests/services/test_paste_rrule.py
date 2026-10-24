@@ -14,10 +14,12 @@ Israeli DST change (Sun 25 Oct 2026) — a 10:00 local meeting stays 10:00
 local every week; the UTC instant shifts with the offset.
 """
 
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pytest
 from qdrant_client import QdrantClient
 from sqlalchemy import func, select, text
 from tests.conftest import assert_test_database
@@ -207,24 +209,39 @@ def test_non_recurring_ics_is_unchanged():
 # ---- persistence: idempotent re-paste + the real search path ---------------------
 
 
-def _fresh_service() -> tuple[IngestService, ItemsRepository, Any]:
+@pytest.fixture(name="fresh_service")
+def fresh_service_fixture() -> Iterator[tuple[IngestService, ItemsRepository, Any]]:
+    """A clean-slate ingest service; the session is owned HERE and closed with
+    the test (house convention, cf. tests/services/test_memory.py).
+
+    Closing is not optional: an un-closed session keeps its pooled connection
+    checked out with the last SELECT's transaction still open (idle in
+    transaction), and those locks deadlock the migration DDL that
+    tests/test_datetime_serialization.py runs later in the full suite — the
+    documented flaky hang that its ``engine.dispose()`` hygiene cannot fix
+    (dispose never closes a still-checked-out connection).
+    """
     assert_test_database(str(engine.url))
     session = SessionLocal()
-    session.execute(text("DELETE FROM memory_items"))
-    session.commit()
-    repo = ItemsRepository(session)
-    store = QdrantVectorStore(client=QdrantClient(":memory:"))
-    indexer = QdrantItemIndexer(FakeEmbedder(dim=8), store)
-    service = IngestService(repo, StubClassifier(FULL_CLASSIFICATION), indexer)
-    return service, repo, session
+    try:
+        session.execute(text("DELETE FROM memory_items"))
+        session.commit()
+        repo = ItemsRepository(session)
+        store = QdrantVectorStore(client=QdrantClient(":memory:"))
+        indexer = QdrantItemIndexer(FakeEmbedder(dim=8), store)
+        service = IngestService(repo, StubClassifier(FULL_CLASSIFICATION), indexer)
+        yield service, repo, session
+    finally:
+        session.rollback()
+        session.close()
 
 
 def _item_count(session) -> int:
     return int(session.execute(select(func.count()).select_from(MemoryItem)).scalar_one())
 
 
-def test_repaste_of_the_same_series_creates_zero_new_items():
-    service, repo, session = _fresh_service()
+def test_repaste_of_the_same_series_creates_zero_new_items(fresh_service):
+    service, repo, session = fresh_service
     parsed = _parse_ics(_WEDNESDAY_SERIES)
 
     first = service.capture_parsed(parsed)
@@ -235,8 +252,8 @@ def test_repaste_of_the_same_series_creates_zero_new_items():
     assert _item_count(session) == 9
 
 
-def test_temporal_question_finds_the_occurrence_through_the_real_search_path():
-    service, repo, session = _fresh_service()
+def test_temporal_question_finds_the_occurrence_through_the_real_search_path(fresh_service):
+    service, repo, session = fresh_service
     service.capture_parsed(_parse_ics(_WEDNESDAY_SERIES))
 
     # the ask path's temporal leg: resolve the question's ranges, then fetch
