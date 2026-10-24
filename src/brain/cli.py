@@ -227,6 +227,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Loop batch after batch until the source is drained (or a batch "
         "makes no progress). Caps at 500 batches as a runaway guard.",
     )
+    connectors_adopt = connectors_sub.add_parser(
+        "adopt",
+        help="One-time: point the idempotency ledger at EXISTING legacy items "
+        "(pasted calendar one-liners / bot emails) so the FIRST sync does not "
+        "duplicate them. Requires consent; runs before the first sync only",
+    )
+    connectors_adopt.add_argument("name", help="Connector name (email|gcal|gdrive|gtasks)")
+    connectors_adopt.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and print the adoption report; write NOTHING (no ledger rows)",
+    )
+    connectors_adopt.add_argument(
+        "--undo",
+        action="store_true",
+        help="Remove the ledger rows the last real adopt wrote (refuses rows a "
+        "sync has since touched or the user deleted the item through)",
+    )
+    connectors_adopt.add_argument(
+        "--limit", type=int, default=200, help="Max records per fetch batch (default 200)"
+    )
     connectors_auth = connectors_sub.add_parser(
         "auth",
         help="Google OAuth consent for the enabled connectors (stores ONLY the "
@@ -285,6 +306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _connectors_list()
         if args.connectors_command == "sync":
             return _connectors_sync(args)
+        if args.connectors_command == "adopt":
+            return _connectors_adopt(args)
         if args.connectors_command == "auth":
             return _connectors_auth(args)
         parser.error(f"unknown connectors command {args.connectors_command!r}")
@@ -1303,6 +1326,79 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
 
 
 # pragma: no cover - needs google libs
+def _connectors_adopt(args: argparse.Namespace) -> int:
+    """One-time legacy adoption: teach the ledger about EXISTING items.
+
+    Same gates as sync (live-store guard, enabled, registered, consent) plus
+    the adopt-specific cursor guard. Exit codes mirror sync: 0 ok, 78
+    refused/auth (nothing written), 1 retryable/other error.
+    """
+    import os  # noqa: PLC0415
+
+    from brain.config import assert_not_live_store, get_settings
+    from brain.connectors import all_names, ensure_registered
+    from brain.connectors import get as get_connector
+    from brain.connectors.adopt import adopt_connector, format_report, undo_adopt
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+    canonical = "email" if args.name.lower() == "gmail" else args.name.lower()
+    if canonical not in settings.connectors_enabled:
+        print(
+            f"connectors: {args.name!r} is not enabled — add it to BRAIN_CONNECTORS "
+            f"(currently: {','.join(settings.connectors_enabled) or 'none'})",
+            file=sys.stderr,
+        )
+        return 78
+    ensure_registered()
+    try:
+        get_connector(args.name)  # resolves aliases; KeyError when absent
+    except KeyError:
+        print(
+            f"connectors: {args.name!r} is enabled but not available on this install "
+            f"(registered: {', '.join(all_names()) or 'none'})",
+            file=sys.stderr,
+        )
+        return 78
+
+    if args.undo:
+        with SessionLocal() as session:
+            report = undo_adopt(canonical, session)
+        print(report.summary_line())
+        return 1 if report.refused else 0
+
+    from brain.connectors.base import ConnectorAuthError, ConnectorError  # noqa: PLC0415
+
+    connector = _build_connector(args.name)  # SystemExit(78) without a token
+    try:
+        with SessionLocal() as session:
+            report = adopt_connector(
+                connector, session, dry_run=args.dry_run, limit=args.limit
+            )
+    except ConnectorAuthError as exc:
+        print(
+            f"connectors adopt: re-consent needed — run `brain connectors auth google` ({exc})",
+            file=sys.stderr,
+        )
+        return 78
+    except ConnectorError as exc:
+        print(f"connectors adopt: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        connector.close()
+    print(format_report(report))
+    if report.wrote:
+        print(
+            f"wrote {len(report.adopted)} ledger row(s) (ops event recorded). "
+            f"Undo: brain connectors adopt {canonical} --undo"
+        )
+    return 78 if report.refused_cursor else 0
+
+
 def _build_connectors_oauth_flow(client_secret_path: str, scopes: list[str]) -> Any:
     """Build the installed-app OAuth flow for the union of enabled scopes
     (patched with fakes in tests; never run against a real account there)."""
