@@ -469,6 +469,14 @@ a whole batch succeeds; an auth error stops the connector (`state.last_error`
 says re-consent is needed), transient errors back off. `reset=True` batches
 are upserted as-is — deletions are never inferred from absent records.
 
+Shipped sources:
+
+| name (items.source) | module | scope | cursor | notes |
+| --- | --- | --- | --- | --- |
+| `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner |
+
+### How to add a new source (the recipe, ≤15 lines)
+
 ### How to add a new source (the recipe, ≤15 lines)
 
 1. `src/brain/connectors/google/<name>.py`: `class MyConnector(GoogleConnector):`
@@ -497,25 +505,26 @@ reboots — API, Telegram bot, WhatsApp poller, and an opt-in Gmail agent
 ```bash
 scripts/service.sh install     # takeover-first: stops manual instances, then bootstraps
 scripts/service.sh status      # per-agent state/pid/last-exit + sleep + docker notes
-scripts/service.sh restart     # kickstart -k both agents
-scripts/service.sh logs [api|telegram]
+scripts/service.sh restart     # kickstart -k installed agents (skips the rest)
+scripts/service.sh logs [api|telegram|email|whatsapp]
 scripts/service.sh uninstall
 ```
 
 - **com.secondbrain.api** runs `scripts/run-server.sh` (foreground uvicorn);
-  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, which maps the bot's
-  exit codes onto launchd's KeepAlive (`SuccessfulExit=false`): disabled (0)
-  and permanent config errors (78, incl. a 409 conflict that outlasts the
-  10-minute retry window) exit 0 → no restart; transient failures exit 1 →
-  restart with backoff. The opt-in **com.secondbrain.email** runs
-  `scripts/run-email.sh` (`brain gmail-poll`) with the same mapping
-  (0/78 → exit 0; needs-re-auth pauses inside the poller instead of exiting);
-  `install` skips it unless `GMAIL_LABEL_ID` is set.
+  **com.secondbrain.telegram** runs `scripts/run-bot.sh`, **com.secondbrain.email**
+  runs `scripts/run-email.sh` (the Gmail connector loop — OPT-IN: installed only
+  when `GMAIL_LABEL_ID` is set, else install prints a skipped line and removes any
+  stale plist), and **com.secondbrain.whatsapp** runs `scripts/run-whatsapp.sh`.
+  All map their exit codes onto launchd's KeepAlive (`SuccessfulExit=false`):
+  disabled (0) and permanent config errors (78, incl. the bot's 409 conflict that
+  outlasts the 10-minute retry window) exit 0 → no restart; transient failures
+  exit 1 → restart with backoff. A needed re-auth pauses inside the email loop
+  instead of exiting.
 - The single-instance lock is machine-wide and per bot id
   (`~/Library/Caches/second-brain/telegram-<bot_id>.lock`, bot id = the
   token's numeric prefix — never the secret): a second bot instance from any
   checkout exits 78 with `another bot instance is running (pid N)`.
-- Both agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
+- All agents get `COMPOSE_PROJECT_NAME=second-brain`; secrets stay out of
   the plists (the app reads `.env` itself via its working directory). Logs:
   `~/Library/Logs/second-brain/`.
 - Accepted deviation: the API launcher does NOT wait for docker and does NOT
