@@ -320,7 +320,11 @@ def _is_live_database_url(url: str) -> bool:
     """True when `url` points at the live database.
 
     Either the exact default URL, or any driver scheme pointing at database
-    name 'brain' on localhost:27432 (the live service's port).
+    name 'brain' on localhost:27432 (the live service's port), or a
+    unix-socket connection (no netloc host/port) to the live dbname — this
+    host's default-cluster 'brain' database can only be the live one, and
+    the compose stack publishes no host unix socket, so such a URL is both
+    live-classified and structurally unreachable (guard tests rely on that).
     """
     if url == LIVE_DATABASE_URL:
         return True
@@ -332,6 +336,8 @@ def _is_live_database_url(url: str) -> bool:
         return False
     host = (parsed.host or "").lower()
     name = (parsed.database or "").lstrip("/")
+    if name == "brain" and parsed.host is None and parsed.port is None:
+        return True  # unix-socket connection to the live-named database
     return name == "brain" and parsed.port == 27432 and host in {"localhost", "127.0.0.1", "::1"}
 
 
