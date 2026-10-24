@@ -66,8 +66,12 @@ check_env_file() {
     # any value — only the bare dbname comparison below.
     local url db
     url="$(grep -E '^DATABASE_URL=' "$env_file" | head -1 | cut -d= -f2- || true)"
-    url="${url%\"}"; url="${url#\"}"; url="${url%'}"; url="${url#'}"
-    db="${url##*/}"; db="${db%%\?*}"
+    url="${url%\"}"
+    url="${url#\"}"
+    url="${url%'}"
+    url="${url#'}"
+    db="${url##*/}"
+    db="${db%%\?*}"
     if [ "$db" = "brain" ]; then
       say "env: WARNING: the created env file points at database 'brain' (the live database) — in a git worktree set a *_test dbname before running anything against it"
     fi
