@@ -200,6 +200,14 @@ def _derive_status(component: str, raw: dict[str, Any]) -> dict[str, Any]:
             raw,
         )
     if component == "enrichment":
+        worker = raw.get("worker") or {}
+        if worker.get("phase") == "stalled":
+            return _entry(
+                "degraded",
+                f"worker pass running {worker.get('age_s', '?')}s > deadline "
+                f"{worker.get('deadline_s', '?')}s",
+                raw,
+            )
         worker = raw.get("worker_enabled")
         summary = (
             f"queue {raw.get('queue_depth', 0)} · cap {raw.get('cap_used_today', 0)}"
@@ -913,5 +921,15 @@ def _enrichment_check() -> dict[str, Any]:
             "queue_depth": service.queue_depth(),
             "cap_used_today": service.cap_used_today(now),
             "cap_limit": get_settings().enrichment_daily_cap,
+        }
+    # The in-bot worker publishes its phase (idle/running/stalled) through the
+    # enrichment-worker heartbeat (written by the bot process, read here —
+    # cross-process via the DB). phase=stalled means a pass blew its deadline:
+    # _derive_status renders the entry degraded.
+    worker = ops.heartbeat_detail("enrichment-worker")
+    if worker is not None:
+        details["worker"] = {
+            **worker,
+            "hb_age_s": ops.heartbeat_age_seconds("enrichment-worker"),
         }
     return details

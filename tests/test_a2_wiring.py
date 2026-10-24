@@ -497,3 +497,191 @@ def test_shutdown_without_a_pass_is_a_noop():
 
     asyncio.run(go())  # returns immediately, nothing raised
     assert core._enrich_task is None  # noqa: SLF001
+
+
+# --- (deadline) a hung pass must not stall the worker forever -----------------
+
+
+def _timeout_settings(**overrides):
+    return _settings(enrichment_pass_timeout_s=0, **overrides)
+
+
+def _wipe_deadline_state() -> None:
+    """Deadline tests must not see earlier runs' ops rows (shared test DB)."""
+    from brain.ops import _get_engine
+
+    with _get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM ops_events WHERE component = 'enrichment'"))
+        conn.execute(text("DELETE FROM ops_heartbeats WHERE component = 'enrichment-worker'"))
+
+
+def _ops_events_of_kind(kind: str) -> list[dict]:
+    from brain.ops import _get_engine
+
+    with _get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT component, kind, ok, detail FROM ops_events "
+                "WHERE kind = :k ORDER BY ts"
+            ),
+            {"k": kind},
+        ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def _health_enrichment_entry() -> dict:
+    from brain.ops.health import _derive_status, _enrichment_check
+
+    return _derive_status("enrichment", _enrichment_check())
+
+
+def test_pass_past_deadline_records_timeout_and_degrades_health(monkeypatch):
+    from brain.ops import heartbeat_detail
+
+    _wipe_deadline_state()
+
+    fake = _BlockingEnrichment()
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _timeout_settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        try:
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+            await _await_started(fake)
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        finally:
+            pass
+        events = _ops_events_of_kind("worker_pass_timeout")
+        assert len(events) == 1
+        assert events[0]["ok"] is False
+        assert events[0]["detail"]["extractor"] == "stub"
+        hb = heartbeat_detail("enrichment-worker")
+        assert hb is not None and hb["phase"] == "stalled"
+        entry = _health_enrichment_entry()
+        assert entry["status"] == "degraded"
+        assert "pass running" in entry["summary"] and "> deadline" in entry["summary"]
+
+    asyncio.run(go())
+    fake.release.set()
+
+
+def test_stalled_thread_finishing_lets_the_next_due_tick_run(monkeypatch):
+    from brain.ops import heartbeat_detail
+
+    _wipe_deadline_state()
+
+    fake = _BlockingEnrichment()
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _timeout_settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_started(fake)
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)  # timeout fires
+        assert len(fake.calls) == 1
+        fake.release.set()
+        while core._enrich_stalled_task is not None and not core._enrich_stalled_task.done():  # noqa: SLF001
+            await asyncio.sleep(0.01)
+        core._enrich_last_run = 0.0  # noqa: SLF001  the next tick is due
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)  # a NEW pass ran
+        assert len(fake.calls) == 2
+        hb = heartbeat_detail("enrichment-worker")
+        assert hb["phase"] in ("running", "idle")  # recovered
+
+    asyncio.run(go())
+
+
+def test_no_second_concurrent_pass_while_the_stalled_thread_is_alive(monkeypatch):
+    _wipe_deadline_state()
+    fake = _BlockingEnrichment()
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _timeout_settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        try:
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+            await _await_started(fake)
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)  # timeout
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)  # later tick
+            await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)  # and again
+        finally:
+            fake.release.set()
+        assert len(fake.calls) == 1  # still only the ORIGINAL pass
+        assert len(_ops_events_of_kind("worker_pass_timeout")) == 1  # logged once
+
+    asyncio.run(go())
+
+
+def test_health_enrichment_ok_without_a_worker_heartbeat(monkeypatch):
+    session = SessionLocal()
+    session.execute(text("DELETE FROM ops_heartbeats WHERE component = 'enrichment-worker'"))
+    session.commit()
+    monkeypatch.setattr("brain.config.get_settings", lambda: _settings())
+    entry = _health_enrichment_entry()
+    assert entry["status"] == "ok"  # worker off (inert) stays the designed ok
+    session.close()
+
+
+# --- (deadline) a finished STALLED pass still delivers its cards ---------------
+
+
+def test_finished_stalled_pass_still_delivers_its_cards(monkeypatch):
+    session = SessionLocal()
+    _wipe(session)
+    _wipe_deadline_state()
+    repo = ItemsRepository(session)
+    source = repo.add(MemoryItem(raw_text=SOURCE_BODY, source="email"))
+    repo.commit()
+    child = repo.add(
+        MemoryItem(raw_text="child x", source="email", child_state="proposed")
+    )
+    repo.commit()
+    session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
+    repo.commit()
+    fake = _BlockingEnrichment(outcomes=_outcomes_for(source))
+    _use_pass_service(monkeypatch, fake)
+
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _timeout_settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        try:
+            tg1 = _Tg()
+            await asyncio.wait_for(_flush_bot_jobs(tg1, core), timeout=2.0)
+            await _await_started(fake)
+            await asyncio.wait_for(_flush_bot_jobs(tg1, core), timeout=2.0)  # deadline
+            assert tg1.sent == [] and len(_ops_events_of_kind("worker_pass_timeout")) == 1
+            fake.release.set()
+            while core._enrich_stalled_task is None or not core._enrich_stalled_task.done():  # noqa: SLF001
+                await asyncio.sleep(0.01)
+            tg2 = _Tg()
+            await _flush_bot_jobs(tg2, core)  # the stalled task's harvest + flush
+            # the pass ran past its deadline, but its changed source STILL
+            # gets exactly one proposal card
+            assert len(tg2.sent) == 1
+            assert "🧠 found" in tg2.sent[0]["text"]
+        finally:
+            fake.release.set()
+
+    asyncio.run(go())
+    _wipe(session)
+    session.close()

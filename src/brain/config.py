@@ -130,6 +130,11 @@ class Settings(BaseSettings):
     # A2 wiring: the in-bot worker's tick interval. Only read when
     # enrichment_worker_enabled is true (default OFF: nothing scheduled).
     enrichment_worker_interval_s: int = 300
+    # A2 wiring: per-pass deadline. A pass older than this is declared stalled
+    # (ops event enrichment/worker_pass_timeout, health degraded) and the
+    # worker stops waiting; a to_thread body cannot be killed, so no new pass
+    # starts until the stalled thread has actually finished.
+    enrichment_pass_timeout_s: int = 900
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
