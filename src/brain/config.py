@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     # real extractor (never blocks the capture reply either way).
     enrichment_daily_cap: int = 100
     enrichment_worker_enabled: bool = False
+    # A2 activation seam: which extractor the enrichment pipeline builds
+    # (services.extraction.service.build_extractor is the ONE chooser).
+    # 'stub' (default) keeps live behaviour exactly as A1 shipped it; 'llm'
+    # selects the real LLM extractor. Activation = this + the worker switch,
+    # never a code change. Literal validation rejects anything else.
+    enrichment_extractor: Literal["stub", "llm"] = "stub"
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
