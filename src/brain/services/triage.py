@@ -130,6 +130,27 @@ def mentions_name(name: str, text: str) -> bool:
     return re.search(rf"(?<!\w){body}(?!\w)", text, re.IGNORECASE) is not None
 
 
+def is_name_token(name: str, token: str) -> bool:
+    """Full-TOKEN name match (audience resolution — the conservative sibling).
+
+    Unlike :func:`mentions_name` (a whole-word SEARCH inside longer text),
+    here the token must BE the name: an extracted "רונה לוי" or "Rona
+    Cohen" must NOT resolve to our Rona — zero wrong-child is the A2 bar,
+    and an "unknown" is always safer. Same normalisation as mentions_name:
+    case-insensitive, and for Hebrew-letter names an optional run of up to
+    3 Hebrew prefix letters directly before the name (ורונה still matches).
+    """
+    if not name or not token:
+        return False
+    token = token.strip()
+    if not token:
+        return False
+    body = re.escape(name)
+    if re.search(_HEBREW_LETTER, name):
+        body = rf"{_HEBREW_PREFIX_RUN}{body}"
+    return re.fullmatch(body, token, re.IGNORECASE) is not None
+
+
 def confirmed_kid_names(entities: Sequence[dict[str, Any]]) -> list[str]:
     """Names + aliases of confirmed kids (kind 'person' with a grade fact).
 

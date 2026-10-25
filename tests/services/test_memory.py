@@ -156,6 +156,35 @@ def test_named_kids_name_and_alias_do_not_double_count(memory: MemoryService):
     assert memory.resolve_applies_to({"named_kids": ["Rona", "רונה"]}) == ["Rona"]
 
 
+def test_named_kids_full_token_no_classmate_collision(memory: MemoryService):
+    """A classmate sharing the first name must stay unknown (zero wrong-child)."""
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Itamar", "איתמר")
+    assert memory.resolve_applies_to({"named_kids": ["רונה לוי"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["Rona Cohen"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["איתמר ס."]}) == ["unknown"]
+
+
+def test_named_kids_compound_token_stays_unknown(memory: MemoryService):
+    """One token naming two kids is conservative: unknown, never a guess."""
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Itamar", "איתמר")
+    assert memory.resolve_applies_to({"named_kids": ["רונה ואיתמר"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["רונה", "איתמר"]}) == [
+        "Rona", "Itamar"
+    ]
+
+
+def test_named_kids_whitespace_and_prefix_forms(memory: MemoryService):
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    assert memory.resolve_applies_to({"named_kids": [" רונה "]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["ורונה"]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["רונית"]}) == ["unknown"]
+
+
 def test_named_kids_unknown_name_stays_unknown_with_aliases_present(memory: MemoryService):
     _seed_world(memory)
     _add_alias(memory, "Rona", "רונה")
