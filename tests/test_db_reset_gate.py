@@ -45,10 +45,20 @@ def _admin_url() -> str:
 
 
 def _gate_db_url() -> str:
-    """A scratch *_test DB derived from this suite's own DB (per-worktree)."""
-    base = _database_name(get_settings().database_url)
+    """A scratch *_test DB derived from this suite's own DB (per-worktree).
+
+    Same derivation as test_db_session_reset's sub DB: the suite URL's
+    scheme/host/port prefix + a new name — never a hardcoded port (CI runs
+    Postgres on 5432, the dev stack on 27432)."""
+    suite_url = get_settings().database_url
+    base = _database_name(suite_url)
     assert base.endswith("_test")
-    return f"postgresql://brain:brain@localhost:27432/{base[: -len('_test')]}_rgate_test"
+    left, _, _rest = suite_url.rpartition("/")
+    # plain libpq URL: this value is passed to psycopg.connect directly (the
+    # children that want the SQLAlchemy dialect get it via DATABASE_URL)
+    return f"{left}/{base[: -len('_test')]}_rgate_test".replace(
+        "postgresql+psycopg", "postgresql"
+    )
 
 
 def _drop_database(url: str) -> None:
