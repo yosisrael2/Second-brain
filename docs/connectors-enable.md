@@ -399,6 +399,12 @@ be small on a first run right after adoption (recent mail only).
 BRAIN_ALLOW_LIVE=1 QDRANT_COLLECTION=brain_items .venv/bin/brain connectors sync email
 ```
 
+Gmail pacing note: every Gmail API call is paced `gmail_min_call_interval_s`
+apart (default 6 s; the budget is per Google USER, shared with the running
+gmail-poll agent) — a first adopt/sync of ~200 messages takes ~20 minutes by
+design, and a transient 403 quota error is retried in-run. See
+[connectors-setup.md](connectors-setup.md), the Gmail quota section.
+
 From then on the launchd agent syncs automatically (historyId cursor; an
 expired history is handled internally with a full re-list + dedupe — never
 double capture).
