@@ -703,6 +703,13 @@ def _queued(session, *, source: str, text: str, sent_days_ago: int = 1):
     return item
 
 
+def _job_row(session, item_id):
+    return session.execute(
+        text("SELECT attempts, not_before, state FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(item_id)},
+    ).one()
+
+
 def test_worker_source_filter_processes_only_email(monkeypatch):
     """Week 1: with ENRICHMENT_WORKER_SOURCES=email the worker pass runs the
     email job ONLY — the WhatsApp job stays queued and its row is UNTOUCHED
@@ -710,20 +717,8 @@ def test_worker_source_filter_processes_only_email(monkeypatch):
     session = SessionLocal()
     _wipe(session)
     email = _queued(session, source="email", text=SOURCE_BODY)
-    whatsapp = _queued(
-        session,
-        source="whatsapp",
-        text="[21/10] הודעה מהכיתה: מחר 22/10 איסוף ב-13:00 "
-        "וביום חמישי 23/10 חולצה לבנה וכן תיק ספורט ליום שבת 25/10",
-    )
-
-    def _job_row(item_id):
-        return session.execute(
-            text("SELECT attempts, not_before, state FROM enrichment_jobs WHERE item_id = :i"),
-            {"i": str(item_id)},
-        ).one()
-
-    snapshot = _job_row(whatsapp.id)
+    whatsapp = _queued(session, source="whatsapp", text=WA_BODY)
+    snapshot = _job_row(session, whatsapp.id)
     service = EnrichmentService(ItemsRepository(session), session)
     _use_pass_service(monkeypatch, service)
     monkeypatch.setattr(
@@ -738,18 +733,11 @@ def test_worker_source_filter_processes_only_email(monkeypatch):
         await _await_pass_done(core)
         tg2 = _Tg()
         await _flush_bot_jobs(tg2, core)
-        assert email_job_state(session, email.id) == "done"
-        assert email_job_state(session, whatsapp.id) == "queued"
         assert len(tg2.sent) == 1  # only the email's card
 
-    def email_job_state(session, item_id):
-        return session.execute(
-            text("SELECT state FROM enrichment_jobs WHERE item_id = :i"),
-            {"i": str(item_id)},
-        ).scalar()
-
     asyncio.run(go())
-    assert _job_row(whatsapp.id) == snapshot  # attempts/not_before/state identical
+    assert _job_row(session, email.id).state == "done"
+    assert _job_row(session, whatsapp.id) == snapshot  # attempts/not_before/state identical
     _wipe(session)
     session.close()
 
@@ -759,11 +747,7 @@ def test_worker_without_filter_processes_all_sources(monkeypatch):
     session = SessionLocal()
     _wipe(session)
     _queued(session, source="email", text=SOURCE_BODY)
-    _queued(
-        session,
-        source="whatsapp",
-        text=WA_BODY,
-    )
+    _queued(session, source="whatsapp", text=WA_BODY)
     service = EnrichmentService(ItemsRepository(session), session)
     _use_pass_service(monkeypatch, service)
     monkeypatch.setattr(
@@ -789,11 +773,7 @@ def test_cli_run_once_stays_unfiltered():
     session = SessionLocal()
     _wipe(session)
     _queued(session, source="email", text=SOURCE_BODY)
-    _queued(
-        session,
-        source="whatsapp",
-        text=WA_BODY,
-    )
+    _queued(session, source="whatsapp", text=WA_BODY)
     service = EnrichmentService(ItemsRepository(session), session)
     report = service.run_once(datetime.now(tz=UTC), limit=20)
     assert report.processed == 2, report
@@ -808,12 +788,7 @@ def test_cap_counts_only_executed_jobs(monkeypatch):
     _wipe(session)
     e1 = _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=3)
     e2 = _queued(session, source="email", text=SOURCE_BODY + " א", sent_days_ago=2)
-    wa = _queued(
-        session,
-        source="whatsapp",
-        text=WA_BODY,
-        sent_days_ago=1,
-    )
+    wa = _queued(session, source="whatsapp", text=WA_BODY, sent_days_ago=1)
     # the pass seam bypasses _build_pass_service: the cap lives on the
     # service we inject (the real builder forwards settings.enrichment_daily_cap)
     service = EnrichmentService(ItemsRepository(session), session, daily_cap=1)
@@ -834,13 +809,6 @@ def test_cap_counts_only_executed_jobs(monkeypatch):
         await _await_pass_done(core)
 
     asyncio.run(go())
-    import brain.telegram_bot as _tb  # noqa: PLC0415
-
-    print(
-        "\nPASSES:",
-        _tb._enrich_pass.__wrapped__ if hasattr(_tb._enrich_pass, "__wrapped__") else "n/a",
-    )
-    print(session.execute(text("SELECT item_id, state, not_before FROM enrichment_jobs")).all())
     rows = {
         str(j["item_id"]): j
         for j in session.execute(
@@ -857,13 +825,40 @@ def test_cap_counts_only_executed_jobs(monkeypatch):
 
 
 def test_starvation_the_filter_is_in_sql(monkeypatch):
-    """50 old WhatsApp jobs ahead of ONE newer email job: the very first
-    filtered pass runs the email (limit 25 could never reach it post-fetch)."""
+    """50 QUALIFYING old WhatsApp jobs ahead of ONE newer email job: the very
+    first filtered pass runs the email (limit 25 could never reach it if the
+    filter were a post-fetch skip)."""
     session = SessionLocal()
     _wipe(session)
-    for n in range(50):
-        _queued(session, source="whatsapp", text=f"[21/10] הודעה מספר {n}", sent_days_ago=10)
+    for _ in range(50):
+        _queued(session, source="whatsapp", text=WA_BODY, sent_days_ago=10)
     email = _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=1)
+    # deterministic queue order: the fillers enqueued strictly earlier than
+    # the email (same-second queued_at would fall back to random uuid order)
+    session.execute(
+        text("UPDATE enrichment_jobs SET queued_at = :q WHERE item_id <> :i"),
+        {"q": datetime.now(tz=UTC) - timedelta(days=2), "i": str(email.id)},
+    )
+    session.commit()
+    # the premise, asserted: 51 queued jobs, 50 WhatsApp, ALL older than the
+    # email's job — if enqueue had skipped the fillers this test proves nothing
+    counts = session.execute(
+        text(
+            "SELECT source, COUNT(*) FROM enrichment_jobs j "
+            "JOIN memory_items m ON m.id = j.item_id "
+            "WHERE j.state = 'queued' GROUP BY source"
+        )
+    ).all()
+    assert dict(counts) == {"whatsapp": 50, "email": 1}, counts
+    email_queued_at = session.execute(
+        text("SELECT queued_at FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(email.id)},
+    ).scalar()
+    older = session.execute(
+        text("SELECT COUNT(*) FROM enrichment_jobs WHERE item_id <> :i AND queued_at < :q"),
+        {"i": str(email.id), "q": email_queued_at},
+    ).scalar()
+    assert older == 50  # every filler is strictly ahead of the email job
     service = EnrichmentService(ItemsRepository(session), session)
     _use_pass_service(monkeypatch, service)
     monkeypatch.setattr(
@@ -883,6 +878,42 @@ def test_starvation_the_filter_is_in_sql(monkeypatch):
         assert state == "done"
 
     asyncio.run(go())
+    _wipe(session)
+    session.close()
+
+
+def test_starvation_deferred_jobs_never_hide_a_due_job():
+    """Same post-fetch starvation class, not_before leg: 30 jobs deferred to
+    tomorrow (not_before) sit ahead of 1 DUE job in queue order. The 25-row
+    scan window must not fill up with not-yet-due rows — the due job runs."""
+    session = SessionLocal()
+    _wipe(session)
+    tomorrow = datetime.now(tz=UTC) + timedelta(days=1)
+    for _ in range(30):
+        _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=10)
+    due = _queued(session, source="email", text=SOURCE_BODY + " ד", sent_days_ago=1)
+    # defer the 30 oldest (as D5 does), keep the newest due
+    session.execute(
+        text("UPDATE enrichment_jobs SET not_before = :nb, queued_at = :q WHERE item_id <> :i"),
+        {"nb": tomorrow, "q": datetime.now(tz=UTC) - timedelta(days=2), "i": str(due.id)},
+    )
+    session.commit()
+    # the premise: 31 queued jobs; the due one is strictly the newest
+    counts = session.execute(
+        text(
+            "SELECT state, COUNT(*) FROM enrichment_jobs "
+            "WHERE not_before IS NOT NULL GROUP BY state"
+        )
+    ).all()
+    assert dict(counts) == {"queued": 30}, counts
+    service = EnrichmentService(ItemsRepository(session), session)
+    report = service.run_once(datetime.now(tz=UTC), limit=20)
+    assert report.processed == 1, report  # the due job ran DESPITE 30 deferred ahead
+    state = session.execute(
+        text("SELECT state FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(due.id)},
+    ).scalar()
+    assert state == "done"
     _wipe(session)
     session.close()
 

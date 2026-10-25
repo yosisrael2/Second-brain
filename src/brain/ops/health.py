@@ -922,10 +922,10 @@ def _enrichment_check() -> dict[str, Any]:
             # [] = every source. Queued jobs waiting only on the filter are
             # NEVER degraded — they are the designed week-2 backlog.
             "worker_sources": list(settings.worker_source_list),
-            "extractor": get_settings().enrichment_extractor,
+            "extractor": settings.enrichment_extractor,
             "queue_depth": service.queue_depth(),
             "cap_used_today": service.cap_used_today(now),
-            "cap_limit": get_settings().enrichment_daily_cap,
+            "cap_limit": settings.enrichment_daily_cap,
         }
     # The in-bot worker publishes its phase (idle/running/stalled) through the
     # enrichment-worker heartbeat (written by the bot process, read here —

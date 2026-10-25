@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from brain import ops
@@ -339,6 +339,11 @@ class EnrichmentService:
             select(EnrichmentJob)
             .where(EnrichmentJob.state == "queued")
             .where(EnrichmentJob.budget == budget)
+            # DUE-ness is part of the SQL, not a post-fetch skip: deferred
+            # jobs (not_before = tomorrow) pile up oldest-first, and 25 of
+            # them ahead of the scan limit would hide every due job behind
+            # them — the same starvation the sources filter had.
+            .where(or_(EnrichmentJob.not_before.is_(None), EnrichmentJob.not_before <= now))
             .order_by(EnrichmentJob.queued_at.asc(), EnrichmentJob.id.asc())
             .limit(25)
         )
@@ -348,10 +353,7 @@ class EnrichmentService:
             stmt = stmt.join(MemoryItem, EnrichmentJob.item_id == MemoryItem.id).where(
                 MemoryItem.source.in_(sources)
             )
-        for job in self._session.scalars(stmt):
-            if job.not_before is None or job.not_before <= now:
-                return job
-        return None
+        return self._session.scalars(stmt).first()
 
     def _next_day_start(self, now: datetime) -> datetime:
         local = now.astimezone(self._tz)
