@@ -50,6 +50,11 @@ from brain.connectors.google.base import GoogleConnector
 
 logger = logging.getLogger(__name__)
 
+# Reset sweep budget (PR-c finding 5): ids-only pages of 500; 20 pages cap the
+# sweep at 10k ids (~20 list calls ≈ 100 quota units, paced). Past the budget
+# the sweep reports "incomplete" and the runner reconciles nothing.
+_MAX_SWEEP_PAGES = 20
+
 
 def record_from_message(msg: GmailMessage, *, deleted: bool = False) -> SourceRecord:
     """Map one parsed Gmail message onto a SourceRecord (pure).
@@ -434,10 +439,61 @@ class GmailConnector(GoogleConnector):
             # resume point — the next sync's history walk re-reports anything
             # that arrived during the listing, and the ledger dedupes it.
             next_cursor = resume_history_id
+        # Reset reconcile (PR-c finding 5): on a reset, sweep the EXACT sync
+        # scope (same label AND query as the listing above) for ids only, so
+        # the runner can diff the ledger against it and tombstone what the
+        # source no longer lists. A first sync (reset=False) sweeps not.
+        sweep_ids: tuple[str, ...] | None = None
+        if reset:
+            sweep_ids = self._sweep_listing_ids(label, query)
         # more=True when the batch hit the limit: there are more records the
         # source yields, and the resume cursor (None when truncated) cannot
         # express it. The --drain loop and adopt._fetch_all keep going on it.
-        return FetchResult(records=records, next_cursor=next_cursor, reset=reset, more=truncated)
+        return FetchResult(
+            records=records,
+            next_cursor=next_cursor,
+            reset=reset,
+            more=truncated,
+            full_listing_ids=sweep_ids,
+        )
+
+    def _sweep_listing_ids(self, label: str, query: str) -> tuple[str, ...] | None:
+        """IDS-ONLY walk of the EXACT sync scope for the reset reconcile.
+
+        Same label AND query as the record listing — a narrower or broader
+        sweep would break the diff's meaning (an item outside the swept scope
+        would look deleted, or a real deletion would look alive). Returns the
+        full id set ONLY when the walk ended naturally (nextPageToken None)
+        within the page budget; ANY early stop (budget, API error) returns
+        None — the runner then reconciles nothing (never tombstone on a
+        partial list). No messages.get at all: each page is one ~5-unit
+        messages.list, so a 10k-id label sweeps for ~20 calls (~100 units),
+        paced by the client's interval, once per rare reset.
+        """
+        client = self._gmail()
+        ids: list[str] = []
+        page_token: str | None = None
+        for _page in range(_MAX_SWEEP_PAGES):
+            try:
+                stubs, page_token = self._boundary(
+                    lambda pt=page_token: client.list_messages_page(
+                        query=query, label_ids=[label], page_token=pt, max_results=500,
+                    )
+                )
+            except ConnectorError as exc:
+                if getattr(exc, "status", None) == 404:
+                    # The label vanished mid-resync: terminal, same as the listing.
+                    raise ConnectorError(f"label lookup failed during resync: {exc}") from exc
+                logger.warning("connectors: email reset sweep aborted (%s) — no reconcile", exc)
+                return None
+            ids.extend(stub.id for stub in stubs)
+            if page_token is None:
+                return tuple(ids)
+        logger.warning(
+            "connectors: email reset sweep hit the %d-page budget — no reconcile",
+            _MAX_SWEEP_PAGES,
+        )
+        return None
 
     def _current_history_id(self) -> str | None:
         client = self._gmail()

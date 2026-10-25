@@ -67,6 +67,15 @@ logger = logging.getLogger(__name__)
 
 _BACKOFF_BASE_S = 5.0
 _BACKOFF_CAP_S = 600.0
+
+# Reset reconcile (PR-c finding 5): refuse the sweep diff when it would
+# tombstone more than _MAX_RESET_TOMBSTONES records, or more than
+# _MAX_RESET_TOMBSTONE_FRACTION of the ledgered live items — whichever first.
+# A mass-hide from a bad listing must never happen silently: the refusal is
+# logged and recorded as an ops event, and the reset applies WITHOUT the
+# reconcile (the next reset can reconcile once the anomaly is explained).
+_MAX_RESET_TOMBSTONES = 200
+_MAX_RESET_TOMBSTONE_FRACTION = 0.25
 # Attachments larger than the core's cap are recorded and skipped (the same
 # policy as the email poller) — never a record failure.
 from brain.services.attachments import MAX_FILE_BYTES  # noqa: E402
@@ -227,8 +236,12 @@ class ConnectorRunner:
         except ConnectorError as exc:
             return self._fail(name, "error", str(exc))
 
+        records = result.records
+        if result.reset and result.full_listing_ids is not None:
+            records = self._reconcile_reset(name, result.full_listing_ids, records)
+
         created = updated = deleted = skipped = deduped = errors = 0
-        for record in result.records:
+        for record in records:
             try:
                 outcome = self._handle(record)
             except Exception as exc:  # noqa: BLE001 — one bad record holds the cursor
@@ -309,6 +322,72 @@ class ConnectorRunner:
         return summary
 
     # --- per-record semantics -------------------------------------------------
+
+    def _reconcile_reset(
+        self, name: str, listed: tuple[str, ...], records: list[SourceRecord]
+    ) -> list[SourceRecord]:
+        """Reset reconcile (PR-c finding 5): ledger ids the connector's FULL
+        reset sweep no longer lists are deleted from the source — synthesized
+        tombstones applied through the normal deletion path.
+
+        Only a COMPLETE sweep reaches here (the connector sets
+        ``full_listing_ids`` only when its ids-only walk ended naturally
+        within budget). The diff base is the ledger's live captures (rows
+        with an item); user-deleted rows (item_id NULL) are excluded by the
+        repo and are never resurrected or tombstoned. A diff above the
+        ceiling (more than _MAX_RESET_TOMBSTONES, or more than
+        _MAX_RESET_TOMBSTONE_FRACTION of the ledgered live items) is REFUSED:
+        logged + an ops event, and the batch applies without the reconcile —
+        a mass-hide from a bad listing must never happen silently.
+        """
+        ledger_ids = self._records.external_ids(name)
+        missing = sorted(ledger_ids - set(listed))
+        if not missing:
+            return records
+        if len(missing) > _MAX_RESET_TOMBSTONES or (
+            ledger_ids and len(missing) > _MAX_RESET_TOMBSTONE_FRACTION * len(ledger_ids)
+        ):
+            logger.warning(
+                "connectors: %s reset reconcile REFUSED — %d of %d ledgered ids missing "
+                "(ceiling %d / %.0f%%)",
+                name,
+                len(missing),
+                len(ledger_ids),
+                _MAX_RESET_TOMBSTONES,
+                _MAX_RESET_TOMBSTONE_FRACTION * 100,
+            )
+            ops.record_event(
+                f"connector:{name}",
+                "reset_reconcile_refused",
+                ok=False,
+                detail={
+                    "missing": len(missing),
+                    "ledger": len(ledger_ids),
+                    "listed": len(listed),
+                },
+            )
+            return records
+        logger.info(
+            "connectors: %s reset reconcile tombstoning %d missing record(s)",
+            name,
+            len(missing),
+        )
+        return [
+            *records,
+            *(
+                SourceRecord(
+                    source=name,
+                    external_id=eid,
+                    version=None,
+                    title="",
+                    text="",
+                    occurred_at=None,
+                    meta={"tombstone": True, "reason": "reset-reconcile"},
+                    deleted=True,
+                )
+                for eid in missing
+            ),
+        ]
 
     def _handle(self, record: SourceRecord) -> str:
         """Apply one record; returns created|deduped|updated|deleted|skipped."""

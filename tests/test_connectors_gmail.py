@@ -130,6 +130,10 @@ class _FakeMessages:
         self._state.calls.append(("messages.list", kwargs))
         if self._state.list_error is not None:
             return _FakeRequest(error=self._state.list_error)
+        if self._state.list_pages is not None:
+            if len(self._state.list_pages) > 1:
+                return _FakeRequest(result=self._state.list_pages.pop(0))
+            return _FakeRequest(result=self._state.list_pages[0])
         return _FakeRequest(result=self._state.list_result)
 
     def get(self, userId, id, format="full"):  # noqa: N803, A002
@@ -220,6 +224,10 @@ class _ServiceState:
         self.messages: dict[str, dict] = {}
         self.get_errors: dict[str, Exception] = {}
         self.list_result: dict = {"messages": []}
+        # Per-call page sequence for the reset-sweep tests: popped per
+        # messages.list call; when exhausted the LAST page repeats (so a
+        # trailing nextPageToken is an endless page train).
+        self.list_pages: list[dict] | None = None
         self.list_error: Exception | None = None
         self.history_pages: dict[str, dict] = {}
         self.history_error: Exception | None = None
@@ -1545,3 +1553,72 @@ class TestQuotaAnd404:
         assert sum(1 for c in state.calls if c[0] == "history.list") == 1
         assert [r.external_id for r in result.records] == ["m1"]
         assert result.next_cursor == "h1"  # stopped between entries, safely
+
+
+class TestResetSweep:
+    """PR-c finding (5): the ids-only reset sweep (reconcile-on-reset)."""
+
+    def test_sweep_uses_the_exact_listing_scope(self):
+        """Adjustment (a): the sweep must list with EXACTLY the same label AND
+        gmail_query as the record listing — a message on the label but outside
+        the query must never be swept INTO or OUT OF scope. Every list call
+        (listing + sweep) carries the same query and labelIds."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.messages["m1"] = _msg_fixture("m1")
+        state.messages["m2"] = _msg_fixture("m2")
+        state.list_result = {"messages": [{"id": "m1"}, {"id": "m2"}]}
+        state.history_error = _FakeHttpError(404, b"Requested entity was not found")
+        connector = _connector(state, query="from:x")
+        result = connector.fetch("expired", limit=10)  # history 404 -> reset
+        assert result.reset is True
+        assert result.full_listing_ids == ("m1", "m2")
+        list_calls = [c for c in state.calls if c[0] == "messages.list"]
+        assert len(list_calls) >= 2, "the listing AND the sweep both ran"
+        for _kind, kwargs in list_calls:
+            assert kwargs.get("q") == "from:x"
+            assert kwargs.get("labelIds") == [LABEL]
+
+    def test_sweep_never_gets_messages(self):
+        """The sweep is IDS-ONLY: no messages.get for ids the ledger already
+        knows, and no GET at all beyond the record listing's own needs."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.list_result = {"messages": [{"id": "m1"}, {"id": "m2"}]}
+        state.history_error = _FakeHttpError(404, b"Requested entity was not found")
+        connector = _connector(
+            state, is_known=lambda mid: mid in {"m1", "m2"}
+        )
+        result = connector.fetch("expired", limit=10)
+        assert result.reset is True
+        assert result.full_listing_ids == ("m1", "m2")
+        assert not [c for c in state.calls if c[0] == "messages.get"], (
+            "the sweep must not GET messages (quota hygiene)"
+        )
+
+    def test_sweep_budget_exhausted_reports_no_full_listing(self):
+        """A sweep that never sees a final page (page budget hit) reports
+        None — NEVER tombstone on a partial list."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        # The record listing is ONE final page; the sweep then rides an
+        # endless page train (every page carries a nextPageToken).
+        state.list_pages = [
+            {"messages": [{"id": "a"}, {"id": "b"}]},
+            {"messages": [{"id": "a"}, {"id": "b"}], "nextPageToken": "more"},
+        ]
+        state.history_error = _FakeHttpError(404, b"Requested entity was not found")
+        connector = _connector(state)
+        result = connector.fetch("expired", limit=10)
+        assert result.reset is True
+        assert result.full_listing_ids is None
+
+    def test_no_sweep_on_first_sync(self):
+        """The reconcile is reset-only: a first sync (no cursor) sweeps not."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.list_result = {"messages": []}
+        connector = _connector(state)
+        result = connector.fetch(None, limit=10)
+        assert result.reset is False
+        assert result.full_listing_ids is None
