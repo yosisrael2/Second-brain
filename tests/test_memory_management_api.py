@@ -762,3 +762,138 @@ def test_single_valued_set_matches_set_kid_signature(
     from brain.services.memory import SINGLE_VALUED_KID_PREDICATES
 
     assert set(SINGLE_VALUED_KID_PREDICATES) == params
+
+
+# --- 13. Undo of delete: multi-valued classes stay restorable -----------------
+
+
+def test_restore_connection_to_other_child_allowed(
+    client: TestClient, clean_memory: None
+) -> None:
+    """connection:* facts are multi-valued (one per related person, keyed by
+    object_id): deleting the link to Itamar must be Undo-able even though a
+    connection:child to Rona still exists. The single-value guard must
+    compare object_id for connections, not just the predicate."""
+    entity = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+    itamar = _add_entity(client, name="Itamar")
+    _add_fact(
+        client, entity["id"], predicate="connection:child",
+        object_id=rona["id"], value=None,
+    )
+    to_itamar = _add_fact(
+        client, entity["id"], predicate="connection:child",
+        object_id=itamar["id"], value=None,
+    )
+    client.delete(f"{_ENDPOINT}/facts/{to_itamar['id']}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{to_itamar['id']}/restore")
+
+    assert response.status_code == 200, response.text
+    links = sorted(
+        f["object_id"]
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "connection:child"
+    )
+    assert links == sorted([rona["id"], itamar["id"]])
+
+
+def test_restore_same_connection_to_same_child_still_refused(
+    client: TestClient, clean_memory: None
+) -> None:
+    """The object_id comparison still guards the REAL duplicate: restoring a
+    connection:child to Rona while another current connection:child to Rona
+    exists would put two identical links on the profile. add_fact refuses
+    such duplicates upfront, so the deleted-duplicate state is built through
+    the repo directly (the guard stays as defense-in-depth for restores)."""
+    import uuid as _uuid
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from brain.db.models import MemoryFact
+
+    entity = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+    _add_fact(client, entity["id"], predicate="connection:child", object_id=rona["id"])
+    with _memory_service_for_tests() as service:
+        duplicate = service._repo.add_fact(
+            MemoryFact(
+                subject_id=_uuid.UUID(entity["id"]),
+                predicate="connection:child",
+                object_id=_uuid.UUID(rona["id"]),
+                value=None,
+                status="confirmed",
+                valid_from=datetime.now(ZoneInfo("UTC")),
+                supersedes_id=None,
+                provenance={"source": "user"},
+            )
+        )
+        service._repo.commit()
+        duplicate_id = str(duplicate.id)
+    client.delete(f"{_ENDPOINT}/facts/{duplicate_id}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{duplicate_id}/restore")
+
+    assert response.status_code == 409
+
+
+def test_restore_memory_category_facts_stay_additive(
+    client: TestClient, clean_memory: None
+) -> None:
+    """routine/preference/date are free-form memories like notes: many
+    current ones per person are the norm, so their Undo must never 409."""
+    entity = _add_entity(client, name="Noa")
+    _add_fact(client, entity["id"], predicate="routine", value="swims Fridays")
+    deleted = _add_fact(client, entity["id"], predicate="routine", value="library Tuesdays")
+    client.delete(f"{_ENDPOINT}/facts/{deleted['id']}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{deleted['id']}/restore")
+
+    assert response.status_code == 200, response.text
+    values = sorted(
+        f["value"]
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "routine"
+    )
+    assert values == ["library Tuesdays", "swims Fridays"]
+
+
+def test_alias_containing_a_slash_can_be_removed(
+    client: TestClient, clean_memory: None
+) -> None:
+    """An alias like 'a/b' must be removable: the path segment arrives
+    percent-encoded and the route must decode it (it 404'd before)."""
+    entity = _add_entity(client, name="Noa")
+    response = client.post(f"{_ENDPOINT}/entities/{entity['id']}/aliases", json={"alias": "a/b"})
+    assert response.status_code == 201, response.text
+    stored = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "a/b" in stored, f"alias not stored: {stored}"
+
+    removed = client.delete(f"{_ENDPOINT}/entities/{entity['id']}/aliases/a%2Fb")
+
+    assert removed.status_code == 204, removed.text
+    names = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "a/b" not in names
+
+
+def test_add_fact_refuses_a_duplicate_connection(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Two identical connection:child links to the same person are the same
+    fact twice — the second must be refused (409), not silently doubled."""
+    entity = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+    _add_fact(client, entity["id"], predicate="connection:child", object_id=rona["id"])
+
+    response = client.post(f"{_ENDPOINT}/facts", json={
+        "subject_id": entity["id"], "predicate": "connection:child",
+        "object_id": rona["id"],
+    })
+
+    assert response.status_code == 409, response.text
+    links = [
+        f for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "connection:child" and f["object_id"] == rona["id"]
+    ]
+    assert len(links) == 1
+

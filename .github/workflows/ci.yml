@@ -103,11 +103,18 @@ jobs:
           .venv/bin/pip install -e '.[dev,telegram]' shellcheck-py
       - name: Apply migrations (brain_test)
         run: .venv/bin/alembic upgrade head
+      # The memory-screen behavior tests boot the REAL cockpit files in jsdom
+      # (tests/_jsdom_screen.py); without it the harness reports a clean skip,
+      # so install once and point node module resolution at it.
+      - name: Install jsdom (screen-behavior tests)
+        run: npm install --silent --no-save --prefix "$HOME/npm" jsdom@24
       - name: Pytest
         # Plain `pytest` works from the repo root since pyproject sets
         # pytest pythonpath = ["."] (the suite imports tests.fakes).
         # --timeout=60 (thread method) fails AND dumps the stuck test's
         # traceback instead of hanging the runner.
+        env:
+          NODE_PATH: ${{ env.HOME }}/npm/node_modules
         run: .venv/bin/pytest -q --timeout=60 --timeout-method=thread
 
   shellcheck:

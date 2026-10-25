@@ -660,6 +660,16 @@ class MemoryService:
             raise KeyError(subject_id)
         if object_id is None and value is None:
             raise ValueError("a fact needs an object or a value")
+        if (
+            status == "confirmed"
+            and predicate.startswith(CONNECTION_PREFIX)
+            and object_id is not None
+        ):
+            for fact in self._repo.current_facts(subject_ids=[subject_id], status="confirmed"):
+                if fact.predicate == predicate and fact.object_id == object_id:
+                    raise MemoryError(
+                        f"this {predicate.removeprefix(CONNECTION_PREFIX)} link already exists"
+                    )  # the same link twice is the same fact, not two facts
         supersedes = None
         if (
             status == "confirmed"
@@ -748,7 +758,11 @@ class MemoryService:
         must not put two current values next to each other) — EXCEPT for
         'note' facts: free-text memories are additive by design (a person
         carries many current notes), and blocking their Undo would make
-        every note delete-with-undo a trap.
+        every note delete-with-undo a trap. The same holds for the other
+        multi-valued classes — the memory categories (routine/preference/
+        date) and connection:* links, which are one per related person: for
+        connections the guard compares object_id, so a link to a different
+        person never blocks an Undo while a true duplicate does.
         """
         fact = self._repo.get_fact(fact_id)
         if fact is None:
@@ -757,9 +771,13 @@ class MemoryService:
             raise MemoryError("only a deleted fact can be restored")
         provenance = dict(fact.provenance or {})
         prior = provenance.pop("deleted_from", "confirmed")
+        multi_valued = fact.predicate in MEMORY_CATEGORIES or fact.predicate.startswith(
+            CONNECTION_PREFIX
+        )
         for current in self._repo.current_facts(subject_ids=[fact.subject_id]):
             if (
                 fact.predicate != "note"
+                and not multi_valued
                 and current.id != fact.id
                 and current.predicate == fact.predicate
                 and current.status == prior
@@ -767,6 +785,18 @@ class MemoryService:
                 raise MemoryError(
                     f"cannot restore: a current {fact.predicate!r} fact already "
                     "exists for this entity — delete or edit it first"
+                )
+            if (
+                multi_valued
+                and current.id != fact.id
+                and current.predicate == fact.predicate
+                and current.status == prior
+                and current.object_id is not None
+                and current.object_id == fact.object_id
+            ):
+                raise MemoryError(
+                    f"cannot restore: a current {fact.predicate!r} link to the "
+                    "same person already exists — delete or edit it first"
                 )
         provenance["restored_at"] = utcnow().isoformat()
         fact.provenance = provenance

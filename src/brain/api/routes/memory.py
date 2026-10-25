@@ -113,6 +113,8 @@ def create_fact(
         raise HTTPException(
             status_code=404, detail=f"subject entity '{data.subject_id}' not found"
         ) from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     return schemas.FactRead.model_validate(fact)
 
 
@@ -207,18 +209,29 @@ def add_alias(
     return schemas.EntityRead.model_validate(entity)
 
 
-@router.delete("/entities/{entity_id}/aliases/{alias}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/entities/{entity_id}/aliases/{alias:path}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_alias(
     entity_id: uuid.UUID,
     alias: str,
     service: MemoryService = Depends(get_memory_service),
 ) -> None:
-    """Remove one alias; 404 when the entity or the alias is unknown."""
+    """Remove one alias; 404 when the entity or the alias is unknown.
+
+    ``:path`` so an alias containing "/" (percent-encoded by the client)
+    still routes here instead of 404ing on the extra segment. Clients may
+    deliver it single- or double-encoded (httpx re-encodes '%'); unquote
+    accepts both."""
+    from urllib.parse import unquote  # noqa: PLC0415 — stdlib, per-call fine
+
+    alias = unquote(alias).rstrip("/")
+    if not alias:
+        raise HTTPException(status_code=404, detail="empty alias")
     try:
         service.remove_alias(entity_id, alias)
     except KeyError:
         raise HTTPException(
-            status_code=404, detail=f"alias '{alias}' not found on entity '{entity_id}'"
+            status_code=404,
+            detail=f"alias {alias!r} not found on entity '{entity_id}'",
         ) from None
 
 
