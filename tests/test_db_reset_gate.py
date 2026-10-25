@@ -29,9 +29,19 @@ from brain.config import get_settings
 from conftest import _database_name
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MAINTENANCE_URL = "postgresql://brain:brain@localhost:27432/postgres"
 UNKNOWN_REVISION = "deadbeefdeadunknown"
 MARKER_RAW_TEXT = "__reset_gate_marker__"
+
+
+def _admin_url() -> str:
+    """The maintenance DB next to whatever server the suite itself uses.
+
+    Derived from the suite's resolved DATABASE_URL (like conftest's own
+    admin connections) — the port is NOT hardcoded: CI runs Postgres on
+    5432, the dev stack on 27432.
+    """
+    url = get_settings().database_url
+    return url.rsplit("/", 1)[0].replace("postgresql+psycopg", "postgresql") + "/postgres"
 
 
 def _gate_db_url() -> str:
@@ -44,13 +54,13 @@ def _gate_db_url() -> str:
 def _drop_database(url: str) -> None:
     name = _database_name(url)
     assert name.endswith("_test"), f"refusing to drop non-test db {name!r}"
-    with psycopg.connect(MAINTENANCE_URL, connect_timeout=3, autocommit=True) as conn:
+    with psycopg.connect(_admin_url(), connect_timeout=3, autocommit=True) as conn:
         conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 def _create_and_migrate(url: str) -> None:
     name = _database_name(url)
-    with psycopg.connect(MAINTENANCE_URL, connect_timeout=3, autocommit=True) as conn:
+    with psycopg.connect(_admin_url(), connect_timeout=3, autocommit=True) as conn:
         conn.execute(f'CREATE DATABASE "{name}"')
     migrated = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
@@ -107,10 +117,15 @@ def _run_child(extra_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
 def stamped_db_fixture():
     """A migrated scratch DB stamped at an unknown revision, with a marker row."""
     url = _gate_db_url()
-    _drop_database(url)
-    _create_and_migrate(url)
-    _stamp_unknown_revision(url)
-    _plant_marker(url)
+    try:
+        _drop_database(url)
+        _create_and_migrate(url)
+        _stamp_unknown_revision(url)
+        _plant_marker(url)
+    except psycopg.OperationalError as exc:
+        # Same posture as test_db_isolation: no Postgres (or an unreachable
+        # admin server) skips the subprocess legs instead of erroring.
+        pytest.skip(f"Postgres unavailable ({exc})")
     yield url
     _drop_database(url)
 
