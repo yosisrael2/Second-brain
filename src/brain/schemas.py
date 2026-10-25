@@ -187,6 +187,21 @@ class EntityRead(BaseModel):
     aliases: list[str] = Field(default_factory=list)
     facts: list[FactRead] = Field(default_factory=list)
     created_at: datetime
+    archived: bool = False
+
+
+class AliasCreate(BaseModel):
+    """Payload for POST /memory/entities/{id}/aliases."""
+
+    alias: str = Field(min_length=1, max_length=ENTITY_NAME_MAX_LENGTH)
+    lang: str | None = Field(default=None, max_length=8)
+
+    @field_validator("alias")
+    @classmethod
+    def _alias_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("alias must not be blank")
+        return value
 
 
 class MemoryOverview(BaseModel):

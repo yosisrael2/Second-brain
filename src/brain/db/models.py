@@ -280,6 +280,11 @@ class Entity(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Soft removal (Memory Management screen): an archived entity is out of
+    # every listing (so the WhatsApp poller's allowlist drops it) while its
+    # facts and aliases stay put — the Undo of a "remove group" reopens the
+    # exact same row instead of recreating history.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class EntityAlias(Base):
