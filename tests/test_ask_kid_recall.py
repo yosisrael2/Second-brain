@@ -583,33 +583,6 @@ def _service2(
     search: RecordingSearch,
     *,
     top_k: int = 8,
-    kid_reserved_slots: int = 3,
-) -> AskService:
-    return AskService(
-        search,
-        FakeLLMClient(reply=cite_every_source),  # type: ignore[arg-type]
-        memory=memory,
-        items_repo=repo,
-        top_k=top_k,
-        kid_reserved_slots=kid_reserved_slots,
-    )
-
-
-def _email(repo: ItemsRepository, n: int) -> MemoryItem:
-    """A high-scoring semantic item (school email) that outranks chat noise."""
-    return repo.add(
-        MemoryItem(
-            raw_text=f"מכתב מנהלת בית הספר בראשית — הודעה כללית מספר {n} על תשלומים",
-        )
-    )
-
-
-def _service2(
-    memory: MemoryService,
-    repo: ItemsRepository,
-    search: RecordingSearch,
-    *,
-    top_k: int = 8,
     kid_reserved_slots: int | None = None,
 ) -> AskService:
     kwargs: dict = {}
@@ -656,8 +629,9 @@ def test_kid_items_are_additions_not_carve_out(clean_items, memory_db) -> None:
         "the general reranked top_k must never be displaced by kid additions"
     )
     assert str(kid_item.id) in ids, "the kid item joins the context as an addition"
-    assert len(ids) == 8 + len(search.seen_extra[0]) or len(ids) == 8 + 2, (
-        "general top_k plus the kid additions"
+    assert len(ids) == 10, (
+        "general top_k (8) plus exactly two kid additions: the slippers "
+        "conversation and the class-needle item the kid leg also fetched"
     )
 
 
