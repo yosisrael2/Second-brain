@@ -19,7 +19,7 @@ class FakeFlow:
         self._token = token
         self.requested_scopes: list[str] | None = None
 
-    def from_client_secret_file(self, path: str, scopes: list[str]) -> "FakeFlow":
+    def from_client_secrets_file(self, path: str, scopes: list[str]) -> "FakeFlow":
         self.requested_scopes = scopes
         return self
 
