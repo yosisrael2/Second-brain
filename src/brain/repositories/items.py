@@ -12,7 +12,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
-from brain.db.models import ItemSource, MemoryItem
+from brain.db.models import ItemRelation, ItemSource, MemoryItem
 
 SOURCE_WHATSAPP = "whatsapp"
 
@@ -261,6 +261,43 @@ class ItemsRepository:
             for cond in default_hidden_conditions():
                 stmt = stmt.where(cond)
         return list(self._db.scalars(stmt))
+
+    def conflict_counterparts(
+        self, item_ids: Sequence[uuid.UUID], *, limit: int = 4
+    ) -> Sequence[tuple[ItemRelation, MemoryItem]]:
+        """``(relation, other_item)`` for every conflicts relation touching
+        the given items (PR-b, item 38's ask leg).
+
+        The counterpart is returned regardless of its state: a PROPOSED
+        child that contradicts a captured item is exactly what the user
+        needs to see next to it (the answer must quote both versions).
+        Only live relations are read — rows are never deleted, but undone
+        applies_to/supersedes states do not exist for ``conflicts``.
+        Bounded: newest relations first, ``limit`` pairs.
+        """
+        if not item_ids:
+            return []
+        ids = list(item_ids)
+        stmt = (
+            select(ItemRelation, MemoryItem)
+            .join(
+                MemoryItem,
+                or_(
+                    and_(
+                        ItemRelation.to_id.in_(ids),
+                        MemoryItem.id == ItemRelation.from_id,
+                    ),
+                    and_(
+                        ItemRelation.from_id.in_(ids),
+                        MemoryItem.id == ItemRelation.to_id,
+                    ),
+                ),
+            )
+            .where(ItemRelation.kind == "conflicts")
+            .order_by(ItemRelation.created_at.desc(), ItemRelation.id.desc())
+            .limit(limit)
+        )
+        return [(rel, item) for rel, item in self._db.execute(stmt).all()]
 
     def by_channels(
         self,
