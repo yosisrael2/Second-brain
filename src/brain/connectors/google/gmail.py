@@ -421,6 +421,13 @@ class GmailConnector(GoogleConnector):
                 records.append(record)
             if truncated or page_token is None:
                 break
+            if len(records) >= limit:
+                # The page filled the limit exactly at its end and a next page
+                # exists: fetching it would only confirm what nextPageToken
+                # already proves — more stubs remain. (Finding 3: the extra
+                # page call cost 5 quota units + one pacing interval.)
+                truncated = True
+                break
         next_cursor: str | None = None
         if not truncated:
             # The whole listing fit: the PRE-listing historyId is a safe
@@ -445,12 +452,20 @@ class GmailConnector(GoogleConnector):
         pending: list[tuple[str, bool]] = []  # (gmail_id, deleted) last-state-wins
         emitted_entry: str | None = None  # last FULLY consumed entry id
 
-        def _history_pages() -> list[dict[str, Any]]:
-            # Materialize INSIDE the error boundary: the generator body (the
-            # API calls) must execute where the Gmail->connector mapping runs.
-            return list(client.list_history(start_history_id=start_history_id, label_id=label))
+        def _history_pages() -> Any:
+            # The GENERATOR is created here; pages are pulled one at a time in
+            # the loop below (each next() runs the API call inside the error
+            # boundary, where the Gmail->connector mapping lives).
+            return client.list_history(start_history_id=start_history_id, label_id=label)
 
-        for page in self._boundary(_history_pages):
+        pages = self._boundary(_history_pages)
+        while True:
+            # One page per iteration: the limit check after the entry loop
+            # stops BEFORE the next page is fetched (finding 7 — the old
+            # list(...) materialized every page even for a tiny --limit).
+            page = self._boundary(lambda: next(pages, None))
+            if page is None:
+                break
             for entry in page.get("history") or []:
                 # The limit stops BETWEEN entries only: one coalesced Gmail
                 # entry can carry many messages (dragging a folder into the
@@ -480,14 +495,23 @@ class GmailConnector(GoogleConnector):
                 if len(pending) >= limit:
                     break  # the entry above is fully consumed — safe checkpoint
             if len(pending) >= limit:
-                break
+                break  # stop BEFORE fetching the next page
         # Last state wins per message (added after removed -> present again).
         final: dict[str, bool] = {}
         for mid, deleted in pending:
             final[mid] = deleted
         records = []
         for mid, deleted in final.items():
-            record = self._record(mid, deleted=deleted)
+            try:
+                record = self._record(mid, deleted=deleted)
+            except ConnectorError as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise
+                # ADDED then hard-deleted between the history read and the
+                # GET: gone is gone (the query path's semantics). This is a
+                # vanished MESSAGE, not cursor expiry — never a full resync.
+                logger.info("connectors: email message %s vanished (404)", mid)
+                continue
             if self._backstop_catches(record):
                 continue  # re-delivery under a new id: ledgered, no new item
             records.append(record)

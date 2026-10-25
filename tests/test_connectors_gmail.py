@@ -1476,3 +1476,72 @@ class TestAdoptDrainProgress:
                                  dry_run=True, limit=200)
         assert report.nothing_to_adopt is True  # gtasks/gdrive-shaped source
         assert connector.run_seen is None
+
+
+# --- PR-b: findings 2 + 3 + 7 (quota waste / wrong 404 semantics) ---------------
+
+
+class TestQuotaAnd404:
+    """Finding 2: a history-path GET 404 of an ADDED message is 'vanished,
+    skip it' — not cursor expiry. Finding 3: an exact-limit-at-page-end batch
+    must not fetch the next page just to discover it is over the limit.
+    Finding 7: history pages are fetched lazily, stopping at the limit."""
+
+    def test_vanishing_added_message_is_skipped_not_a_reset(self):
+        state = _ServiceState()
+        state.history_pages = {
+            "first": {
+                "history": [{"id": "h1", "messagesAdded": [{"message": {"id": "m1"}}]}],
+                "historyId": "9002",
+            }
+        }
+        state.get_errors["m1"] = _FakeHttpError(404, b"Requested entity was not found")
+        connector = _connector(state)
+
+        result = connector.fetch("9001", limit=200)
+
+        # RED pre-fix: the GET 404 escaped _history_batch and fetch() read it
+        # as cursor expiry -> reset=True + a full re-list fallback.
+        assert result.reset is False
+        assert result.records == []  # vanished: gone is gone, no tombstone
+        assert result.next_cursor == "h1"  # the entry was fully consumed
+        assert sum(1 for c in state.calls if c[0] == "messages.list") == 0
+
+    def test_exact_limit_at_page_end_does_not_fetch_the_next_page(self):
+        state = _ServiceState()
+        state.messages = {f"m{i}": _msg_fixture(f"m{i}") for i in range(50)}
+        state.list_result = {
+            "messages": [{"id": f"m{i}"} for i in range(50)],
+            "nextPageToken": "p2",  # a next page EXISTS but must not be fetched
+        }
+        connector = _connector(state)
+
+        result = connector.fetch(None, limit=50)
+
+        assert sum(1 for c in state.calls if c[0] == "messages.list") == 1
+        assert len(result.records) == 50
+        assert result.next_cursor is None  # truncated: the cursor is dropped
+        assert result.more is True  # ... and the source said more is coming
+
+    def test_history_pages_are_fetched_lazily_up_to_the_limit(self):
+        state = _ServiceState()
+        state.messages = {"m1": _msg_fixture("m1"), "m2": _msg_fixture("m2")}
+        state.history_pages = {
+            "first": {
+                "history": [{"id": "h1", "messagesAdded": [{"message": {"id": "m1"}}]}],
+                "nextPageToken": "tok-page2",
+            },
+            "tok-page2": {
+                "history": [{"id": "h2", "messagesAdded": [{"message": {"id": "m2"}}]}],
+                "historyId": "9003",
+            },
+        }
+        connector = _connector(state)
+
+        result = connector.fetch("9001", limit=1)
+
+        # RED pre-fix: list() materialized BOTH pages before the limit loop
+        # ever ran (2 history.list calls for a 1-record batch).
+        assert sum(1 for c in state.calls if c[0] == "history.list") == 1
+        assert [r.external_id for r in result.records] == ["m1"]
+        assert result.next_cursor == "h1"  # stopped between entries, safely
