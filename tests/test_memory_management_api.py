@@ -662,3 +662,21 @@ def test_set_channel_on_archived_name_unarchives_same_row(
         assert seeded["archived"] is False
         names = [e["name"] for e in service.overview()]
         assert names.count("דמו הורים קבוצה") == 1
+
+
+def test_restore_note_fact_allowed_next_to_other_notes(
+    client: TestClient, clean_memory: None
+) -> None:
+    """'note' facts are additive free-text memories (one card each): their
+    Undo must NOT hit the single-value restore guard — a person carries
+    many current notes at once."""
+    entity = _add_entity(client, name="Noa")
+    _add_fact(client, entity["id"], predicate="note", value="swims Fridays")
+    deleted = _add_fact(client, entity["id"], predicate="note", value="chess club maybe")
+    client.delete(f"{_ENDPOINT}/facts/{deleted['id']}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{deleted['id']}/restore")
+
+    assert response.status_code == 200, response.text
+    values = sorted(f["value"] for f in client.get(_ENDPOINT).json()["entities"][0]["facts"])
+    assert values == ["chess club maybe", "swims Fridays"]
