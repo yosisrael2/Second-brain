@@ -82,7 +82,13 @@ def token_grants_modify(
         with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (fixed URL)
             return json.loads(resp.read())
 
-    payload = (poster or _default_post)(form)
+    try:
+        payload = (poster or _default_post)(form)
+    except Exception as exc:  # HTTPError 400 invalid_grant, URLError, OSError…
+        raise GmailAuthError(
+            "could not verify the token's granted scopes (the token may be "
+            "revoked or expired) — run `brain gmail-label --auth` to re-consent",
+        ) from exc
     granted = str(payload.get("scope") or "").split(" ")
     return MODIFY_SCOPE in granted
 
@@ -256,7 +262,7 @@ def _consent_error(exc: Exception) -> GmailAuthError:
     """A 403 from a write call = gmail.modify not consented (rate-limit 403s
     are retried inside the client and never surface here)."""
     raise GmailAuthError(
-        "gmail.modify is not consented — run `brain connectors auth email` to "
+        "gmail.modify is not consented — run `brain gmail-label --auth` to "
         "re-consent (the labeler writes labels only)",
     ) from exc
 
