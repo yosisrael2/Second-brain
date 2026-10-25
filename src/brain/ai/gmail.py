@@ -33,11 +33,6 @@ logger = logging.getLogger(__name__)
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
-# list_messages follows nextPageToken at most this many pages (Gmail's
-# default page is ~100 messages; a 60s poll is unlikely to need even two,
-# so the cap only bounds a pathological backlog walk).
-_MAX_LIST_PAGES = 5
-
 
 class GmailError(RuntimeError):
     """A Gmail call failed transiently (network, 5xx) — retry with backoff.
@@ -224,10 +219,21 @@ class RestGmailClient:
     100 units/minute/USER, ~5 units per call — an unpaced burst of
     messages.get blows it inside one run), and (b) retries rate-limit
     errors (403 rateLimitExceeded / 429) with exponential backoff,
-    honoring a ``Retry-After`` header when the response carries one. Any
-    OTHER error is translated and raised as before (a plain 403 is never
-    retried).
+    honoring a ``Retry-After`` header when the response carries one —
+    clamped to :data:`_MAX_IN_RUN_BACKOFF_S`: a larger server ask stops
+    the retries and raises, so the runner's between-runs backoff owns the
+    long wait. Any OTHER error is translated and raised as before (a
+    plain 403 is never retried).
+
+    Blocking-sleep note: every consumer of this client (``connectors
+    sync`` / ``connectors adopt`` / the ``gmail-poll`` launchd loop) is a
+    synchronous CLI process on its own main thread — no asyncio event
+    loop and no API request thread ever reaches :meth:`_execute`.
     """
+
+    # The longest in-run backoff: beyond this the wait belongs to the
+    # runner's between-runs backoff, not to one blocking call.
+    _MAX_IN_RUN_BACKOFF_S = 60.0
 
     def __init__(
         self,
@@ -311,6 +317,16 @@ class RestGmailClient:
                 delay = self._retry_after(exc)
                 if delay is None:
                     delay = 2.0 * (2**attempt)  # 2s, 4s, 8s…
+                if delay > self._MAX_IN_RUN_BACKOFF_S:
+                    # The server asks for a longer wait than one run may
+                    # block: stop retrying — the runner's between-runs
+                    # backoff owns the long wait.
+                    logger.warning(
+                        "gmail asked for %.0fs backoff (> %.0fs in-run cap) — giving up "
+                        "to the runner's backoff",
+                        delay, self._MAX_IN_RUN_BACKOFF_S,
+                    )
+                    raise translated from exc
                 logger.warning(
                     "gmail rate limited (attempt %d/%d) — retrying in %.1fs",
                     attempt + 1, self._max_retries, delay,
@@ -326,9 +342,10 @@ class RestGmailClient:
     ) -> tuple[list[GmailMessageStub], str | None]:
         """ONE users.messages.list page: (stubs, next_page_token).
 
-        Bounded listing for ``--limit`` runs: the CALLER decides whether the
-        next page is needed, so a small limit never walks the whole label
-        (each page costs 5 quota units).
+        The ONLY listing entry point (the eager whole-label walk is gone):
+        callers decide whether the next page is needed, so a ``--limit``
+        run never walks the label just to fill a small limit (each page
+        costs 5 quota units).
         """
         params = gmail_list_params(query, label_ids)
         if max_results:
@@ -343,27 +360,6 @@ class RestGmailClient:
             for m in (result.get("messages") or [])
         ]
         return stubs, result.get("nextPageToken")
-
-    def list_messages(self, *, query: str, label_ids: Sequence[str]) -> list[GmailMessageStub]:
-        params = gmail_list_params(query, label_ids)
-        service = self._get_service()
-        stubs: list[GmailMessageStub] = []
-        page_token: str | None = None
-        for _page in range(_MAX_LIST_PAGES):
-            call_params = dict(params)
-            if page_token:
-                call_params["pageToken"] = page_token
-            result = self._execute(
-                service.users().messages().list(userId=self._user_id, **call_params)
-            )
-            stubs.extend(
-                GmailMessageStub(id=m["id"], thread_id=m.get("threadId", ""))
-                for m in (result.get("messages") or [])
-            )
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
-        return stubs
 
     def get_message(self, message_id: str) -> GmailMessage:
         service = self._get_service()

@@ -253,7 +253,7 @@ class TestPacing:
             sleep=sleeps.append,
             clock=lambda: 0.0,  # frozen clock: every pace fires
         )
-        client.list_messages(query="", label_ids=[LABEL])
+        client.list_messages_page(query="", label_ids=[LABEL])[0]
         client.get_message("m000")
         client.get_message("m001")
 
@@ -265,7 +265,7 @@ class TestPacing:
         state = _label_of(2)
         sleeps: list[float] = []
         client = _client(state, min_interval_s=0.0, sleep=sleeps.append, clock=lambda: 0.0)
-        client.list_messages(query="", label_ids=[LABEL])
+        client.list_messages_page(query="", label_ids=[LABEL])[0]
         client.get_message("m000")
         assert sleeps == []
 
@@ -291,7 +291,7 @@ class TestRateLimitRetry:
         sleeps: list[float] = []
         client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
 
-        stubs = client.list_messages(query="", label_ids=[LABEL])
+        stubs, _tok = client.list_messages_page(query="", label_ids=[LABEL])
         assert [s.id for s in stubs] == ["m000", "m001"]
         list_calls = [c for c in state.calls if c[0] == "messages.list"]
         assert len(list_calls) == 3  # 2 throttled + 1 success
@@ -305,7 +305,7 @@ class TestRateLimitRetry:
         sleeps: list[float] = []
         client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
 
-        client.list_messages(query="", label_ids=[LABEL])
+        client.list_messages_page(query="", label_ids=[LABEL])[0]
         assert sleeps == [7.0]
 
     def test_429_is_retried_too(self):
@@ -313,8 +313,90 @@ class TestRateLimitRetry:
         state.list_errors = [_HttpError(429, b"rate limit")]
         sleeps: list[float] = []
         client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
-        client.list_messages(query="", label_ids=[LABEL])
+        client.list_messages_page(query="", label_ids=[LABEL])[0]
         assert len([c for c in state.calls if c[0] == "messages.list"]) == 2
+
+    def test_403_user_rate_limit_exceeded_is_retried_too(self):
+        """Every Gmail throttle reason retries: userRateLimitExceeded."""
+        state = _label_of(2)
+        state.list_errors = [
+            _HttpError(403, json.dumps(
+                {"error": {"errors": [{"reason": "userRateLimitExceeded"}]}}
+            ).encode()),
+        ]
+        sleeps: list[float] = []
+        client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
+
+        client.list_messages_page(query="", label_ids=[LABEL])
+        assert len([c for c in state.calls if c[0] == "messages.list"]) == 2
+        assert sleeps == [2.0]
+
+    def test_403_insufficient_permissions_is_never_retried(self):
+        """A non-throttle 403 is exactly one attempt, zero sleeps."""
+        state = _label_of(2)
+        state.list_errors = [
+            _HttpError(403, json.dumps(
+                {"error": {"errors": [{"reason": "insufficientPermissions"}]}}
+            ).encode()),
+        ]
+        sleeps: list[float] = []
+        client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
+
+        with pytest.raises(Exception) as excinfo:
+            client.list_messages_page(query="", label_ids=[LABEL])
+        assert len([c for c in state.calls if c[0] == "messages.list"]) == 1
+        assert sleeps == []
+        assert getattr(excinfo.value, "status", None) == 403
+
+    def test_retry_after_clamped_to_the_in_run_cap(self):
+        """A Retry-After at the cap is honored (60s max in-run wait)."""
+        state = _label_of(2)
+        state.list_errors = [
+            _HttpError(403, _rate_limited_content(), headers={"Retry-After": "60"}),
+        ]
+        sleeps: list[float] = []
+        client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
+
+        client.list_messages_page(query="", label_ids=[LABEL])
+        assert sleeps == [60.0]
+        assert len([c for c in state.calls if c[0] == "messages.list"]) == 2
+
+    def test_retry_after_over_the_cap_stops_the_retry(self):
+        """The server asks for more than one run may block (3600s): stop
+        retrying, raise the translated error — the runner's between-runs
+        backoff owns the long wait."""
+        state = _label_of(2)
+        state.list_errors = [
+            _HttpError(403, _rate_limited_content(), headers={"Retry-After": "3600"}),
+        ]
+        sleeps: list[float] = []
+        client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
+
+        with pytest.raises(Exception) as excinfo:
+            client.list_messages_page(query="", label_ids=[LABEL])
+        assert sleeps == []  # nothing slept — not even once
+        assert len([c for c in state.calls if c[0] == "messages.list"]) == 1
+        assert getattr(excinfo.value, "status", None) == 403
+
+    def test_exponential_backoff_never_exceeds_the_cap(self):
+        """A deep retry chain's exponential delay is capped the same way."""
+        state = _label_of(2)
+        state.list_errors = [
+            _HttpError(403, _rate_limited_content()) for _ in range(10)
+        ]
+        sleeps: list[float] = []
+        client = _client(
+            state, sleep=sleeps.append, clock=lambda: 0.0,
+            min_interval_s=0.0, max_retries=6,
+        )
+
+        from brain.ai.gmail import GmailError
+
+        with pytest.raises(GmailError):
+            client.list_messages_page(query="", label_ids=[LABEL])
+        # 2,4,8,16,32 slept; the 7th delay would be 64 > 60 -> stop (5 sleeps)
+        assert sleeps == [2.0, 4.0, 8.0, 16.0, 32.0]
+        assert len([c for c in state.calls if c[0] == "messages.list"]) == 6
 
     def test_a_plain_403_is_never_retried(self):
         state = _label_of(2)
@@ -323,7 +405,7 @@ class TestRateLimitRetry:
         client = _client(state, sleep=sleeps.append, clock=lambda: 0.0, min_interval_s=0.0)
 
         with pytest.raises(Exception) as excinfo:
-            client.list_messages(query="", label_ids=[LABEL])
+            client.list_messages_page(query="", label_ids=[LABEL])[0]
         assert len(state.calls) == 1  # no retry attempts
         assert sleeps == []
         assert getattr(excinfo.value, "status", None) == 403
@@ -340,7 +422,7 @@ class TestRateLimitRetry:
         )
 
         with pytest.raises(Exception) as excinfo:
-            client.list_messages(query="", label_ids=[LABEL])
+            client.list_messages_page(query="", label_ids=[LABEL])[0]
         list_calls = [c for c in state.calls if c[0] == "messages.list"]
         assert len(list_calls) == 4  # 1 + max_retries
         assert len(sleeps) == 3
@@ -373,5 +455,5 @@ class TestDryRunBudget:
             sleep=lambda _s: (_ for _ in ()).throw(RuntimeError("timer broke")),
             clock=lambda: 0.0,
         )
-        stubs = client.list_messages(query="", label_ids=[LABEL])
+        stubs = client.list_messages_page(query="", label_ids=[LABEL])[0]
         assert [s.id for s in stubs] == ["m000"]

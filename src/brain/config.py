@@ -214,7 +214,12 @@ class Settings(BaseSettings):
     # Quota hygiene (gmail 'Total Query Cost' is 100 units/min/user, ~5 per
     # call): a minimum interval between the client's consecutive API calls.
     # 6s keeps one client at <= 10 calls/minute (<= 50 units) with headroom
-    # for the poller sharing the same token's budget.
+    # for the poller sharing the same token's budget. NOTE the budget is per
+    # USER (token), not per process: the gmail-poll agent and a manual
+    # adopt/sync running together spend two budgets (~20 calls/min, ~100
+    # units) — at the limit. That is accepted: the in-run retry (clamped at
+    # 60s) rides out a transient 403 and the runner's between-runs backoff
+    # is the backstop.
     gmail_min_call_interval_s: float = 6.0
 
     # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
