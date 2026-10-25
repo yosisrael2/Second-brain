@@ -26,12 +26,18 @@ commands, check three things.
 beyond. The first **real** adopt/sync freezes the past cutoff into the
 cursor permanently — choose it deliberately:
 
-- For adoption you almost certainly want more than 7 days of history:
-  set `BRAIN_GCAL_PAST_DAYS` to cover the oldest pasted event you still
-  care about (e.g. `365`).
+- Set `BRAIN_GCAL_PAST_DAYS` to the SMALLEST value that covers the oldest
+  pasted event you still care about. The pastes are from October, so ~30
+  is the starting point. Do not reach for a big number "just in case":
+  the past cutoff is frozen forever at the first REAL run, and a year of
+  past instances of every weekly/daily series can be thousands of records
+  fetched on every re-list.
 - Dry-runs persist nothing, so the env is free to experiment with.
   The **real** run locks it in. After that, changing it has no effect on
   the frozen cutoff (new cursors only).
+- Before the real run, look at the dry-run's **fetched count**: if it is
+  in the thousands, lower `BRAIN_GCAL_PAST_DAYS` until it is sane, then
+  re-run the dry-run.
 
 ## Step 1 — dry-run (writes NOTHING)
 
@@ -39,44 +45,46 @@ cursor permanently — choose it deliberately:
 cd /Users/yos.i/git/Second-brain   # the live install
 export BRAIN_ALLOW_LIVE=1          # sanctioned live-store opt-in
 export BRAIN_CONNECTORS=gcal       # the connector must be enabled
-export BRAIN_GCAL_PAST_DAYS=365    # choose deliberately: frozen at first REAL run
+export QDRANT_COLLECTION=brain_items  # every live CLI command needs the live collection
+export BRAIN_GCAL_PAST_DAYS=30     # smallest value covering the oldest pasted event
 # BRAIN_GCAL_FUTURE_DAYS defaults to 60
 .venv/bin/brain connectors adopt gcal --dry-run
 ```
 
-You get a report like (fakes-only rehearsal on 2ddd581, 18 pasted events
-modelled as the three real shape classes):
+**EXAMPLE OUTPUT — not your data** (shape only, from a fakes-only
+rehearsal; your numbers will differ):
 
 ```
-adopt gcal: 11 record(s) fetched, 11 would adopt, 0 ambiguous,
+adopt gcal: 9 record(s) fetched, 9 would adopt, 0 ambiguous,
 0 new on first sync, 0 user-deleted, 0 already adopted
-  WOULD ADOPT (11)
+  WOULD ADOPT (9)
     <event-id> (v="…") -> item <id> [B]
     …
 ```
 
-**How to read it against your 18 pasted events:**
+**How to read it:**
 
 - Only pastes stored with `source=calendar` are candidates at all.
   Announcement-style pastes (prose like "אוסף בשער ב-8:45") were captured
   as **notes** and never enter the pool — they can NOT adopt, by design
   (an exact-text match against rendered event one-liners can never hit
   prose, and a fuzzy matcher would risk pointing the ledger at the wrong
-  item). In the rehearsal: 18 pastes → 11 candidates, 7 notes excluded.
+  item).
 - `WOULD ADOPT [B]` = literal Google-web-UI copies whose stored one-liner
   matches the adapter's rendering of the same event (title + local time +
-  minute + optional `Location:`/`מקום:` line — the label fix). The rehearsal's
-  11 candidates all adopted via rule B.
+  minute + optional `Location:`/`מקום:` line — the label fix).
 - Events older than your `BRAIN_GCAL_PAST_DAYS` are not fetched at all —
   they can't adopt in this run. Re-run the dry-run with a wider
   `BRAIN_GCAL_PAST_DAYS` if the counts look short.
-- The exact split of YOUR 18 (copies vs announcements vs out-of-window)
-  is what this report tells you — that is the point of the dry-run.
+- Which of your pasted events fall in which bucket is EXACTLY what this
+  report tells you — compare its counts against your own list before
+  running for real.
 
 ## Step 2 — the real run (same command, no `--dry-run`)
 
 ```bash
-export BRAIN_ALLOW_LIVE=1 BRAIN_CONNECTORS=gcal BRAIN_GCAL_PAST_DAYS=365
+export BRAIN_ALLOW_LIVE=1 BRAIN_CONNECTORS=gcal QDRANT_COLLECTION=brain_items
+export BRAIN_GCAL_PAST_DAYS=30   # whatever your checked dry-run used — frozen from here on
 .venv/bin/brain connectors adopt gcal
 ```
 
@@ -91,8 +99,14 @@ through — it never destroys those).
 ## Step 3 — first sync, then check
 
 ```bash
-.venv/bin/brain connectors sync gcal   # with the same env; add BRAIN_CONNECTORS as configured
+export BRAIN_ALLOW_LIVE=1 BRAIN_CONNECTORS=gcal QDRANT_COLLECTION=brain_items
+export BRAIN_GCAL_PAST_DAYS=30
+.venv/bin/brain connectors sync gcal
 ```
+
+NOTE: nothing syncs gcal on a schedule yet — the connectors launchd agent
+is not installed, and installing it is a separate decision. Until then,
+gcal only syncs when you run the command above by hand.
 
 Check:
 
@@ -104,13 +118,15 @@ Check:
    daily re-list after it enters the window (nothing is silently lost —
    the window re-lists when its edge advances).
 
-## The 18 events that won't adopt
+## Announcement-style pastes (source=note)
 
-The announcement-derived notes (rehearsal split: 7 of 18) are **not
-calendar candidates and never will be** — that is the agreed design, not
-a failure. Options: leave them as notes (recommended; once memory-layer
-extraction goes live, reconciliation can propose supersedes), or delete
-them yourself. Nothing adopt-side will touch them.
+Announcement-derived captures are **not calendar candidates and never
+will be** — that is the agreed design, not a failure. Which of your
+pastes these are shows up as the gap between your pasted list and the
+dry-run's candidate count. Options: leave them as notes (recommended;
+once memory-layer extraction goes live, reconciliation can propose
+supersedes), or delete them yourself. Nothing adopt-side will touch
+them.
 
 ## Failure modes
 
