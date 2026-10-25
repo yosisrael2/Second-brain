@@ -152,7 +152,6 @@ def user_acted_on_item(item: MemoryItem) -> bool:
     if item.child_state in ("kept", "dropped"):
         return True
     return item.triage_label is not None and item.triage_method is None
-    return item.triage_label is not None and item.triage_method is None
 
 
 def apply_triage_decision(item: MemoryItem, *, prior_label: str | None, result: Any) -> bool:
@@ -226,11 +225,18 @@ def retriage_after_attachment_read(
     except Exception as exc:  # noqa: BLE001 — triage never blocks the read
         ops.record_event(
             "triage", "failed", ok=False,
-            detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+            detail={
+                "item_id": str(parent.id),
+                "error": type(exc).__name__,
+                "reason": str(exc)[:120],
+            },
         )
         return
     if result is None:
-        ops.record_event("triage", "failed", ok=False, detail={"error": "no decision"})
+        ops.record_event(
+            "triage", "failed", ok=False,
+            detail={"item_id": str(parent.id), "error": "no decision"},
+        )
         return
     apply_triage_decision(parent, prior_label=prior, result=result)
 # Offsets are bounded by ±14h (± Leo threshold); a lower SQL bound this far
@@ -961,13 +967,17 @@ class WhatsAppPoller:
         except Exception as exc:  # noqa: BLE001 — triage never blocks capture
             ops.record_event(
                 "triage", "failed", ok=False,
-                detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                detail={
+                    "item_id": str(item.id),
+                    "error": type(exc).__name__,
+                    "reason": str(exc)[:120],
+                },
             )
             return
         if result is None:
             ops.record_event(
                 "triage", "failed", ok=False,
-                detail={"error": "no decision"},
+                detail={"item_id": str(item.id), "error": "no decision"},
             )
             return
         apply_triage_decision(item, prior_label=prior, result=result)

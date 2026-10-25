@@ -19,7 +19,7 @@ from tests.conftest import assert_test_database
 
 from brain.ai.jev import JevChoice, JevError
 from brain.config import get_settings
-from brain.db.models import MemoryItem
+from brain.db.models import Attachment, MemoryItem
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
 from brain.services.triage import (
@@ -1251,6 +1251,13 @@ def test_backfill_refuses_to_run_when_kid_names_read_fails(
 # when the last marker is replaced, never touching user-acted items.
 
 
+class _BoomTrier:
+    """A trier whose call raises — exercises the failure path of the hook."""
+
+    def __call__(self, item: Any) -> Any:
+        raise RuntimeError("triage backend exploded")
+
+
 class _CountingTrier:
     """Delegates to a real/scripted trier and counts invocations."""
 
@@ -1989,3 +1996,130 @@ def _make_on_read_callback(trier: Any) -> Any:
 class _NoIndexer:
     def index(self, item: Any) -> None:
         return None
+
+
+def test_m_production_wiring_retriages_on_the_read_session(
+    triage_world: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """(m) The CLI wiring runs the re-triage on the session the attachment
+    pipeline HANDS IT (read_session) — production builds the attachments
+    service with session_factory=SessionLocal, so _finish's session is NOT
+    the poller's, and the row _finish just marked done is uncommitted when
+    the hook runs. Wiring that closes over the poller session never sees
+    the read (SessionLocal is autoflush=False) and silently never triages."""
+    from tests.test_attachments import FakeQuery  # noqa: PLC0415
+
+    from brain import cli as cli_mod  # noqa: PLC0415
+    from brain.services.attachments import (  # noqa: PLC0415
+        AttachmentFileStore,
+        AttachmentService,
+        ClaudeFileReader,
+        PdfTextLayerReader,
+    )
+
+    # the REAL builder builds the REAL trier: fake its clients (kid override
+    # fires on the confirmed kid before Jev is ever consulted)
+    monkeypatch.setattr("brain.api.deps.get_jev_client", lambda: FakeJev(JevError("skip")))
+    monkeypatch.setattr("brain.api.deps.get_llm_client", lambda: FakeLLM("garbage"))
+    world = triage_world
+    _wipe_items()
+    _confirmed_kid(world.memory, "רונה")
+    world.session.commit()
+
+    # two REAL sessions, production-style: poller session + _finish session
+    poller_session = world.session
+    finish_session = SessionLocal()
+    repo_finish = ItemsRepository(finish_session)
+
+    item = repo_finish.add(
+        _conversation(
+            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Rinat: "
+            "[image: photo.jpg — attachment 3f2b7c1e-1111-4c2a-9d3e-5f6a7b8c9d01]"
+        )
+    )
+    finish_session.commit()
+
+    trier, on_read = cli_mod._build_whatsapp_triage_hooks(poller_session)
+    assert callable(on_read)
+    service = AttachmentService(
+        store=AttachmentFileStore(root=tmp_path / "store"),
+        pdf_reader=PdfTextLayerReader(),
+        claude_reader=ClaudeFileReader(
+            query_fn=FakeQuery(reply="רונה: החולצה הלבנה ליום חמישי מצולמת כאן"),
+            scratch_root=tmp_path / "scratch",
+        ),
+        indexer=SimpleNamespace(index=lambda i: None),
+        session_factory=lambda: finish_session,
+        daily_budget=50,
+        on_read=on_read,
+    )
+    att = service.capture(item.id, b"\x89PNG fake", "trip.jpg", "image/png", "whatsapp")
+    finish_session.commit()
+    import asyncio  # noqa: PLC0415
+
+    status = asyncio.run(service.process(att.id))
+    finish_session.commit()
+    finish_session.expire_all()
+    item2 = finish_session.get(MemoryItem, item.id)
+    assert status == "done"
+    assert item2.triage_label == "relevant" and item2.triage_method == "kid_named", (
+        "the re-triage ran on the read session and saw the uncommitted read"
+    )
+
+
+def test_n_hook_failure_keeps_the_read_savepoint_scoped(triage_world: Any, tmp_path: Any) -> None:
+    """(n) A DB error inside the on_read hook must not abort _finish's
+    transaction: the attachment stays done + text stored, the re-triage is
+    skipped, and the failure is logged (savepoint, #117/#121 trap)."""
+    from sqlalchemy import text as sql_text  # noqa: PLC0415
+    from tests.test_attachments import FakeQuery  # noqa: PLC0415
+
+    from brain.services.attachments import (  # noqa: PLC0415
+        AttachmentFileStore,
+        AttachmentService,
+        ClaudeFileReader,
+        PdfTextLayerReader,
+    )
+
+    world = triage_world
+    _wipe_items()
+    session = world.session
+    repo = ItemsRepository(session)
+    item = repo.add(
+        _conversation(
+            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Rinat: "
+            "[image: photo.jpg — attachment 3f2b7c1e-1111-4c2a-9d3e-5f6a7b8c9d01]"
+        )
+    )
+    session.commit()
+
+    def broken_hook(hook_session: Any, att: Any) -> None:
+        from brain.services.whatsapp import retriage_after_attachment_read  # noqa: PLC0415
+
+        retriage_after_attachment_read(hook_session, att, trier=_BoomTrier())
+        hook_session.execute(sql_text("SELECT * FROM table_that_does_not_exist"))
+
+    service = AttachmentService(
+        store=AttachmentFileStore(root=tmp_path / "store"),
+        pdf_reader=PdfTextLayerReader(),
+        claude_reader=ClaudeFileReader(
+            query_fn=FakeQuery(reply="רונה שלחה תמונה"),
+            scratch_root=tmp_path / "scratch",
+        ),
+        indexer=SimpleNamespace(index=lambda i: None),
+        session_factory=lambda: session,
+        daily_budget=50,
+        on_read=broken_hook,
+    )
+    att = service.capture(item.id, b"\x89PNG fake", "trip.jpg", "image/png", "whatsapp")
+    session.commit()
+    import asyncio  # noqa: PLC0415
+
+    status = asyncio.run(service.process(att.id))
+    session.commit()
+    session.expire_all()
+    att2 = session.get(Attachment, att.id)
+    item2 = session.get(MemoryItem, item.id)
+    assert status == "done", "the hook failure must not lose the read"
+    assert att2.status == "done" and (att2.text or "").strip(), "the text is stored"
+    assert item2.triage_label is None, "the re-triage was skipped, not half-applied"

@@ -415,9 +415,16 @@ class AttachmentService:
                 # is not readable text). Same session, ONE commit covers the
                 # read AND the re-triage; failures are recorded, never raised
                 # into the reader.
+                # Savepoint (#117/#121 trap): a DB error inside the hook
+                # aborts the transaction — without a savepoint the commit
+                # below would fail and LOSE the read. Only the re-triage
+                # rolls back; the read itself survives.
+                nested = session.begin_nested()
                 try:
                     self._on_read(session, att)
+                    nested.commit()
                 except Exception as exc:  # noqa: BLE001 — a triage failure must not fail the read
+                    nested.rollback()
                     logger.error("attachment %s re-triage failed: %s", attachment_id, exc)
             session.commit()
             if text is not None:

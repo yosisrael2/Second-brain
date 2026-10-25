@@ -698,6 +698,26 @@ def _cli_attachment_service(settings: Any, indexer: Any = None, on_read: Any = N
     )
 
 
+def _build_whatsapp_triage_hooks(session: Any) -> tuple[Any, Any]:
+    """One trier + the post-read re-triage callback (the #113 follow-up).
+
+    The callback MUST run on the session the attachment pipeline hands it
+    (read_session): production builds the attachments service with
+    session_factory=SessionLocal, so _finish's session is not the poller's,
+    and the row it just marked done is uncommitted (autoflush=False) when
+    the hook fires. The same trier drives both the poller's triage and the
+    post-read re-triage.
+    """
+    trier = _build_trier(session)
+
+    def _on_attachment_read(read_session: Any, att: Any) -> None:
+        from brain.services.whatsapp import retriage_after_attachment_read  # noqa: PLC0415
+
+        retriage_after_attachment_read(read_session, att, trier=trier)
+
+    return trier, _on_attachment_read
+
+
 def _build_trier(session):
     """The real triage callable: kid override, then Jev, then the LLM (D2a).
 
@@ -848,15 +868,9 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
 
     interval = float(interval_s) if interval_s else settings.whatsapp_poll_interval_s
     session = SessionLocal()
-    trier = _build_trier(session)
-
-    def _on_attachment_read(read_session: Any, att: Any) -> None:
-        from brain.services.whatsapp import retriage_after_attachment_read  # noqa: PLC0415
-
-        retriage_after_attachment_read(session, att, trier=trier)
-
+    trier, on_read = _build_whatsapp_triage_hooks(session)
     attachment_service = _cli_attachment_service(
-        settings, indexer=indexer, on_read=_on_attachment_read
+        settings, indexer=indexer, on_read=on_read
     )
 
     try:
