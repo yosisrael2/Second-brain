@@ -107,7 +107,15 @@ def _marker_count(url: str) -> int:
 
 
 def _child_env() -> dict[str, str]:
+    """The child's baseline env: the gate var is ALWAYS pinned explicitly.
+
+    Each gate test decides the child's ``BRAIN_TEST_DB_RESET`` itself (the
+    fail-fast test must see it ABSENT, the reset test sets it to "1"); an
+    exported outer value must never leak into the child and flip the
+    behaviour the test is trying to pin.
+    """
     env = dict(os.environ)
+    env.pop("BRAIN_TEST_DB_RESET", None)
     env.pop("QDRANT_COLLECTION", None)  # the child derives its own from its DB
     return env
 
