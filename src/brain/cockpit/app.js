@@ -828,6 +828,9 @@ function tabFromHash() {
 
 function switchTab(name) {
   state.tab = name;
+  // CSS hook: the Memory tab swaps the 5s countdown for its own quiet
+  // "Synced" status (memory.css).
+  document.body.dataset.tab = name;
   history.replaceState(null, "", `#${name}`);
   for (const tab of document.querySelectorAll(".tab")) {
     const active = tab.dataset.tab === name;

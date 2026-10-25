@@ -47,13 +47,48 @@ def test_memory_js_wires_the_part_a_endpoints() -> None:
 def test_memory_index_has_the_master_detail_skeleton() -> None:
     html = _index_html()
     assert "memory-left" in html          # the people list card
-    assert "memory-detail" in html        # the person detail card
+    assert "memory-detail" in html        # the person profile
     assert "memory-add-person" in html    # the add-person modal
     assert "memory-back" in html          # phone back button
 
 
 def test_memory_js_renders_list_sections() -> None:
     js = _memory_js()
-    # the left list groups: Family first, then People / Groups / Places & orgs
-    for section in ("Family", "People", "Groups", "Places"):
+    # the left list groups by meaning: the household first, then everyone
+    # else (relation unknown is flagged), then groups, then places & orgs
+    for section in ("Household", "Other people", "Groups", "Places & orgs"):
         assert section in js
+    assert "Relation unknown" in js
+
+
+def test_memory_redesign_views_are_wired() -> None:
+    """Profile (basic info vs memories), review inbox and family map."""
+    html = _index_html()
+    for node_id in ("memory-review", "memory-review-btn", "memory-review-count",
+                    "memory-map", "memory-map-canvas", "memory-sync",
+                    "memory-view-list", "memory-view-map"):
+        assert f'id="{node_id}"' in html
+    js = _memory_js()
+    # the review inbox reads proposed facts and confirms them in place
+    assert "/memory?status=proposed" in js
+    assert "/memory/facts/${fact.id}/confirm" in js
+    # basic info and memories are separate cards; connections are typed facts
+    markers = (
+        "basicInfoCard", "memoriesCard", "connectionsCard", 'CONNECTION_PREFIX = "connection:"',
+    )
+    for marker in markers:
+        assert marker in js
+    # the 5s poll becomes a quiet "Synced" status
+    assert "Synced · listening to" in js
+
+
+def test_memory_categories_match_the_prompt_block() -> None:
+    """The screen's memory categories are the ones compact_block renders
+    with their subject — a category added on one side only would silently
+    drop out of the Ask prompt."""
+    from brain.services.memory import CONNECTION_PREFIX, MEMORY_CATEGORIES
+
+    js = _memory_js()
+    assert 'const MEMORY_CATEGORIES = ["routine", "preference", "date", "note"];' in js
+    assert MEMORY_CATEGORIES == {"routine", "preference", "date"}  # + 'note', rendered on its own
+    assert f'const CONNECTION_PREFIX = "{CONNECTION_PREFIX}";' in js

@@ -32,6 +32,13 @@ CHANNEL_KINDS = frozenset({"teacher", "parents", "kids", "club", "committee"})
 
 BLOCK_MAX_CHARS = 6000  # ~1500 tokens; hard cap, truncated with a marker
 
+# Free-text memory categories the Memory screen files besides 'note' (which
+# keeps its own subject-less prompt line for byte stability).
+MEMORY_CATEGORIES = frozenset({"routine", "preference", "date"})
+# Typed two-way links: predicate 'connection:<type>' + object_id, read as
+# "<subject> is <object>'s <type>" (the screen derives the reverse side).
+CONNECTION_PREFIX = "connection:"
+
 
 class MemoryError(Exception):
     """A memory use case could not be completed (bad state transition)."""
@@ -267,12 +274,20 @@ class MemoryService:
         notes: list[str] = []
         other: list[str] = []
         for fact in facts:
-            if fact.value is None:
-                continue  # object-linked facts render from PR A (relations)
             subject = entities.get(fact.subject_id)
             if subject is None:
                 continue
-            if subject.name in kid_names and fact.predicate != "note":
+            if fact.predicate.startswith(CONNECTION_PREFIX):
+                target = entities.get(fact.object_id) if fact.object_id else None
+                if target is not None:
+                    kind = fact.predicate.removeprefix(CONNECTION_PREFIX)
+                    other.append(f"{subject.name} is {target.name}'s {kind}")
+                continue
+            if fact.value is None:
+                continue  # other object-linked facts render from PR A (relations)
+            if fact.predicate in MEMORY_CATEGORIES:
+                other.append(f"{subject.name} ({fact.predicate}): {fact.value}")
+            elif subject.name in kid_names and fact.predicate != "note":
                 kid_attrs.setdefault(subject.name, {})[fact.predicate] = fact.value
             elif fact.predicate == "note":
                 notes.append(fact.value)
