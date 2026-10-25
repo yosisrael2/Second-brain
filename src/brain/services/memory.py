@@ -91,6 +91,8 @@ class MemoryService:
                 continue
             kid: dict[str, Any] = {"name": entity.name}
             kid.update(attrs)
+            # Added AFTER attrs so a fact predicate can never shadow the id.
+            kid["entity_id"] = entity.id
             kids.append(kid)
         return kids
 
@@ -340,16 +342,13 @@ class MemoryService:
             # A2 bar, and unknown is always safer than a wrong kid. Hebrew
             # prefix runs (ורונה) still match, case-insensitively for
             # English; a name and its alias never double-count.
-            # Alias lookup is scoped to the kids only — never every person
-            # entity (teachers, parents are persons too and stay unqueried).
-            people_by_name = {
-                entity.name: entity
-                for entity in self._repo.list_entities(kinds=["person"])
-            }
+            # Aliases come from each kid's OWN entity (the id kids() already
+            # resolved via the kid's confirmed grade fact) — never a
+            # name-keyed person lookup: a second person entity sharing the
+            # kid's name (parent, classmate) must not lend its aliases.
             alias_map = {
-                kid["name"]: self._repo.aliases_for(people_by_name[kid["name"]].id)
+                kid["name"]: self._repo.aliases_for(kid["entity_id"])
                 for kid in kids
-                if kid["name"] in people_by_name
             }
             known: list[str] = []
             for kid in kids:
