@@ -316,6 +316,12 @@ function detailHeader(entity) {
     tools.append(addAlias);
     const removeBtn = el("button", { class: "btn btn-sm btn-ghost mm-remove", text: "🗑 Remove", title: "remove (archived — Undo restores it)" });
     removeBtn.addEventListener("click", () => {
+      // a kid's removal has a consequence beyond this screen: triage and
+      // A2 key on these facts to recognise the child — say so BEFORE the
+      // second click, not just "Sure?".
+      const armedLabel = isKid(entity)
+        ? `Triage and A2 stop recognising ${entity.name} — sure?`
+        : undefined;
       armConfirm(removeBtn, async () => {
         try {
           await api(`/memory/entities/${entity.id}/archive`, { method: "POST" });
@@ -332,7 +338,7 @@ function detailHeader(entity) {
           });
         } catch (error) { toast(`remove failed: ${error.message}`); }
         refreshMemory();
-      });
+      }, armedLabel);
     });
     tools.append(removeBtn);
     wrap.append(tools);
@@ -341,14 +347,14 @@ function detailHeader(entity) {
 }
 
 // A two-click destructive confirm: first click arms ("Sure?"), second acts.
-function armConfirm(button, onConfirm) {
+function armConfirm(button, onConfirm, armedLabel = "Sure?") {
   if (button.dataset.armed) {
     onConfirm();
     return;
   }
   button.dataset.armed = "1";
   const original = button.textContent;
-  button.textContent = "Sure?";
+  button.textContent = armedLabel;
   button.classList.add("armed");
   setTimeout(() => {
     if (!button.isConnected) return;
@@ -639,24 +645,28 @@ async function addPersonFromForm() {
     });
   } catch (error) { toast(`add failed: ${error.message}`); return; }
   // no duplicates: if the API returned an entity that was already there,
-  // say so and open it instead of pretending it is new.
+  // say so and open it WITHOUT re-posting its facts — the modal is a
+  // create form; re-adding facts it already has would pile up duplicates
+  // (one extra grade fact per submit).
   const existed = memoryState.entities.some((candidate) => candidate.id === entity.id);
   const facts = [];
   for (const [predicate, inputId] of PERSON_FIELDS) {
     const value = $(inputId).value.trim();
     if (value) facts.push({ predicate, value });
   }
-  for (const { predicate, value } of facts) {
-    try {
-      await api("/memory/facts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subject_id: entity.id, predicate, value, status: "confirmed",
-          provenance: { source: "user" },
-        }),
-      });
-    } catch (error) { toast(`fact ${predicate} failed: ${error.message}`); }
+  if (!existed) {
+    for (const { predicate, value } of facts) {
+      try {
+        await api("/memory/facts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            subject_id: entity.id, predicate, value, status: "confirmed",
+            provenance: { source: "user" },
+          }),
+        });
+      } catch (error) { toast(`fact ${predicate} failed: ${error.message}`); }
+    }
   }
   $("memory-add-person").hidden = true;
   for (const [, inputId] of PERSON_FIELDS) $(inputId).value = "";
