@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from brain.db.enums import ITEM_SOURCE_DOMAIN
 from brain.schemas import RAW_TEXT_MAX_LENGTH
 
 # --- AI defaults (canonical definitions; ai/ modules re-export these) ---------
@@ -151,6 +152,11 @@ class Settings(BaseSettings):
     # worker stops waiting; a to_thread body cannot be killed, so no new pass
     # starts until the stalled thread has actually finished.
     enrichment_pass_timeout_s: int = 900
+    # A2 step 2 (week 1): the WORKER pass processes only these sources
+    # (comma-separated; empty = every source). The CLI `brain enrich` is
+    # never filtered. Values are validated against the source CHECK domain
+    # taken from the model — an unknown value fails at startup.
+    enrichment_worker_sources: str = ""
 
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
@@ -231,6 +237,26 @@ class Settings(BaseSettings):
     # `brain connectors auth google` requests the union of their scopes.
     # Field name mirrors the env var (pydantic-settings convention).
     brain_connectors: str = ""
+
+    @field_validator("enrichment_worker_sources")
+    @classmethod
+    def _validate_worker_sources(cls, value: str) -> str:
+        """Trim, lowercase, drop empties; every value must be a real source
+        (ITEM_SOURCE_DOMAIN). An unknown value (a typo like 'gmail' for
+        'email') must fail the load — it must never silently match nothing."""
+        parts = list(dict.fromkeys(p.strip().lower() for p in value.split(",") if p.strip()))
+        for part in parts:
+            if part not in ITEM_SOURCE_DOMAIN:
+                raise ValueError(
+                    f"ENRICHMENT_WORKER_SOURCES: unknown source {part!r}; "
+                    f"known: {', '.join(ITEM_SOURCE_DOMAIN)}"
+                )
+        return ", ".join(parts)
+
+    @property
+    def worker_source_list(self) -> tuple[str, ...]:
+        """The parsed worker source filter; () = every source."""
+        return tuple(p for p in self.enrichment_worker_sources.split(", ") if p)
 
     @field_validator("brain_connectors")
     @classmethod

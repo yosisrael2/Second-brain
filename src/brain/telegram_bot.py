@@ -52,7 +52,7 @@ import secrets
 import sys
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1894,16 +1894,18 @@ def _build_pass_service(settings: Any, session: Any) -> Any:
     )
 
 
-def _enrich_pass(service: Any) -> list:
+def _enrich_pass(service: Any, *, sources: Sequence[str] | None = None) -> list:
     """One ``run_once`` pass with a LOCAL completion collector (B2).
 
     The hook delivers one LIST of changed-source outcomes per call — they
     collect into a plain local list; core state is NEVER touched from the
     worker thread. The loop thread alone turns outcomes into proposal cards.
+    ``sources`` is the A2 step-2 week-1 filter: the worker drains only those
+    sources (empty/None = every source; the CLI is never filtered).
     """
     outcomes: list = []
     service.on_children_changed = outcomes.extend
-    service.run_once(datetime.now(tz=UTC), limit=20)
+    service.run_once(datetime.now(tz=UTC), limit=20, sources=sources or None)
     return outcomes
 
 
@@ -1921,7 +1923,10 @@ def _run_enrichment_pass() -> list:
 
     session = SessionLocal()
     try:
-        return _enrich_pass(_build_pass_service(settings, session))
+        return _enrich_pass(
+            _build_pass_service(settings, session),
+            sources=settings.worker_source_list or None,
+        )
     finally:
         session.close()
 

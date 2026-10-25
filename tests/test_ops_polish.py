@@ -228,3 +228,60 @@ class TestAskRecordOpsFlag:
                 sa_text("SELECT count(*) FROM ops_events WHERE component = 'ask'")
             ).scalar_one()
         assert rows >= 1  # the ask->search and ask->llm spans
+
+
+class TestEnrichmentWorkerSources:
+    def test_filtered_queue_does_not_alarm(self, client, ops_tables, monkeypatch):
+        """Follow-up A2 step 2: jobs waiting ONLY because of the worker's
+        source filter are queued, never stuck/failed/degraded — health shows
+        ok and states the filter. Seeded: old queued WhatsApp jobs (the
+        designed week-2 backlog) + a fresh worker heartbeat."""
+        from datetime import UTC, datetime, timedelta
+
+        from brain.config import Settings
+        from brain.db.models import MemoryItem
+        from brain.db.session import SessionLocal
+        from brain.repositories.items import ItemsRepository
+        from brain.services.extraction.service import EnrichmentService
+
+        monkeypatch.setattr(
+            ops_health,
+            "get_settings",
+            lambda: Settings(
+                enrichment_worker_enabled=True,
+                enrichment_worker_sources="email",
+                _env_file=None,
+            ),
+        )
+        session = SessionLocal()
+        try:
+            session.execute(sa_text("DELETE FROM enrichment_jobs"))
+            session.execute(sa_text("DELETE FROM memory_items"))
+            repo = ItemsRepository(session)
+            service = EnrichmentService(repo, session)
+            for n in range(5):
+                item = repo.add(
+                    MemoryItem(
+                        raw_text=f"אספה 22.10 ואז טיול 23.10 מספר {n}",
+                        source="whatsapp",
+                        occurred_at=datetime.now(tz=UTC) - timedelta(days=3),
+                    )
+                )
+                job = service.enqueue(item)
+                assert job is not None
+            session.execute(
+                sa_text("UPDATE enrichment_jobs SET queued_at = :q"),
+                {"q": datetime.now(tz=UTC) - timedelta(days=2)},
+            )
+            session.commit()
+            ops.heartbeat("enrichment-worker", {"phase": "idle"})  # fresh heartbeat
+            body = client.get("/ops/health").json()
+        finally:
+            session.execute(sa_text("DELETE FROM enrichment_jobs"))
+            session.execute(sa_text("DELETE FROM memory_items"))
+            session.commit()
+            session.close()
+        enr = body["components"]["enrichment"]
+        assert enr["status"] == "ok"  # filter-waiting jobs never degrade health
+        assert enr["details"]["worker_sources"] == ["email"]
+        assert enr["details"]["queue_depth"] == 5
