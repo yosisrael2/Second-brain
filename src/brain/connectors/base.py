@@ -89,6 +89,13 @@ class FetchResult:
     next_cursor: str | None
     reset: bool = False
     more: bool = False
+    # Reset reconcile (PR-c finding 5): the connector's IDS-ONLY sweep of the
+    # ENTIRE sync scope on a reset batch — set ONLY when the sweep walked to a
+    # natural end within its page budget. The runner diffs it against the
+    # ledger and tombstones the missing ids through the normal deletion path.
+    # None (incomplete sweep, non-reset batch, or a connector that does not
+    # sweep) means NO reconcile — never tombstone on a partial list.
+    full_listing_ids: tuple[str, ...] | None = None
     # Adapter-observed counters for this batch (e.g. gcal's "beyond_window":
     # instances dropped because they start beyond the future window). The
     # runner may surface them in ops detail; tests assert on them directly.

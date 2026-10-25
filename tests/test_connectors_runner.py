@@ -1065,4 +1065,167 @@ def test_quarantine_still_holds_same_version_content_record(runner_db):
     row = h.records.get("gcal", "q2")
     assert row is not None and row.status == "failed", "still quarantined"
     assert row.fail_count == 3
-    assert h.item("q2") is None  # never captured
+    assert _email_item(h, "q2") is None  # never captured
+
+
+# --- PR-c finding (5): reset reconcile — ledger vs the full reset sweep -------
+
+def _seed_items(h: Any, external_ids: list[str]) -> None:
+    """Create one captured item per external id through the runner (v1).
+
+    Distinct texts: ingest's fingerprint dedupe would otherwise collapse
+    same-text records onto one item."""
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            _batch(
+                *[
+                    make_record(external_id=eid, source="email", text=f"body of {eid}")
+                    for eid in external_ids
+                ]
+            )
+        ],
+    )
+    h.runner(connector).run()
+
+
+def _email_item(h: Any, external_id: str) -> Any:
+    """h.item is gcal-hardcoded; the email ledger needs its own lookup."""
+    row = h.records.get("email", external_id)
+    if row is None or row.item_id is None:
+        return None
+    return h.repo.get(row.item_id)
+
+
+def test_reset_reconcile_tombstones_missing_ledger_ids(runner_db):
+    """PR-c finding (5): on a reset batch whose connector swept the ENTIRE
+    sync scope, ledgered ids the sweep no longer lists are tombstoned through
+    the normal deletion path (source_deleted marks, no content write)."""
+    h = Harness(runner_db)
+    ids = [f"r{i}" for i in range(1, 11)]  # 10 live items
+    _seed_items(h, ids)
+    assert all(_email_item(h, eid) is not None for eid in ids)
+
+    # History expired: the connector re-lists the scope and sweeps ALL ids.
+    # r9 and r10 lost the label before the reset — 2 of 10 missing (20%,
+    # under the 25% ceiling): a legitimate reconcile.
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(records=[], next_cursor="h2", reset=True,
+                        full_listing_ids=tuple(ids[:8])),
+        ],
+    )
+    s = h.runner(connector).run()
+
+    assert s.deleted == 2, "the two missing ids are tombstoned"
+    for eid in ("r9", "r10"):
+        item = _email_item(h, eid)
+        assert item is not None
+        assert item.meta.get("source_deleted") is True, f"{eid} hidden"
+    assert _email_item(h, "r1").meta.get("source_deleted") is None
+
+
+def test_reset_reconcile_refused_above_fraction_ceiling(runner_db):
+    """A diff above the fraction ceiling (more than 25% of the ledgered live
+    items) is REFUSED and logged — a mass-hide from a bad listing must never
+    happen silently. Nothing is tombstoned on refusal."""
+    h = Harness(runner_db)
+    ids = [f"r{i}" for i in range(1, 5)]  # 4 live items
+    _seed_items(h, ids)
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(records=[], next_cursor="h2", reset=True,
+                        full_listing_ids=("r1",)),  # 3 of 4 missing = 75%
+        ],
+    )
+    s = h.runner(connector).run()
+
+    assert s.deleted == 0, "refused: nothing tombstoned"
+    for eid in ("r2", "r3", "r4"):
+        item = _email_item(h, eid)
+        assert item is not None
+        assert item.meta.get("source_deleted") is not True
+    from sqlalchemy import text as sql_text
+
+    refused = h.session.execute(
+        sql_text("SELECT count(*) FROM ops_events WHERE kind = 'reset_reconcile_refused'")
+    ).scalar()
+    assert refused and refused >= 1, "the refusal is recorded as an ops event"
+
+
+def test_reset_reconcile_refused_above_absolute_cap(runner_db):
+    """More than 200 missing ids is refused outright, whatever the fraction."""
+    h = Harness(runner_db)
+    ids = [f"m{i:03d}" for i in range(210)]
+    _seed_items(h, ids)
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(records=[], next_cursor="h2", reset=True,
+                        full_listing_ids=("m000",)),  # 209 missing
+        ],
+    )
+    s = h.runner(connector).run()
+    assert s.deleted == 0, "refused: above the absolute cap"
+
+
+def test_reset_reconcile_ignores_user_deleted_and_incomplete_sweep(runner_db):
+    """(a) A user-deleted row (item_id NULL) is never resurrected or deleted
+    by the sweep; (b) an INCOMPLETE sweep (full_listing_ids None) reconciles
+    nothing — never tombstone on a partial list."""
+    from brain.db.models import ConnectorRecord
+
+    h = Harness(runner_db)
+    ids = [f"r{i}" for i in range(1, 9)]  # 8 live items
+    _seed_items(h, ids)
+    # A user-deleted row: the item was deleted out-of-band; the ledger keeps
+    # the row with item_id NULL.
+    h.session.add(ConnectorRecord(source="email", external_id="u1", version=None, item_id=None))
+    h.session.commit()
+
+    # Incomplete sweep: the connector could not finish the walk.
+    connector = FakeConnector(
+        name="email",
+        batches=[FetchResult(records=[], next_cursor="h2", reset=True, full_listing_ids=None)],
+    )
+    s = h.runner(connector).run()
+    assert s.deleted == 0, "an incomplete sweep reconciles nothing"
+    assert _email_item(h, "r1").meta.get("source_deleted") is not True
+
+    # Complete sweep missing r1 AND u1: r1 tombstoned (1 of 8 = 12.5%, under
+    # the ceiling), u1 untouched (item_id NULL is not a diff candidate).
+    connector = FakeConnector(
+        name="email",
+        batches=[FetchResult(records=[], next_cursor="h3", reset=True,
+                             full_listing_ids=tuple(ids[1:]))],
+    )
+    s = h.runner(connector).run()
+    assert s.deleted == 1
+    assert _email_item(h, "r1").meta.get("source_deleted") is True
+    row = h.session.get(ConnectorRecord, ("email", "u1"))
+    assert row is not None and row.item_id is None  # user-deleted: untouched
+
+
+def test_reset_reconcile_is_idempotent(runner_db):
+    """A second reset with the same sweep re-tombstones nothing: the items
+    are already source_deleted (put + skipped)."""
+    h = Harness(runner_db)
+    ids = [f"r{i}" for i in range(1, 9)]
+    _seed_items(h, ids)
+    deleted_counts = []
+    for cursor in ("h2", "h3"):
+        connector = FakeConnector(
+            name="email",
+            batches=[FetchResult(records=[], next_cursor=cursor, reset=True,
+                                 full_listing_ids=tuple(ids[1:]))],
+        )
+        deleted_counts.append(h.runner(connector).run().deleted)
+    assert deleted_counts == [1, 0], (
+        "the first reset tombstones r1; the second re-tombstones nothing"
+    )
+    item = _email_item(h, "r1")
+    assert item is not None and item.meta.get("source_deleted") is True
+
+

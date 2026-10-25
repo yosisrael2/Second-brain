@@ -92,6 +92,18 @@ class ConnectorRecordRepo:
         )
         return self._session.scalars(stmt).first()
 
+    def external_ids(self, source: str) -> set[str]:
+        """Live-captured external ids for ONE source (rows with an item).
+
+        The reset reconcile's diff base (PR-c finding 5). Rows whose item was
+        deleted by the USER (item_id NULL) are excluded — the sweep never
+        resurrects and never tombstones those.
+        """
+        stmt = select(ConnectorRecord.external_id).where(
+            ConnectorRecord.source == source, ConnectorRecord.item_id.is_not(None)
+        )
+        return set(self._session.scalars(stmt))
+
     def put(
         self,
         source: str,
