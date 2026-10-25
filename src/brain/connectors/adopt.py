@@ -153,10 +153,10 @@ def adopt_connector(
     # query batch's re-list (next_cursor=None, more=True) would re-GET the
     # same first `limit` records forever. Connectors that opt in (Gmail:
     # run_seen) skip these ids without a GET; connectors with resumable
-    # cursors never consult it.
+    # cursors never consult it. The ONLY assignment is inside the guarded
+    # block below (try/finally clears it) — an early return must never
+    # leave the set attached.
     seen: set[str] = set()
-    if hasattr(connector, "run_seen"):
-        connector.run_seen = seen  # type: ignore[attr-defined]
 
     candidates = _legacy_items(session, legacy_source)
     if not candidates:

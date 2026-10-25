@@ -1464,3 +1464,15 @@ class TestAdoptDrainProgress:
         summary = gmail_harness.runner.run(limit=200)
         assert summary.created == 200
         assert gmail_harness.runner.run(limit=200).created == 1
+
+    def test_nothing_to_adopt_never_attaches_run_seen(self, gmail_harness):
+        """The early return before any fetch must leave run_seen untouched —
+        no early-return path may leak the set onto the connector."""
+        connector = gmail_harness.connector
+        assert connector.run_seen is None  # never attached pre-fetch
+        from brain.connectors.adopt import adopt_connector
+
+        report = adopt_connector(connector, gmail_harness.session,
+                                 dry_run=True, limit=200)
+        assert report.nothing_to_adopt is True  # gtasks/gdrive-shaped source
+        assert connector.run_seen is None
