@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -216,6 +217,16 @@ class RestGmailClient:
 
     Error mapping is duck-typed (``exc.resp.status`` / type names) so it is
     testable without google libs installed.
+
+    Quota hygiene (the live 403 rateLimitExceeded): every API call goes
+    through :meth:`_execute`, which (a) paces consecutive calls at least
+    ``min_interval_s`` apart (Gmail's 'Total Query Cost' budget is
+    100 units/minute/USER, ~5 units per call — an unpaced burst of
+    messages.get blows it inside one run), and (b) retries rate-limit
+    errors (403 rateLimitExceeded / 429) with exponential backoff,
+    honoring a ``Retry-After`` header when the response carries one. Any
+    OTHER error is translated and raised as before (a plain 403 is never
+    retried).
     """
 
     def __init__(
@@ -225,6 +236,10 @@ class RestGmailClient:
         service_factory: ServiceFactory = default_service_factory,
         user_id: str = "me",
         service: Any | None = None,
+        min_interval_s: float | None = None,
+        max_retries: int = 3,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._token_loader = token_loader
         self._service_factory = service_factory
@@ -232,6 +247,15 @@ class RestGmailClient:
         # Optional pre-built service (the connector passes the shared OAuth
         # service it already built — ONE service per connector, not two).
         self._service: Any = service
+        if min_interval_s is None:
+            from brain.config import get_settings  # noqa: PLC0415
+
+            min_interval_s = float(getattr(get_settings(), "gmail_min_call_interval_s", 0.0))
+        self._min_interval_s = float(min_interval_s)
+        self._max_retries = max(0, int(max_retries))
+        self._sleep = sleep
+        self._clock = clock
+        self._last_call_at: float | None = None
 
     def _get_service(self) -> Any:
         if self._service is None:
@@ -241,11 +265,84 @@ class RestGmailClient:
             self._service = self._service_factory(token, self._user_id)
         return self._service
 
-    def _execute(self, request: Any) -> Any:
+    def _pace(self) -> None:
+        """Wait so consecutive calls are >= min_interval_s apart. A broken
+        timer must never kill a sync (the throttle is hygiene, not
+        correctness): sleep failures are swallowed."""
+        if self._min_interval_s <= 0:
+            self._last_call_at = self._clock()
+            return
+        now = self._clock()
+        if self._last_call_at is not None:
+            wait = self._last_call_at + self._min_interval_s - now
+            if wait > 0:
+                try:
+                    self._sleep(wait)
+                except Exception:  # noqa: BLE001 (hygiene, not correctness)
+                    logger.warning("gmail pacing sleep failed — continuing unpaced")
+        self._last_call_at = self._clock()
+
+    @staticmethod
+    def _retry_after(exc: Exception) -> float | None:
+        """A duck-typed Retry-After header (seconds), or None."""
+        headers = getattr(getattr(exc, "resp", None), "headers", None) or {}
+        if not hasattr(headers, "get"):
+            return None
+        value = headers.get("Retry-After")
+        if value is None:
+            return None
         try:
-            return request.execute()
-        except Exception as exc:  # noqa: BLE001 (translated below)
-            raise _translate_error(exc) from exc
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _execute(self, request: Any) -> Any:
+        from brain.connectors.google.base import is_rate_limited  # noqa: PLC0415
+
+        for attempt in range(self._max_retries + 1):
+            self._pace()
+            try:
+                return request.execute()
+            except Exception as exc:  # noqa: BLE001 (translated below)
+                translated = _translate_error(exc)
+                throttled = is_rate_limited(exc) or getattr(translated, "status", None) == 429
+                if not throttled or attempt >= self._max_retries:
+                    raise translated from exc
+                delay = self._retry_after(exc)
+                if delay is None:
+                    delay = 2.0 * (2**attempt)  # 2s, 4s, 8s…
+                logger.warning(
+                    "gmail rate limited (attempt %d/%d) — retrying in %.1fs",
+                    attempt + 1, self._max_retries, delay,
+                )
+                try:
+                    self._sleep(delay)
+                except Exception:  # noqa: BLE001 (hygiene, not correctness)
+                    logger.warning("gmail backoff sleep failed — continuing")
+
+    def list_messages_page(
+        self, *, query: str, label_ids: Sequence[str],
+        page_token: str | None = None, max_results: int | None = None,
+    ) -> tuple[list[GmailMessageStub], str | None]:
+        """ONE users.messages.list page: (stubs, next_page_token).
+
+        Bounded listing for ``--limit`` runs: the CALLER decides whether the
+        next page is needed, so a small limit never walks the whole label
+        (each page costs 5 quota units).
+        """
+        params = gmail_list_params(query, label_ids)
+        if max_results:
+            params["maxResults"] = max_results
+        if page_token:
+            params["pageToken"] = page_token
+        result = self._execute(
+            self._get_service().users().messages().list(userId=self._user_id, **params)
+        )
+        stubs = [
+            GmailMessageStub(id=m["id"], thread_id=m.get("threadId", ""))
+            for m in (result.get("messages") or [])
+        ]
+        return stubs, result.get("nextPageToken")
 
     def list_messages(self, *, query: str, label_ids: Sequence[str]) -> list[GmailMessageStub]:
         params = gmail_list_params(query, label_ids)

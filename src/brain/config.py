@@ -211,6 +211,11 @@ class Settings(BaseSettings):
     gmail_query: str = ""
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
+    # Quota hygiene (gmail 'Total Query Cost' is 100 units/min/user, ~5 per
+    # call): a minimum interval between the client's consecutive API calls.
+    # 6s keeps one client at <= 10 calls/minute (<= 50 units) with headroom
+    # for the poller sharing the same token's budget.
+    gmail_min_call_interval_s: float = 6.0
 
     # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
     # comma-separated list of immutable Drive folder ids; EMPTY (the default)
