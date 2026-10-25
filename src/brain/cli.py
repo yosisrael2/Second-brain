@@ -672,8 +672,14 @@ def _side_process_indexer() -> Any:
         return None
 
 
-def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
-    """F3: the attachments core for side-process pollers (own queue/budget)."""
+def _cli_attachment_service(settings: Any, indexer: Any = None, on_read: Any = None) -> Any:
+    """F3: the attachments core for side-process pollers (own queue/budget).
+
+    ``on_read`` (the #113 follow-up) is the post-read re-triage hook: called
+    on the SAME session _finish uses for every successful read of a
+    whatsapp attachment. The poller wires it to the post-read re-triage;
+    the backfill and other callers pass nothing.
+    """
     from brain.services.attachments import (  # noqa: PLC0415
         AttachmentFileStore,
         AttachmentService,
@@ -688,7 +694,28 @@ def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
         indexer=indexer,  # attachment items are indexed by the service itself
         session_factory=SessionLocal,
         daily_budget=settings.attachment_daily_budget,
+        on_read=on_read,
     )
+
+
+def _build_whatsapp_triage_hooks(session: Any) -> tuple[Any, Any]:
+    """One trier + the post-read re-triage callback (the #113 follow-up).
+
+    The callback MUST run on the session the attachment pipeline hands it
+    (read_session): production builds the attachments service with
+    session_factory=SessionLocal, so _finish's session is not the poller's,
+    and the row it just marked done is uncommitted (autoflush=False) when
+    the hook fires. The same trier drives both the poller's triage and the
+    post-read re-triage.
+    """
+    trier = _build_trier(session)
+
+    def _on_attachment_read(read_session: Any, att: Any) -> None:
+        from brain.services.whatsapp import retriage_after_attachment_read  # noqa: PLC0415
+
+        retriage_after_attachment_read(read_session, att, trier=trier)
+
+    return trier, _on_attachment_read
 
 
 def _build_trier(session):
@@ -731,6 +758,7 @@ def _whatsapp_triage(*, limit: int) -> int:
     decided = 0
     failed = 0
     skipped = 0
+    attachments = _cli_attachment_service(settings)
     with SessionLocal() as session:
         trier = _build_trier(session)
         if not getattr(trier, "kid_names_loaded", True):
@@ -748,11 +776,14 @@ def _whatsapp_triage(*, limit: int) -> int:
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:
-            if is_unread_media_only(item.raw_text):
-                # Same skip the poller's _triage_item applies: an unread-media-
-                # only conversation has nothing readable to triage, and this
-                # IS the run that must not label those NOISE. 0 trier/model
-                # calls, columns stay NULL; counted separately in the summary.
+            if is_unread_media_only(
+                item.raw_text, meta=item.meta, attachment_text=attachments.attachment_text
+            ):
+                # Same skip the poller's _triage_item applies — enriched with
+                # the attachment lookup: a SAVED-but-unread image (marker
+                # already swapped, nothing extracted) is still unread media.
+                # 0 trier/model calls, columns stay NULL; counted separately
+                # in the summary.
                 skipped += 1
                 continue
             result = trier(item)
@@ -837,6 +868,11 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
 
     interval = float(interval_s) if interval_s else settings.whatsapp_poll_interval_s
     session = SessionLocal()
+    trier, on_read = _build_whatsapp_triage_hooks(session)
+    attachment_service = _cli_attachment_service(
+        settings, indexer=indexer, on_read=on_read
+    )
+
     try:
         poller = WhatsAppPoller(
             bridge=bridge,
@@ -844,17 +880,20 @@ def _whatsapp(interval_s: float | None, since: str | None, once: bool = False) -
             items=ItemsRepository(session),
             memory=MemoryRepository(session),
             indexer=indexer,  # side processes index like the API does (best-effort)
-            trier=_build_trier(session),  # D2a: relevance triage on create + update
+            trier=trier,  # D2a: relevance triage on create + update
             zone_name=settings.timezone,
             gap_minutes=settings.whatsapp_gap_minutes,
             overlap_minutes=settings.whatsapp_overlap_minutes,
             backfill_since=backfill,
             commit=True,
-            attachments=_cli_attachment_service(settings, indexer=indexer),
+            attachments=attachment_service,
             media_client=WhatsAppMediaClient(
                 settings.whatsapp_bridge_url,
                 store_root=Path(settings.whatsapp_bridge_db).expanduser().parent,
             ),
+            # the media triage skip resolves readability through the
+            # attachment's EXTRACTED text (the #113 follow-up)
+            attachment_text=attachment_service.attachment_text,
         )
     except PollerError as exc:
         print(f"whatsapp: {exc}", file=sys.stderr)

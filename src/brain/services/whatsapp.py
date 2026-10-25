@@ -50,9 +50,11 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -80,19 +82,38 @@ _NOT_READ_YET = " — attachment not read yet"
 _UNREAD_MEDIA_LINE = re.compile(
     r"^\[\d{2}/\d{2}/\d{4}, \d{2}:\d{2}\] .{1,80}?: \[[^:\]]+: [^\]]*attachment not read yet\]$"
 )
+# The READ marker: a saved file + an id — NOT readable text. Readability is
+# decided by the attachment's EXTRACTED text (via the lookup), never here.
+_READ_MEDIA_LINE = re.compile(
+    r"^\[\d{2}/\d{2}/\d{4}, \d{2}:\d{2}\] .{1,80}?: \[[^:\]]+: [^\]]* — attachment "
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\]$"
+)
 
 
-def is_unread_media_only(raw_text: str) -> bool:
-    """True when every message line is an UNREAD media marker — no caption,
-    no text: there is nothing readable to triage yet. Labelling a filename is
-    how media-only conversations landed NOISE on zero content.
+def is_unread_media_only(
+    raw_text: str,
+    *,
+    meta: dict | None = None,
+    attachment_text: Any = None,
+) -> bool:
+    """True when every message line is media with NOTHING readable — no
+    caption, no text, and (when a lookup is provided) no extracted text.
+    Labelling a filename is how media-only conversations landed NOISE on
+    zero content.
+
+    Pure mode (no ``attachment_text``/``meta``): only the unread marker
+    counts — a READ marker (``attachment <id>``) fails the match and the
+    conversation looks readable. That mode is kept for callers without a
+    lookup (tests, tools that merely render).
+
+    Enriched mode (``meta`` + ``attachment_text(id) -> str | None``): a
+    message whose marker was already swapped is readable ONLY when its
+    attachment resolves to real extracted text. SAVED-but-UNREAD images are
+    therefore still skipped — the backfill must not triage a filename.
 
     Scaffolding (the header line, blank lines) is ignored; any readable line
-    (plain text, or a caption before the marker) makes this False — a
-    captioned image is a MIXED conversation and gets triaged at capture.
-    Pure over the rendered text (no meta needed), so both triage paths — the
-    poller's _triage_item AND the backfill command, which calls the trier
-    directly — can check it before invoking any model.
+    (plain text, a caption before the marker, or an attachment WITH text)
+    makes this False — that is a MIXED conversation and gets triaged.
     """
     saw_message = False
     for line in raw_text.splitlines():
@@ -100,7 +121,15 @@ def is_unread_media_only(raw_text: str) -> bool:
         if not stripped or stripped.startswith("[WhatsApp · "):
             continue
         saw_message = True
-        if not _UNREAD_MEDIA_LINE.match(stripped):
+        if _UNREAD_MEDIA_LINE.match(stripped):
+            continue  # unread: saved? no — not read yet, nothing to look up
+        read_marker = _READ_MEDIA_LINE.match(stripped)
+        if read_marker is None:
+            return False  # plain text or caption: readable
+        if attachment_text is None:
+            return False  # pure mode (no lookup): as #113, a read marker is readable
+        # enriched mode: readable ONLY if the extracted text is real
+        if (attachment_text(uuid.UUID(read_marker.group(1))) or "").strip():
             return False
     return saw_message
 
@@ -123,6 +152,93 @@ def user_acted_on_item(item: MemoryItem) -> bool:
     if item.child_state in ("kept", "dropped"):
         return True
     return item.triage_label is not None and item.triage_method is None
+
+
+def apply_triage_decision(item: MemoryItem, *, prior_label: str | None, result: Any) -> bool:
+    """THE one triage apply point — the poller's _triage_item AND the
+    post-read re-triage both land here, so the v3 no-downgrade rule exists
+    exactly once. Returns True when the columns were written."""
+    if prior_label == "relevant" and result.label == "noise":
+        # Asymmetry rule (v3 review): hiding something real is worse than
+        # showing chatter — keep the stronger label on update.
+        ops.record_event(
+            "triage", "downgrade_blocked", ok=True,
+            detail={
+                "item_id": str(item.id),
+                "kept": "relevant",
+                "rejected": "noise",
+                "version": result.version,
+            },
+        )
+        return False
+    item.triage_label = result.label
+    item.triage_confidence = result.confidence
+    item.triage_method = result.method
+    item.triage_version = result.version
+    return True
+
+
+def retriage_after_attachment_read(
+    session: Any, att: Any, *, trier: Any, max_chars: int = 2000
+) -> None:
+    """Post-read re-triage (the #113 follow-up): an attachment of a WhatsApp
+    conversation was READ (status done, real text) — re-triage the parent
+    ONCE on the SAME session the caller owns (no new session, no commit).
+
+    Input = parent.raw_text + ALL extracted attachment texts of that parent
+    so far (status done, text not null, ordered by read_at), capped at
+    ``max_chars``. Never triage filenames or ids: an attachment whose
+    extraction produced nothing contributes no text and cannot make the
+    conversation readable.
+
+    Cost bound: this only follows a successful read, and reads are capped by
+    attachment_daily_budget (config.py, enforced in attachments.py).
+    """
+    from brain.db.models import Attachment  # noqa: PLC0415
+
+    parent = session.get(MemoryItem, att.parent_item_id)
+    if parent is None or parent.source != SOURCE_WHATSAPP:
+        return
+    if user_acted_on_item(parent):
+        return
+    # make the caller's in-flight writes visible (SessionLocal is
+    # autoflush=False): the row _finish is finishing must be seen here
+    session.flush()
+    rows = (
+        session.query(Attachment)
+        .filter(
+            Attachment.parent_item_id == parent.id,
+            Attachment.status == "done",
+            Attachment.text.is_not(None),
+        )
+        .order_by(Attachment.read_at.asc())
+        .all()
+    )
+    texts = [row.text for row in rows if (row.text or "").strip()]
+    if not texts:
+        return
+    composed = (parent.raw_text or "") + "".join(f"\n{text}" for text in texts)
+    composed = composed[:max_chars]
+    prior = parent.triage_label
+    try:
+        result = trier(SimpleNamespace(raw_text=composed))
+    except Exception as exc:  # noqa: BLE001 — triage never blocks the read
+        ops.record_event(
+            "triage", "failed", ok=False,
+            detail={
+                "item_id": str(parent.id),
+                "error": type(exc).__name__,
+                "reason": str(exc)[:120],
+            },
+        )
+        return
+    if result is None:
+        ops.record_event(
+            "triage", "failed", ok=False,
+            detail={"item_id": str(parent.id), "error": "no decision"},
+        )
+        return
+    apply_triage_decision(parent, prior_label=prior, result=result)
 # Offsets are bounded by ±14h (± Leo threshold); a lower SQL bound this far
 # below the wanted window keeps the string comparison safe across DST changes
 # (bridge timestamps carry varying offsets, so raw string comparison cannot
@@ -473,6 +589,7 @@ class WhatsAppPoller:
         commit: bool = False,
         attachments: Any | None = None,
         media_client: Any | None = None,
+        attachment_text: Any | None = None,
     ) -> None:
         if overlap_minutes >= gap_minutes:
             raise PollerError(
@@ -500,6 +617,10 @@ class WhatsAppPoller:
         # keep the plain "not read yet" marker (previous behaviour).
         self._attachments = attachments
         self._media = media_client
+        # Post-#113: the media-only skip decides readability through the
+        # attachment's EXTRACTED text (a saved-but-unread image is still
+        # unread media). Optional: without it the pure marker regex holds.
+        self._attachment_text = attachment_text
 
     def poll(self, *, now: datetime) -> list[ChannelPollResult]:
         """Poll every allowlisted channel once; per-channel failures are logged, not raised."""
@@ -764,14 +885,6 @@ class WhatsAppPoller:
                 entry["media"] = media
         meta["messages"] = messages
         item.meta = meta
-        if _NOT_READ_YET not in item.raw_text and not user_acted_on_item(item):
-            # Fully read: the conversation now carries its real text (the
-            # swapped-in attachment links are readable content). Re-triage
-            # through the normal update path — the v3 rules hold inside
-            # (_triage_item: relevant is never downgraded to noise, and a
-            # blocked downgrade is recorded). Fires ONCE, when the LAST
-            # unread marker is replaced; user-acted items are never touched.
-            self._triage_item(item)
 
     @staticmethod
     def _known_message_ids(item: MemoryItem | None) -> set[str]:
@@ -837,7 +950,11 @@ class WhatsAppPoller:
         """
         if self._trier is None:
             return
-        if is_unread_media_only(item.raw_text):
+        if is_unread_media_only(
+            item.raw_text,
+            meta=item.meta,
+            attachment_text=getattr(self, "_attachment_text", None),
+        ):
             # Nothing readable yet (only unread media markers): labelling a
             # filename is how media-only conversations landed NOISE on zero
             # content. The item stays untriaged (still listed) and is
@@ -850,32 +967,20 @@ class WhatsAppPoller:
         except Exception as exc:  # noqa: BLE001 — triage never blocks capture
             ops.record_event(
                 "triage", "failed", ok=False,
-                detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                detail={
+                    "item_id": str(item.id),
+                    "error": type(exc).__name__,
+                    "reason": str(exc)[:120],
+                },
             )
             return
         if result is None:
             ops.record_event(
                 "triage", "failed", ok=False,
-                detail={"error": "no decision"},
+                detail={"item_id": str(item.id), "error": "no decision"},
             )
             return
-        if prior == "relevant" and result.label == "noise":
-            # Asymmetry rule (v3 review): hiding something real is worse than
-            # showing chatter — keep the stronger label on update.
-            ops.record_event(
-                "triage", "downgrade_blocked", ok=True,
-                detail={
-                    "item_id": str(item.id),
-                    "kept": "relevant",
-                    "rejected": "noise",
-                    "version": result.version,
-                },
-            )
-            return
-        item.triage_label = result.label
-        item.triage_confidence = result.confidence
-        item.triage_method = result.method
-        item.triage_version = result.version
+        apply_triage_decision(item, prior_label=prior, result=result)
 
     def _index_item(self, item: MemoryItem) -> None:
         """Best-effort vector indexing; failures defer to 'brain reindex'."""
