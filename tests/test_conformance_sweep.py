@@ -49,6 +49,12 @@ def _pin_connector_settings(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    # The donor dataset carries fixed 2026 dates: pin BOTH window bounds wide
+    # (the adapter tests' _OLD_ENOUGH pattern) so the sweep is independent of
+    # the BRAIN_GCAL_PAST_DAYS / BRAIN_GCAL_FUTURE_DAYS defaults and of when
+    # the suite runs.
+    monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", "36500")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "36500")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
