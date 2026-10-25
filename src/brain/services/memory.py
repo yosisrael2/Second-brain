@@ -334,12 +334,12 @@ class MemoryService:
 
         named = audience.get("named_kids") or []
         if named:
-            # GO-A follow-up: match extracted names against the kid's stored
-            # aliases too, with the SAME whole-word matcher triage uses
-            # (services/triage.py mentions_name) — no second matcher. An
-            # extracted Hebrew "רונה" must resolve to Rona once the alias
-            # exists, case-insensitively for English, with Hebrew prefix runs
-            # (לרונה); a name and its alias together never double-count.
+            # FULL-TOKEN match required (the searching mentions_name is not
+            # used here on purpose): an extracted classmate "רונה לוי" or
+            # "Rona Cohen" must stay ["unknown"] — zero wrong-child is the
+            # A2 bar, and unknown is always safer than a wrong kid. Hebrew
+            # prefix runs (ורונה) still match, case-insensitively for
+            # English; a name and its alias never double-count.
             # Alias lookup is scoped to the kids only — never every person
             # entity (teachers, parents are persons too and stay unqueried).
             people_by_name = {
