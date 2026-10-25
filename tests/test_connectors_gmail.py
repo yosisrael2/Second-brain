@@ -1416,3 +1416,51 @@ class TestAdoptDrainProgress:
         assert len(gets) == 201  # 200 + 1: the ledger fast path skipped the rest
         ids_second_pass = [c[1]["id"] for c in state.calls if c[0] == "messages.get"][200:]
         assert ids_second_pass == ["m200"]  # only the tail message was GET
+
+    def test_run_seen_is_cleared_after_adopt_so_a_later_sync_captures(
+        self, gmail_harness, monkeypatch
+    ):
+        """adopt (dry-run) then sync on the SAME connector instance: the seen
+        set is adopt-scoped — left set, the query path would skip every id
+        adopt collected (the NEW ones were never ledgered) and the sync would
+        capture nothing, forever."""
+        import brain.connectors.adopt as adopt_module
+        from brain.connectors.adopt import adopt_connector
+        from brain.db.models import MemoryItem
+
+        monkeypatch.setattr(adopt_module, "_MAX_ADOPT_BATCHES", 3)
+
+        state = gmail_harness._state_service
+        for i in range(201):
+            raw = _msg_fixture(f"m{i}")
+            raw["payload"]["parts"][0]["body"]["data"] = _b64(
+                f"Distinct school note number {i}."
+            )
+            state.messages[f"m{i}"] = raw
+        state.list_result = {"messages": [{"id": f"m{i}"} for i in range(201)]}
+
+        legacy = MemoryItem(
+            raw_text="totally unrelated legacy body text",
+            source="email",
+            type="event",
+            status="filed",
+            actionability="none",
+            importance=3,
+            confidence=0.8,
+            occurred_at=datetime(2020, 1, 1, tzinfo=UTC),
+            meta={"subject": "unrelated", "from": "x@y.z"},
+        )
+        gmail_harness.session.add(legacy)
+        gmail_harness.session.commit()
+
+        report = adopt_connector(gmail_harness.connector, gmail_harness.session,
+                                 dry_run=True, limit=200)
+        assert report.fetched == 201
+        assert gmail_harness.connector.run_seen is None  # cleared by adopt
+
+        # The SAME instance now syncs: dry-run ledgered nothing, so every
+        # record must be capturable. Red pre-fix: created == 0 (every stub
+        # still skipped by the stale run_seen set).
+        summary = gmail_harness.runner.run(limit=200)
+        assert summary.created == 200
+        assert gmail_harness.runner.run(limit=200).created == 1

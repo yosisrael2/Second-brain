@@ -163,7 +163,17 @@ def adopt_connector(
         report.nothing_to_adopt = True
         return report
 
-    records = _fetch_all(connector, limit=limit, seen=seen)
+    if hasattr(connector, "run_seen"):
+        connector.run_seen = seen  # type: ignore[attr-defined]
+    try:
+        records = _fetch_all(connector, limit=limit, seen=seen)
+    finally:
+        # The seen set is adopt-SCOPED: a connector instance reused after
+        # adopt (a later sync in-process, a test, a future adopt-then-sync
+        # flow) must never keep skipping the ids adopt collected — the NEW
+        # ones were never ledgered and would never be captured.
+        if hasattr(connector, "run_seen"):
+            connector.run_seen = None  # type: ignore[attr-defined]
     report.fetched = len(records)
 
     index = _CandidateIndex(candidates)
