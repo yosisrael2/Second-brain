@@ -770,8 +770,9 @@ def test_ask_conflict_leg_failure_degrades_to_plain_answer(db):
         synthetic = False
 
         def complete(self, prompt: str):
-            from brain.ai.ask import Completion
             from tests.test_ask_service import cite_every_source
+
+            from brain.ai.ask import Completion
 
             return Completion(cite_every_source(prompt), model="real-stub")
 

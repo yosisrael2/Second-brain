@@ -15,10 +15,10 @@ from brain import ops
 from brain.ai.ask import LLMClient, answer
 from brain.db.models import MemoryItem
 from brain.services.search import SearchHit, SearchService
-
-logger = logging.getLogger(__name__)
 from brain.services.temporal import parse_question_ranges
 from brain.services.triage import mentions_name
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 8
 # Candidates fetched from semantic search before truncating to top_k. The
