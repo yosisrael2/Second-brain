@@ -409,6 +409,7 @@ def test_fetch_full_sync_requests_instances_bounded_by_time_min(
 ) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue("primary", {"items": [_timed()], "nextSyncToken": "sync-1"})
@@ -426,7 +427,12 @@ def test_fetch_full_sync_requests_instances_bounded_by_time_min(
     # The fresh cutoff is frozen into the cursor for all later syncs.
     decoded = json.loads(result.next_cursor or "{}")
     assert decoded["calendars"] == {
-        "primary": {"sync_token": "sync-1", "page_token": None, "mode": "incr"}
+        "primary": {
+            "sync_token": "sync-1",
+            "page_token": None,
+            "mode": "incr",
+            "edge": _jlm_edge(61).isoformat(),
+        }
     }
     assert abs(
         (datetime.fromisoformat(decoded["cutoff"]) - time_min).total_seconds()
@@ -437,6 +443,7 @@ def test_fetch_incremental_sends_saved_sync_tokens_without_time_min(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue("primary", {"items": [], "nextSyncToken": "sync-primary-2"})
@@ -453,7 +460,12 @@ def test_fetch_incremental_sends_saved_sync_tokens_without_time_min(
     # The frozen cutoff is reused, not recomputed.
     assert json.loads(result.next_cursor or "{}")["cutoff"] == _FROZEN_CUTOVER.isoformat()
     assert json.loads(result.next_cursor or "{}")["calendars"] == {
-        "primary": {"sync_token": "sync-primary-2", "page_token": None, "mode": "incr"}
+        "primary": {
+            "sync_token": "sync-primary-2",
+            "page_token": None,
+            "mode": "incr",
+            "edge": _jlm_edge(61).isoformat(),
+        }
     }
 
 
@@ -461,6 +473,7 @@ def test_fetch_410_resets_the_calendar_and_relists_from_the_frozen_cutoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue(
@@ -479,9 +492,9 @@ def test_fetch_410_resets_the_calendar_and_relists_from_the_frozen_cutoff(
     full_relist = fake.calls[1]
     assert "syncToken" not in full_relist
     assert datetime.fromisoformat(full_relist["timeMin"]) == _FROZEN_CUTOVER  # frozen
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {
-        "primary": {"sync_token": "fresh", "page_token": None, "mode": "incr"}
-    }
+    decoded_410 = json.loads(result.next_cursor or "{}")["calendars"]["primary"]
+    assert datetime.fromisoformat(decoded_410["edge"]) == _jlm_edge(61)
+    assert "walk_edge" not in decoded_410
 
 
 def test_fetch_propagates_non_410_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -501,6 +514,7 @@ def test_fetch_walks_next_page_token_then_stores_next_sync_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue(
@@ -509,6 +523,7 @@ def test_fetch_walks_next_page_token_then_stores_next_sync_token(
         {"items": [_instance1()], "nextSyncToken": "sync-end"},
     )
     conn = _connector(fake)
+    # the stamped edge is tz-dependent: pin the zone (see _jlm_edge)
 
     result = conn.fetch(None, limit=50)
 
@@ -519,9 +534,9 @@ def test_fetch_walks_next_page_token_then_stores_next_sync_token(
     assert fake.calls[0].get("pageToken") is None
     assert fake.calls[1]["pageToken"] == "page-2"
     assert fake.calls[1]["maxResults"] == 250  # fixed page size (consistency rule)
-    assert json.loads(result.next_cursor or "{}")["calendars"] == {
-        "primary": {"sync_token": "sync-end", "page_token": None, "mode": "incr"}
-    }
+    decoded_walk = json.loads(result.next_cursor or "{}")["calendars"]["primary"]
+    assert datetime.fromisoformat(decoded_walk["edge"]) == _jlm_edge(61)
+    assert "walk_edge" not in decoded_walk
 
 
 def test_fetch_stops_at_page_boundaries_and_stays_resumable(
@@ -599,6 +614,7 @@ def test_fetch_drops_instances_that_ended_before_the_cutoff_but_keeps_the_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     stale = _timed()  # Thu 29 Oct 17:00-18:30 IST — before the frozen cutoff (Oct 1)? no:
     # Oct 29 is AFTER Oct 1; make it truly stale by moving it to September.
@@ -613,7 +629,12 @@ def test_fetch_drops_instances_that_ended_before_the_cutoff_but_keeps_the_token(
     # The stale September instance is filtered client-side; the token is kept.
     assert [r.external_id for r in result.records] == ["1q2w3e4r5t6y7u8i9o0p"]
     assert json.loads(result.next_cursor or "{}")["calendars"] == {
-        "primary": {"sync_token": "sync-1", "page_token": None, "mode": "incr"}
+        "primary": {
+            "sync_token": "sync-1",
+            "page_token": None,
+            "mode": "incr",
+            "edge": _jlm_edge(61).isoformat(),
+        }
     }
 
 
@@ -947,6 +968,7 @@ def test_incremental_walk_bigger_than_the_limit_resumes_without_replay(
     # are in-window for this resumability test (the beyond-window drop is
     # tested separately).
     monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "500")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue_page(
@@ -968,7 +990,12 @@ def test_incremental_walk_bigger_than_the_limit_resumes_without_replay(
     assert fake.calls[1]["pageToken"] == "p2"
     assert "timeMin" not in fake.calls[1]  # still an incremental call
     final_state = json.loads(second.next_cursor or "{}")["calendars"]["primary"]
-    assert final_state == {"sync_token": "S2", "page_token": None, "mode": "incr"}
+    assert final_state == {
+        "sync_token": "S2",
+        "page_token": None,
+        "mode": "incr",
+        "edge": _jlm_edge(501).isoformat(),
+    }
 
 
 def test_rejected_stored_page_token_restarts_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -977,6 +1004,7 @@ def test_rejected_stored_page_token_restarts_the_walk(monkeypatch: pytest.Monkey
     token and reports reset=True — instead of erroring the sync or losing
     the token."""
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue_page("primary", "", {"items": [_instance1()], "nextSyncToken": "S-fresh"})
@@ -998,7 +1026,12 @@ def test_rejected_stored_page_token_restarts_the_walk(monkeypatch: pytest.Monkey
     assert restart["syncToken"] == "T0"  # ...of the SAME incremental walk
     assert [r.external_id for r in result.records] == ["weekly-series-id-5678_20261104T170000Z"]
     final_state = json.loads(result.next_cursor or "{}")["calendars"]["primary"]
-    assert final_state == {"sync_token": "S-fresh", "page_token": None, "mode": "incr"}
+    assert final_state == {
+        "sync_token": "S-fresh",
+        "page_token": None,
+        "mode": "incr",
+        "edge": _jlm_edge(61).isoformat(),
+    }
 
 
 def test_walk_stopped_at_a_page_boundary_produces_no_gaps_or_repeats(
@@ -1028,6 +1061,9 @@ def test_unwalked_calendars_keep_their_stored_state(monkeypatch: pytest.MonkeyPa
     lost sync token would silently downgrade them to full re-lists, and a
     full list is not a change feed (deletions would be missed)."""
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary, secondary")
+    monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", "36500")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "36500")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue_page("primary", "", {"items": _instance_page(0, 250), "nextPageToken": "p2"})
@@ -1046,7 +1082,12 @@ def test_unwalked_calendars_keep_their_stored_state(monkeypatch: pytest.MonkeyPa
 
     # primary filled the batch: boundary stop, resume position stored...
     states = json.loads(result.next_cursor or "{}")["calendars"]
-    assert states["primary"] == {"sync_token": None, "page_token": "p2", "mode": "full"}
+    assert states["primary"] == {
+        "sync_token": None,
+        "page_token": "p2",
+        "mode": "full",
+        "walk_edge": _jlm_edge(36501).isoformat(),  # FUTURE_DAYS pinned to 36500
+    }
     # ...and secondary did NOT lose its held sync token.
     assert states["secondary"] == {"sync_token": "S_B", "page_token": None, "mode": "incr"}
     assert all(call["calendarId"] == "primary" for call in fake.calls)
@@ -1066,13 +1107,22 @@ def _jlm_edge(days_from_today: int) -> datetime:
     return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(UTC)
 
 
-def _cursor_with_edge(sync_token: str | None, edge: datetime) -> str:
+def _cursor_with_edge(
+    sync_token: str | None,
+    edge: datetime,
+    *,
+    calendar: str = "primary",
+    page_token: str | None = None,
+    walk_edge: datetime | None = None,
+) -> str:
+    """A cursor with a per-calendar edge (the gcal-window v2 shape)."""
+    state = _state(sync_token, page_token)
+    if edge is not None:
+        state["edge"] = edge.isoformat()
+    if walk_edge is not None:
+        state["walk_edge"] = walk_edge.isoformat()
     return json.dumps(
-        {
-            "cutoff": _FROZEN_CUTOVER.isoformat(),
-            "future_edge": edge.isoformat(),
-            "calendars": {"primary": _state(sync_token)},
-        }
+        {"cutoff": _FROZEN_CUTOVER.isoformat(), "calendars": {calendar: state}}
     )
 
 
@@ -1121,7 +1171,7 @@ def test_first_full_sync_sends_time_max_and_stores_the_future_edge(
     assert datetime.fromisoformat(call["timeMin"])  # past bound present
     assert datetime.fromisoformat(call["timeMax"]) == _jlm_edge(61)
     decoded = json.loads(result.next_cursor or "{}")
-    assert datetime.fromisoformat(decoded["future_edge"]) == _jlm_edge(61)
+    assert datetime.fromisoformat(decoded["calendars"]["primary"]["edge"]) == _jlm_edge(61)
     assert result.reset is False
 
 
@@ -1200,7 +1250,7 @@ def test_window_advance_forces_a_full_relist(monkeypatch: pytest.MonkeyPatch) ->
     assert datetime.fromisoformat(call["timeMin"]) == _FROZEN_CUTOVER
     assert datetime.fromisoformat(call["timeMax"]) == _jlm_edge(61)
     decoded = json.loads(result.next_cursor or "{}")
-    assert datetime.fromisoformat(decoded["future_edge"]) == _jlm_edge(61)
+    assert datetime.fromisoformat(decoded["calendars"]["primary"]["edge"]) == _jlm_edge(61)
 
 
 def test_incremental_within_window_does_not_relist(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1222,3 +1272,144 @@ def test_incremental_within_window_does_not_relist(monkeypatch: pytest.MonkeyPat
     assert call["syncToken"] == "sync-1"
     assert "timeMin" not in call and "timeMax" not in call
     assert result.stats == {"beyond_window": 0}
+
+
+# --- review round 2: the control-flow holes -------------------------------------
+
+
+class _ShiftingNow:
+    """A clock the test can move (the walks are day-quantized)."""
+
+    offset_days = 0
+
+    @classmethod
+    def now(cls, tz=None):
+        base = datetime.now(UTC) + timedelta(days=cls.offset_days)
+        return base.astimezone(tz) if tz is not None else base
+
+
+def test_page_token_retry_after_400_carries_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCKING (review round 2): a STORED page token rejected with 400
+    restarts the walk — the retried full walk must carry the window too
+    (timeMin+timeMax), not timeMin only: the original flood to 2040."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.fail_next("primary", _FakeHttpError(400))  # the stored page token dies
+    fake.queue("primary", {"items": [_timed()], "nextSyncToken": "sync-2"})
+    conn = _connector(fake)
+    # token-less walk mid-resume: page_token held, no sync token, current edge
+    cursor = _cursor_with_edge(None, _jlm_edge(61), page_token="stale-page")
+
+    result = conn.fetch(cursor, limit=50)
+
+    assert fake.calls[0]["pageToken"] == "stale-page"  # the rejected resume
+    retry = fake.calls[1]
+    assert "syncToken" not in retry
+    assert datetime.fromisoformat(retry["timeMin"]) == _FROZEN_CUTOVER
+    assert datetime.fromisoformat(retry["timeMax"]) == _jlm_edge(61)
+    assert [r.external_id for r in result.records] == ["1q2w3e4r5t6y7u8i9o0p"]
+
+
+def test_full_walk_resume_uses_the_edge_the_walk_started_with(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A limit-cut full walk resumes on a LATER day: the resumed page request
+    must carry the edge the walk STARTED with (params identical per page —
+    the sync guide's consistency rule), not today's moved edge; the calendar
+    edge is only stamped when the walk COMPLETES."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue_page("primary", "", {"items": [_timed()], "nextPageToken": "p2"})
+    conn = _connector(fake)
+
+    day_edge = _jlm_edge(61)
+    result = conn.fetch(None, limit=1)  # limit-cut: page 1 only
+    decoded = json.loads(result.next_cursor or "{}")
+    state = decoded["calendars"]["primary"]
+    assert state["page_token"] == "p2"  # the walk is incomplete
+    assert datetime.fromisoformat(state["walk_edge"]) == day_edge
+    assert "edge" not in state  # not completed: not stamped
+
+    # The next day: the resume reuses the walk's own edge.
+    _ShiftingNow.offset_days = 1
+    try:
+        fake.queue_page("primary", "p2", {"items": [_instance1()], "nextSyncToken": "sync-9"})
+        resumed = conn.fetch(result.next_cursor, limit=10)
+    finally:
+        _ShiftingNow.offset_days = 0
+
+    resume_call = fake.calls[-1]
+    assert resume_call["pageToken"] == "p2"
+    assert "syncToken" not in resume_call
+    assert datetime.fromisoformat(resume_call["timeMax"]) == day_edge  # NOT tomorrow's edge
+    assert resumed.reset is False
+    final = json.loads(resumed.next_cursor or "{}")["calendars"]["primary"]
+    assert final["sync_token"] == "sync-9"  # walk completed
+    assert datetime.fromisoformat(final["edge"]) == day_edge  # stamped at completion
+    assert "walk_edge" not in final  # cleared: the walk completed
+
+
+def test_per_calendar_edges_do_not_relist_finished_calendars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A limit-cut batch must not make already-re-listed calendars re-list
+    again on the next run: the edge is PER CALENDAR. Two stale calendars, a
+    limit fitting one re-list per run: run 1 re-lists A, run 2 re-lists B
+    (A goes incremental), run 3 is incremental for both — it converges."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary, work@example.com")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    conn = _connector(_FakeCalendarService())  # replaced per run below
+    stale = _jlm_edge(56)
+    cursor = _cursor_with_edge("sync-a", stale)
+    decoded = json.loads(cursor)
+    decoded["calendars"]["work@example.com"] = dict(decoded["calendars"]["primary"])
+    cursor = json.dumps(decoded)
+    edge = _jlm_edge(61)
+
+    # Run 1: budget fits ONE calendar's re-list (primary sorts first).
+    fake1 = _FakeCalendarService()
+    fake1.queue("primary", {"items": [_timed()], "nextSyncToken": "sync-a2"})
+    conn = _connector(fake1)
+    result1 = conn.fetch(cursor, limit=1)
+    assert fake1.calls[0].get("timeMax") == edge.isoformat()  # primary re-listed
+    assert "syncToken" not in fake1.calls[0]
+    assert not any("work@example.com" == c.get("calendarId") for c in fake1.calls)
+    cur1 = json.loads(result1.next_cursor or "{}")
+    assert datetime.fromisoformat(cur1["calendars"]["primary"]["edge"]) == edge
+    # work was cut: no re-list, keeps its stale edge
+    assert datetime.fromisoformat(cur1["calendars"]["work@example.com"]["edge"]) == stale
+
+    # Run 2: primary is current (incremental); work re-lists.
+    fake2 = _FakeCalendarService()
+    fake2.queue("primary", {"items": [], "nextSyncToken": "sync-a3"})
+    fake2.queue("work@example.com", {"items": [], "nextSyncToken": "sync-b2"})
+    conn = _connector(fake2)
+    result2 = conn.fetch(result1.next_cursor, limit=1)
+    calls2 = {c["calendarId"]: c for c in fake2.calls}
+    assert calls2["primary"].get("syncToken") == "sync-a2"  # incremental
+    assert "timeMax" not in calls2["primary"]
+    assert "timeMax" in calls2["work@example.com"]  # work re-listed
+    cur2 = json.loads(result2.next_cursor or "{}")
+    assert datetime.fromisoformat(cur2["calendars"]["work@example.com"]["edge"]) == edge
+
+    # Run 3: both incremental — it converged.
+    fake3 = _FakeCalendarService()
+    fake3.queue("primary", {"items": [], "nextSyncToken": "sync-a4"})
+    fake3.queue("work@example.com", {"items": [], "nextSyncToken": "sync-b3"})
+    conn = _connector(fake3)
+    result3 = conn.fetch(result2.next_cursor, limit=1)
+    calls3 = {c["calendarId"]: c for c in fake3.calls}
+    assert calls3["primary"].get("syncToken") == "sync-a3"
+    assert calls3["work@example.com"].get("syncToken") == "sync-b2"
+    assert "timeMax" not in calls3["primary"] and "timeMax" not in calls3["work@example.com"]
+    assert result3.reset is False

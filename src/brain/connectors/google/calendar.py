@@ -224,22 +224,25 @@ def record_from_event(payload: dict[str, Any], tz: ZoneInfo) -> SourceRecord:
 
 def _parse_cursor(
     cursor: str | None,
-) -> tuple[datetime | None, datetime | None, dict[str, dict[str, Any]]]:
-    """Decode the gcal cursor: (frozen cutoff, stored future edge, states).
+) -> tuple[datetime | None, dict[str, dict[str, Any]]]:
+    """Decode the gcal cursor: (frozen cutoff, {calendarId: walk state}).
 
-    Per-calendar state: {"sync_token": str|None, "page_token": str|None,
-    "mode": "full"|"incr"}; ``mode`` is derived from ``sync_token`` presence
-    (``incr`` iff a sync token is held) and stored for the review-spec shape.
-    A bad/absent cursor means full resync: (None, None, {}).
+    Per-calendar state: {"sync_token", "page_token", "mode", "edge",
+    "walk_edge"} — ``edge`` is the window bound of the calendar's last
+    COMPLETED full walk (the re-list trigger: stale edge -> re-list);
+    ``walk_edge`` is the bound the CURRENT incomplete walk started with
+    (a page resume must send the SAME parameters it started with, even
+    across midnight); it is cleared when the walk completes. A bad/absent
+    cursor means full resync: (None, {}).
     """
     if not cursor:
-        return None, None, {}
+        return None, {}
     try:
         decoded = json.loads(cursor)
     except ValueError:
-        return None, None, {}
+        return None, {}
     if not isinstance(decoded, dict):
-        return None, None, {}
+        return None, {}
     calendars = decoded.get("calendars")
     if not isinstance(calendars, dict):
         calendars = {}
@@ -254,6 +257,16 @@ def _parse_cursor(
             "page_token": page_token,
             "mode": "incr" if sync_token is not None else "full",
         }
+        for edge_key in ("edge", "walk_edge"):
+            raw = str(value.get(edge_key) or "").strip()
+            if not raw:
+                continue
+            try:
+                parsed_edge = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if parsed_edge.tzinfo is not None:
+                states[str(key)][edge_key] = parsed_edge
     cutoff: datetime | None = None
     raw_cutoff = str(decoded.get("cutoff") or "").strip()
     if raw_cutoff:
@@ -263,16 +276,7 @@ def _parse_cursor(
             parsed = None
         if parsed is not None and parsed.tzinfo is not None:
             cutoff = parsed
-    edge: datetime | None = None
-    raw_edge = str(decoded.get("future_edge") or "").strip()
-    if raw_edge:
-        try:
-            parsed_edge = datetime.fromisoformat(raw_edge)
-        except ValueError:
-            parsed_edge = None
-        if parsed_edge is not None and parsed_edge.tzinfo is not None:
-            edge = parsed_edge
-    return cutoff, edge, states
+    return cutoff, states
 
 
 @register
@@ -298,21 +302,19 @@ class GCalConnector(GoogleConnector):
         """
         if limit <= 0:
             return FetchResult(records=[], next_cursor=cursor, reset=False)
-        frozen_cutoff, stored_edge, calendar_states = _parse_cursor(cursor)
+        frozen_cutoff, calendar_states = _parse_cursor(cursor)
         service = self._service()
         zone = self._zone()
         settings = self._settings()
         cutoff = frozen_cutoff or datetime.now(UTC) - timedelta(
             days=settings.brain_gcal_past_days
         )
-        # The rolling future window: full walks are bounded by today's edge;
-        # a stored edge behind today's means the window advanced (a day
-        # passed) and the sync must re-list the whole window.
+        # The rolling future window: full walks are bounded by the edge they
+        # start with; a calendar whose COMPLETED edge is behind today's edge
+        # must re-list the whole window (a day passed).
         today_edge = _future_edge(zone, settings.brain_gcal_future_days, datetime.now(UTC))
-        window_advanced = stored_edge is not None and stored_edge < today_edge
         records: list[SourceRecord] = []
         beyond_window = 0
-        walked_all = True
         allowlist = self._calendar_ids()
         # Seed with every allowlisted calendar's STORED state: calendars the
         # limit never let us walk this run keep their held sync/page token —
@@ -325,52 +327,59 @@ class GCalConnector(GoogleConnector):
         reset = False
         for calendar_id in allowlist:
             if len(records) >= limit:
-                walked_all = False
                 break
             state = calendar_states.get(calendar_id) or {}
             sync_token = state.get("sync_token")
             page_token = state.get("page_token")
-            # A held token with a CURRENT edge stays incremental; a stale (or
-            # advancing) edge forces the rolling full re-list — a resync for
-            # that calendar (reset semantics: deletions never inferred). A
-            # token-less walk (fresh or page-resumable) is always FULL and
-            # sends the window bounds; its resume keeps the same parameters
-            # (consistency rule) — the date-quantized edge is the same value
-            # the walk started with.
-            relist = sync_token is not None and window_advanced
+            own_edge = state.get("edge")
+            walk_edge = state.get("walk_edge")
+            # The bound THIS walk runs under: an incomplete walk's resume
+            # reuses the edge it STARTED with (page params must be identical
+            # across the walk — even across midnight); a fresh walk uses
+            # today's edge.
+            bound = walk_edge or today_edge
+            relist = sync_token is not None and own_edge is not None and own_edge < today_edge
             if relist:
+                # A stale per-calendar edge (a day passed since this
+                # calendar's last completed walk): full re-list of the whole
+                # window — reset semantics, deletions never inferred.
                 reset = True
+                bound = today_edge
             remaining = limit - len(records)
             try:
                 if relist:
                     events, next_state = self._walk_calendar(
                         service, calendar_id, None, None, cutoff, zone, remaining,
-                        future_edge=today_edge,
+                        future_edge=bound,
                     )
                 else:
                     events, next_state = self._walk_calendar(
                         service, calendar_id, sync_token, page_token, cutoff, zone, remaining,
-                        future_edge=today_edge,
+                        future_edge=bound,
                     )
             except _SyncTokenExpired:
                 # SyncToken expired/invalid (410): drop it and fully re-list
                 # this calendar from the frozen cutoff. Other calendars'
                 # states stay valid.
                 reset = True
+                bound = today_edge
                 events, next_state = self._walk_calendar(
                     service, calendar_id, None, None, cutoff, zone, remaining,
-                    future_edge=today_edge,
+                    future_edge=bound,
                 )
             except ConnectorError as exc:
                 if page_token is None or exc.status not in (400, 410):
                     raise
                 # A STORED page_token was rejected (expired page token —
                 # pageTokens are short-lived): restart THIS calendar's walk
-                # from page 1 with the same mode/token (the sync guide's
+                # from page 1 with the same mode/params (the sync guide's
                 # consistency rule) and tell the runner this is a resync.
+                # A token-less walk's retry MUST carry the window too —
+                # timeMin alone would re-flood the future to 2040.
                 reset = True
                 events, next_state = self._walk_calendar(
-                    service, calendar_id, sync_token, None, cutoff, zone, remaining
+                    service, calendar_id, sync_token, None, cutoff, zone, remaining,
+                    future_edge=bound,
                 )
             mapped = self._map_events(events, calendar_id, zone)
             if relist or sync_token is None:
@@ -390,19 +399,39 @@ class GCalConnector(GoogleConnector):
                         continue
                     kept.append(record)
                 records.extend(kept)
-            next_states[calendar_id] = next_state
-        cursor_payload: dict[str, Any] = {
-            "cutoff": cutoff.isoformat(),
-            "calendars": next_states,
-        }
-        # The stored edge may only advance after a batch that walked EVERY
-        # allowlisted calendar — an edge recorded while a calendar's walk was
-        # cut by the limit would mark its pending re-list as done.
-        if walked_all:
-            cursor_payload["future_edge"] = today_edge.isoformat()
-        elif stored_edge is not None:
-            cursor_payload["future_edge"] = stored_edge.isoformat()
-        next_cursor = json.dumps(cursor_payload, sort_keys=True)
+            # Per-calendar edge bookkeeping: a COMPLETED walk stamps the edge
+            # it ran under; an incomplete walk holds its walk_edge for the
+            # resume and keeps the previous completed edge untouched.
+            if next_state.get("page_token") is None and next_state.get("sync_token") is not None:
+                next_states[calendar_id] = {
+                    "sync_token": next_state["sync_token"],
+                    "page_token": None,
+                    "mode": "incr",
+                    "edge": bound.isoformat(),
+                }
+            else:
+                entry = dict(next_state)
+                if own_edge is not None:
+                    entry["edge"] = own_edge.isoformat()
+                if sync_token is None or relist:
+                    entry["walk_edge"] = bound.isoformat()
+                next_states[calendar_id] = entry
+        # Datetimes in the states (edge/walk_edge) go back as ISO strings.
+        dumped: dict[str, dict[str, Any]] = {}
+        for cal, entry in next_states.items():
+            dumped[cal] = {
+                key: value.isoformat() if isinstance(value, datetime) else value
+                for key, value in entry.items()
+            }
+        next_cursor = json.dumps(
+            {"cutoff": cutoff.isoformat(), "calendars": dumped}, sort_keys=True
+        )
+        return FetchResult(
+            records=records,
+            next_cursor=next_cursor,
+            reset=reset,
+            stats={"beyond_window": beyond_window},
+        )
         return FetchResult(
             records=records,
             next_cursor=next_cursor,
