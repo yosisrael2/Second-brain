@@ -6,6 +6,7 @@ import hashlib
 import logging
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -64,6 +65,25 @@ class AskResult:
     cited_ids: list[str] = field(default_factory=list)
     sources: list[SearchHit] = field(default_factory=list)
     model: str | None = None
+
+
+def _dedupe_keep_conflicts(
+    hits: list[SearchHit],
+) -> tuple[list[SearchHit], dict[uuid.UUID, uuid.UUID]]:
+    """Collapse hits with identical raw_text (split WhatsApp chunks), keeping
+    the FIRST occurrence; map every dropped id to its surviving id so conflict
+    markers can be re-pointed instead of silently lost."""
+    seen_text: dict[str, uuid.UUID] = {}
+    survivor_of: dict[uuid.UUID, uuid.UUID] = {}
+    unique: list[SearchHit] = []
+    for hit in hits:
+        first = seen_text.get(hit.item.raw_text)
+        if first is None:
+            seen_text[hit.item.raw_text] = hit.item.id
+            unique.append(hit)
+        else:
+            survivor_of[hit.item.id] = first
+    return unique, survivor_of
 
 
 def _unique_by_text(hits: list[SearchHit]) -> list[SearchHit]:
@@ -173,9 +193,36 @@ class AskService:
             # rerank sees the whole pool; only the top_k best reach the prompt.
             # No kid named -> the call is EXACTLY the pre-0d one (byte-identical
             # pool; also keeps third-party search fakes without the kwarg working).
-            kid_items = self._kid_recall_items(
-                question, record_ops=recording, now=now
-            )
+            try:
+                # The kid leg runs SQL on the shared request session (memory
+                # overview + items repo). A REAL db error aborts the whole
+                # transaction — the savepoints scope the rollback to the leg
+                # (the #117 trap), the ask continues without kid additions,
+                # and later queries on the same session still work.
+                sessions = [
+                    s
+                    for s in (
+                        getattr(self._items_repo, "_db", None),
+                        getattr(getattr(self._memory, "_repo", None), "_db", None),
+                    )
+                    if s is not None and hasattr(s, "begin_nested")
+                ]
+                with ExitStack() as stack:
+                    for s in sessions:
+                        stack.enter_context(s.begin_nested())
+                    kid_items = self._kid_recall_items(
+                        question, record_ops=recording, now=now
+                    )
+            except Exception as exc:  # noqa: BLE001 — the leg must never kill the ask
+                logger.warning(
+                    "ask: kid leg failed; continuing without it (%s)", exc
+                )
+                if recording:
+                    ops.record_event(
+                        "ask", "kid_leg_failed", ok=False,
+                        detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                    )
+                kid_items = []
             if kid_items:
                 pool = self._search.search(
                     question,
@@ -194,7 +241,7 @@ class AskService:
                 hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
             try:
-                conflict_hits, conflict_map = self._conflict_leg(
+                conflict_hits, conflict_map, conflict_note = self._conflict_leg(
                     pool_ids, recording=recording
                 )
             except Exception as exc:  # noqa: BLE001 — the leg must never kill the ask
@@ -207,6 +254,7 @@ class AskService:
                         detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
                     )
                 conflict_hits, conflict_map = [], {}
+                conflict_note = None
             span.detail = {
                 "kid_leg_fired": bool(kid_items),
                 "kid_leg_count": len(kid_items),
@@ -215,16 +263,35 @@ class AskService:
                 "pool_hash": hashlib.sha1(",".join(pool_ids).encode()).hexdigest()[:12],
             }
         context_hits = self._temporal_hits(question, now) + hits + conflict_hits
-        context_hits = _unique_by_text(self._unique_by_id(context_hits))
-        # MAJOR 3: the map may reference a counterpart the dedupe dropped —
-        # a "conflicts with [id]" for a source that is not in the context is
-        # a dangling citation. Rebuild the map against the FINAL ids only.
+        # Text-dedupe that keeps conflicts: a dropped text-duplicate is
+        # mapped to its survivor, so a counterpart collapsing into an
+        # in-context item RE-POINTS the conflict marker instead of losing it
+        # (the contradiction the corpus holds must reach the prompt).
+        context_hits, survivor_of = _dedupe_keep_conflicts(
+            self._unique_by_id(context_hits)
+        )
+        # Rebuild the map against the FINAL ids only, re-pointing through the
+        # text-duplicate survivors. A pair whose ends collapse into ONE item
+        # carries no quotable contradiction and is dropped.
         final_ids = {str(hit.item.id) for hit in context_hits}
-        conflict_map = {
-            item_id: [other for other in others if other in final_ids]
-            for item_id, others in conflict_map.items()
-            if item_id in final_ids and any(other in final_ids for other in others)
-        }
+        rebuilt: dict[str, list[str]] = {}
+        for a_str, others in conflict_map.items():
+            for b_str in others:
+                a = uuid.UUID(a_str)
+                b = uuid.UUID(b_str)
+                sa = survivor_of.get(a, a)
+                sb = survivor_of.get(b, b)
+                if sa == sb:
+                    continue
+                if str(sa) not in final_ids or str(sb) not in final_ids:
+                    continue
+                forward = rebuilt.setdefault(str(sa), [])
+                if str(sb) not in forward:
+                    forward.append(str(sb))
+                backward = rebuilt.setdefault(str(sb), [])
+                if str(sa) not in backward:
+                    backward.append(str(sa))
+        conflict_map = rebuilt
         context = [
             {
                 "id": str(hit.item.id),
@@ -249,6 +316,7 @@ class AskService:
                 now=now,
                 tz=self._tz,
                 memory_block=self._memory_block() if self._memory_block else "",
+                truncation_note=conflict_note,
             )
             span.detail = {"model": result["model"], "cited": len(result["cited_ids"])}
         return AskResult(
@@ -456,7 +524,7 @@ class AskService:
 
     def _conflict_leg(
         self, pool_ids: list[str], *, recording: bool
-    ) -> tuple[list[SearchHit], dict[str, list[str]]]:
+    ) -> tuple[list[SearchHit], dict[str, list[str]], str | None]:
         """PR-b (item 38's ask leg): pull conflict counterparts into the context.
 
         Every conflicts relation touching a recalled item contributes its
@@ -466,16 +534,18 @@ class AskService:
         of every in-context relation are marked ``conflict_with`` so the
         prompt renders the ⚠️ line and the answer quotes both versions.
 
-        Returns (counterpart hits, item_id -> [conflicting item ids]). With
-        no repository or no relations: ([], {}) — the pipeline is
+        Returns (counterpart hits, item_id -> [conflicting item ids],
+        truncation note). The cap stays; when relations were left out the
+        note says HOW MANY, so the answer knows the context is incomplete.
+        With no repository or no relations: ([], {}, None) — the pipeline is
         byte-identical to the pre-leg one. An older repository without the
         method (third-party fakes) gets no leg, no change.
         """
         if self._items_repo is None or not pool_ids:
-            return [], {}
+            return [], {}, None
         repo_method = getattr(self._items_repo, "conflict_counterparts", None)
         if repo_method is None:
-            return [], {}
+            return [], {}, None
         try:
             uuids = [uuid.UUID(item_id) for item_id in pool_ids]
         except ValueError:
@@ -492,7 +562,7 @@ class AskService:
         else:  # a third-party fake without a session: no savepoint to take
             pairs = list(repo_method(uuids, limit=self._conflict_leg_limit))
         if not pairs:
-            return [], {}
+            return [], {}, None
         pool_set = set(uuids)
         pulled: dict[uuid.UUID, MemoryItem] = {}
         for _rel, other in pairs:
@@ -516,7 +586,34 @@ class AskService:
                 ok=True,
                 detail={"pulled": len(pulled), "relations": len(pairs)},
             )
-        return [SearchHit(item=item, score=None) for item in pulled.values()], conflict_map
+        return (
+            [SearchHit(item=item, score=None) for item in pulled.values()],
+            conflict_map,
+            self._truncation_note(pairs, uuids),
+        )
+
+    def _truncation_note(
+        self, pairs: list[tuple[Any, MemoryItem]], uuids: list[uuid.UUID]
+    ) -> str | None:
+        """One line for the prompt when the cap left live conflicts out —
+        the answer must know the context is incomplete. The cap itself is
+        unchanged (4 pairs); the count comes from the repo's live-relation
+        count (same predicates), so the note says the real number."""
+        if len(pairs) < self._conflict_leg_limit:
+            return None
+        count_method = getattr(self._items_repo, "count_conflict_relations", None)
+        if count_method is None:
+            return None
+        total = count_method(uuids)
+        hidden = total - len(pairs)
+        if hidden <= 0:
+            return None
+        note = (
+            f"{hidden} more conflicting items were not shown "
+            f"(only the {len(pairs)} newest conflicts are quoted)"
+        )
+        logger.info("ask: conflict leg truncated: %s", note)
+        return note
 
     def _temporal_hits(self, question: str, now: datetime | None) -> list[SearchHit]:
         """Fetch every item inside the question's resolved date ranges."""

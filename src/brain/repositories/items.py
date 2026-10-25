@@ -273,9 +273,11 @@ class ItemsRepository:
         user needs to see next to it (the answer must quote both versions).
         But DEAD counterparts are excluded — dropped children (the A1
         re-run diff rejected them), superseded (an applied newer version)
-        and confirmed-cancelled items are not live contradictions. Only
-        live relations are read — rows are never deleted, but undone
-        applies_to/supersedes states do not exist for ``conflicts``.
+        and confirmed-cancelled items are not live contradictions. The same
+        rule as the kid leg: NOISE-TRIAGED conversations are excluded too —
+        a triaged-as-noise chat is not a contradiction the answer should
+        quote. Only live relations are read — rows are never deleted, but
+        undone applies_to/supersedes states do not exist for ``conflicts``.
         Bounded: newest relations first, ``limit`` pairs.
         """
         if not item_ids:
@@ -307,7 +309,48 @@ class ItemsRepository:
         stmt = stmt.where(
             MemoryItem.child_state.is_(None) | (MemoryItem.child_state != "dropped")
         )
+        # the kid leg's noise rule: a noise-triaged chat is not a live
+        # contradiction for the ask context
+        stmt = stmt.where(
+            MemoryItem.triage_label.is_(None) | (MemoryItem.triage_label != "noise")
+        )
         return [(rel, item) for rel, item in self._db.execute(stmt).all()]
+
+    def count_conflict_relations(self, item_ids: Sequence[uuid.UUID]) -> int:
+        """How many live conflicts relations touch the given items — the same
+        predicates as :meth:`conflict_counterparts` (dead counterparts and
+        noise excluded), without the cap. The ask's conflict leg reads it to
+        say HOW MANY counterparts its cap left out."""
+        if not item_ids:
+            return 0
+        ids = list(item_ids)
+        stmt = (
+            select(func.count())
+            .select_from(ItemRelation)
+            .join(
+                MemoryItem,
+                or_(
+                    and_(
+                        ItemRelation.to_id.in_(ids),
+                        MemoryItem.id == ItemRelation.from_id,
+                    ),
+                    and_(
+                        ItemRelation.from_id.in_(ids),
+                        MemoryItem.id == ItemRelation.to_id,
+                    ),
+                ),
+            )
+            .where(ItemRelation.kind == "conflicts")
+        )
+        for cond in default_hidden_conditions():
+            stmt = stmt.where(cond)
+        stmt = stmt.where(
+            MemoryItem.child_state.is_(None) | (MemoryItem.child_state != "dropped")
+        )
+        stmt = stmt.where(
+            MemoryItem.triage_label.is_(None) | (MemoryItem.triage_label != "noise")
+        )
+        return int(self._db.scalar(stmt) or 0)
 
     def by_channels(
         self,
