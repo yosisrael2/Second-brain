@@ -149,16 +149,14 @@ class RefreshableTrier:
         error) and only the savepoint is rolled back.
         """
         self.refresh_calls += 1
-        nested = self._session.begin_nested()
-        try:
-            with nested:
-                names = self._read_kid_names()
-        except Exception:
-            # The savepoint has been rolled back by the context manager; the
-            # outer transaction (pending captures) is untouched. Propagate:
-            # the poller logs one warning, records ops, and carries on with
-            # the last-known names.
-            raise
+        # begin_nested + the with-block: a failure inside rolls back ONLY the
+        # savepoint (the outer transaction — pending captures — is untouched);
+        # the exception propagates so the poller logs one warning, records
+        # ops, and carries on with the last-known names. The reassignment
+        # happens only after a successful read, so a failure never blanks
+        # the list.
+        with self._session.begin_nested():
+            names = self._read_kid_names()
         self._kid_names = names
 
     def __call__(self, item: Any) -> "TriageResult | None":
