@@ -66,17 +66,14 @@ class TestGmailAuth:
         assert "1//the-refresh-token" not in out  # the token is NEVER printed
         assert "keychain" in out
 
-    def test_scope_is_readonly_plus_modify(self, fake_keychain):
+    def test_read_only_scope_is_the_only_scope(self, fake_keychain):
         # The CLI builds the flow with scopes=[GMAIL_SCOPE]; the seam itself is
         # monkeypatched above, so assert the constant the CLI passes. The
-        # labeler (v1) added gmail.modify — in CODE only: granting it is the
-        # USER's re-consent at a later GO.
+        # labeler's gmail.modify lives in GMAIL_LABEL_SCOPES — the SYNC flow
+        # stays readonly-only (the live token must never be asked for more).
         from brain.ai.gmail import GMAIL_SCOPE
 
-        assert GMAIL_SCOPE == (
-            "https://www.googleapis.com/auth/gmail.readonly",
-            "https://www.googleapis.com/auth/gmail.modify",
-        )
+        assert GMAIL_SCOPE == "https://www.googleapis.com/auth/gmail.readonly"
 
     def test_missing_secret_path_is_config_error(self, capsys, fake_keychain):
         code = cli.main(["gmail-auth"])

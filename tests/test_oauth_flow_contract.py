@@ -82,7 +82,7 @@ def test_both_flow_builders_call_the_real_library_method(monkeypatch, tmp_path):
     secret.write_text("{}")
 
     for builder, args, expected_scopes in (
-        (cli._build_oauth_flow, (str(secret),), list(cli.GMAIL_SCOPE)),
+        (cli._build_oauth_flow, (str(secret),), [cli.GMAIL_SCOPE]),
         (cli._build_connectors_oauth_flow, (str(secret), ["email.readonly"]), ["email.readonly"]),
     ):
         _SpyFlowClass.method = None

@@ -296,3 +296,110 @@ class _FakeSettings:
         self.gmail_min_call_interval_s = 0.0
         self.database_url = "postgresql+psycopg://brain:brain@localhost:27432/brain_w3_labeler_test"
         self.qdrant_collection = "brain_items_w3_labeler_test"
+
+
+class TestScopes:
+    """Review round 1: the SYNC path keeps readonly exactly; the labeler's
+    scope set is separate; a readonly-only token fails --apply before any
+    call."""
+
+    def test_connector_credentials_are_readonly_only(self, monkeypatch):
+        """(a) The REAL credential builder on the poller/connector path gets
+        [readonly] exactly — asserted on the built Credentials, not the
+        constant. Skipped where the gmail extra is absent (CI)."""
+        google_creds = pytest.importorskip("google.oauth2.credentials")
+
+        captured: dict[str, Any] = {}
+
+        class _SpyCredentials:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(google_creds, "Credentials", _SpyCredentials)
+        from brain.connectors.google.base import default_service_factory
+
+        class _FakeDiscovery:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                pass
+
+        import googleapiclient.discovery as discovery_mod
+
+        monkeypatch.setattr(discovery_mod, "build", lambda *a, **k: _FakeDiscovery())
+        client_config = {
+            "client_id": "cid", "client_secret": "sek",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+        import brain.connectors.google.base as base_mod
+
+        monkeypatch.setattr(base_mod, "oauth_client_config", lambda settings=None: client_config)
+        default_service_factory(
+            "1//tok",
+            ["https://www.googleapis.com/auth/gmail.readonly"],
+            "gmail", "v1",
+        )
+        assert captured["scopes"] == ["https://www.googleapis.com/auth/gmail.readonly"], (
+            "the sync credential path must request readonly ONLY"
+        )
+
+    def test_labeler_client_requests_readonly_plus_modify(self):
+        """(b) The labeler's client is built with GMAIL_LABEL_SCOPES
+        (readonly + gmail.modify) — never the sync-only set."""
+        from brain.ai.gmail import GMAIL_LABEL_SCOPES
+        from brain.services.gmail_labeler import build_labeler_client
+
+        captured: dict[str, Any] = {}
+
+        def _fake_factory(token: str, scopes: list[str], api: str, version: str) -> Any:
+            captured["scopes"] = scopes
+            return "fake-service"
+
+        build_labeler_client(
+            "1//tok",
+            settings=_FakeSettings(rules_path=""),
+            service_factory=_fake_factory,
+        )
+        assert captured["scopes"] == list(GMAIL_LABEL_SCOPES)
+        assert "https://www.googleapis.com/auth/gmail.modify" in captured["scopes"]
+
+    def test_readonly_only_token_fails_apply_before_any_call(
+        self, tmp_path, monkeypatch, capsys, database
+    ):
+        """(c) A readonly-only token + --apply: the granted-scope check fails
+        with the re-consent message and ZERO Gmail calls (not even reads)."""
+        import json as _json
+
+        from brain import cli
+
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.messages["m1"] = _msg_with_headers(
+            "m1", sender="office@school.example", subject="trip"
+        )
+        state.list_result = {"messages": [{"id": "m1"}]}
+        rules = tmp_path / "rules.json"
+        rules.write_text(_json.dumps({"School": {"domains": ["school.example"], "list_ids": []}}))
+
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings: _client(state))
+        monkeypatch.setattr(cli, "_labeler_token", lambda: "1//readonly-token")
+        monkeypatch.setattr(
+            cli, "_labeler_client_config",
+            lambda settings: {"client_id": "c", "client_secret": "s",
+                              "token_uri": "https://oauth2.googleapis.com/token"},
+        )
+
+        def _readonly_post(form: bytes) -> dict:
+            return {"scope": "https://www.googleapis.com/auth/gmail.readonly"}
+
+        import brain.services.gmail_labeler as labeler_mod
+
+        real_check = labeler_mod.token_grants_modify
+
+        def _checked(token: str, client_config: dict, poster: Any = None) -> bool:
+            return real_check(token, client_config=client_config, poster=_readonly_post)
+
+        monkeypatch.setattr(labeler_mod, "token_grants_modify", _checked)
+
+        code = cli.main(["gmail-label", "--apply"])
+        assert code == 78
+        assert "gmail.modify" in capsys.readouterr().err
+        assert state.calls == [], "zero Gmail calls: the check runs before anything"

@@ -40,9 +40,51 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from brain.ai.gmail import GmailAuthError, GmailError
+from brain.ai.gmail import GMAIL_LABEL_SCOPES, GmailAuthError, GmailError
 from brain.ops import record_event
 from brain.services.triage import is_name_token
+
+MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+
+
+def token_grants_modify(
+    refresh_token: str,
+    *,
+    client_config: dict[str, str],
+    poster: Any = None,
+) -> bool:
+    """True when the token's GRANTED scopes include gmail.modify.
+
+    Refreshes the token ONCE against the OAuth token endpoint (stdlib POST —
+    no google libs, no Gmail API call, no quota) and inspects the granted
+    scope list. The check runs before ANY Gmail call, so a readonly-only
+    token (the live state until the USER runs `brain gmail-label --auth`)
+    fails with zero writes. ``poster(form) -> payload`` is the test seam.
+    """
+    import urllib.parse
+    import urllib.request
+
+    form = urllib.parse.urlencode(
+        {
+            "client_id": client_config["client_id"],
+            "client_secret": client_config["client_secret"],
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+    ).encode()
+
+    def _default_post(body: bytes) -> dict[str, Any]:
+        req = urllib.request.Request(
+            client_config["token_uri"],
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 (fixed URL)
+            return json.loads(resp.read())
+
+    payload = (poster or _default_post)(form)
+    granted = str(payload.get("scope") or "").split(" ")
+    return MODIFY_SCOPE in granted
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +170,26 @@ class LabelPlan:
     label_path: str
     label_id: str | None  # the existing Gmail label id, when already created
     source: str  # "kid:<name>" | "domain" | "list-id" | "unsorted"
+
+
+def build_labeler_client(
+    refresh_token: str,
+    *,
+    settings: Any,
+    service_factory: Any = None,
+) -> Any:
+    """RestGmailClient over GMAIL_LABEL_SCOPES (readonly + gmail.modify),
+    paced by the connector's quota-hygiene interval. The SYNC path never uses
+    this (its credentials stay readonly-only)."""
+    from brain.ai.gmail import RestGmailClient
+    from brain.connectors.google.base import default_service_factory
+
+    factory = service_factory or default_service_factory
+    service = factory(refresh_token, list(GMAIL_LABEL_SCOPES), "gmail", "v1")
+    return RestGmailClient(
+        service=service,
+        min_interval_s=getattr(settings, "gmail_min_call_interval_s", None),
+    )
 
 
 def plan_labels(

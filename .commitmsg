@@ -1,0 +1,30 @@
+fix(gmail-labeler): the sync path keeps readonly-only scopes; the labeler scope set is separate
+
+Review round 1, two blockers:
+
+1. TYPE BREAK: GMAIL_SCOPE had become a tuple, and two callers still
+   wrapped it - ai/gmail.py:223 scopes=[GMAIL_SCOPE] (a list containing
+   a tuple) and connectors/google/gmail.py:271 SCOPES=(GMAIL_SCOPE,)
+   (a tuple of a tuple) - both on the poller/connector credential path.
+2. SCOPE ESCALATION ON THE SYNC PATH: the live token holds
+   gmail.readonly only; requesting gmail.modify at its refresh risks
+   invalid_scope - mail ingest would break on deploy before the user
+   re-consents.
+
+Fix: GMAIL_SCOPE is back to the readonly STRING, untouched - the sync,
+poller and connector credential path is byte-identical to main
+(SCOPE_BY_CONNECTOR['email'] reverted too). The labeler gets a separate
+GMAIL_LABEL_SCOPES = (readonly, gmail.modify), used ONLY by
+build_labeler_client and the new explicit consent path
+'brain gmail-label --auth' (the labeler's own subcommand). --apply
+first REFRESHES the token once (stdlib POST to the token endpoint -
+no google libs, no quota, no Gmail call) and inspects the GRANTED
+scopes; a readonly-only token fails with the re-consent message and
+ZERO Gmail calls (the check runs before reads too).
+
+Red-first: (a) the real credential builder on the sync path receives
+[readonly] exactly (asserted on the built Credentials, skipped where
+the gmail extra is absent); (b) build_labeler_client requests
+readonly+modify; (c) a readonly-only token + --apply -> exit 78, the
+re-consent message, zero calls. The 3 scope-contract tests pin
+readonly again. Full suite 1706 passed / 4 skipped.

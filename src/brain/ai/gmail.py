@@ -31,7 +31,14 @@ from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
-GMAIL_SCOPE = (
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+
+# The LABELER's scope set: readonly + gmail.modify (label writes). Used ONLY
+# by the labeler's client and `brain gmail-label --auth`; the sync/poller/
+# connector credential path keeps GMAIL_SCOPE (readonly) exactly as before —
+# the live token holds readonly only, and requesting modify at its refresh
+# would risk invalid_scope and break mail ingest before the user re-consents.
+GMAIL_LABEL_SCOPES = (
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
 )
