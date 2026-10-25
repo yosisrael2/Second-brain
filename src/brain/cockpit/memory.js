@@ -1,128 +1,584 @@
-/* Cockpit Memory tab — the Memory Management screen (part B).
+/* Cockpit Memory tab — the redesigned Memory screen.
  *
- * Master-detail per the user's reference: LEFT = search + sections
- * (Family / People / Groups / Places & orgs) with one row per entity
- * (name, sub-line, updated time); RIGHT = the selected entity's page —
- * header (name, sub-line, Edit toggle, + Add) over a scrollable stack of
- * memory cards, ONE self-contained card per fact, full CRUD with Undo
- * (delete-fact reopens via /facts/{id}/restore; remove-entity archives
- * via /archive and undoes via /restore). Phone: list first, tap opens
- * the detail, back button returns.
+ * Three views over the same data:
+ *   profile  LEFT = Household / Other people / Groups / Places; RIGHT = the
+ *            selected entity's profile: Basic info (typed fields, one value
+ *            each) + Connections (typed, two-way) beside the Memories feed
+ *            (free text that can mention several people, with a category).
+ *   review   every PROPOSED fact (picked up from chats) waits here until it
+ *            is confirmed, edited first, or rejected — nothing is saved on
+ *            its own.
+ *   map      the family map: solid lines = family connections, dashed =
+ *            group membership, dotted amber = people with no connection yet.
+ *
+ * Data model (no new tables — all facts on /memory):
+ *   basic info   facts with a typed predicate (relation, birthday, gender,
+ *                work, phone, email, grade, class, school, teacher, ...)
+ *   memories     facts whose predicate is a category: note / routine /
+ *                preference / date
+ *   connections  'connection:<type>' + object_id ("subject is object's
+ *                <type>"); the reverse side is derived here, so one fact
+ *                shows on both profiles
+ *   groups       channel entities; applies_to + channel_kind label them by
+ *                meaning ("Itamar · parents' chat")
  *
  * Depends only on app.js's globals (el, $, api, toast, shortId,
  * switchTab, openInspector) and exposes ONE global:
  * window.MemoryTab.refresh(). All dynamic values render via textContent.
  *
  * Data sources (same origin, localhost only):
- *   GET    /memory                              overview (?status=, ?q=)
+ *   GET    /memory                              overview (confirmed facts)
+ *   GET    /memory?status=proposed              the review inbox
  *   POST   /memory/entities                     add entity (+aliases)
  *   PATCH  /memory/entities/{id}                rename
- *   POST   /memory/entities/{id}/aliases        add alias (part A)
- *   DELETE /memory/entities/{id}/aliases/{a}    remove alias (part A)
- *   POST   /memory/entities/{id}/archive        soft-remove (part A)
- *   POST   /memory/entities/{id}/restore        Undo the archive (part A)
+ *   POST   /memory/entities/{id}/aliases        add alias
+ *   DELETE /memory/entities/{id}/aliases/{a}    remove alias
+ *   POST   /memory/entities/{id}/archive        soft-remove
+ *   POST   /memory/entities/{id}/restore        Undo the archive
  *   POST   /memory/facts                        add fact (source=user)
  *   PATCH  /memory/facts/{id}                   edit = new version
  *   DELETE /memory/facts/{id}                   soft delete (history kept)
- *   POST   /memory/facts/{id}/restore           Undo the soft delete (A)
+ *   POST   /memory/facts/{id}/restore           Undo the soft delete
  *   POST   /memory/facts/{id}/confirm           proposed -> confirmed
  *   GET    /memory/facts/{id}/history           version chain (+provenance)
  */
 "use strict";
 
 const memoryState = {
-  status: "confirmed",
-  q: "",
-  entities: [],
-  selected: null,         // entity id whose page is open (detail pane)
-  editMode: false,        // the detail's Edit toggle
-  editingFact: null,      // fact id being inline-edited
-  addingFactFor: null,    // entity id with an open add-fact form
-  addingMemoryFor: null,  // entity id with an open add-memory (note) form
-  addingAliasFor: null,   // entity id with an open add-alias input
-  drawerFact: null,       // fact id whose history is in the drawer
-  undoFn: null,           // the pending Undo callback (destructive toast)
+  mode: "profile",        // profile | review | map
+  q: "",                  // sidebar search (client-side)
+  entities: [],           // GET /memory (confirmed facts)
+  proposed: [],           // GET /memory?status=proposed (entities with proposals)
+  online: true,
+  dataKey: "",            // last rendered payload — re-render only on change
+  selected: null,         // entity id whose profile is open
+  editMode: false,        // the profile header's Edit toggle (rename/remove)
+  editingField: null,     // basic-info predicate being edited inline
+  addingAlias: false,
+  addingConnection: false,
+  editingFact: null,      // memory fact id being edited inline
+  menuFact: null,         // memory fact id whose actions row is open
+  promoting: null,        // memory fact id with the "move to basic info" form
+  memoryFilter: "all",
+  reviewFilter: "all",
+  reviewEditing: null,    // proposed fact id being edited before confirm
+  showAllGroups: false,
+  drawerFact: null,
+  undoFn: null,
 };
 
-// Predicates that mark a person entity as one of the kids ("kids first").
-const KID_PREDICATES = new Set(["grade", "class", "gender", "teacher"]);
-const KID_LINE_ORDER = ["class", "grade", "gender", "teacher"];
-// The one-step add-person fields (part B): each becomes a confirmed fact.
+// Free-text memory categories (the predicate IS the category).
+const MEMORY_CATEGORIES = ["routine", "preference", "date", "note"];
+const CATEGORY_LABEL = {
+  routine: "Routine", preference: "Preference", date: "Date", note: "Note",
+};
+const CATEGORY_PLURAL = {
+  routine: "Routines", preference: "Preferences", date: "Dates", note: "Notes",
+};
+const CONNECTION_PREFIX = "connection:";
+// type -> labels (gendered by the entity the label describes) + the reverse.
+const CONNECTION_TYPES = {
+  spouse: { label: "Spouse", m: "Husband", f: "Wife", inverse: "spouse", of: "Married to" },
+  parent: { label: "Parent", m: "Dad", f: "Mom", inverse: "child" },
+  child: { label: "Child", m: "Son", f: "Daughter", inverse: "parent" },
+  sibling: { label: "Sibling", m: "Brother", f: "Sister", inverse: "sibling" },
+  grandparent: { label: "Grandparent", m: "Grandpa", f: "Grandma", inverse: "grandchild" },
+  grandchild: { label: "Grandchild", m: "Grandson", f: "Granddaughter", inverse: "grandparent" },
+  friend: { label: "Friend", inverse: "friend" },
+  teacher: { label: "Teacher", inverse: "student" },
+  student: { label: "Student", inverse: "teacher" },
+  coach: { label: "Coach", inverse: "trainee" },
+  trainee: { label: "Trainee", inverse: "coach" },
+  member: { label: "Member", inverse: "group" },
+  group: { label: "Group", inverse: "member" },
+  other: { label: "Connected", inverse: "other", of: "Connected to" },
+};
+// What "+ Add connection" offers (the rest are reverses).
+const CONNECTION_CHOICES = [
+  "spouse", "parent", "child", "sibling", "grandparent", "grandchild",
+  "friend", "teacher", "student", "coach", "member", "other",
+];
+const FAMILY_TYPES = new Set(["spouse", "parent", "child", "sibling", "grandparent", "grandchild"]);
+// Basic info: one row per field, in this order. Kid fields show for kids.
+const PERSON_BASIC = [
+  ["relation", "Role"], ["birthday", "Birthday"], ["gender", "Gender"],
+  ["aliases", "Also known as"], ["work", "Work"], ["phone", "Phone"], ["email", "Email"],
+];
+const KID_BASIC = [["grade", "Grade"], ["class", "Class"], ["school", "School"], ["teacher", "Teacher"]];
+const CHANNEL_BASIC = [["applies_to", "For"], ["channel_kind", "Kind"], ["aliases", "Also known as"]];
+const CHANNEL_KINDS = ["parents", "kids", "teacher", "committee", "club", "community"];
+const CHANNEL_KIND_LABEL = {
+  parents: "parents' chat", kids: "kids' chat", teacher: "teacher's channel",
+  committee: "class committee", club: "club", community: "community",
+};
+// Kids are recognised by school facts (gender alone is not enough: adults have one).
+const KID_PREDICATES = new Set(["grade", "class", "teacher"]);
+const PARENT_ROLE_RE = /\b(father|mother|dad|mom|parent)\b/i;
+const FAMILY_ROLE_RE = /\b(father|mother|dad|mom|parent|wife|husband|spouse)\b/i;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const AVATAR_TONES = 6;
+const GROUPS_SHOWN = 6;
+// The one-step add-person fields: each becomes a confirmed fact.
 const PERSON_FIELDS = [
   ["relation", "memory-person-relation"],
   ["gender", "memory-person-gender"],
+  ["birthday", "memory-person-birthday"],
   ["grade", "memory-person-grade"],
   ["class", "memory-person-class"],
   ["school", "memory-person-school"],
   ["teacher", "memory-person-teacher"],
 ];
-// Suggested predicates for the add-fact picker (no secrets — public facts).
-const FACT_SUGGESTIONS = [
-  "grade", "class", "school", "teacher", "gender", "relation",
-  "activity", "phone-free only", "note",
-];
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// ---------- small model helpers ----------
+
+function factsOf(entity, predicate) {
+  const wanted = predicate.toLowerCase();
+  return (entity.facts || []).filter((fact) => fact.predicate.toLowerCase() === wanted);
+}
+
+function factValue(entity, predicate) {
+  const fact = factsOf(entity, predicate).find((candidate) => candidate.value);
+  return fact ? fact.value : null;
+}
 
 function isKid(entity) {
-  return entity.kind === "person"
-    && (entity.facts || []).some((f) => KID_PREDICATES.has(f.predicate));
+  return Boolean(entity) && entity.kind === "person"
+    && (entity.facts || []).some((fact) => KID_PREDICATES.has(fact.predicate.toLowerCase()));
 }
 
-function kidFacts(entity) {
-  const kids = entity.facts.filter((f) => KID_PREDICATES.has(f.predicate));
-  return [...kids].sort(
-    (a, b) => KID_LINE_ORDER.indexOf(a.predicate) - KID_LINE_ORDER.indexOf(b.predicate),
-  );
+function isMemoryFact(fact) {
+  return MEMORY_CATEGORIES.includes(fact.predicate.toLowerCase());
 }
 
+function isConnectionFact(fact) {
+  return fact.predicate.startsWith(CONNECTION_PREFIX);
+}
+
+function genderOf(entity) {
+  const value = (entity && factValue(entity, "gender")) || "";
+  if (/^(boy|man|male|m)$/i.test(value.trim())) return "m";
+  if (/^(girl|woman|female|f)$/i.test(value.trim())) return "f";
+  return null;
+}
+
+function typeLabel(type, entity) {
+  const spec = CONNECTION_TYPES[type];
+  if (!spec) return type;
+  const gender = genderOf(entity);
+  return (gender === "m" && spec.m) || (gender === "f" && spec.f) || spec.label;
+}
+
+function inverseType(type) {
+  return (CONNECTION_TYPES[type] || {}).inverse || type;
+}
+
+function capitalize(text) {
+  const value = String(text ?? "");
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value;
+}
+
+function initialOf(name) {
+  const first = [...String(name || "?").trim()][0] || "?";
+  return first.toUpperCase();
+}
+
+function toneOf(id) {
+  let hash = 0;
+  for (const char of String(id)) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return hash % AVATAR_TONES;
+}
+
+function shortDate(iso) {
+  if (!iso) return "";
+  return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function gradeText(value) {
+  const grade = String(value).trim();
+  const number = Number.parseInt(grade, 10);
+  if (String(number) !== grade) return `grade ${grade}`;
+  const suffix = number % 100 >= 11 && number % 100 <= 13 ? "th"
+    : ({ 1: "st", 2: "nd", 3: "rd" })[number % 10] || "th";
+  return `${number}${suffix} grade`;
+}
+
+// "05.12.1985" / "1985-12-05" / "5.12" -> {day, month, year|null}
+function parseBirthday(raw) {
+  const text = String(raw ?? "").trim();
+  let day; let month; let year = null;
+  let match = text.match(/^(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?$/);
+  if (match) {
+    day = Number(match[1]); month = Number(match[2]);
+    if (match[3]) {
+      year = Number(match[3]);
+      if (year < 100) year += year > 30 ? 1900 : 2000;
+    }
+  } else if ((match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/))) {
+    year = Number(match[1]); month = Number(match[2]); day = Number(match[3]);
+  } else {
+    return null;
+  }
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return { day, month, year };
+}
+
+// "5 Dec 1985 · 40 · turns 41 in 41 days" — the form people use.
+function birthdayText(raw) {
+  const birthday = parseBirthday(raw);
+  if (!birthday) return String(raw);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const label = `${birthday.day} ${MONTHS[birthday.month - 1]}${birthday.year ? ` ${birthday.year}` : ""}`;
+  let next = new Date(today.getFullYear(), birthday.month - 1, birthday.day);
+  if (next < today) next = new Date(today.getFullYear() + 1, birthday.month - 1, birthday.day);
+  const days = Math.round((next - today) / 86400000);
+  const when = days === 0 ? "today" : `in ${days} day${days === 1 ? "" : "s"}`;
+  if (!birthday.year) return `${label} · ${days === 0 ? "birthday today" : `birthday ${when}`}`;
+  const turning = next.getFullYear() - birthday.year;
+  const age = days === 0 ? turning : turning - 1;
+  return `${label} · ${age} · turns ${turning} ${when}`;
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ---------- the derived model (rebuilt per render) ----------
+
+let mm = null;
+
+function buildModel() {
+  const entities = memoryState.entities;
+  const byId = new Map(entities.map((entity) => [entity.id, entity]));
+  const links = [];   // {from, to, type, fact|null} — "from is to's <type>"
+  for (const entity of entities) {
+    for (const fact of entity.facts || []) {
+      if (isConnectionFact(fact) && fact.object_id && byId.has(fact.object_id)) {
+        links.push({
+          from: entity.id, to: fact.object_id,
+          type: fact.predicate.slice(CONNECTION_PREFIX.length), fact,
+        });
+      }
+    }
+  }
+  const kids = entities.filter(isKid);
+  // A "father"/"mother" role is a parent of the household's kids unless an
+  // explicit connection between the two already says something.
+  for (const entity of entities) {
+    if (entity.kind !== "person" || isKid(entity)) continue;
+    if (!PARENT_ROLE_RE.test(factValue(entity, "relation") || "")) continue;
+    for (const kid of kids) {
+      const linked = links.some((link) => (link.from === entity.id && link.to === kid.id)
+        || (link.from === kid.id && link.to === entity.id));
+      if (!linked) links.push({ from: entity.id, to: kid.id, type: "parent", fact: null });
+    }
+  }
+  const proposedBySubject = new Map();
+  for (const entity of memoryState.proposed) {
+    if ((entity.facts || []).length) proposedBySubject.set(entity.id, entity.facts);
+  }
+  // Mention tokens: names + aliases of people/groups (not channels: their
+  // names are long chat titles), longest first so "Rona C." beats "Rona".
+  const tokens = [];
+  for (const entity of entities) {
+    if (entity.kind === "channel" || entity.name === "me") continue;
+    for (const token of new Set([entity.name, ...(entity.aliases || [])])) {
+      if (token && token.trim().length >= 2) tokens.push({ token: token.trim(), entity });
+    }
+  }
+  tokens.sort((a, b) => b.token.length - a.token.length);
+  const mentionRes = tokens.map(({ token, entity }) => ({
+    entity,
+    re: new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(token)}(?![\\p{L}\\p{N}])`, "giu"),
+  }));
+  return { byId, links, kids, proposedBySubject, mentionRes };
+}
+
+function isHousehold(entity) {
+  if (!entity || entity.kind !== "person") return false;
+  if (isKid(entity) || entity.name === "me") return true;
+  if (FAMILY_ROLE_RE.test(factValue(entity, "relation") || "")) return true;
+  return mm.links.some((link) => FAMILY_TYPES.has(link.type)
+    && (link.from === entity.id || link.to === entity.id)
+    && isKid(mm.byId.get(link.from === entity.id ? link.to : link.from)));
+}
+
+function channelsFor(entity) {
+  return memoryState.entities.filter((candidate) => candidate.kind === "channel"
+    && factsOf(candidate, "applies_to").some((fact) => fact.value === entity.name));
+}
+
+// [{start, end, entity}] — non-overlapping mention spans in a memory text.
+function findMentions(text) {
+  const spans = [];
+  const source = String(text ?? "");
+  for (const { entity, re } of mm.mentionRes) {
+    re.lastIndex = 0;
+    for (const match of source.matchAll(re)) {
+      const start = match.index;
+      const end = start + match[0].length;
+      if (spans.some((span) => start < span.end && end > span.start)) continue;
+      spans.push({ start, end, entity });
+    }
+  }
+  return spans.sort((a, b) => a.start - b.start);
+}
+
+function mentionedIds(text) {
+  return new Set(findMentions(text).map((span) => span.entity.id));
+}
+
+// Connection rows for one profile: [{other, label, link|null, group}]
+function connectionsOf(entity) {
+  const rows = [];
+  for (const link of mm.links) {
+    if (link.from === entity.id) {
+      const other = mm.byId.get(link.to);
+      rows.push({ other, label: typeLabel(inverseType(link.type), other), link, myType: link.type });
+    } else if (link.to === entity.id) {
+      const other = mm.byId.get(link.from);
+      rows.push({ other, label: typeLabel(link.type, other), link, myType: inverseType(link.type) });
+    }
+  }
+  if (entity.kind === "person") {
+    for (const channel of channelsFor(entity)) {
+      rows.push({ other: channel, label: "Group", link: null, group: true });
+    }
+  }
+  if (entity.kind === "channel") {
+    for (const fact of factsOf(entity, "applies_to")) {
+      const target = memoryState.entities.find((candidate) => candidate.kind === "person"
+        && candidate.name === fact.value);
+      if (target) rows.push({ other: target, label: "For", link: null });
+    }
+  }
+  return rows;
+}
+
+// "Dad of Itamar and Rona · Married to Zohar · in 5 groups"
+function connectionSummary(entity, rows) {
+  const byRole = new Map();
+  let groups = 0;
+  for (const row of rows) {
+    if (row.group) { groups += 1; continue; }
+    if (!row.myType) continue;
+    const spec = CONNECTION_TYPES[row.myType];
+    const role = spec && spec.of ? spec.of : `${typeLabel(row.myType, entity)} of`;
+    if (!byRole.has(role)) byRole.set(role, []);
+    byRole.get(role).push(row.other.name);
+  }
+  const parts = [];
+  for (const [role, names] of byRole) {
+    const joined = names.length > 1
+      ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
+    parts.push(`${role} ${joined}`);
+  }
+  if (groups) parts.push(`in ${groups} group${groups === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
+// The sidebar's sub-line: role/class for people, meaning for groups.
 function subLine(entity) {
+  if (entity.kind === "channel") {
+    const appliesTo = factValue(entity, "applies_to");
+    const kind = factValue(entity, "channel_kind");
+    const who = appliesTo === "family" ? "Family" : appliesTo === "me" ? "You" : appliesTo;
+    const what = CHANNEL_KIND_LABEL[kind] || kind;
+    return [who, what].filter(Boolean).join(" · ") || "WhatsApp group";
+  }
+  if (entity.kind !== "person") return capitalize(entity.kind);
   if (isKid(entity)) {
-    return kidFacts(entity).map((f) => f.value).filter(Boolean).join(" · ");
+    const parentLink = mm.links.find((link) => link.to === entity.id && link.type === "parent");
+    const role = parentLink ? typeLabel("child", entity) : null;
+    const grade = factValue(entity, "grade");
+    return [role, grade ? gradeText(grade) : null, factValue(entity, "class")]
+      .filter(Boolean).join(" · ");
   }
-  const relation = (entity.facts || []).find((f) => f.predicate === "relation");
-  if (relation) return relation.value;
-  return entity.kind;
-}
-
-// "updated <local time>" — the newest fact stamp the overview carries.
-function entityUpdated(entity) {
-  let newest = entity.created_at;
-  for (const fact of entity.facts || []) {
-    if (fact.valid_from && (!newest || fact.valid_from > newest)) newest = fact.valid_from;
+  const relation = factValue(entity, "relation");
+  let role = null;
+  if (relation) {
+    role = relation.length <= 24 ? capitalize(relation)
+      : /mother|mom/i.test(relation) ? "Mom" : /father|dad/i.test(relation) ? "Dad" : capitalize(relation);
+  } else {
+    const row = connectionsOf(entity).find((candidate) => !candidate.group);
+    if (row) role = `${typeLabel(row.myType, entity)} of ${row.other.name}`;
   }
-  return newest ? new Date(newest).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+  const work = factValue(entity, "work");
+  const alias = (entity.aliases || []).find((candidate) => candidate.toLowerCase() !== entity.name.toLowerCase());
+  const extra = work ? `works at ${work}` : alias ? `aka ${alias}` : null;
+  return [role, extra].filter(Boolean).join(" · ");
 }
 
-function sectionOf(entity) {
-  if (entity.name === "Family") return "Family"; // the Family unit (kind group) tops the list
-  if (entity.kind === "person") return "People";
-  if (entity.kind === "group") return "Groups";
-  if (entity.kind === "place") return "Places";
-  if (entity.kind === "org") return "Places";
-  return "Channels";
+function hasNoConnection(entity) {
+  return entity.kind === "person" && !factValue(entity, "relation")
+    && !mm.links.some((link) => link.from === entity.id || link.to === entity.id);
 }
-
-const SECTION_ORDER = ["Family", "People", "Groups", "Places", "Channels"];
 
 function selectedEntity() {
   return memoryState.entities.find((entity) => entity.id === memoryState.selected) || null;
 }
 
+function proposedCount() {
+  let count = 0;
+  for (const facts of mm.proposedBySubject.values()) count += facts.length;
+  return count;
+}
+
+// ---------- shared bits of UI ----------
+
+function avatar(entity, size = "md") {
+  if (entity.kind !== "person") {
+    const box = el("span", { class: `mm-av mm-av-${size} mm-av-group`, "aria-hidden": "true" });
+    box.append(groupIcon());
+    return box;
+  }
+  return el("span", {
+    class: `mm-av mm-av-${size} tone-${toneOf(entity.id)}`, "aria-hidden": "true",
+    text: initialOf(entity.name),
+  });
+}
+
+function svgEl(tag, attrs) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, value);
+  return node;
+}
+
+function groupIcon() {
+  const svg = svgEl("svg", {
+    width: "18", height: "18", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
+    "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true",
+  });
+  svg.append(
+    svgEl("circle", { cx: "9", cy: "8", r: "3" }),
+    svgEl("circle", { cx: "17", cy: "9", r: "2.5" }),
+    svgEl("path", { d: "M3 19c0-3 3-5 6-5s6 2 6 5M15 14.5c3 0 6 1.5 6 4.5" }),
+  );
+  return svg;
+}
+
+function bidi(text) {
+  return el("bdi", { text: text ?? "" });
+}
+
+// A tappable chip naming an entity (opens its profile).
+function entityChip(entity) {
+  const chip = el("button", {
+    type: "button", class: `mm-mention tone-${toneOf(entity.id)}${entity.kind !== "person" ? " is-group" : ""}`,
+    title: `open ${entity.name}`,
+  });
+  chip.append(bidi(entity.name));
+  chip.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openProfile(entity.id);
+  });
+  return chip;
+}
+
+// Memory text with mentioned people rendered as chips.
+function mentionText(text) {
+  const node = el("p", { class: "mm-memtext", dir: "auto" });
+  const source = String(text ?? "");
+  let cursor = 0;
+  for (const span of findMentions(source)) {
+    if (span.start > cursor) node.append(document.createTextNode(source.slice(cursor, span.start)));
+    node.append(entityChip(span.entity));
+    cursor = span.end;
+  }
+  if (cursor < source.length) node.append(document.createTextNode(source.slice(cursor)));
+  return node;
+}
+
+// "From <chat> · confirmed by you · Oct 23" (nodes: chat names stay bidi-safe).
+function sourceLine(fact) {
+  const provenance = fact.provenance || {};
+  const line = el("span", { class: "mm-source" });
+  const bits = [];
+  if (provenance.source === "item") {
+    if (provenance.channel) {
+      const from = el("span", { text: "From " });
+      from.append(bidi(provenance.channel));
+      bits.push(from);
+    } else {
+      const count = (provenance.item_ids || []).length;
+      bits.push(el("span", { text: count > 1 ? `Learned from ${count} messages` : "Learned from a message" }));
+    }
+    if (fact.status === "confirmed") bits.push(el("span", { text: "confirmed by you" }));
+  } else {
+    bits.push(el("span", { text: "Added by you" }));
+  }
+  if (fact.valid_from) bits.push(el("span", { text: shortDate(fact.valid_from) }));
+  bits.forEach((bit, index) => {
+    if (index) line.append(document.createTextNode(" · "));
+    line.append(bit);
+  });
+  return line;
+}
+
+function openSourceItem(fact) {
+  const itemIds = (fact.provenance || {}).item_ids || [];
+  if (!itemIds.length) return null;
+  const button = el("button", { type: "button", class: "mm-linkbtn", text: "Show message" });
+  button.addEventListener("click", () => {
+    switchTab("debug");
+    openInspector(itemIds[0]);
+  });
+  return button;
+}
+
+// ---------- refresh ----------
+
 let memoryRefreshSeq = 0;
 
-function refreshMemory() {
+function memoryBusy() {
+  if (memoryState.editingField || memoryState.editingFact || memoryState.addingConnection
+    || memoryState.addingAlias || memoryState.promoting || memoryState.reviewEditing) return true;
+  const active = document.activeElement;
+  const panel = $("tab-memory");
+  return Boolean(active && panel && panel.contains(active)
+    && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName) && active.id !== "memory-q");
+}
+
+// The 5s poll re-renders only when the data changed and nobody is typing
+// (a re-render would wipe a half-written memory). Actions pass force.
+function refreshMemory({ force = false } = {}) {
   const seq = ++memoryRefreshSeq;
-  const params = new URLSearchParams();
-  // confirmed view: NO status param — the route drops fact-less entities
-  // when an explicit status is given, and a freshly added person/group
-  // must still be listed. The proposed inbox keeps its explicit filter.
-  if (memoryState.status === "proposed") params.set("status", "proposed");
-  if (memoryState.q) params.set("q", memoryState.q);
-  return api(`/memory?${params}`).then((body) => {
+  return Promise.all([api("/memory"), api("/memory?status=proposed")]).then(([all, proposed]) => {
     if (seq !== memoryRefreshSeq) return; // a newer refresh superseded this one
-    memoryState.entities = body.entities || [];
-    if (memoryState.editingFact === null && memoryState.addingFactFor === null) {
-      renderMemory();
-    }
+    memoryState.online = true;
+    const key = JSON.stringify([all.entities, proposed.entities]);
+    const changed = key !== memoryState.dataKey;
+    memoryState.entities = all.entities || [];
+    memoryState.proposed = proposed.entities || [];
+    memoryState.dataKey = key;
+    if (force || (changed && !memoryBusy())) renderMemory();
+    else renderSync();
+  }, (error) => {
+    memoryState.online = false;
+    renderSync();
+    throw error;
+  });
+}
+
+function reloadMemory() {
+  return refreshMemory({ force: true }).catch((error) => toast(`refresh failed: ${error.message}`));
+}
+
+async function postFact(body) {
+  return api("/memory/facts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "confirmed", ...body }),
+  });
+}
+
+async function patchFact(factId, body) {
+  return api(`/memory/facts/${factId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
   });
 }
 
@@ -139,216 +595,19 @@ function undoToast(message, undoFn) {
   }, 6000);
 }
 
-// ---------- left list ----------
-
-function renderMemory() {
-  const list = $("memory-list");
-  const entities = [...memoryState.entities].sort(memoryOrder);
-  const bySection = new Map();
-  for (const entity of entities) {
-    const section = sectionOf(entity);
-    if (!bySection.has(section)) bySection.set(section, []);
-    bySection.get(section).push(entity);
-  }
-  const nodes = [];
-  for (const section of SECTION_ORDER) {
-    const members = bySection.get(section) || [];
-    if (!members.length) continue;
-    nodes.push(el("div", { class: "mm-sect", text: section }));
-    for (const entity of members) nodes.push(memoryRow(entity));
-  }
-  if (!nodes.length) {
-    nodes.push(el("div", { class: "empty", text: memoryState.q
-      ? `no entities match “${memoryState.q}”`
-      : memoryState.status === "proposed"
-        ? "inbox empty — nothing proposed"
-        : "no memory yet — add a person" }));
-  }
-  list.replaceChildren(...nodes);
-  renderDetail();
-}
-
-function memoryRow(entity) {
-  const row = el("button", {
-    class: `mm-row kind-${entity.kind}${entity.id === memoryState.selected ? " sel" : ""}`,
-    "data-entity": entity.id, type: "button",
-  });
-  const top = el("span", { class: "mm-row-top" });
-  top.append(
-    el("span", { class: "mm-row-name", text: entity.name, dir: "auto" }),
-    el("span", { class: "mm-row-upd", text: entityUpdated(entity) ? `updated ${entityUpdated(entity)}` : "" }),
-  );
-  row.append(top);
-  const aliases = (entity.aliases || []).length ? ` · aka ${entity.aliases.join(", ")}` : "";
-  row.append(el("span", { class: "mm-row-sub", text: `${subLine(entity)}${aliases}`, dir: "auto" }));
-  row.addEventListener("click", () => {
-    memoryState.selected = entity.id;
-    memoryState.editMode = false;
-    memoryState.editingFact = null;
-    memoryState.addingFactFor = null;
-    memoryState.addingMemoryFor = null;
-    memoryState.addingAliasFor = null;
-    $("memory-wrap").dataset.view = "detail";
-    renderMemory();
-  });
-  return row;
-}
-
-function memoryOrder(a, b) {
-  const rank = (entity) => {
-    if (entity.name === "Family") return -1; // Family first, always
-    return entity.kind === "person" ? (isKid(entity) ? 1 : 2)
-      : entity.kind === "group" ? 3 : entity.kind === "org" || entity.kind === "place" ? 4 : 5;
-  };
-  if (rank(a) !== rank(b)) return rank(a) - rank(b);
-  return a.name.localeCompare(b.name);
-}
-
-// ---------- right detail (the selected entity's page) ----------
-
-function renderDetail() {
-  const head = $("memory-detail-head");
-  const body = $("memory-detail-body");
-  const entity = selectedEntity();
-  if (!entity) {
-    head.replaceChildren();
-    body.replaceChildren(el("div", {
-      class: "empty",
-      text: memoryState.status === "proposed"
-        ? "pick a person to review their proposed memories"
-        : "pick a person — their memories appear here",
-    }));
-    return;
-  }
-  head.replaceChildren(detailHeader(entity));
-  const cards = [];
-  for (const fact of entity.facts || []) {
-    cards.push(memoryCard(entity, fact));
-  }
-  // add-fact / add-memory forms (open state renders inside the stack)
-  if (memoryState.addingFactFor === entity.id) cards.push(memoryFactAddForm(entity));
-  if (memoryState.addingMemoryFor === entity.id) cards.push(memoryNoteAddForm(entity));
-  if (memoryState.addingAliasFor === entity.id) cards.push(aliasAddForm(entity));
-  if (!cards.length) {
-    cards.push(el("div", { class: "empty", text: "no memories yet — use + Add" }));
-  }
-  body.replaceChildren(...cards);
-}
-
-function detailHeader(entity) {
-  const wrap = el("div", { class: "mm-dhead-wrap" });
-  const main = el("div", { class: "mm-dhead-main" });
-  main.append(el("div", { class: "mm-dname", text: entity.name, dir: "auto" }));
-  const aliases = (entity.aliases || []).length
-    ? ` · aka ${entity.aliases.join(", ")}` : "";
-  main.append(el("div", { class: "mm-dsub", text: `${subLine(entity)}${aliases}`, dir: "auto" }));
-  wrap.append(main);
-
-  const actions = el("div", { class: "mm-dhead-actions" });
-  const editBtn = el("button", { class: "btn btn-sm", text: memoryState.editMode ? "Done" : "Edit" });
-  editBtn.addEventListener("click", () => {
-    memoryState.editMode = !memoryState.editMode;
-    memoryState.editingFact = null;
-    memoryState.addingFactFor = null;
-    memoryState.addingMemoryFor = null;
-    memoryState.addingAliasFor = null;
-    renderMemory();
-  });
-  actions.append(editBtn);
-  const addBtn = el("button", { class: "btn btn-sm btn-pri", text: "+ Add" });
-  addBtn.addEventListener("click", () => {
-    const wantMemory = !memoryState.addingMemoryFor;
-    memoryState.addingMemoryFor = wantMemory ? entity.id : null;
-    memoryState.addingFactFor = null;
-    memoryState.editingFact = null;
-    renderMemory();
-  });
-  actions.append(addBtn);
-  wrap.append(actions);
-
-  // Edit mode: rename + alias chips + remove (archive with Undo).
-  if (memoryState.editMode) {
-    const tools = el("div", { class: "mm-tools" });
-    const renameBtn = el("button", { class: "btn btn-sm btn-ghost", text: "✏️ rename", title: "rename" });
-    renameBtn.addEventListener("click", () => {
-      const input = el("input", { type: "text", value: entity.name, dir: "auto", class: "mm-rename" });
-      const nameNode = wrap.querySelector(".mm-dname");
-      nameNode.replaceWith(input);
-      input.focus();
-      const save = async () => {
-        const name = input.value.trim();
-        if (!name || name === entity.name) { input.replaceWith(nameNode); return; }
-        try {
-          await api(`/memory/entities/${entity.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name }),
-          });
-          toast("renamed");
-        } catch (error) { toast(`rename failed: ${error.message}`); }
-        refreshMemory();
-      };
-      input.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") save();
-        if (event.key === "Escape") input.replaceWith(nameNode);
-      });
-      input.addEventListener("blur", save);
+// Soft-delete a fact with Undo (reopens the same row).
+async function deleteFactWithUndo(fact, message) {
+  try {
+    await api(`/memory/facts/${fact.id}`, { method: "DELETE" });
+    undoToast(message, async () => {
+      try {
+        await api(`/memory/facts/${fact.id}/restore`, { method: "POST" });
+        toast("restored");
+      } catch (error) { toast(`restore failed: ${error.message}`); }
+      reloadMemory();
     });
-    tools.append(renameBtn);
-    for (const alias of entity.aliases || []) {
-      const chip = el("span", { class: "mm-alias-chip", text: alias, dir: "auto" });
-      const remove = el("button", { class: "icon", title: `remove alias ${alias}`, text: "✕" });
-      remove.addEventListener("click", async () => {
-        try {
-          await api(`/memory/entities/${entity.id}/aliases/${encodeURIComponent(alias)}`, { method: "DELETE" });
-          toast("alias removed");
-        } catch (error) { toast(`remove failed: ${error.message}`); }
-        refreshMemory();
-      });
-      chip.append(remove);
-      tools.append(chip);
-    }
-    const addAlias = el("button", { class: "btn btn-sm btn-ghost", text: "+ alias" });
-    addAlias.addEventListener("click", () => {
-      memoryState.addingAliasFor = entity.id;
-      renderMemory();
-    });
-    tools.append(addAlias);
-    const removeBtn = el("button", { class: "btn btn-sm btn-ghost mm-remove", text: "🗑 Remove", title: "remove (archived — Undo restores it)" });
-    removeBtn.addEventListener("click", () => {
-      // a kid's removal has a consequence beyond this screen: triage and
-      // A2 key on these facts to recognise the child — say so BEFORE the
-      // second click, not just "Sure?".
-      const kid = isKid(entity);
-      const armedLabel = kid
-        ? `Triage and A2 stop recognising ${entity.name} — sure?`
-        : undefined;
-      armConfirm(removeBtn, async () => {
-        try {
-          await api(`/memory/entities/${entity.id}/archive`, { method: "POST" });
-          memoryState.selected = null;
-          $("memory-wrap").dataset.view = "list";
-          // the toast mirrors the consequence: the undo window is the only
-          // place left that still names it once the confirm is gone.
-          undoToast(kid
-            ? `removed ${entity.name} — Triage and A2 stop recognising them until you Undo`
-            : `removed ${entity.name} — items already captured stay`, async () => {
-            try {
-              await api(`/memory/entities/${entity.id}/restore`, { method: "POST" });
-              memoryState.selected = entity.id;
-              $("memory-wrap").dataset.view = "detail";
-              toast("restored");
-            } catch (error) { toast(`restore failed: ${error.message}`); }
-            refreshMemory();
-          });
-        } catch (error) { toast(`remove failed: ${error.message}`); }
-        refreshMemory();
-      }, armedLabel);
-    });
-    tools.append(removeBtn);
-    wrap.append(tools);
-  }
-  return wrap;
+  } catch (error) { toast(`delete failed: ${error.message}`); }
+  reloadMemory();
 }
 
 // A two-click destructive confirm: first click arms ("Sure?"), second acts.
@@ -369,190 +628,493 @@ function armConfirm(button, onConfirm, armedLabel = "Sure?") {
   }, 2500);
 }
 
-// ---------- memory cards (one per fact) ----------
+// ---------- render: dispatch ----------
 
-function factProvenanceLine(fact) {
-  const provenance = fact.provenance || {};
-  const bits = [];
-  if (provenance.source === "item") bits.push("from WhatsApp");
-  else if (provenance.source === "user") bits.push("added by you");
-  else if (provenance.source) bits.push(provenance.source);
-  if (fact.valid_from) {
-    bits.push(new Date(fact.valid_from).toLocaleString([], {
-      month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-    }));
-  }
-  return bits.join(" · ");
+function resetInlineState() {
+  memoryState.editMode = false;
+  memoryState.editingField = null;
+  memoryState.addingAlias = false;
+  memoryState.addingConnection = false;
+  memoryState.editingFact = null;
+  memoryState.menuFact = null;
+  memoryState.promoting = null;
+  memoryState.memoryFilter = "all";
 }
 
-function memoryCard(entity, fact) {
-  const current = !fact.valid_to;
-  const card = el("div", { class: `mm-card st-${fact.status}` });
-  const textRow = el("div", { class: "mm-card-text" });
-  const sentence = fact.predicate === "note"
-    ? (fact.value ?? "")
-    : `${fact.predicate}: ${fact.value ?? ""}`;
-  textRow.append(el("span", { class: "mm-card-sentence", text: sentence, dir: "auto" }));
-  if (fact.status === "proposed") {
-    textRow.append(el("span", { class: "chip proposed", text: "proposed" }));
-  }
-  card.append(textRow);
-  const meta = el("div", { class: "mm-card-meta" });
-  meta.append(el("span", { text: factProvenanceLine(fact) }));
-  const historyBtn = el("button", { class: "icon", title: "history + provenance", text: "🕘" });
-  historyBtn.addEventListener("click", () => openMemoryDrawer(fact.id));
-  meta.append(historyBtn);
-  card.append(meta);
+function setMode(mode) {
+  memoryState.mode = mode;
+  memoryState.reviewEditing = null;
+  renderMemory();
+  window.scrollTo({ top: 0 });
+}
 
-  const actions = el("div", { class: "mm-card-actions" });
-  if (current && memoryState.status === "confirmed") {
-    const editBtn = el("button", { class: "icon", title: "edit (creates a new version)", text: "✏️" });
-    editBtn.addEventListener("click", () => {
-      memoryState.editingFact = fact.id;
-      memoryState.addingFactFor = null;
-      memoryState.addingMemoryFor = null;
-      renderMemory();
+function openProfile(entityId) {
+  memoryState.selected = entityId;
+  resetInlineState();
+  memoryState.mode = "profile";
+  $("memory-wrap").dataset.view = "detail";
+  renderMemory();
+}
+
+function renderMemory() {
+  mm = buildModel();
+  const mode = memoryState.mode;
+  $("memory-wrap").hidden = mode !== "profile";
+  $("memory-review").hidden = mode !== "review";
+  $("memory-map").hidden = mode !== "map";
+  $("memory-view-list").setAttribute("aria-pressed", String(mode === "profile"));
+  $("memory-view-map").setAttribute("aria-pressed", String(mode === "map"));
+  renderSync();
+  if (mode === "review") renderReview();
+  else if (mode === "map") renderMap();
+  else {
+    // desktop opens on a profile; the phone layout starts on the list
+    if (!selectedEntity() && window.matchMedia("(min-width: 721px)").matches) {
+      const first = sortedEntities().find(isHousehold) || sortedEntities()[0];
+      memoryState.selected = first ? first.id : null;
+    }
+    renderList();
+    renderDetail();
+  }
+}
+
+function renderSync() {
+  const channels = memoryState.entities.filter((entity) => entity.kind === "channel").length;
+  const sync = $("memory-sync");
+  sync.replaceChildren(
+    el("span", { class: `dot ${memoryState.online ? "ok" : "degraded"}`, "aria-hidden": "true" }),
+    el("span", {
+      text: memoryState.online
+        ? `Synced · listening to ${channels} group${channels === 1 ? "" : "s"}`
+        : "Can't reach the server — retrying",
+    }),
+  );
+  const count = mm ? proposedCount() : 0;
+  $("memory-review-count").textContent = String(count);
+  $("memory-review-btn").classList.toggle("has-items", count > 0);
+  $("memory-review-btn").setAttribute("aria-label", `Review, ${count} waiting`);
+}
+
+// ---------- left list ----------
+
+function sortedEntities() {
+  return [...memoryState.entities].sort((a, b) => {
+    const rank = (entity) => (entity.name === "Family" ? -1
+      : entity.kind === "person" ? (isKid(entity) ? 1 : 0)
+        : entity.kind === "channel" || entity.kind === "group" ? 3 : 4);
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function matchesSearch(entity, needle) {
+  if (!needle) return true;
+  const haystack = [entity.name, ...(entity.aliases || []), subLine(entity),
+    ...(entity.facts || []).map((fact) => fact.value || "")].join("\n").toLowerCase();
+  return haystack.includes(needle);
+}
+
+function sectionOf(entity) {
+  if (entity.name === "Family" || isHousehold(entity)) return "Household";
+  if (entity.kind === "person") return "Other people";
+  if (entity.kind === "channel" || entity.kind === "group") return "Groups";
+  return "Places & orgs";
+}
+
+const SECTION_ORDER = ["Household", "Other people", "Groups", "Places & orgs"];
+
+function renderList() {
+  const needle = memoryState.q.toLowerCase();
+  const bySection = new Map();
+  for (const entity of sortedEntities()) {
+    if (!matchesSearch(entity, needle)) continue;
+    const section = sectionOf(entity);
+    if (!bySection.has(section)) bySection.set(section, []);
+    bySection.get(section).push(entity);
+  }
+  if (bySection.has("Groups")) {
+    // groups by who they are for, then name
+    bySection.get("Groups").sort((a, b) => (factValue(a, "applies_to") || "~")
+      .localeCompare(factValue(b, "applies_to") || "~") || a.name.localeCompare(b.name));
+  }
+  const nodes = [];
+  for (const section of SECTION_ORDER) {
+    let members = bySection.get(section) || [];
+    if (!members.length) continue;
+    const block = el("div", { class: "mm-sect" });
+    const head = el("div", { class: "mm-sect-head" });
+    head.append(el("span", { text: section }), el("span", { text: String(members.length) }));
+    block.append(head);
+    const collapse = section === "Groups" && !needle && !memoryState.showAllGroups
+      && members.length > GROUPS_SHOWN + 1;
+    const hidden = collapse ? members.length - GROUPS_SHOWN : 0;
+    if (collapse) members = members.slice(0, GROUPS_SHOWN);
+    for (const entity of members) block.append(memoryRow(entity));
+    if (hidden) {
+      const more = el("button", { type: "button", class: "mm-more", text: `Show ${hidden} more` });
+      more.addEventListener("click", () => {
+        memoryState.showAllGroups = true;
+        renderList();
+      });
+      block.append(more);
+    }
+    nodes.push(block);
+  }
+  if (!nodes.length) {
+    nodes.push(el("div", {
+      class: "empty",
+      text: needle ? `nothing matches “${memoryState.q}”` : "no memory yet — add a person",
+    }));
+  }
+  $("memory-list").replaceChildren(...nodes);
+}
+
+function memoryRow(entity) {
+  const selected = entity.id === memoryState.selected;
+  const row = el("button", {
+    type: "button", class: `mm-row kind-${entity.kind}${selected ? " sel" : ""}`,
+    "data-entity": entity.id,
+  });
+  if (selected) row.setAttribute("aria-current", "true");
+  row.append(avatar(entity));
+  const text = el("span", { class: "mm-row-text" });
+  text.append(el("span", { class: "mm-row-name", text: entity.name, dir: "auto" }));
+  const unknown = hasNoConnection(entity);
+  const sub = unknown ? "Relation unknown" : subLine(entity);
+  text.append(el("span", { class: `mm-row-sub${unknown ? " is-unknown" : ""}`, text: sub, dir: "auto" }));
+  row.append(text);
+  const waiting = (mm.proposedBySubject.get(entity.id) || []).length;
+  if (waiting) {
+    row.append(el("span", { class: "mm-row-dot", title: `${waiting} to review`, "aria-label": `${waiting} to review` }));
+  }
+  row.addEventListener("click", () => openProfile(entity.id));
+  return row;
+}
+
+// ---------- right: the profile ----------
+
+function renderDetail() {
+  const head = $("memory-detail-head");
+  const body = $("memory-detail-body");
+  const entity = selectedEntity();
+  if (!entity) {
+    head.replaceChildren();
+    body.replaceChildren(el("div", { class: "empty", text: "pick a person — their profile appears here" }));
+    return;
+  }
+  head.replaceChildren(profileHeader(entity));
+  const nodes = [];
+  const waiting = (mm.proposedBySubject.get(entity.id) || []).length;
+  if (waiting) nodes.push(reviewBanner(entity, waiting));
+  const columns = el("div", { class: "mm-columns" });
+  const left = el("div", { class: "mm-col-left" });
+  left.append(basicInfoCard(entity), connectionsCard(entity));
+  columns.append(left, memoriesCard(entity));
+  nodes.push(columns);
+  body.replaceChildren(...nodes);
+}
+
+function profileHeader(entity) {
+  const card = el("section", { class: "mm-card mm-profile" });
+  card.append(avatar(entity, "lg"));
+  const main = el("div", { class: "mm-profile-main" });
+  const titleRow = el("div", { class: "mm-profile-title" });
+  if (memoryState.editMode) {
+    const input = el("input", {
+      type: "text", value: entity.name, dir: "auto", class: "mm-rename", "aria-label": "name",
     });
-    const deleteBtn = el("button", { class: "icon", title: "delete (soft; Undo reopens it)", text: "🗑" });
-    deleteBtn.addEventListener("click", () => {
-      armConfirm(deleteBtn, async () => {
+    const save = async () => {
+      const name = input.value.trim();
+      if (!name || name === entity.name) return;
+      try {
+        await api(`/memory/entities/${entity.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        toast("renamed");
+      } catch (error) { toast(`rename failed: ${error.message}`); }
+      reloadMemory();
+    };
+    input.addEventListener("keydown", (event) => { if (event.key === "Enter") save(); });
+    input.addEventListener("change", save);
+    titleRow.append(input);
+  } else {
+    titleRow.append(el("h2", { class: "mm-dname", text: entity.name, dir: "auto" }));
+  }
+  const aliases = (entity.aliases || []).filter((alias) => alias.toLowerCase() !== entity.name.toLowerCase());
+  if (aliases.length) {
+    const also = el("span", { class: "mm-also", text: "also " });
+    aliases.forEach((alias, index) => {
+      if (index) also.append(document.createTextNode(", "));
+      also.append(bidi(alias));
+    });
+    titleRow.append(also);
+  }
+  main.append(titleRow);
+  const rows = connectionsOf(entity);
+  const summary = entity.kind === "channel" ? subLine(entity) : connectionSummary(entity, rows);
+  if (summary) main.append(el("p", { class: "mm-dsub", text: summary, dir: "auto" }));
+  card.append(main);
+
+  const actions = el("div", { class: "mm-profile-actions" });
+  const editBtn = el("button", {
+    type: "button", class: "btn", text: memoryState.editMode ? "Done" : "Edit",
+  });
+  editBtn.addEventListener("click", () => {
+    memoryState.editMode = !memoryState.editMode;
+    renderDetail();
+  });
+  actions.append(editBtn);
+  if (memoryState.editMode) {
+    const removeBtn = el("button", {
+      type: "button", class: "btn mm-remove", text: "Remove",
+      title: "remove (archived — Undo restores it)",
+    });
+    removeBtn.addEventListener("click", () => {
+      // a kid's removal has a consequence beyond this screen: triage and
+      // A2 key on these facts to recognise the child — say so BEFORE the
+      // second click, not just "Sure?".
+      const kid = isKid(entity);
+      const armedLabel = kid ? `Triage and A2 stop recognising ${entity.name} — sure?` : undefined;
+      armConfirm(removeBtn, async () => {
         try {
-          await api(`/memory/facts/${fact.id}`, { method: "DELETE" });
-          undoToast("deleted — Undo reopens it", async () => {
+          await api(`/memory/entities/${entity.id}/archive`, { method: "POST" });
+          memoryState.selected = null;
+          $("memory-wrap").dataset.view = "list";
+          // the toast mirrors the consequence: the undo window is the only
+          // place left that still names it once the confirm is gone.
+          undoToast(kid
+            ? `removed ${entity.name} — Triage and A2 stop recognising them until you Undo`
+            : `removed ${entity.name} — items already captured stay`, async () => {
             try {
-              await api(`/memory/facts/${fact.id}/restore`, { method: "POST" });
+              await api(`/memory/entities/${entity.id}/restore`, { method: "POST" });
+              memoryState.selected = entity.id;
+              $("memory-wrap").dataset.view = "detail";
               toast("restored");
             } catch (error) { toast(`restore failed: ${error.message}`); }
-            refreshMemory();
+            reloadMemory();
           });
-        } catch (error) { toast(`delete failed: ${error.message}`); }
-        refreshMemory();
-      });
+        } catch (error) { toast(`remove failed: ${error.message}`); }
+        reloadMemory();
+      }, armedLabel);
     });
-    actions.append(editBtn, deleteBtn);
-  } else if (fact.status === "proposed") {
-    const confirmBtn = el("button", { class: "btn ok-btn", text: "✅" });
-    confirmBtn.addEventListener("click", async () => {
-      try { await api(`/memory/facts/${fact.id}/confirm`, { method: "POST" }); }
-      catch (error) { toast(`confirm failed: ${error.message}`); }
-      refreshMemory();
+    actions.append(removeBtn);
+  } else {
+    const addBtn = el("button", { type: "button", class: "btn btn-pri", text: "+ Add memory" });
+    addBtn.addEventListener("click", () => {
+      const input = $("memory-new");
+      if (input) {
+        input.scrollIntoView({ block: "center", behavior: "smooth" });
+        input.focus();
+      }
     });
-    const rejectBtn = el("button", { class: "btn btn-ghost", title: "reject (soft delete; Undo reopens it)", text: "❌" });
-    rejectBtn.addEventListener("click", () => {
-      armConfirm(rejectBtn, async () => {
-        try { await api(`/memory/facts/${fact.id}`, { method: "DELETE" }); }
-        catch (error) { toast(`reject failed: ${error.message}`); }
-        refreshMemory();
-      });
-    });
-    actions.append(confirmBtn, rejectBtn);
+    actions.append(addBtn);
   }
-  if (actions.childNodes.length) card.append(actions);
-  if (memoryState.editingFact === fact.id) card.append(memoryFactEditForm(fact));
+  card.append(actions);
   return card;
 }
 
-function memoryFactEditForm(fact) {
-  const form = el("div", { class: "mm-form" });
-  const predInput = el("input", { type: "text", value: fact.predicate, dir: "auto", class: "fpred" });
-  const valInput = el("input", { type: "text", value: fact.value ?? "", dir: "auto", class: "fval" });
-  const saveBtn = el("button", { class: "btn btn-sm", text: "Save" });
-  const cancelBtn = el("button", { class: "btn btn-sm btn-ghost", text: "Cancel" });
-  cancelBtn.addEventListener("click", () => {
-    memoryState.editingFact = null;
-    renderMemory();
-  });
-  saveBtn.addEventListener("click", async () => {
-    const value = valInput.value.trim();
-    if (!value) { toast("value must not be empty"); return; }
-    try {
-      await api(`/memory/facts/${fact.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ predicate: predInput.value.trim(), value }),
-      });
-      memoryState.editingFact = null;
-    } catch (error) { toast(`edit failed: ${error.message}`); }
-    refreshMemory();
-  });
-  form.append(predInput, valInput, saveBtn, cancelBtn);
-  return form;
+function reviewBanner(entity, waiting) {
+  const banner = el("section", { class: "mm-banner" });
+  const text = el("span", { class: "mm-banner-text" });
+  text.append(
+    el("b", { text: `${waiting} new thing${waiting === 1 ? "" : "s"} about ${entity.name}` }),
+    document.createTextNode(" picked up from your chats. Nothing is saved until you confirm it."),
+  );
+  const go = el("button", { type: "button", class: "btn btn-sm mm-banner-btn", text: "Review" });
+  go.addEventListener("click", () => setMode("review"));
+  banner.append(text, go);
+  return banner;
 }
 
-function memoryFactAddForm(entity) {
-  const form = el("div", { class: "mm-form" });
-  const predInput = el("input", { type: "text", placeholder: "predicate", dir: "auto", class: "fpred", list: "fact-suggestions" });
-  const suggestions = el("datalist", { id: "fact-suggestions" });
-  for (const suggestion of FACT_SUGGESTIONS) {
-    suggestions.append(el("option", { value: suggestion }));
+// ---------- basic info ----------
+
+function basicFieldsFor(entity) {
+  if (entity.kind === "channel") return CHANNEL_BASIC;
+  if (entity.kind !== "person") return [["aliases", "Also known as"]];
+  const fields = [...PERSON_BASIC];
+  if (isKid(entity)) fields.splice(3, 0, ...KID_BASIC);
+  return fields;
+}
+
+function basicInfoCard(entity) {
+  const card = el("section", { class: "mm-card", "aria-labelledby": "mm-basic-h" });
+  const head = el("div", { class: "mm-card-head" });
+  head.append(el("h3", { id: "mm-basic-h", text: "Basic info" }));
+  card.append(head);
+  card.append(el("p", { class: "mm-card-hint", text: "Stable facts, one value each." }));
+  const list = el("dl", { class: "mm-dl" });
+  const fields = basicFieldsFor(entity);
+  const known = new Set(fields.map(([predicate]) => predicate));
+  for (const [predicate, label] of fields) {
+    list.append(el("dt", { text: label }), basicValue(entity, predicate, label));
   }
-  const valInput = el("input", { type: "text", placeholder: "value", dir: "auto", class: "fval" });
-  const saveBtn = el("button", { class: "btn btn-sm", text: "Save" });
-  const cancelBtn = el("button", { class: "btn btn-sm btn-ghost", text: "Cancel" });
-  cancelBtn.addEventListener("click", () => {
-    memoryState.addingFactFor = null;
-    renderMemory();
+  // any other typed fact this entity carries (e.g. 'activity') still shows
+  const extra = new Map();
+  for (const fact of entity.facts || []) {
+    const predicate = fact.predicate.toLowerCase();
+    if (known.has(predicate) || isMemoryFact(fact) || isConnectionFact(fact)) continue;
+    extra.set(predicate, fact.predicate);
+  }
+  for (const [predicate, original] of extra) {
+    list.append(el("dt", { text: capitalize(original) }), basicValue(entity, predicate, capitalize(original)));
+  }
+  card.append(list);
+  const stamps = (entity.facts || []).filter((fact) => !isMemoryFact(fact) && !isConnectionFact(fact))
+    .map((fact) => fact.valid_from).filter(Boolean).sort();
+  if (stamps.length) {
+    const last = new Date(stamps[stamps.length - 1]);
+    card.append(el("p", {
+      class: "mm-card-foot",
+      text: `Last edited ${last.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`,
+    }));
+  }
+  return card;
+}
+
+function displayValue(predicate, value) {
+  if (predicate === "birthday") return birthdayText(value);
+  if (predicate === "grade") return gradeText(value);
+  if (predicate === "gender" || predicate === "relation") return capitalize(value);
+  if (predicate === "channel_kind") return capitalize(CHANNEL_KIND_LABEL[value] || value);
+  if (predicate === "applies_to") return value === "family" ? "The whole family" : value === "me" ? "You" : value;
+  return value;
+}
+
+function basicValue(entity, predicate, label) {
+  const dd = el("dd", {});
+  if (predicate === "aliases") return aliasValue(entity, dd);
+  const facts = factsOf(entity, predicate);
+  if (memoryState.editingField === predicate) {
+    dd.append(basicEditor(entity, predicate, label, facts[0] || null));
+    return dd;
+  }
+  if (!facts.length) {
+    const add = el("button", { type: "button", class: "mm-linkbtn", text: "+ Add", "aria-label": `add ${label}` });
+    add.addEventListener("click", () => {
+      memoryState.editingField = predicate;
+      renderDetail();
+    });
+    dd.append(add);
+    return dd;
+  }
+  const value = el("span", { class: "mm-dd-value" });
+  facts.forEach((fact, index) => {
+    if (index) value.append(document.createTextNode(", "));
+    value.append(el("span", { text: displayValue(predicate, fact.value ?? ""), dir: "auto" }));
   });
-  saveBtn.addEventListener("click", async () => {
-    const predicate = predInput.value.trim();
-    const value = valInput.value.trim();
-    if (!predicate || !value) { toast("predicate and value are required"); return; }
+  dd.append(value);
+  const tools = el("span", { class: "mm-dd-tools" });
+  const edit = el("button", { type: "button", class: "mm-icon", text: "Edit", "aria-label": `edit ${label}` });
+  edit.addEventListener("click", () => {
+    memoryState.editingField = predicate;
+    renderDetail();
+  });
+  const history = el("button", { type: "button", class: "mm-icon", text: "History", "aria-label": `${label} history` });
+  history.addEventListener("click", () => openMemoryDrawer(facts[0].id));
+  tools.append(edit, history);
+  dd.append(tools);
+  return dd;
+}
+
+function basicEditor(entity, predicate, label, fact) {
+  const form = el("span", { class: "mm-form" });
+  let input;
+  if (predicate === "channel_kind" || predicate === "applies_to" || predicate === "gender") {
+    input = el("select", { "aria-label": label });
+    const options = predicate === "channel_kind" ? [...CHANNEL_KINDS]
+      : predicate === "gender" ? ["girl", "boy", "woman", "man"]
+        : [...mm.kids.map((kid) => kid.name), "family", "me"];
+    if (fact && fact.value && !options.includes(fact.value)) options.unshift(fact.value);
+    for (const option of options) {
+      const node = el("option", { value: option, text: displayValue(predicate, option) });
+      if (fact && fact.value === option) node.selected = true;
+      input.append(node);
+    }
+  } else {
+    input = el("input", {
+      type: "text", value: fact ? fact.value ?? "" : "", dir: "auto", "aria-label": label,
+      placeholder: predicate === "birthday" ? "dd.mm.yyyy" : label,
+    });
+  }
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  const close = () => {
+    memoryState.editingField = null;
+    renderDetail();
+  };
+  cancel.addEventListener("click", close);
+  const submit = async () => {
+    const value = input.value.trim();
+    if (!value) { toast(`${label} must not be empty`); return; }
+    if (fact && value === fact.value) { close(); return; }
     try {
-      await api("/memory/facts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subject_id: entity.id, predicate, value, status: "confirmed",
-          provenance: { source: "user" },
-        }),
-      });
-      memoryState.addingFactFor = null;
-    } catch (error) { toast(`add failed: ${error.message}`); }
-    refreshMemory();
+      if (fact) await patchFact(fact.id, { value });
+      else await postFact({ subject_id: entity.id, predicate, value });
+      memoryState.editingField = null;
+      toast(`${label} saved`);
+    } catch (error) { toast(`save failed: ${error.message}`); }
+    reloadMemory();
+  };
+  save.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+    if (event.key === "Escape") close();
   });
-  form.append(suggestions, predInput, valInput, saveBtn, cancelBtn);
+  form.append(input, save, cancel);
+  if (fact) {
+    const remove = el("button", { type: "button", class: "btn btn-sm btn-ghost mm-remove", text: "Clear" });
+    remove.addEventListener("click", () => {
+      memoryState.editingField = null;
+      deleteFactWithUndo(fact, `${label} cleared — Undo reopens it`);
+    });
+    form.append(remove);
+  }
+  setTimeout(() => input.focus(), 0);
   return form;
 }
 
-function memoryNoteAddForm(entity) {
-  const form = el("div", { class: "mm-form" });
-  const input = el("input", { type: "text", placeholder: "one memory, one sentence…", dir: "auto", class: "fval" });
-  const saveBtn = el("button", { class: "btn btn-sm", text: "Save" });
-  const cancelBtn = el("button", { class: "btn btn-sm btn-ghost", text: "Cancel" });
-  cancelBtn.addEventListener("click", () => {
-    memoryState.addingMemoryFor = null;
-    renderMemory();
-  });
-  saveBtn.addEventListener("click", async () => {
-    const value = input.value.trim();
-    if (!value) { toast("write the memory first"); return; }
-    try {
-      await api("/memory/facts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          subject_id: entity.id, predicate: "note", value, status: "confirmed",
-          provenance: { source: "user" },
-        }),
-      });
-      memoryState.addingMemoryFor = null;
-    } catch (error) { toast(`add failed: ${error.message}`); }
-    refreshMemory();
-  });
-  form.append(input, saveBtn, cancelBtn);
-  return form;
+function aliasValue(entity, dd) {
+  const chips = el("span", { class: "mm-chips" });
+  for (const alias of entity.aliases || []) {
+    const chip = el("span", { class: "mm-chip" });
+    chip.append(bidi(alias));
+    const remove = el("button", { type: "button", class: "mm-chip-x", text: "×", "aria-label": `remove alias ${alias}` });
+    remove.addEventListener("click", async () => {
+      try {
+        await api(`/memory/entities/${entity.id}/aliases/${encodeURIComponent(alias)}`, { method: "DELETE" });
+        toast("alias removed");
+      } catch (error) { toast(`remove failed: ${error.message}`); }
+      reloadMemory();
+    });
+    chip.append(remove);
+    chips.append(chip);
+  }
+  if (memoryState.addingAlias) {
+    chips.append(aliasAddForm(entity));
+  } else {
+    const add = el("button", { type: "button", class: "mm-linkbtn", text: "+ Add", "aria-label": "add alias" });
+    add.addEventListener("click", () => {
+      memoryState.addingAlias = true;
+      renderDetail();
+    });
+    chips.append(add);
+  }
+  dd.append(chips);
+  return dd;
 }
 
 function aliasAddForm(entity) {
-  const form = el("div", { class: "mm-form" });
-  const input = el("input", { type: "text", placeholder: "alias (Hebrew or English)", dir: "auto", class: "fval" });
-  const saveBtn = el("button", { class: "btn btn-sm", text: "Save" });
-  const cancelBtn = el("button", { class: "btn btn-sm btn-ghost", text: "Cancel" });
-  cancelBtn.addEventListener("click", () => {
-    memoryState.addingAliasFor = null;
-    renderMemory();
+  const form = el("span", { class: "mm-form" });
+  const input = el("input", { type: "text", placeholder: "alias (Hebrew or English)", dir: "auto", "aria-label": "alias" });
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  cancel.addEventListener("click", () => {
+    memoryState.addingAlias = false;
+    renderDetail();
   });
-  saveBtn.addEventListener("click", async () => {
+  const submit = async () => {
     const alias = input.value.trim();
     if (!alias) { toast("write the alias first"); return; }
     try {
@@ -561,13 +1123,670 @@ function aliasAddForm(entity) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ alias }),
       });
-      memoryState.addingAliasFor = null;
+      memoryState.addingAlias = false;
       toast("alias added");
     } catch (error) { toast(`add failed: ${error.message}`); }
-    refreshMemory();
+    reloadMemory();
+  };
+  save.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+    if (event.key === "Escape") cancel.click();
   });
-  form.append(input, saveBtn, cancelBtn);
+  form.append(input, save, cancel);
+  setTimeout(() => input.focus(), 0);
   return form;
+}
+
+// ---------- connections ----------
+
+function connectionsCard(entity) {
+  const card = el("section", { class: "mm-card", "aria-labelledby": "mm-conn-h" });
+  const head = el("div", { class: "mm-card-head" });
+  head.append(el("h3", { id: "mm-conn-h", text: "Connections" }));
+  const mapLink = el("button", { type: "button", class: "mm-linkbtn", text: "Open family map" });
+  mapLink.addEventListener("click", () => setMode("map"));
+  head.append(mapLink);
+  card.append(head);
+  const rows = connectionsOf(entity);
+  const list = el("div", { class: "mm-conn-list" });
+  for (const row of rows) list.append(connectionRow(row));
+  if (!rows.length) list.append(el("p", { class: "mm-card-hint", text: `No connections yet. How is ${entity.name} connected?` }));
+  card.append(list);
+  if (memoryState.addingConnection) {
+    card.append(connectionAddForm(entity));
+  } else {
+    const add = el("button", { type: "button", class: "mm-dashed", text: "+ Add connection" });
+    add.addEventListener("click", () => {
+      memoryState.addingConnection = true;
+      renderDetail();
+    });
+    card.append(add);
+  }
+  card.append(el("p", { class: "mm-card-foot", text: "Connections are two-way: they show on both profiles." }));
+  return card;
+}
+
+function connectionRow(row) {
+  const wrap = el("div", { class: "mm-conn" });
+  const open = el("button", { type: "button", class: "mm-conn-open" });
+  open.append(avatar(row.other, "sm"));
+  open.append(el("span", { class: "mm-conn-name", text: row.other.name, dir: "auto" }));
+  const label = row.group ? subLine(row.other) || "Group" : row.label;
+  open.append(el("span", { class: "mm-conn-label", text: label, dir: "auto" }));
+  open.addEventListener("click", () => openProfile(row.other.id));
+  wrap.append(open);
+  if (row.link && row.link.fact) {
+    const remove = el("button", {
+      type: "button", class: "mm-icon", text: "×", "aria-label": `remove connection with ${row.other.name}`,
+    });
+    remove.addEventListener("click", () => deleteFactWithUndo(row.link.fact, "connection removed — Undo restores it"));
+    wrap.append(remove);
+  } else if (row.link) {
+    wrap.append(el("span", { class: "mm-conn-from", text: "from role", title: "derived from the Role field" }));
+  }
+  return wrap;
+}
+
+function connectionAddForm(entity) {
+  const form = el("div", { class: "mm-form mm-conn-form" });
+  form.append(el("span", { class: "mm-form-lead", text: `${entity.name} is the` }));
+  const typeSelect = el("select", { "aria-label": "connection type" });
+  for (const type of CONNECTION_CHOICES) {
+    typeSelect.append(el("option", { value: type, text: CONNECTION_TYPES[type].label.toLowerCase() }));
+  }
+  form.append(typeSelect, el("span", { class: "mm-form-lead", text: "of" }));
+  const targetSelect = el("select", { "aria-label": "connected to" });
+  for (const candidate of sortedEntities()) {
+    if (candidate.id === entity.id || candidate.kind === "channel") continue;
+    targetSelect.append(el("option", { value: candidate.id, text: candidate.name }));
+  }
+  form.append(targetSelect);
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  cancel.addEventListener("click", () => {
+    memoryState.addingConnection = false;
+    renderDetail();
+  });
+  save.addEventListener("click", async () => {
+    if (!targetSelect.value) { toast("pick who they are connected to"); return; }
+    try {
+      await postFact({
+        subject_id: entity.id,
+        predicate: `${CONNECTION_PREFIX}${typeSelect.value}`,
+        object_id: targetSelect.value,
+      });
+      memoryState.addingConnection = false;
+      toast("connection added — it shows on both profiles");
+    } catch (error) { toast(`add failed: ${error.message}`); }
+    reloadMemory();
+  });
+  form.append(save, cancel);
+  return form;
+}
+
+// ---------- memories ----------
+
+// This entity's own memories plus other entities' memories that mention it.
+function memoriesFor(entity) {
+  const out = [];
+  for (const owner of memoryState.entities) {
+    for (const fact of owner.facts || []) {
+      if (!isMemoryFact(fact)) continue;
+      if (owner.id === entity.id || mentionedIds(fact.value).has(entity.id)) out.push({ fact, owner });
+    }
+  }
+  return out.sort((a, b) => (b.fact.valid_from || "").localeCompare(a.fact.valid_from || ""));
+}
+
+function memoriesCard(entity) {
+  const card = el("section", { class: "mm-card mm-memories", "aria-labelledby": "mm-mem-h" });
+  const all = memoriesFor(entity);
+  const head = el("div", { class: "mm-card-head" });
+  const title = el("h3", { id: "mm-mem-h", text: "Memories " });
+  title.append(el("span", { class: "mm-count-muted", text: `· ${all.length}` }));
+  head.append(title);
+  card.append(head);
+  card.append(el("p", {
+    class: "mm-card-hint",
+    text: "Things worth remembering: routines, preferences, dates, notes. Names of people link automatically.",
+  }));
+  card.append(memoryComposer(entity));
+
+  const counts = new Map();
+  for (const { fact } of all) {
+    const category = fact.predicate.toLowerCase();
+    counts.set(category, (counts.get(category) || 0) + 1);
+  }
+  if (all.length) {
+    const filters = el("div", { class: "mm-filters", role: "group", "aria-label": "Filter memories" });
+    const chip = (key, label) => {
+      const pressed = memoryState.memoryFilter === key;
+      const button = el("button", { type: "button", class: "mm-filter", "aria-pressed": String(pressed), text: label });
+      button.addEventListener("click", () => {
+        memoryState.memoryFilter = key;
+        renderDetail();
+      });
+      return button;
+    };
+    filters.append(chip("all", `All ${all.length}`));
+    for (const category of MEMORY_CATEGORIES) {
+      if (counts.get(category)) filters.append(chip(category, `${CATEGORY_PLURAL[category]} ${counts.get(category)}`));
+    }
+    card.append(filters);
+  }
+  const shown = all.filter(({ fact }) => memoryState.memoryFilter === "all"
+    || fact.predicate.toLowerCase() === memoryState.memoryFilter);
+  for (const { fact, owner } of shown) card.append(memoryCard(entity, fact, owner));
+  if (!all.length) {
+    card.append(el("div", { class: "empty", text: `Nothing remembered about ${entity.name} yet.` }));
+  }
+  return card;
+}
+
+function memoryComposer(entity) {
+  const form = el("div", { class: "mm-composer" });
+  const input = el("input", {
+    id: "memory-new", type: "text", dir: "auto",
+    placeholder: "Add a memory…",
+    "aria-label": `Add a memory about ${entity.name}`,
+  });
+  const category = el("select", { "aria-label": "category", class: "mm-composer-cat" });
+  for (const key of MEMORY_CATEGORIES) {
+    const option = el("option", { value: key, text: CATEGORY_LABEL[key] });
+    if (key === "note") option.selected = true;
+    category.append(option);
+  }
+  const save = el("button", { type: "button", class: "btn btn-pri", text: "Save" });
+  const submit = async () => {
+    const value = input.value.trim();
+    if (!value) { toast("write the memory first"); return; }
+    try {
+      await postFact({ subject_id: entity.id, predicate: category.value, value });
+      input.value = "";
+      input.blur();
+      toast("remembered");
+    } catch (error) { toast(`add failed: ${error.message}`); }
+    reloadMemory();
+  };
+  save.addEventListener("click", submit);
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") submit(); });
+  form.append(input, category, save);
+  return form;
+}
+
+function memoryCard(entity, fact, owner) {
+  const card = el("article", { class: "mm-mem" });
+  const category = fact.predicate.toLowerCase();
+  if (memoryState.editingFact === fact.id) {
+    card.append(memoryEditForm(fact));
+    return card;
+  }
+  const top = el("div", { class: "mm-mem-top" });
+  top.append(mentionText(fact.value));
+  const more = el("button", {
+    type: "button", class: "mm-more-btn", "aria-label": "More actions",
+    "aria-expanded": String(memoryState.menuFact === fact.id), text: "···",
+  });
+  more.addEventListener("click", () => {
+    memoryState.menuFact = memoryState.menuFact === fact.id ? null : fact.id;
+    renderDetail();
+  });
+  top.append(more);
+  card.append(top);
+  const meta = el("div", { class: "mm-mem-meta" });
+  meta.append(el("span", { class: `mm-tag cat-${category}`, text: CATEGORY_LABEL[category] || category }));
+  if (owner.id !== entity.id) {
+    const about = el("span", { class: "mm-about", text: "about " });
+    about.append(entityChip(owner));
+    meta.append(about);
+  }
+  meta.append(sourceLine(fact));
+  card.append(meta);
+
+  if (memoryState.menuFact === fact.id) card.append(memoryActions(fact));
+  if (memoryState.promoting === fact.id) {
+    card.append(promoteForm(owner, fact));
+  } else if (category === "date") {
+    const hint = el("div", { class: "mm-promote" });
+    hint.append(el("span", { text: "A fixed date is a stable fact. Make it basic info?" }));
+    const go = el("button", { type: "button", class: "btn btn-sm", text: "Move to basic info" });
+    go.addEventListener("click", () => {
+      memoryState.promoting = fact.id;
+      renderDetail();
+    });
+    hint.append(go);
+    card.append(hint);
+  }
+  return card;
+}
+
+function memoryActions(fact) {
+  const row = el("div", { class: "mm-mem-actions" });
+  const edit = el("button", { type: "button", class: "btn btn-sm", text: "Edit" });
+  edit.addEventListener("click", () => {
+    memoryState.editingFact = fact.id;
+    memoryState.menuFact = null;
+    renderDetail();
+  });
+  const promote = el("button", { type: "button", class: "btn btn-sm", text: "Move to basic info" });
+  promote.addEventListener("click", () => {
+    memoryState.promoting = fact.id;
+    memoryState.menuFact = null;
+    renderDetail();
+  });
+  const history = el("button", { type: "button", class: "btn btn-sm", text: "History" });
+  history.addEventListener("click", () => openMemoryDrawer(fact.id));
+  const remove = el("button", { type: "button", class: "btn btn-sm mm-remove", text: "Delete" });
+  remove.addEventListener("click", () => {
+    armConfirm(remove, () => {
+      memoryState.menuFact = null;
+      deleteFactWithUndo(fact, "memory deleted — Undo reopens it");
+    });
+  });
+  row.append(edit, promote, history, remove);
+  return row;
+}
+
+function memoryEditForm(fact) {
+  const form = el("div", { class: "mm-form mm-mem-edit" });
+  const input = el("textarea", { dir: "auto", rows: "2", "aria-label": "memory text" });
+  input.value = fact.value ?? "";
+  const category = el("select", { "aria-label": "category" });
+  for (const key of MEMORY_CATEGORIES) {
+    const option = el("option", { value: key, text: CATEGORY_LABEL[key] });
+    if (key === fact.predicate.toLowerCase()) option.selected = true;
+    category.append(option);
+  }
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  cancel.addEventListener("click", () => {
+    memoryState.editingFact = null;
+    renderDetail();
+  });
+  save.addEventListener("click", async () => {
+    const value = input.value.trim();
+    if (!value) { toast("the memory must not be empty"); return; }
+    try {
+      await patchFact(fact.id, { value, predicate: category.value });
+      memoryState.editingFact = null;
+    } catch (error) { toast(`edit failed: ${error.message}`); }
+    reloadMemory();
+  });
+  form.append(input, category, save, cancel);
+  setTimeout(() => input.focus(), 0);
+  return form;
+}
+
+// "Move to basic info": a typed field on the owner (and, for a shared date,
+// on the people it mentions), then the memory is retired (Undo-able).
+function promoteForm(owner, fact) {
+  const form = el("div", { class: "mm-form mm-promote-form" });
+  const field = el("select", { "aria-label": "basic info field" });
+  const fields = [["birthday", "Birthday"], ["anniversary", "Anniversary"], ["relation", "Role"],
+    ["work", "Work"], ["phone", "Phone"], ["email", "Email"], ["school", "School"], ["teacher", "Teacher"]];
+  for (const [predicate, label] of fields) field.append(el("option", { value: predicate, text: label }));
+  if (/anniversar/i.test(fact.value || "")) field.value = "anniversary";
+  const dateMatch = String(fact.value || "").match(/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/);
+  const value = el("input", {
+    type: "text", dir: "auto", "aria-label": "value",
+    value: dateMatch ? dateMatch[0] : fact.value || "",
+  });
+  form.append(field, value);
+  const others = [...mentionedIds(fact.value)].filter((id) => id !== owner.id)
+    .map((id) => mm.byId.get(id)).filter((entity) => entity && entity.kind === "person");
+  const boxes = [];
+  for (const other of others) {
+    const label = el("label", { class: "mm-check" });
+    const box = el("input", { type: "checkbox" });
+    box.checked = true;
+    boxes.push([box, other]);
+    label.append(box, document.createTextNode(` also on ${other.name}'s profile`));
+    form.append(label);
+  }
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Move" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  cancel.addEventListener("click", () => {
+    memoryState.promoting = null;
+    renderDetail();
+  });
+  save.addEventListener("click", async () => {
+    const text = value.value.trim();
+    if (!text) { toast("the value must not be empty"); return; }
+    const subjects = [owner, ...boxes.filter(([box]) => box.checked).map(([, other]) => other)];
+    try {
+      for (const subject of subjects) {
+        await postFact({ subject_id: subject.id, predicate: field.value, value: text });
+      }
+      memoryState.promoting = null;
+      await deleteFactWithUndo(fact, `moved to basic info on ${subjects.map((s) => s.name).join(" and ")} — Undo brings the memory back`);
+    } catch (error) {
+      toast(`move failed: ${error.message}`);
+      reloadMemory();
+    }
+  });
+  form.append(save, cancel);
+  return form;
+}
+
+// ---------- review inbox ----------
+
+function reviewKind(fact) {
+  if (isConnectionFact(fact) || fact.object_id) return "connection";
+  if (isMemoryFact(fact)) return "memory";
+  return "basic";
+}
+
+const REVIEW_KIND_LABEL = { basic: "Basic info", memory: "Memory", connection: "Connection" };
+
+function reviewItems() {
+  const items = [];
+  for (const entity of memoryState.proposed) {
+    const subject = mm.byId.get(entity.id) || entity;
+    for (const fact of entity.facts || []) items.push({ subject, fact, kind: reviewKind(fact) });
+  }
+  return items.sort((a, b) => (b.fact.valid_from || "").localeCompare(a.fact.valid_from || ""));
+}
+
+function renderReview() {
+  const items = reviewItems();
+  const main = $("memory-review-list");
+  const nodes = [];
+  const header = el("div", { class: "mm-review-intro" });
+  header.append(el("h2", {
+    text: items.length ? `${items.length} thing${items.length === 1 ? "" : "s"} to review` : "All caught up",
+  }));
+  header.append(el("p", {
+    text: items.length
+      ? "Picked up from your chats. Nothing is saved until you confirm it, and every confirmed item keeps a link back to where it came from."
+      : "Suggestions picked up from your chats wait here. Nothing is saved until you confirm it.",
+  }));
+  nodes.push(header);
+  if (items.length) {
+    const counts = { basic: 0, memory: 0, connection: 0 };
+    for (const item of items) counts[item.kind] += 1;
+    const filters = el("div", { class: "mm-filters", role: "group", "aria-label": "Filter suggestions" });
+    const chip = (key, label) => {
+      const button = el("button", {
+        type: "button", class: "mm-filter", text: label,
+        "aria-pressed": String(memoryState.reviewFilter === key),
+      });
+      button.addEventListener("click", () => {
+        memoryState.reviewFilter = key;
+        renderReview();
+      });
+      return button;
+    };
+    filters.append(chip("all", `All ${items.length}`));
+    for (const key of ["basic", "memory", "connection"]) {
+      if (counts[key]) filters.append(chip(key, `${REVIEW_KIND_LABEL[key]} ${counts[key]}`));
+    }
+    nodes.push(filters);
+  }
+  for (const item of items) {
+    if (memoryState.reviewFilter !== "all" && memoryState.reviewFilter !== item.kind) continue;
+    nodes.push(reviewCard(item));
+  }
+  main.replaceChildren(...nodes);
+}
+
+function reviewCard({ subject, fact, kind }) {
+  const card = el("article", { class: "mm-card mm-rcard" });
+  const head = el("div", { class: "mm-rhead" });
+  head.append(el("span", { class: `mm-rtag rk-${kind}`, text: REVIEW_KIND_LABEL[kind] }));
+  head.append(el("span", { class: "mm-rhead-word", text: kind === "memory" ? "about" : "for" }));
+  head.append(entityChip(subject));
+  if (kind === "memory") {
+    for (const id of mentionedIds(fact.value)) {
+      if (id === subject.id) continue;
+      head.append(el("span", { class: "mm-rhead-word", text: "and" }), entityChip(mm.byId.get(id)));
+    }
+  }
+  card.append(head);
+
+  const editing = memoryState.reviewEditing === fact.id;
+  if (kind === "basic") {
+    const grid = el("div", { class: "mm-rdiff" });
+    grid.append(el("span", { class: "mm-rdiff-label", text: capitalize(fact.predicate) }));
+    const change = el("span", { class: "mm-rdiff-change" });
+    const confirmed = mm.byId.get(subject.id);
+    const current = confirmed ? factsOf(confirmed, fact.predicate) : [];
+    const predicate = fact.predicate.toLowerCase();
+    change.append(current.length
+      ? el("span", { class: "mm-rdiff-old", text: current.map((old) => displayValue(predicate, old.value ?? "")).join(", "), dir: "auto" })
+      : el("span", { class: "mm-rdiff-empty", text: "empty" }));
+    change.append(el("span", { class: "mm-rdiff-arrow", "aria-hidden": "true", text: "→" }));
+    change.append(el("b", { class: "mm-rdiff-new", text: displayValue(predicate, fact.value ?? ""), dir: "auto" }));
+    grid.append(change);
+    card.append(grid);
+  } else if (kind === "memory") {
+    const block = el("div", { class: "mm-rbody" });
+    block.append(mentionText(fact.value));
+    card.append(block);
+  } else {
+    const target = fact.object_id ? mm.byId.get(fact.object_id) : null;
+    const type = isConnectionFact(fact) ? fact.predicate.slice(CONNECTION_PREFIX.length) : fact.predicate;
+    const pair = el("div", { class: "mm-rpair" });
+    pair.append(avatar(subject, "sm"), el("b", { text: subject.name, dir: "auto" }));
+    pair.append(el("span", { class: "mm-rpair-line", "aria-hidden": "true" }));
+    if (target) pair.append(avatar(target, "sm"), el("b", { text: target.name, dir: "auto" }));
+    card.append(pair);
+    const spec = CONNECTION_TYPES[type] || { label: type };
+    card.append(el("p", {
+      class: "mm-rquestion",
+      text: target ? `${subject.name} is ${target.name}'s ${spec.label.toLowerCase()}?` : `${subject.name}: ${type}`,
+    }));
+  }
+  if (editing) card.append(reviewEditForm(fact));
+
+  const provenance = fact.provenance || {};
+  const source = el("div", { class: "mm-rsource" });
+  if (provenance.quote) source.append(el("q", { text: provenance.quote, dir: "auto" }));
+  source.append(sourceLine(fact));
+  const show = openSourceItem(fact);
+  if (show) source.append(show);
+  card.append(source);
+
+  if (!editing) {
+    const actions = el("div", { class: "mm-ractions" });
+    const confirm = el("button", { type: "button", class: "btn btn-pri", text: "Confirm" });
+    confirm.addEventListener("click", () => confirmProposal(subject, fact, kind));
+    actions.append(confirm);
+    if (kind !== "connection") {
+      const edit = el("button", { type: "button", class: "btn", text: "Edit first" });
+      edit.addEventListener("click", () => {
+        memoryState.reviewEditing = fact.id;
+        renderReview();
+      });
+      actions.append(edit);
+    }
+    const reject = el("button", { type: "button", class: "btn btn-ghost", text: "Not right" });
+    reject.addEventListener("click", () => deleteFactWithUndo(fact, "dismissed — Undo brings it back"));
+    actions.append(reject);
+    card.append(actions);
+  }
+  return card;
+}
+
+function reviewEditForm(fact) {
+  const form = el("div", { class: "mm-form" });
+  const input = el("input", { type: "text", dir: "auto", value: fact.value ?? "", "aria-label": "corrected value" });
+  const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save & confirm" });
+  const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
+  cancel.addEventListener("click", () => {
+    memoryState.reviewEditing = null;
+    renderReview();
+  });
+  save.addEventListener("click", async () => {
+    const value = input.value.trim();
+    if (!value) { toast("the value must not be empty"); return; }
+    try {
+      const edited = await patchFact(fact.id, { value });
+      memoryState.reviewEditing = null;
+      const subject = mm.byId.get(fact.subject_id) || { id: fact.subject_id, name: "" };
+      await confirmProposal(subject, edited, reviewKind(edited));
+    } catch (error) {
+      toast(`edit failed: ${error.message}`);
+      reloadMemory();
+    }
+  });
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") save.click(); });
+  form.append(input, save, cancel);
+  setTimeout(() => input.focus(), 0);
+  return form;
+}
+
+// Confirm in place; a basic-info field is single-valued, so the value it
+// replaces is closed (soft delete, history kept).
+async function confirmProposal(subject, fact, kind) {
+  try {
+    await api(`/memory/facts/${fact.id}/confirm`, { method: "POST" });
+    if (kind === "basic") {
+      const entity = mm.byId.get(subject.id);
+      const previous = entity ? factsOf(entity, fact.predicate).filter((old) => old.id !== fact.id) : [];
+      for (const old of previous) {
+        try { await api(`/memory/facts/${old.id}`, { method: "DELETE" }); } catch { /* already closed */ }
+      }
+    }
+    toast(`saved to ${subject.name || "memory"}`);
+  } catch (error) { toast(`confirm failed: ${error.message}`); }
+  reloadMemory();
+}
+
+// ---------- family map ----------
+
+function renderMap() {
+  const canvas = $("memory-map-canvas");
+  const width = Math.max(320, canvas.clientWidth || 960);
+  const people = sortedEntities().filter((entity) => entity.kind === "person");
+  const adults = people.filter((entity) => isHousehold(entity) && !isKid(entity));
+  const kids = people.filter(isKid);
+  const others = people.filter((entity) => !isHousehold(entity));
+  const gap = 16;
+  const widest = Math.max(adults.length, kids.length, 1);
+  const nodeW = Math.max(132, Math.min(220, Math.floor((width - gap * (widest + 1)) / widest)));
+  const nodeH = 64;
+  const pillH = 40;
+  const pos = new Map();
+  let y = 24;
+
+  // even slots per row; wraps when the row does not fit (phone width)
+  const placeRow = (list, rowY) => {
+    const perRow = Math.max(1, Math.floor((width - gap) / (nodeW + gap)));
+    list.forEach((entity, index) => {
+      const row = Math.floor(index / perRow);
+      const inRow = Math.min(perRow, list.length - row * perRow);
+      const slot = width / inRow;
+      const x = Math.round(slot * (index % perRow) + slot / 2 - nodeW / 2);
+      pos.set(entity.id, { x, y: rowY + row * (nodeH + gap), w: nodeW, h: nodeH });
+    });
+    return list.length ? Math.ceil(list.length / perRow) * (nodeH + gap) : 0;
+  };
+
+  if (adults.length) y += placeRow(adults, y) + 56;
+  if (kids.length) y += placeRow(kids, y) + 28;
+  // each kid's groups stack under the kid (two, then "+N more")
+  let groupsBottom = y;
+  const groupPills = [];
+  for (const kid of kids) {
+    const anchor = pos.get(kid.id);
+    const top = anchor.y + nodeH + 28;
+    const groups = channelsFor(kid);
+    groups.slice(0, 2).forEach((group, index) => {
+      const pill = { x: anchor.x, y: top + index * (pillH + 10), w: nodeW, h: pillH };
+      pos.set(group.id, pill);
+      groupPills.push({ group, kid, pill });
+      groupsBottom = Math.max(groupsBottom, pill.y + pillH + 10);
+    });
+    if (groups.length > 2) {
+      const pill = { x: anchor.x, y: top + 2 * (pillH + 10), w: nodeW, h: 32 };
+      groupPills.push({ more: groups.length - 2, kid, pill });
+      groupsBottom = Math.max(groupsBottom, pill.y + 32 + 10);
+    }
+  }
+  y = Math.max(y, groupsBottom) + 16;
+  let othersY = null;
+  if (others.length) {
+    othersY = y + 32;
+    y = othersY + placeRow(others, othersY);
+  }
+  const height = y + 16;
+
+  const svg = svgEl("svg", {
+    class: "mm-map-lines", width: String(width), height: String(height),
+    viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true",
+  });
+  const center = (box) => [box.x + box.w / 2, box.y + box.h / 2];
+  const labels = [];
+  for (const link of mm.links) {
+    const from = pos.get(link.from);
+    const to = pos.get(link.to);
+    if (!from || !to) continue;
+    const [x1, y1] = center(from);
+    const [x2, y2] = center(to);
+    svg.append(svgEl("line", {
+      x1, y1, x2, y2, class: `mm-edge ${FAMILY_TYPES.has(link.type) ? "is-family" : "is-other"}`,
+    }));
+    if (link.type !== "parent" && link.type !== "child") {
+      const text = link.type === "spouse" ? "married" : (CONNECTION_TYPES[link.type] || { label: link.type }).label.toLowerCase();
+      labels.push({ text, x: (x1 + x2) / 2, y: (y1 + y2) / 2 });
+    }
+  }
+  for (const { kid, pill } of groupPills) {
+    const anchor = pos.get(kid.id);
+    svg.append(svgEl("path", {
+      d: `M ${anchor.x + 24} ${anchor.y + anchor.h} V ${pill.y + pill.h / 2} H ${pill.x + 16}`,
+      class: "mm-edge is-member",
+    }));
+  }
+
+  const canvasNodes = [];
+  for (const entity of people) {
+    const box = pos.get(entity.id);
+    if (!box) continue;
+    const unknown = hasNoConnection(entity);
+    const node = el("button", {
+      type: "button", class: `mm-map-node${unknown ? " is-unknown" : ""}`,
+      style: `left:${box.x}px;top:${box.y}px;width:${box.w}px;height:${box.h}px`,
+    });
+    node.append(avatar(entity));
+    const text = el("span", { class: "mm-row-text" });
+    text.append(el("span", { class: "mm-row-name", text: entity.name, dir: "auto" }));
+    text.append(el("span", {
+      class: `mm-row-sub${unknown ? " is-unknown" : ""}`,
+      text: unknown ? "How are they connected?" : subLine(entity), dir: "auto",
+    }));
+    node.append(text);
+    node.addEventListener("click", () => openProfile(entity.id));
+    canvasNodes.push(node);
+  }
+  for (const { group, kid, more, pill } of groupPills) {
+    const node = el("button", {
+      type: "button", class: `mm-map-pill${more ? " is-more" : ""}`,
+      style: `left:${pill.x + 16}px;top:${pill.y}px;width:${pill.w - 16}px;height:${pill.h}px`,
+    });
+    if (more) {
+      node.textContent = `+${more} more group${more === 1 ? "" : "s"}`;
+      node.addEventListener("click", () => openProfile(kid.id));
+    } else {
+      node.append(groupIcon(), el("span", { class: "mm-map-pill-name", text: group.name, dir: "auto" }));
+      node.title = subLine(group);
+      node.addEventListener("click", () => openProfile(group.id));
+    }
+    canvasNodes.push(node);
+  }
+  for (const label of labels) {
+    canvasNodes.push(el("span", {
+      class: "mm-edge-label", text: label.text,
+      style: `left:${Math.round(label.x)}px;top:${Math.round(label.y)}px`,
+    }));
+  }
+  if (othersY !== null) {
+    canvasNodes.push(el("span", { class: "mm-map-row-label", text: "Other people", style: `top:${othersY - 26}px` }));
+  }
+  if (!people.length) canvasNodes.push(el("div", { class: "empty", text: "no people yet — add a person" }));
+  canvas.style.height = `${height}px`;
+  canvas.replaceChildren(svg, ...canvasNodes);
 }
 
 // ---------- fact history drawer (unchanged behavior) ----------
@@ -609,9 +1828,9 @@ async function openMemoryDrawer(factId) {
     if (provenance.quote) {
       row.append(el("div", { class: "hquote", text: `“${provenance.quote}”`, dir: "auto" }));
     }
-    const sourceLine = el("div", { class: "hsource" });
+    const sourceLineNode = el("div", { class: "hsource" });
     if (provenance.source === "item" && (provenance.item_ids || []).length) {
-      sourceLine.append(el("span", { text: "source item" + (provenance.item_ids.length > 1 ? "s" : "") + ": " }));
+      sourceLineNode.append(el("span", { text: "source item" + (provenance.item_ids.length > 1 ? "s" : "") + ": " }));
       for (const itemId of provenance.item_ids) {
         const btn = el("button", { class: "btn btn-ghost item-link", text: shortId(itemId), title: "open in the Debug inspector" });
         btn.addEventListener("click", () => {
@@ -619,12 +1838,12 @@ async function openMemoryDrawer(factId) {
           switchTab("debug");
           openInspector(itemId);
         });
-        sourceLine.append(btn);
+        sourceLineNode.append(btn);
       }
     } else {
-      sourceLine.append(el("span", { text: provenance.source === "item" ? "source item (id missing)" : "👤 added by you" }));
+      sourceLineNode.append(el("span", { text: provenance.source === "item" ? "source item (id missing)" : "added by you" }));
     }
-    row.append(sourceLine);
+    row.append(sourceLineNode);
     body.append(row);
   }
 }
@@ -654,22 +1873,12 @@ async function addPersonFromForm() {
   // create form; re-adding facts it already has would pile up duplicates
   // (one extra grade fact per submit).
   const existed = memoryState.entities.some((candidate) => candidate.id === entity.id);
-  const facts = [];
-  for (const [predicate, inputId] of PERSON_FIELDS) {
-    const value = $(inputId).value.trim();
-    if (value) facts.push({ predicate, value });
-  }
   if (!existed) {
-    for (const { predicate, value } of facts) {
+    for (const [predicate, inputId] of PERSON_FIELDS) {
+      const value = $(inputId).value.trim();
+      if (!value) continue;
       try {
-        await api("/memory/facts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            subject_id: entity.id, predicate, value, status: "confirmed",
-            provenance: { source: "user" },
-          }),
-        });
+        await postFact({ subject_id: entity.id, predicate, value });
       } catch (error) { toast(`fact ${predicate} failed: ${error.message}`); }
     }
   }
@@ -679,8 +1888,10 @@ async function addPersonFromForm() {
   $("memory-person-aliases").value = "";
   toast(existed ? `${name} already existed — opened it` : `${name} added`);
   memoryState.selected = entity.id;
+  memoryState.mode = "profile";
+  resetInlineState();
   $("memory-wrap").dataset.view = "detail";
-  refreshMemory();
+  reloadMemory();
 }
 
 async function addOtherFromForm() {
@@ -700,28 +1911,34 @@ async function addOtherFromForm() {
   $("memory-other-name").value = "";
   toast(existed ? `${name} already existed — opened it` : `${name} added`);
   memoryState.selected = entity.id;
+  memoryState.mode = "profile";
+  resetInlineState();
   $("memory-wrap").dataset.view = "detail";
-  refreshMemory();
+  reloadMemory();
 }
 
 // ---------- tab init ----------
 
 function initMemoryTab() {
-  $("memory-status").addEventListener("change", (event) => {
-    memoryState.status = event.target.value;
-    memoryState.editingFact = null;
-    memoryState.addingFactFor = null;
-    memoryState.addingMemoryFor = null;
-    refreshMemory();
-  });
   let memorySearchTimer = null;
   $("memory-q").addEventListener("input", (event) => {
     clearTimeout(memorySearchTimer);
     memorySearchTimer = setTimeout(() => {
       memoryState.q = event.target.value.trim();
-      refreshMemory();
-    }, 250);
+      if (memoryState.mode !== "profile") {
+        memoryState.mode = "profile";
+        $("memory-wrap").dataset.view = "list";
+        renderMemory();
+      } else {
+        mm = buildModel();
+        renderList();
+      }
+    }, 200);
   });
+  $("memory-review-btn").addEventListener("click", () => setMode(memoryState.mode === "review" ? "profile" : "review"));
+  $("memory-review-back").addEventListener("click", () => setMode("profile"));
+  $("memory-view-list").addEventListener("click", () => setMode("profile"));
+  $("memory-view-map").addEventListener("click", () => setMode("map"));
   $("memory-add-person-btn").addEventListener("click", () => {
     $("memory-add-person").hidden = false;
     $("memory-person-name").focus();
@@ -740,7 +1957,7 @@ function initMemoryTab() {
   $("memory-other-save").addEventListener("click", addOtherFromForm);
   $("memory-back").addEventListener("click", () => {
     memoryState.selected = null;
-    memoryState.editMode = false;
+    resetInlineState();
     $("memory-wrap").dataset.view = "list";
     renderMemory();
   });
@@ -751,6 +1968,13 @@ function initMemoryTab() {
     if (fn) await fn();
   });
   $("memory-drawer-close").addEventListener("click", closeMemoryDrawer);
+  let mapResizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(mapResizeTimer);
+    mapResizeTimer = setTimeout(() => {
+      if (memoryState.mode === "map" && mm) renderMap();
+    }, 150);
+  });
 }
 
 document.addEventListener("DOMContentLoaded", initMemoryTab);

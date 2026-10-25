@@ -320,6 +320,35 @@ def test_compact_block_lists_kids_and_notes(memory: MemoryService):
     assert "- note: school items go to the family calendar" in block
 
 
+def test_compact_block_keeps_memory_categories_with_their_subject(memory: MemoryService):
+    """The Memory screen files memories as routine / preference / date as
+    well as note. A kid's routine must not vanish into the kid's attribute
+    line (which only joins gender/grade/class/school/teacher)."""
+    _seed_world(memory)
+    rona = memory._ensure_entity(kind="person", name="Rona")
+    yos = memory._ensure_entity(kind="person", name="Yos")
+    memory.add_fact(rona.id, "routine", value="football practice on Wednesdays")
+    memory.add_fact(yos.id, "preference", value="WhatsApp over phone calls at work")
+    block = memory.compact_block()
+    assert "- Rona (routine): football practice on Wednesdays" in block
+    assert "- Yos (preference): WhatsApp over phone calls at work" in block
+    assert "- Rona: gender girl, grade 5" in block  # the attribute line is unchanged
+
+
+def test_compact_block_renders_connections_by_name(memory: MemoryService):
+    """A connection is an object-linked fact (connection:<type> -> object_id);
+    the prompt names both ends instead of dropping it."""
+    _seed_world(memory)
+    itamar = memory._ensure_entity(kind="person", name="Itamar")
+    yos = memory._ensure_entity(kind="person", name="Yos")
+    zohar = memory._ensure_entity(kind="person", name="Zohar")
+    memory.add_fact(yos.id, "connection:parent", object_id=itamar.id)
+    memory.add_fact(yos.id, "connection:spouse", object_id=zohar.id)
+    block = memory.compact_block()
+    assert "- Yos is Itamar's parent" in block
+    assert "- Yos is Zohar's spouse" in block
+
+
 def test_proposed_note_is_excluded_from_compact_block(memory: MemoryService):
     _seed_world(memory)
     me = memory._ensure_entity(kind="person", name="me")

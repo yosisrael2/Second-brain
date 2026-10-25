@@ -165,46 +165,80 @@
 
       <!-- MEMORY -->
       <section id="tab-memory" class="tab-panel">
+        <div class="mm-top">
+          <div class="mm-search">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <label for="memory-q" class="sr-only">Search memory</label>
+            <input id="memory-q" type="search" dir="auto" placeholder="Search people, groups, memories…">
+          </div>
+          <div class="mm-top-right">
+            <span id="memory-sync" class="mm-sync" role="status"></span>
+            <div class="mm-seg" role="group" aria-label="Memory view">
+              <button id="memory-view-list" type="button" aria-pressed="true">List</button>
+              <button id="memory-view-map" type="button" aria-pressed="false">Map</button>
+            </div>
+            <button id="memory-review-btn" type="button" class="mm-review-btn">Review <span id="memory-review-count" class="mm-count">0</span></button>
+          </div>
+        </div>
         <div class="mm-wrap" id="memory-wrap" data-view="list">
-          <div class="mm-left" id="memory-left">
-            <div class="mm-left-head">
-              <span class="mm-title">People &amp; groups</span>
-              <select id="memory-status" class="mm-status">
-                <option value="confirmed">confirmed</option>
-                <option value="proposed">proposed inbox</option>
-              </select>
-            </div>
-            <div class="mm-search">
-              <input id="memory-q" type="text" placeholder="Search…">
-            </div>
+          <nav class="mm-left" id="memory-left" aria-label="People and groups">
             <div class="mm-addrow">
-              <button id="memory-add-person-btn" class="btn btn-sm btn-pri">+ Add person</button>
-              <button id="memory-add-other-btn" class="btn btn-sm">+ Other</button>
+              <button id="memory-add-person-btn" type="button" class="btn btn-pri">+ Add person</button>
+              <button id="memory-add-other-btn" type="button" class="btn">+ Group</button>
             </div>
             <div id="memory-list" class="mm-list"></div>
-          </div>
+          </nav>
           <div class="mm-right" id="memory-detail">
             <div class="mm-backbar">
-              <button id="memory-back" class="btn btn-sm btn-ghost">‹ Back to list</button>
+              <button id="memory-back" type="button" class="btn btn-sm btn-ghost">‹ All people</button>
             </div>
-            <div id="memory-detail-head" class="mm-dhead"></div>
+            <div id="memory-detail-head"></div>
             <div id="memory-detail-body" class="mm-stack"></div>
+          </div>
+        </div>
+        <div id="memory-review" class="mm-review" hidden>
+          <div class="mm-review-bar">
+            <button id="memory-review-back" type="button" class="btn btn-sm btn-ghost">‹ Memory</button>
+          </div>
+          <div class="mm-review-grid">
+            <main id="memory-review-list" class="mm-review-list"></main>
+            <aside class="mm-card mm-review-side" aria-labelledby="mm-review-how">
+              <h3 id="mm-review-how">How review works</h3>
+              <p>Facts, memories and connections the system picks up from your chats wait here.</p>
+              <p><b>Confirm</b> saves it. <b>Edit first</b> fixes the wording, then saves. <b>Not right</b> drops it (Undo brings it back).</p>
+              <p>Confirmed items keep a link back to the message they came from.</p>
+            </aside>
+          </div>
+        </div>
+        <div id="memory-map" class="mm-map" hidden>
+          <div class="mm-map-head">
+            <div>
+              <h2>Family map</h2>
+              <p>Every line is a connection. Tap a person to open their profile and edit their connections.</p>
+            </div>
+          </div>
+          <div id="memory-map-canvas" class="mm-map-canvas"></div>
+          <div class="mm-legend" aria-label="legend">
+            <span><svg width="40" height="8" viewBox="0 0 40 8" aria-hidden="true"><path d="M2 4h36" class="mm-edge is-family"/></svg>Family</span>
+            <span><svg width="40" height="8" viewBox="0 0 40 8" aria-hidden="true"><path d="M2 4h36" class="mm-edge is-other"/></svg>Other connection</span>
+            <span><svg width="40" height="8" viewBox="0 0 40 8" aria-hidden="true"><path d="M2 4h36" class="mm-edge is-member"/></svg>Member of a group</span>
+            <span><span class="mm-legend-unknown" aria-hidden="true"></span>No connection yet</span>
           </div>
         </div>
         <aside id="memory-drawer" class="memory-drawer" hidden aria-label="fact history">
           <div class="drawer-head">
-            <h3>Fact history</h3>
-            <button id="memory-drawer-close" class="btn btn-sm">✕ Close</button>
+            <h3>History</h3>
+            <button id="memory-drawer-close" type="button" class="btn btn-sm">✕ Close</button>
           </div>
           <div id="memory-drawer-body" class="drawer-body"></div>
         </aside>
         <div id="memory-add-person" class="mm-modal" hidden>
-          <div class="mm-sheet">
-            <h3>Add person</h3>
-            <div class="mm-field"><label>name</label><input id="memory-person-name" type="text" dir="auto" placeholder="e.g. מיכל"></div>
-            <div class="mm-field"><label>aliases (comma-separated)</label><input id="memory-person-aliases" type="text" dir="auto" placeholder="רונה, Rona C."></div>
+          <div class="mm-sheet" role="dialog" aria-modal="true" aria-labelledby="mm-add-person-h">
+            <h3 id="mm-add-person-h">Add person</h3>
+            <div class="mm-field"><label for="memory-person-name">Name</label><input id="memory-person-name" type="text" dir="auto" placeholder="e.g. מיכל"></div>
+            <div class="mm-field"><label for="memory-person-aliases">Also known as (comma-separated)</label><input id="memory-person-aliases" type="text" dir="auto" placeholder="רונה, Rona C."></div>
             <div class="mm-grid2">
-              <div class="mm-field"><label>relation to the family</label>
+              <div class="mm-field"><label for="memory-person-relation">Role in the family</label>
                 <select id="memory-person-relation">
                   <option value="">—</option>
                   <option value="child">child</option>
@@ -216,48 +250,52 @@
                   <option value="other">other</option>
                 </select>
               </div>
-              <div class="mm-field"><label>gender</label>
+              <div class="mm-field"><label for="memory-person-gender">Gender</label>
                 <select id="memory-person-gender">
                   <option value="">—</option>
                   <option value="girl">girl</option>
                   <option value="boy">boy</option>
+                  <option value="woman">woman</option>
+                  <option value="man">man</option>
                 </select>
               </div>
             </div>
+            <div class="mm-field"><label for="memory-person-birthday">Birthday</label><input id="memory-person-birthday" type="text" inputmode="numeric" placeholder="dd.mm.yyyy"></div>
             <div class="mm-grid2">
-              <div class="mm-field"><label>grade (kids)</label><input id="memory-person-grade" type="text" dir="auto" placeholder="ה"></div>
-              <div class="mm-field"><label>class</label><input id="memory-person-class" type="text" dir="auto" placeholder="ספיר"></div>
+              <div class="mm-field"><label for="memory-person-grade">Grade (kids)</label><input id="memory-person-grade" type="text" dir="auto" placeholder="5"></div>
+              <div class="mm-field"><label for="memory-person-class">Class</label><input id="memory-person-class" type="text" dir="auto" placeholder="ה' ספיר"></div>
             </div>
             <div class="mm-grid2">
-              <div class="mm-field"><label>school / kindergarten</label><input id="memory-person-school" type="text" dir="auto"></div>
-              <div class="mm-field"><label>teacher</label><input id="memory-person-teacher" type="text" dir="auto"></div>
+              <div class="mm-field"><label for="memory-person-school">School / kindergarten</label><input id="memory-person-school" type="text" dir="auto"></div>
+              <div class="mm-field"><label for="memory-person-teacher">Teacher</label><input id="memory-person-teacher" type="text" dir="auto"></div>
             </div>
             <div class="mm-sheet-actions">
-              <button id="memory-person-cancel" class="btn btn-sm btn-ghost">Cancel</button>
-              <button id="memory-person-save" class="btn btn-sm btn-pri">Add person</button>
+              <button id="memory-person-cancel" type="button" class="btn btn-ghost">Cancel</button>
+              <button id="memory-person-save" type="button" class="btn btn-pri">Add person</button>
             </div>
           </div>
         </div>
         <div id="memory-add-other" class="mm-modal" hidden>
-          <div class="mm-sheet">
-            <h3>Add group / place / org</h3>
-            <div class="mm-field"><label>kind</label>
+          <div class="mm-sheet" role="dialog" aria-modal="true" aria-labelledby="mm-add-other-h">
+            <h3 id="mm-add-other-h">Add group, place or org</h3>
+            <div class="mm-field"><label for="memory-other-kind">Kind</label>
               <select id="memory-other-kind">
                 <option value="group">group</option>
                 <option value="place">place</option>
                 <option value="org">org</option>
               </select>
             </div>
-            <div class="mm-field"><label>name</label><input id="memory-other-name" type="text" dir="auto" placeholder="e.g. בית הספר / the Family unit"></div>
+            <div class="mm-field"><label for="memory-other-name">Name</label><input id="memory-other-name" type="text" dir="auto" placeholder="e.g. בית הספר"></div>
+            <p class="mm-card-hint">WhatsApp groups the system listens to are added with <code>brain memory seed-channel</code>, not here.</p>
             <div class="mm-sheet-actions">
-              <button id="memory-other-cancel" class="btn btn-sm btn-ghost">Cancel</button>
-              <button id="memory-other-save" class="btn btn-sm btn-pri">Add</button>
+              <button id="memory-other-cancel" type="button" class="btn btn-ghost">Cancel</button>
+              <button id="memory-other-save" type="button" class="btn btn-pri">Add</button>
             </div>
           </div>
         </div>
-        <div id="memory-undo" class="mm-undo" hidden>
+        <div id="memory-undo" class="mm-undo" hidden role="status">
           <span id="memory-undo-text"></span>
-          <button id="memory-undo-btn" class="btn btn-sm">Undo</button>
+          <button id="memory-undo-btn" type="button">Undo</button>
         </div>
       </section>
     </main>
