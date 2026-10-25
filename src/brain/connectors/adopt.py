@@ -502,33 +502,51 @@ def _last_adopt_event(session: Session, name: str) -> Any:
 # --- user-facing rendering ---------------------------------------------------------
 
 
+_REPORT_ROW_CAP = 20
+
+
+def _capped(rows: list[str]) -> list[str]:
+    """A section's rows, capped for readability at large N (a real recurring
+    first sync fetches 10k+ records): the first 20 rows, then one
+    "… and N more" line. The section header (total) and the report's totals
+    line stay unconditional."""
+    if len(rows) <= _REPORT_ROW_CAP:
+        return rows
+    return rows[:_REPORT_ROW_CAP] + [f"    … and {len(rows) - _REPORT_ROW_CAP} more"]
+
+
 def format_report(report: AdoptReport) -> str:
-    """The dry-run/real-run table the user reads (stable order, ids shortened)."""
+    """The dry-run/real-run table the user reads (stable order, ids shortened,
+    every section's total in its header, rows capped at 20 + a remainder)."""
     lines = [report.summary_line()]
     if report.refused_cursor or report.nothing_to_adopt:
         return "\n".join(lines)
     if report.adopted:
         verb = "ADOPTED" if report.wrote else "WOULD ADOPT"
         lines.append(f"  {verb} ({len(report.adopted)})")
-        for (external_id, version), item_id in report.adopted:
-            rule = report.rules.get(external_id, "?")
-            lines.append(
-                f"    {external_id} (v={version or '-'}) -> item {str(item_id)[:8]}… [{rule}]"
-            )
+        rows = [
+            f"    {external_id} (v={version or '-'}) -> item {str(item_id)[:8]}…"
+            f" [{report.rules.get(external_id, '?')}]"
+            for (external_id, version), item_id in report.adopted
+        ]
+        lines.extend(_capped(rows))
     if report.already:
         lines.append(f"  ALREADY ADOPTED ({len(report.already)})")
-        for external_id, item_id in report.already:
-            lines.append(f"    {external_id} -> item {str(item_id)[:8]}…")
+        lines.extend(
+            _capped(
+                [
+                    f"    {external_id} -> item {str(item_id)[:8]}…"
+                    for external_id, item_id in report.already
+                ]
+            )
+        )
     if report.ambiguous:
         lines.append(f"  AMBIGUOUS ({len(report.ambiguous)}) — skipped, never guessed")
-        for external_id in report.ambiguous:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.ambiguous]))
     if report.user_deleted:
         lines.append(f"  USER-DELETED ({len(report.user_deleted)}) — respected, never repointed")
-        for external_id in report.user_deleted:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.user_deleted]))
     if report.new:
         lines.append(f"  NEW ON FIRST SYNC ({len(report.new)})")
-        for external_id in report.new:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.new]))
     return "\n".join(lines)
