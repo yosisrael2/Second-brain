@@ -258,6 +258,40 @@ class TestCalendar:
         assert parsed.chunks[0].meta["start_raw"] == "Tuesday, October 21 · 10:00 – 11:00am"
         assert parsed.chunks[0].meta["location"] == "Meeting room 2"
 
+    def test_google_copy_location_label_is_stripped(self):
+        """A Google web-UI copy carries "Location: <room>" as its own line
+        AFTER the time range: the label is field syntax, not the location
+        value — it must not leak into the stored location (or the rendered
+        one-liner), or adopt's text match can never hit the real event."""
+        parsed = parse(
+            "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nLocation: Room 3",
+            tz=JERUSALEM,
+        )
+
+        meta = parsed.chunks[0].meta
+        assert meta["location"] == "Room 3"
+        assert meta["location"] != "Location: Room 3"
+        assert "@ Room 3" in parsed.chunks[0].raw_text
+        assert "Location:" not in parsed.chunks[0].raw_text
+
+    def test_hebrew_location_label_is_stripped(self):
+        parsed = parse(
+            "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nמקום: אולם ב'",
+            tz=JERUSALEM,
+        )
+
+        assert parsed.chunks[0].meta["location"] == "אולם ב'"
+
+    def test_location_line_without_colon_is_kept_verbatim(self):
+        """Only a leading LABEL (word + colon) is field syntax. A sentence
+        that merely starts with the word מקום is a real location value."""
+        parsed = parse(
+            "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nמקום מפגש ליד השער",
+            tz=JERUSALEM,
+        )
+
+        assert parsed.chunks[0].meta["location"] == "מקום מפגש ליד השער"
+
     def test_outlook_copied_event(self):
         text = (
             "DPA signature call\n"

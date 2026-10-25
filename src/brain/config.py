@@ -126,12 +126,13 @@ class Settings(BaseSettings):
     # usually SENT on D-1 (occurred_at is the sent time). A ceiling, never a
     # floor; 0 keeps the strict window.
     ask_kid_recall_lookback_days: int = 3
-    # WA39 run 3 part 2: when a question names a confirmed kid, the final
-    # context reserves up to this many top_k slots for the best-ranked
-    # kid-recall items (kid-channel conversations first) — the rerank can
-    # otherwise drop them below the cut. Unused reserved slots go back to
-    # the general ranking; 0 disables.
-    ask_kid_reserved_slots: int = 3
+    # WA39 run 3 part 2 (reworked by run 4): when a question names a
+    # confirmed kid, the context is the general top_k PLUS up to this many
+    # kid items — ADDITIONS, never carved out of the general ranking. Dated
+    # questions fill them by date relevance (in-window kid-channel items
+    # first, then lookback by distance to the window); undated ones in
+    # rerank order. 0 disables.
+    ask_kid_reserved_slots: int = 4
     # Meaning extraction (PR A1): daily LLM-extraction cap (D5) and the
     # in-process worker switch. The worker stays OFF in A1 — the queue is
     # durable and drained by `brain enrich` / tests; A2 flips it on with the
@@ -306,9 +307,16 @@ class Settings(BaseSettings):
     brain_gcal_calendars: str = "primary"
     # How far back the first gcal full sync reaches (instances that ENDED more
     # than this many days ago are never fetched; the cutoff is frozen at the
-    # first sync and persisted in the connector cursor). There is NO future
-    # cap: a dropped future instance would never be re-delivered.
-    brain_gcal_past_days: int = 60
+    # first sync and persisted in the connector cursor). Default 7: a first
+    # sync is hundreds of records, not a two-month flood.
+    brain_gcal_past_days: int = 7
+    # How far ahead the gcal window reaches (instances STARTING beyond
+    # today + this many days are excluded from full syncs via timeMax and
+    # dropped from incremental deliveries). The edge is date-quantized and
+    # persisted in the cursor; when it advances past the stored edge, the
+    # next sync re-lists the whole window (once a day at most), so anything
+    # that enters the window is picked up and nothing is silently lost.
+    brain_gcal_future_days: int = 60
 
     # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
     # of task lists to sync, comma-separated list IDs or titles (titles matched
