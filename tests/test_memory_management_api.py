@@ -21,6 +21,7 @@ brain.main:app, so it inherits the production binding (uvicorn --host
 
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -618,24 +619,32 @@ def test_archived_kid_leaves_kids_and_returns_on_restore(
 ) -> None:
     """An archived person leaves kids() (triage + A2 stop seeing them) and
     comes back on restore — pinned so the UI can spell the consequence out."""
-    from brain.services.memory import MemoryService
-
     entity = _add_entity(client, name="Noa")
     _add_fact(client, entity["id"], predicate="grade", value="ה")
 
-    service = MemoryService(_memory_repo_for_tests())
-    assert [k["name"] for k in service.kids()] == ["Noa"]
-    client.post(f"{_ENDPOINT}/entities/{entity['id']}/archive")
-    assert service.kids() == []
-    client.post(f"{_ENDPOINT}/entities/{entity['id']}/restore")
-    assert [k["name"] for k in service.kids()] == ["Noa"]
+    with _memory_service_for_tests() as service:
+        assert [k["name"] for k in service.kids()] == ["Noa"]
+        client.post(f"{_ENDPOINT}/entities/{entity['id']}/archive")
+        assert service.kids() == []
+        client.post(f"{_ENDPOINT}/entities/{entity['id']}/restore")
+        assert [k["name"] for k in service.kids()] == ["Noa"]
 
 
-def _memory_repo_for_tests():
+@contextmanager
+def _memory_service_for_tests():
+    """A MemoryService over its own session, CLOSED afterwards — a leaked
+    session here stays idle-in-transaction on `entities` and blocks the
+    migration test's DROP COLUMN (CI timeout, round 2)."""
     from brain.db.session import SessionLocal
     from brain.repositories.memory import MemoryRepository
+    from brain.services.memory import MemoryService
 
-    return MemoryRepository(SessionLocal())
+    session = SessionLocal()
+    try:
+        yield MemoryService(MemoryRepository(session))
+    finally:
+        session.rollback()
+        session.close()
 
 
 def test_set_channel_on_archived_name_unarchives_same_row(
@@ -643,18 +652,13 @@ def test_set_channel_on_archived_name_unarchives_same_row(
 ) -> None:
     """The SERVICE seed path (set_channel — what the poller/seed use) on an
     archived name must unarchive the same row, never create a duplicate."""
-    from brain.services.memory import MemoryService
-
     entity = _add_entity(client, name="דמו הורים קבוצה", kind="channel")
     client.post(f"{_ENDPOINT}/entities/{entity['id']}/archive")
 
-    service = MemoryService(_memory_repo_for_tests())
-    seeded = service.set_channel("דמו הורים קבוצה", kind="teacher", applies_to="me")
+    with _memory_service_for_tests() as service:
+        seeded = service.set_channel("דמו הורים קבוצה", kind="teacher", applies_to="me")
 
-    assert seeded["id"] == entity["id"]
-    assert seeded["archived"] is False
-    names = [
-        e["name"]
-        for e in service.overview()
-    ]
-    assert names.count("דמו הורים קבוצה") == 1
+        assert seeded["id"] == entity["id"]
+        assert seeded["archived"] is False
+        names = [e["name"] for e in service.overview()]
+        assert names.count("דמו הורים קבוצה") == 1
