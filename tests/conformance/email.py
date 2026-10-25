@@ -259,6 +259,7 @@ def build(api: Any) -> GmailConnector:
         token_loader=lambda: "refresh-token",
         service_factory=lambda token, scopes, api_name, api_version: _KitGmailService(api),
         settings=Settings(
+            gmail_min_call_interval_s=0.0,
             gmail_label_id=_LABEL, gmail_query="", gmail_credentials_path="", _env_file=None
         ),
         legacy_seed=legacy_seed,
