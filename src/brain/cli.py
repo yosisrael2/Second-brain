@@ -720,6 +720,7 @@ def _whatsapp_triage(*, limit: int) -> int:
 
     from brain.config import assert_not_live_store  # noqa: PLC0415
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.whatsapp import is_unread_media_only  # noqa: PLC0415
 
     settings = get_settings()
     assert_not_live_store(
@@ -729,11 +730,19 @@ def _whatsapp_triage(*, limit: int) -> int:
     )
     decided = 0
     failed = 0
+    skipped = 0
     with SessionLocal() as session:
         trier = _build_trier(session)
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:
+            if is_unread_media_only(item.raw_text):
+                # Same skip the poller's _triage_item applies: an unread-media-
+                # only conversation has nothing readable to triage, and this
+                # IS the run that must not label those NOISE. 0 trier/model
+                # calls, columns stay NULL; counted separately in the summary.
+                skipped += 1
+                continue
             result = trier(item)
             if result is None:
                 failed += 1
@@ -741,7 +750,10 @@ def _whatsapp_triage(*, limit: int) -> int:
             repo.apply_triage(item, result)
             decided += 1
         session.commit()
-    print(f"whatsapp-triage: decided {decided}, failed {failed} of limit {limit}")
+    print(
+        f"whatsapp-triage: decided {decided}, failed {failed}, "
+        f"skipped (unread media) {skipped} of limit {limit}"
+    )
     return 0
 
 
