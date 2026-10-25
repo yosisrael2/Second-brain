@@ -104,7 +104,7 @@ to its section or doc.
 - WhatsApp acceptance re-run 5 (unblocked: #102 and #104 merged)
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
-The live instance runs `2ddd581` (deployed 25 Oct 2026; DB migration `7d90f6ea8407` applied). The enrichment worker is OFF (the default stub extractor), every connector is registered but disabled, and the email + connectors launchd agents are not installed. The reconciliation verdict cards (PR #99) and the Memory Management screen went live with this deploy.
+The live instance runs `2ddd581` (deployed 25 Oct 2026; DB migration `7d90f6ea8407` applied). The enrichment worker is OFF (the default stub extractor), every connector is registered but disabled, and the email + connectors launchd agents are not installed. On 25 Oct the Gmail connector was run by hand once: adopt linked 18 pasted emails and a first partial sync captured 20; it is not scheduled, and the remaining label backlog waits for the next manual sync. The reconciliation verdict cards (PR #99) and the Memory Management screen went live with this deploy.
 
 **Planned**
 
