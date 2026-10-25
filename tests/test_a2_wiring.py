@@ -798,6 +798,18 @@ def test_cap_counts_only_executed_jobs(monkeypatch):
     e1 = _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=3)
     e2 = _queued(session, source="email", text=SOURCE_BODY + " א", sent_days_ago=2)
     wa = _queued(session, source="whatsapp", text=WA_BODY, sent_days_ago=1)
+    # deterministic queue order: WhatsApp job OLDEST, then e1, then e2 —
+    # so on an unfiltered pass the WhatsApp job is reached first (this is
+    # what makes the test red without the filter, not lucky uuid order)
+    session.execute(
+        text(
+            "UPDATE enrichment_jobs SET queued_at = NOW() - "
+            "( INTERVAL '1 day' * CASE item_id "
+            "WHEN :wa THEN 3 WHEN :e1 THEN 2 ELSE 1 END )",
+            ),
+        {"wa": str(wa.id), "e1": str(e1.id)},
+    )
+    session.commit()
     # the pass seam bypasses _build_pass_service: the cap lives on the
     # service we inject (the real builder forwards settings.enrichment_daily_cap)
     service = EnrichmentService(ItemsRepository(session), session, daily_cap=1)
