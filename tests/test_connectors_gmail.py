@@ -375,6 +375,82 @@ class TestQueryPath:
         assert excinfo.value.status == 400
 
 
+class _LateMailMessages(_FakeMessages):
+    """messages.list that injects a late arrival AFTER its page was read:
+    m2 lands in the mailbox and the mailbox historyId moves past the
+    listing — the exact race the resume cursor must survive."""
+
+    def list(self, **kwargs):
+        req = super().list(**kwargs)
+        state = self._state
+        if not getattr(state, "arrived", False):
+            state.arrived = True
+            state.messages["m2"] = _msg_fixture("m2")
+            state.profile_history_id = "9100"
+        return req
+
+
+class _LateMailUsers(_FakeUsers):
+    def messages(self):
+        return _LateMailMessages(self._state)
+
+
+class _LateMailService(_FakeService):
+    def users(self):
+        return _LateMailUsers(self._state)
+
+
+class TestResumeCursorOrder:
+    """Finding 1: the resume historyId must be taken BEFORE the listing.
+
+    Taken after (the old behavior), a message arriving between the last
+    list page and getProfile is in neither the listing nor the future
+    history walk (the saved cursor is past its labelsAdded) — silently
+    never captured. Taken before, the next sync's history walk re-covers
+    the window; the re-delivered m1 is skipped by the ledger.
+    """
+
+    def _connector(self, state: _ServiceState):
+        from brain.config import Settings
+        from brain.connectors.google.gmail import GmailConnector
+
+        return GmailConnector(
+            token_loader=lambda: "refresh-token",
+            service_factory=lambda token, scopes, api, ver: _LateMailService(state),
+            settings=Settings(
+                gmail_min_call_interval_s=0.0,
+                gmail_label_id=LABEL,
+                gmail_query="",
+                gmail_credentials_path="",
+                _env_file=None,
+            ),
+        )
+
+    def test_message_arriving_during_the_listing_is_recovered_by_the_next_sync(self):
+        state = _ServiceState()
+        state.arrived = False
+        state.messages = {"m1": _msg_fixture("m1")}
+        state.list_result = {"messages": [{"id": "m1"}]}  # single page, no token
+        connector = self._connector(state)
+
+        first = connector.fetch(None, limit=200)
+        # m2 arrived (and the mailbox historyId moved to 9100) AFTER the
+        # listing ran: the saved cursor must predate the arrival.
+        assert first.next_cursor == "9002", (
+            "resume cursor was taken after the listing — m2 is skipped forever"
+        )
+
+        # The next sync walks history from the saved cursor and captures m2.
+        state.history_pages = {
+            "first": {
+                "history": [{"id": "h1", "messagesAdded": [{"message": {"id": "m2"}}]}],
+                "historyId": "9100",
+            }
+        }
+        second = connector.fetch(first.next_cursor, limit=200)
+        assert "m2" in [r.external_id for r in second.records]
+
+
 # --- history path (incremental sync) ------------------------------------------
 
 

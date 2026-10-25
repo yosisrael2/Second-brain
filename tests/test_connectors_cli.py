@@ -539,3 +539,40 @@ def test_email_dry_run_backstop_report_silent_for_known_ids(database, capsys, mo
     assert "would ledger" not in out
     with SessionLocal() as session:
         assert session.execute(sql_text("SELECT count(*) FROM connector_records")).scalar() == 1
+
+
+def test_sync_drain_continues_while_more_even_when_the_cursor_does_not_move(
+    settings_env, database, capsys, monkeypatch
+):
+    """Finding 4: a source that truncates WITHOUT a resume cursor (email's
+    query path: next_cursor=None, more=True) must keep the --drain loop
+    going — the old 'cursor unchanged means drained' rule stopped after ONE
+    batch and silently left the tail for later invocations."""
+    from sqlalchemy import text as sql_text
+
+    from brain.db.session import SessionLocal
+
+    connector = _StubGcal(
+        batches=[
+            FetchResult(
+                records=[
+                    make_record(external_id=f"r{i}", text=f"body {i}")
+                    for i in range(200)
+                ],
+                next_cursor=None,
+                more=True,  # truncated, no resume cursor
+            ),
+            FetchResult(
+                records=[make_record(external_id="r200", text="body 200")], next_cursor=None
+            ),
+        ]
+    )
+    monkeypatch.setattr(cli, "_build_connector", lambda name, session=None, **kwargs: connector)
+
+    assert cli.main(["connectors", "sync", "gcal", "--drain", "--limit", "200"]) == 0
+    out = capsys.readouterr().out
+    assert "created=201" in out  # the tail batch ran in the SAME invocation
+    assert connector.cursors == [None, None]
+    with SessionLocal() as session:
+        count = session.execute(sql_text("SELECT count(*) FROM memory_items")).scalar()
+    assert count == 201

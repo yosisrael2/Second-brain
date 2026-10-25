@@ -371,6 +371,12 @@ class GmailConnector(GoogleConnector):
         label = self._label_id()
         client = self._gmail()
         query = getattr(self._settings, "gmail_query", "") or ""
+        # The resume point is taken BEFORE the listing: a message that arrives
+        # while pages are being read sits AFTER this historyId, so the next
+        # sync's history walk re-covers it (re-delivery is idempotent through
+        # the ledger). Taken after the listing, the saved cursor would be past
+        # arrivals the listing never saw — silently lost mail.
+        resume_history_id = self._current_history_id()
         # Bounded listing (quota hygiene): a page of max(limit, 50) stubs —
         # never the whole label just to fill a small --limit.
         page_size = min(500, max(limit, 50))
@@ -410,9 +416,14 @@ class GmailConnector(GoogleConnector):
                 break
         next_cursor: str | None = None
         if not truncated:
-            # The whole listing fit: the current historyId is a safe resume point.
-            next_cursor = self._current_history_id()
-        return FetchResult(records=records, next_cursor=next_cursor, reset=reset)
+            # The whole listing fit: the PRE-listing historyId is a safe
+            # resume point — the next sync's history walk re-reports anything
+            # that arrived during the listing, and the ledger dedupes it.
+            next_cursor = resume_history_id
+        # more=True when the batch hit the limit: there are more records the
+        # source yields, and the resume cursor (None when truncated) cannot
+        # express it. The --drain loop and adopt._fetch_all keep going on it.
+        return FetchResult(records=records, next_cursor=next_cursor, reset=reset, more=truncated)
 
     def _current_history_id(self) -> str | None:
         client = self._gmail()

@@ -376,12 +376,25 @@ def _fetch_all(connector: Connector, *, limit: int) -> list[Any]:
 
     The cursor is NEVER persisted: adopt is outside the sync bookkeeping and
     the next real sync starts from its own state.
+
+    ``more=True`` (the source truncated the batch without a resume cursor —
+    the email query path) keeps the loop going even when next_cursor is
+    None: the re-fetch re-lists from the same cursor and the ledger/idempotency
+    machinery makes already-seen records cheap to skip. Bounded by
+    _MAX_ADOPT_BATCHES.
     """
     records: list[Any] = []
     cursor: str | None = None
     for _ in range(_MAX_ADOPT_BATCHES):
         result = connector.fetch(cursor, limit=limit)
         records.extend(result.records)
+        if result.more:
+            # Truncated: advance only when the source returned a new cursor;
+            # otherwise keep the current one (email's stays None — the
+            # re-fetch re-lists from the start and skips what it already saw).
+            if result.next_cursor is not None:
+                cursor = result.next_cursor
+            continue
         nxt = result.next_cursor
         if nxt is None or nxt == cursor:
             break

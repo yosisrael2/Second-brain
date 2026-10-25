@@ -1411,6 +1411,11 @@ def _connectors_sync(args: argparse.Namespace) -> int:
             # leaves the cursor unchanged means drained (or stuck); a failed/
             # re-authing batch stops the drain. 500 batches is a runaway
             # guard, not a knob.
+            # Exception (finding 4): a batch the source TRUNCATED without a
+            # resume cursor (email's query path: next_cursor=None, more=True)
+            # is not 'drained' — the source said it has more. The loop keeps
+            # going while summary.more is set, even when the cursor is
+            # None -> None (each re-list skips what the ledger already has).
             batches = 1
             previous_cursor = _cursor_of(state_repo, summary.connector)
             while summary.state == "ok" and summary.cursor_saved and batches < 500:
@@ -1418,8 +1423,8 @@ def _connectors_sync(args: argparse.Namespace) -> int:
                 summary = _merge_summary(summary, nxt)
                 batches += 1
                 current_cursor = _cursor_of(state_repo, summary.connector)
-                if current_cursor == previous_cursor:
-                    break  # no cursor movement: drained
+                if current_cursor == previous_cursor and not summary.more:
+                    break  # no cursor movement and nothing more: drained
                 previous_cursor = current_cursor
         connector.close()
     print(
@@ -1478,6 +1483,7 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
         skipped=acc.skipped + nxt.skipped,
         errors=acc.errors + nxt.errors,
         reset=nxt.reset,
+        more=nxt.more,
         cursor_saved=nxt.cursor_saved,
         error=nxt.error,
         retry_in_s=nxt.retry_in_s,

@@ -939,3 +939,24 @@ def test_deduped_create_counts_as_deduped_not_created(runner_db):
     assert h.item("new-id").id == existing.id
     # … and no second item exists.
     assert runner_db.query(MemoryItem).filter(MemoryItem.source == "gcal").count() == 1
+
+
+# --- FetchResult.more plumbing (finding 4) -------------------------------------
+
+
+def test_summary_carries_more_from_the_fetch_result(runner_db):
+    """The runner must surface the source's 'truncated, more coming' signal
+    (FetchResult.more) on the summary, so the CLI --drain loop can keep
+    going even when the cursor did not move (email's query path drops the
+    cursor when it truncates)."""
+    h = Harness(runner_db)
+    connector = FakeConnector(
+        batches=[FetchResult(records=[make_record()], next_cursor=None, more=True)]
+    )
+    summary = h.runner(connector).run()
+
+    assert summary.more is True
+    # ... and the default stays False for every other connector.
+    plain = Harness(runner_db)
+    plain_summary = plain.runner(FakeConnector(batches=[_batch(make_record("r2"))])).run()
+    assert plain_summary.more is False

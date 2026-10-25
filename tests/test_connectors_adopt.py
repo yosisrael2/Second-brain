@@ -903,3 +903,31 @@ def test_adopt_undo_keeps_stamp_on_refused_rows(adopt_db):
     kept = h.repo.get(h.records.get("gcal", "evt_1").item_id)
     assert kept is not None
     assert "connector_text_sha" in (kept.meta or {})  # untouched
+
+
+# --- _fetch_all + FetchResult.more (finding 4) ----------------------------------
+
+
+def test_fetch_all_drains_while_more_even_when_the_cursor_does_not_move():
+    """The email query path cannot express a mid-listing resume cursor: a
+    truncated batch carries next_cursor=None AND more=True. _fetch_all must
+    keep fetching while more is set (the 201st record must be counted),
+    instead of silently stopping after the first truncated batch."""
+    from brain.connectors.adopt import _fetch_all
+    from brain.connectors.testing import make_record
+
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(
+                records=[make_record(f"r{i}", text=f"body {i}") for i in range(200)],
+                next_cursor=None,
+                more=True,
+            ),
+            FetchResult(records=[make_record("r200", text="body 200")], next_cursor=None),
+        ],
+    )
+    records = _fetch_all(connector, limit=200)
+
+    assert len(records) == 201
+    assert connector.cursors == [None, None]  # the cursor never moved; still drained
