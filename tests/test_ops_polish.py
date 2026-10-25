@@ -228,3 +228,25 @@ class TestAskRecordOpsFlag:
                 sa_text("SELECT count(*) FROM ops_events WHERE component = 'ask'")
             ).scalar_one()
         assert rows >= 1  # the ask->search and ask->llm spans
+
+
+class TestEnrichmentWorkerSources:
+    def test_filtered_queue_does_not_alarm(self, client, ops_tables, monkeypatch):
+        """Follow-up A2 step 2: jobs waiting ONLY because of the worker's
+        source filter are queued, never stuck/failed/degraded — health shows
+        ok and states the filter."""
+        from brain.config import Settings
+
+        monkeypatch.setattr(
+            ops_health,
+            "get_settings",
+            lambda: Settings(
+                enrichment_worker_enabled=True,
+                enrichment_worker_sources="email",
+                _env_file=None,
+            ),
+        )
+        body = client.get("/ops/health").json()
+        enr = body["components"]["enrichment"]
+        assert enr["status"] == "ok"
+        assert enr["details"]["worker_sources"] == ["email"]

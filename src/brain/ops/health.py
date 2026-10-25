@@ -915,8 +915,13 @@ def _enrichment_check() -> dict[str, Any]:
     now = datetime.now(tz=UTC)
     with SessionLocal() as session:
         service = EnrichmentService(ItemsRepository(session), session)
+        settings = get_settings()
         details: dict[str, Any] = {
-            "worker_enabled": get_settings().enrichment_worker_enabled,
+            "worker_enabled": settings.enrichment_worker_enabled,
+            # A2 step 2: the worker's source filter (week 1: ["email"]);
+            # [] = every source. Queued jobs waiting only on the filter are
+            # NEVER degraded — they are the designed week-2 backlog.
+            "worker_sources": list(settings.worker_source_list),
             "extractor": get_settings().enrichment_extractor,
             "queue_depth": service.queue_depth(),
             "cap_used_today": service.cap_used_today(now),

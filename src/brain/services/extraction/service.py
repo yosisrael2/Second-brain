@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -217,7 +217,9 @@ class EnrichmentService:
         # reconciled candidate and reused afterwards — production and
         # recon-eval cannot drift. Health/ops constructions never pay.
         self.recon = ReconciliationService(
-            session, repo, tz_name=self._tz_name,
+            session,
+            repo,
+            tz_name=self._tz_name,
             # B1: tests may inject a hermetic factory; production gets the
             # ONE shared builder.
             similarity_factory=similarity_factory or self._build_recon_similarity,
@@ -259,11 +261,7 @@ class EnrichmentService:
 
     def queue_depth(self) -> int:
         """Jobs waiting to run right now (ops: queue depth)."""
-        return (
-            self._session.query(EnrichmentJob)
-            .filter(EnrichmentJob.state == "queued")
-            .count()
-        )
+        return self._session.query(EnrichmentJob).filter(EnrichmentJob.state == "queued").count()
 
     def cap_used_today(self, now: datetime) -> int:
         """LLM extractions charged to TODAY's daily budget (D5 accounting)."""
@@ -281,17 +279,30 @@ class EnrichmentService:
 
     # --- the runner ------------------------------------------------------
 
-    def run_once(self, now: datetime, *, limit: int = 20, backfill: bool = False) -> RunReport:
+    def run_once(
+        self,
+        now: datetime,
+        *,
+        limit: int = 20,
+        backfill: bool = False,
+        sources: Sequence[str] | None = None,
+    ) -> RunReport:
         """Drain due jobs oldest-first, respecting the daily cap (D5).
 
         ``backfill=True`` processes backfill-budget jobs (D6: their own
         budget, so a one-off backfill never eats the live daily cap).
+        ``sources`` scopes the pass to parents from those sources (the A2
+        step-2 worker filter; the CLI passes nothing and drains every
+        source). The filter is applied IN SQL — a filtered-out job never
+        blocks the scan and is never deferred or counted against the cap;
+        it simply stays queued for a wider (week 2+) configuration.
         """
+        wanted = tuple(dict.fromkeys(s.strip().lower() for s in sources)) if sources else None
         report = RunReport()
         budget = "backfill" if backfill else "daily"
         job_outcomes: list[SourceOutcome] = []
         while report.processed < limit:
-            job = self._next_due_job(now, budget)
+            job = self._next_due_job(now, budget, wanted)
             if job is None:
                 break
             if not backfill and self.cap_used_today(now) >= self._daily_cap:
@@ -321,7 +332,9 @@ class EnrichmentService:
 
         return ZoneInfo(self._tz_name)
 
-    def _next_due_job(self, now: datetime, budget: str) -> EnrichmentJob | None:
+    def _next_due_job(
+        self, now: datetime, budget: str, sources: Sequence[str] | None = None
+    ) -> EnrichmentJob | None:
         stmt = (
             select(EnrichmentJob)
             .where(EnrichmentJob.state == "queued")
@@ -329,6 +342,12 @@ class EnrichmentService:
             .order_by(EnrichmentJob.queued_at.asc(), EnrichmentJob.id.asc())
             .limit(25)
         )
+        if sources:
+            # IN SQL: 50 filtered-out jobs ahead must never starve the one
+            # job the worker wants (limit 25 could never reach it post-fetch).
+            stmt = stmt.join(MemoryItem, EnrichmentJob.item_id == MemoryItem.id).where(
+                MemoryItem.source.in_(sources)
+            )
         for job in self._session.scalars(stmt):
             if job.not_before is None or job.not_before <= now:
                 return job
@@ -490,9 +509,7 @@ class EnrichmentService:
             return None
 
     @staticmethod
-    def _narrow_audience(
-        default: list[str] | None, item_level: list[str]
-    ) -> list[str]:
+    def _narrow_audience(default: list[str] | None, item_level: list[str]) -> list[str]:
         """The item-level audience may only NARROW the source default (R1).
 
         - no default (no sender / no teacher match): item resolution stands.
@@ -599,15 +616,11 @@ class EnrichmentService:
             # the ONLY widening allowed past the source default.
             applies_to = item_level
         else:
-            applies_to = self._narrow_audience(
-                self._source_default_audience(source), item_level
-            )
+            applies_to = self._narrow_audience(self._source_default_audience(source), item_level)
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,
             "model": getattr(self._extractor, "name", "stub"),
-            "prompt_version": getattr(
-                self._extractor, "prompt_version", None
-            ),
+            "prompt_version": getattr(self._extractor, "prompt_version", None),
             "run_id": None,  # set at storage time
         }
         if candidate.derived_from is not None:
@@ -664,11 +677,15 @@ class EnrichmentService:
     # --- storage + diff (item 18, item 30) ----------------------------------
 
     def _children_of(self, source_id: uuid.UUID) -> dict[uuid.UUID, MemoryItem]:
-        rows = self._session.execute(
-            select(MemoryItem)
-            .join(ItemSource, ItemSource.child_id == MemoryItem.id)
-            .where(ItemSource.source_id == source_id)
-        ).scalars().all()
+        rows = (
+            self._session.execute(
+                select(MemoryItem)
+                .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+                .where(ItemSource.source_id == source_id)
+            )
+            .scalars()
+            .all()
+        )
         return {row.id: row for row in rows}
 
     @staticmethod
@@ -906,9 +923,7 @@ class EnrichmentService:
             commit=False,  # F1: write() below owns the single commit
         )
         recon.write(result, source=source, child=verdict_child)
-        return ReconOutcome(
-            verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id))
-        )
+        return ReconOutcome(verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id)))
 
     def _link_existing_quote(
         self, matched_id: uuid.UUID, source: MemoryItem, resolved: _ResolvedChild
@@ -923,9 +938,7 @@ class EnrichmentService:
         }
         for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
             if quote and quote not in existing_quotes:
-                self._session.add(
-                    ItemSource(child_id=matched_id, source_id=source.id, quote=quote)
-                )
+                self._session.add(ItemSource(child_id=matched_id, source_id=source.id, quote=quote))
         self._repo.commit()
 
     def _index_child(self, child: MemoryItem) -> None:
@@ -963,9 +976,7 @@ class EnrichmentService:
         existing_quotes = {
             row.quote
             for row in self._session.query(ItemSource)
-            .filter(
-                ItemSource.child_id == child.id, ItemSource.source_id == source.id
-            )
+            .filter(ItemSource.child_id == child.id, ItemSource.source_id == source.id)
             .all()
         }
         self._add_quote_links(child, source, resolved, skip_quotes=existing_quotes)
@@ -987,9 +998,7 @@ class EnrichmentService:
         for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
             if not quote or (skip_quotes and quote in skip_quotes):
                 continue
-            self._session.add(
-                ItemSource(child_id=child.id, source_id=source.id, quote=quote)
-            )
+            self._session.add(ItemSource(child_id=child.id, source_id=source.id, quote=quote))
 
 
 @dataclass(frozen=True)
