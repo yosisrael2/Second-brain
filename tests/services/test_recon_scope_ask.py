@@ -31,7 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from brain.ai.ask import FakeLLMClient
-from brain.db.models import ItemRelation, MemoryItem
+from brain.db.models import ItemRelation, MemoryItem, OpsEvent
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
 from brain.services.ask import AskService
@@ -323,6 +323,11 @@ def test_series_scope_prefills_future_member_cards(db):
     rel1 = db.query(ItemRelation).filter_by(kind="supersedes").one()
     service1 = _service(db, source1)
     service1.answer_series_scope(rel1.id, "from_now_on")
+    # the user CONFIRMS card 1 (the tap that keeps the child): only a KEPT
+    # child's decision is evidence for pre-filling (follow-up major 4 — a
+    # proposed sibling's answer is a proposal, not a confirmation)
+    child1.child_state = "kept"
+    db.commit()
 
     # a FUTURE member of the same series arrives as its own correction
     source2 = _make_source(db, text="שינוי: הטיול יוצא ב-19:00", series_uid="S1")
@@ -696,3 +701,263 @@ def test_series_scope_phrase_outside_the_quotes_leaves_question(db):
     assert len(rels) == 1  # only the original update; the later member untouched
     db.refresh(later)
     assert later.superseded_by is None
+
+
+# --- post-merge follow-ups (review majors 1-5 + minor) --------------------------
+
+
+def test_conflict_counterparts_exclude_dead_counterparts(db):
+    """MAJOR 1: a DROPPED, SUPERSEDED or CANCELLED counterpart is never a
+    conflict for the ask leg — only live counterparts are."""
+    existing = MemoryItem(
+        raw_text="טיול שנתי יוצא ב-16:00",
+        source="email",
+        type="event",
+        occurred_at=_jlm(10, 16, 0),
+        status="filed",
+    )
+    db.add(existing)
+    db.commit()
+    states = {
+        "proposed": "proposed",
+        "dropped": "dropped",
+        "superseded": "kept",  # superseded BY someone else
+        "cancelled": "kept",  # cancelled stamp
+    }
+    made: dict[str, MemoryItem] = {}
+    for name, state in states.items():
+        other = MemoryItem(
+            raw_text=f"טיול שנתי גרסה {name}",
+            source="email",
+            type="event",
+            occurred_at=_jlm(10, 17 + list(states).index(name), 0),
+            child_state=state,
+            extraction_meta=(
+                {"cancelled": {"by": "x", "relation_id": "r"}} if name == "cancelled" else {}
+            ),
+        )
+        if name == "superseded":
+            other.superseded_by = existing.id  # a real row: the FK needs one
+        db.add(other)
+        db.commit()
+        db.add(
+            ItemRelation(
+                from_id=other.id, to_id=existing.id, kind="conflicts",
+                provenance={"how": "recon"},
+            )
+        )
+        db.commit()
+        made[name] = other
+    repo = ItemsRepository(db)
+    pairs = repo.conflict_counterparts([existing.id])
+    counterpart_ids = {str(other.id) for _rel, other in pairs}
+    assert counterpart_ids == {str(made["proposed"].id)}
+
+
+def test_ask_conflict_leg_failure_degrades_to_plain_answer(db):
+    """MAJOR 2: the conflict leg runs INSIDE the fail-safe — a repo raising
+    from conflict_counterparts must not crash the ask; one ops event records
+    the failure and the answer proceeds without the leg."""
+    session, existing, _child = _ask_world()
+
+    class ExplodingRepo(ItemsRepository):
+        def conflict_counterparts(self, item_ids, *, limit=4):
+            raise RuntimeError("boom from the leg")
+
+    class RealStubLLM:
+        """NOT synthetic: its ask events are evidence (the failure event too)."""
+
+        synthetic = False
+
+        def complete(self, prompt: str):
+            from tests.test_ask_service import cite_every_source
+
+            from brain.ai.ask import Completion
+
+            return Completion(cite_every_source(prompt), model="real-stub")
+
+        def close(self) -> None:
+            return None
+
+    ask = AskService(
+        RecordingSearch([SearchHit(item=existing, score=0.9)]),
+        RealStubLLM(),
+        items_repo=ExplodingRepo(session),
+    )
+    result = ask.ask("מתי הטיול?", now=NOW)  # must NOT raise
+    assert result.answer
+    assert [s.item.id for s in result.sources] == [existing.id]
+    events = db.query(OpsEvent).filter_by(
+        component="ask", kind="conflict_leg_failed"
+    ).all()
+    assert len(events) == 1
+    session.close()
+
+
+def test_conflict_map_only_marks_ids_in_the_final_context(db):
+    """MAJOR 3: a counterpart dropped by the text dedupe must not keep a
+    dangling "conflicts with [id]" marker in the prompt — the map is built
+    against the FINAL context ids."""
+    session, existing, child = _ask_world()
+    child.raw_text = existing.raw_text  # the dedupe will drop the counterpart
+    db.commit()
+    llm = FakeLLMClient(
+        reply=lambda prompt: (
+            "Ctx: " + " ".join(line for line in prompt.splitlines() if line.startswith("- ["))
+        )
+    )
+    ask = AskService(
+        RecordingSearch([SearchHit(item=existing, score=0.9)]),
+        llm,
+        items_repo=ItemsRepository(session),
+    )
+    result = ask.ask("מתי הטיול?", now=NOW)
+    assert [s.item.id for s in result.sources] == [existing.id]  # child deduped away
+    prompt = llm.prompts[-1]
+    assert f"[{child.id}]" not in prompt  # no marker names an absent source
+    session.close()
+
+
+def test_series_scope_prefill_ignores_a_proposed_sibling(db):
+    """MAJOR 4: a prior decision on a STILL-PROPOSED sibling is not a user
+    confirmation — no pre_confirmed, the future member's card stays a
+    QUESTION. Only a KEPT child's decision pre-fills."""
+    source1 = _make_source(db, text="שינוי: הטיול יוצא ב-18:00", series_uid="S1")
+    _member(db, start=_jlm(10, 16, 0))
+    _run_update(db, source1, hint=ReconHint(change=True))
+    child1 = db.query(MemoryItem).filter(MemoryItem.child_state == "proposed").one()
+    rel1 = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    service1 = _service(db, source1)
+    service1.answer_series_scope(rel1.id, "from_now_on")
+    db.refresh(child1)
+    assert child1.extraction_meta["recon_series_scope"]["decided_at"] is not None
+    # child1 is STILL proposed: the user has not confirmed anything
+    assert child1.child_state == "proposed"
+
+    source2 = _make_source(db, text="שינוי: הטיול יוצא ב-19:00", series_uid="S1")
+    future_member = _member(db, start=_jlm(24, 16, 0), title=TITLE_FUTURE)
+    _service(db, source2)
+    service2, outcome2 = _run_update(
+        db, source2, hint=ReconHint(change=True),
+        title=TITLE_FUTURE, when_raw="24.11 19:00",
+        quote="הטיול יוצא ב-19:00",
+    )
+    assert outcome2 is not None and outcome2.verdict is Verdict.UPDATE
+    child2 = (
+        db.query(MemoryItem)
+        .filter(MemoryItem.child_state == "proposed")
+        .filter(MemoryItem.id != child1.id)
+        .one()
+    )
+    scope2 = child2.extraction_meta.get("recon_series_scope") or {}
+    assert scope2.get("scope") == "question"  # a question, NOT pre_confirmed
+    assert scope2.get("pre_confirmed") is not True
+    rels2 = [
+        r for r in db.query(ItemRelation).filter_by(kind="supersedes").all()
+        if str(r.to_id) == str(future_member.id)
+    ]
+    # exactly ONE relation reaches the future member: the original UPDATE
+    # from child2 itself — no spread, and nothing from the unconfirmed child1
+    assert len(rels2) == 1 and str(rels2[0].from_id) == str(child2.id)
+    assert (rels2[0].provenance or {}).get("state") == "proposed"
+    assert (
+        db.query(ItemRelation)
+        .filter_by(kind="supersedes", from_id=child1.id)
+        .filter(ItemRelation.id != rel1.id)
+        .all()
+    ) == []  # child1 spread nothing new either
+
+
+def test_series_spread_skips_dropped_members(db):
+    """MAJOR 5: dropped series members get NO proposed supersedes relation
+    (the docstring promises it; the filter now enforces it)."""
+    source = _make_source(db, text="שינוי: הטיול יוצא ב-18:00 מעכשיו לכל המפגשים", series_uid="S1")
+    _member(db, start=_jlm(10, 16, 0))
+    later = _member(db, start=_jlm(17, 16, 0), title=TITLE_LATER)
+    later.child_state = "dropped"
+    db.commit()
+    service, outcome = _run_update(
+        db, source, hint=ReconHint(change=True),
+        quote="הטיול יוצא ב-18:00 מעכשיו לכל המפגשים",
+    )
+    assert outcome is not None and outcome.verdict is Verdict.UPDATE
+    rels = db.query(ItemRelation).filter_by(kind="supersedes").all()
+    assert str(later.id) not in {str(r.to_id) for r in rels}
+
+
+def test_answer_series_scope_with_a_missing_child_is_a_value_error(db):
+    """MINOR: a supersedes relation whose child row is gone answers with a
+    clean ValueError, never an AttributeError on None."""
+    source = _make_source(db, text="שינוי: הטיול יוצא ב-18:00", series_uid="S1")
+    _member(db, start=_jlm(10, 16, 0))
+    service, outcome = _run_update(db, source, hint=ReconHint(change=True))
+    assert outcome is not None
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    db.execute(text("DELETE FROM memory_items WHERE child_state = 'proposed'"))
+    db.commit()
+    with pytest.raises(ValueError):
+        service.answer_series_scope(rel.id, "from_now_on")
+
+
+def test_ask_conflict_leg_survives_a_poisoned_query(db):
+    """MAJOR 2, round 2 (the #117 trap): a REAL db error inside the leg
+    aborts the ask's whole transaction — the catch alone only moves the
+    crash one step later, and the abort silently discards the session's
+    other uncommitted work. The leg's DB work must run in a SAVEPOINT so
+    only it rolls back: the ask answers, one ops event is recorded, and the
+    outer transaction's own work survives."""
+    existing = MemoryItem(
+        raw_text="טיול שנתי יוצא ב-16:00",
+        source="email",
+        type="event",
+        occurred_at=_jlm(10, 16, 0),
+        status="filed",
+    )
+    db.add(existing)
+    db.commit()
+
+    class PoisonedRepo(ItemsRepository):
+        def conflict_counterparts(self, item_ids, *, limit=4):
+            db.execute(text("SELECT * FROM no_such_table_reconfix"))
+            return []
+
+    class RealStubLLM:
+        """NOT synthetic: the leg-failure event must be recorded."""
+
+        synthetic = False
+
+        def complete(self, prompt: str):
+            from tests.test_ask_service import cite_every_source
+
+            from brain.ai.ask import Completion
+
+            return Completion(cite_every_source(prompt), model="real-stub")
+
+        def close(self) -> None:
+            return None
+
+    ask = AskService(
+        RecordingSearch([SearchHit(item=existing, score=0.9)]),
+        RealStubLLM(),
+        items_repo=PoisonedRepo(db),
+    )
+    # UNCOMMITTED outer-transaction work that must survive the failed leg:
+    # without the savepoint the poisoned statement aborts the WHOLE
+    # transaction and the rollback silently discards it
+    outer_write = MemoryItem(
+        raw_text="uncommitted outer work", source="email", type="fact"
+    )
+    db.add(outer_write)
+    db.flush()
+    result = ask.ask("מתי הטיול?", now=NOW)  # must NOT raise
+    assert result.answer
+    assert [s.item.id for s in result.sources] == [existing.id]
+    events = db.query(OpsEvent).filter_by(
+        component="ask", kind="conflict_leg_failed"
+    ).all()
+    assert len(events) == 1
+    # the outer transaction's own work SURVIVES the failed leg (the savepoint
+    # scopes the rollback to the leg; without it the abort eats this row)
+    assert db.get(MemoryItem, outer_write.id) is not None
+    db.commit()
+    assert db.get(MemoryItem, outer_write.id) is not None

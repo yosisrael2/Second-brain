@@ -999,6 +999,8 @@ class ReconciliationService:
         if rel is None or rel.kind != "supersedes":
             raise ValueError(f"not an update relation: {relation_id}")
         child = self._session.get(MemoryItem, rel.from_id)
+        if child is None:  # minor: the verdict child row is gone — fail clean
+            raise ValueError(f"the relation's child is gone: {rel.from_id}")
         meta = dict(child.extraction_meta or {})
         smeta = dict(meta.get("recon_series_scope") or {})
         series_id = smeta.get("series_id")
@@ -1091,8 +1093,10 @@ class ReconciliationService:
     ) -> dict[str, Any] | None:
         """The most recent stored series decision for this series (PR-b).
 
-        Only PROPOSED/AUTO children carry scope decisions; a dropped child's
-        decision is not evidence (the user rejected that proposal).
+        Only a KEPT child's decision is evidence: the user confirmed it
+        (the follow-up review major 4 — a still-PROPOSED sibling's stored
+        answer is a proposal, not a confirmation; a dropped child's
+        decision is out for the same reason).
         """
         from brain.db.models import MemoryItem  # noqa: PLC0415
 
@@ -1103,7 +1107,7 @@ class ReconciliationService:
                 .as_string() == series_id
             )
             .filter(MemoryItem.id != exclude_child_id)
-            .filter(MemoryItem.child_state != "dropped")
+            .filter(MemoryItem.child_state == "kept")
             .order_by(MemoryItem.created_at.desc())
             .limit(5)
             .all()
@@ -1146,6 +1150,11 @@ class ReconciliationService:
         )
         for cond in default_hidden_conditions():
             stmt = stmt.filter(cond)
+        # dropped members are dead proposals — the docstring promises they
+        # are skipped (follow-up review major 5)
+        stmt = stmt.filter(
+            MemoryItem.child_state.is_(None) | (MemoryItem.child_state != "dropped")
+        )
         rows = (
             stmt.filter(MemoryItem.id != matched_id)
             .filter(MemoryItem.id != child.id)
