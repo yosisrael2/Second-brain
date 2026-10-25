@@ -148,6 +148,11 @@ def _ends_before_cutoff(payload: dict[str, Any], tz: ZoneInfo, cutoff: datetime)
     return end is not None and end <= cutoff
 
 
+def _now() -> datetime:
+    """UTC now — injectable clock seam (tests shift it across midnight)."""
+    return datetime.now(UTC)
+
+
 def _future_edge(zone: ZoneInfo, future_days: int, now_utc: datetime) -> datetime:
     """The window's upper bound: midnight (``zone``) of today+future_days+1.
 
@@ -306,13 +311,12 @@ class GCalConnector(GoogleConnector):
         service = self._service()
         zone = self._zone()
         settings = self._settings()
-        cutoff = frozen_cutoff or datetime.now(UTC) - timedelta(
-            days=settings.brain_gcal_past_days
-        )
+        now = _now()
+        cutoff = frozen_cutoff or now - timedelta(days=settings.brain_gcal_past_days)
         # The rolling future window: full walks are bounded by the edge they
         # start with; a calendar whose COMPLETED edge is behind today's edge
         # must re-list the whole window (a day passed).
-        today_edge = _future_edge(zone, settings.brain_gcal_future_days, datetime.now(UTC))
+        today_edge = _future_edge(zone, settings.brain_gcal_future_days, now)
         records: list[SourceRecord] = []
         beyond_window = 0
         allowlist = self._calendar_ids()
@@ -425,12 +429,6 @@ class GCalConnector(GoogleConnector):
             }
         next_cursor = json.dumps(
             {"cutoff": cutoff.isoformat(), "calendars": dumped}, sort_keys=True
-        )
-        return FetchResult(
-            records=records,
-            next_cursor=next_cursor,
-            reset=reset,
-            stats={"beyond_window": beyond_window},
         )
         return FetchResult(
             records=records,

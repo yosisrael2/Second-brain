@@ -23,6 +23,7 @@ from tests.test_connectors_runner import Harness
 from brain.config import get_settings
 from brain.connectors import get as get_connector
 from brain.connectors.base import ConnectorRetryableError
+from brain.connectors.google import calendar as gcal_calendar
 from brain.connectors.google.calendar import (
     GCAL_SCOPE,
     GCalConnector,
@@ -1326,6 +1327,9 @@ def test_full_walk_resume_uses_the_edge_the_walk_started_with(
     monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
     monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
+    # The adapter reads the injectable clock seam: shift it +1 day for the
+    # resume so "the next day" is REAL (today's edge actually moves).
+    monkeypatch.setattr(gcal_calendar, "_now", _ShiftingNow.now)
     fake = _FakeCalendarService()
     fake.queue_page("primary", "", {"items": [_timed()], "nextPageToken": "p2"})
     conn = _connector(fake)
@@ -1339,12 +1343,9 @@ def test_full_walk_resume_uses_the_edge_the_walk_started_with(
     assert "edge" not in state  # not completed: not stamped
 
     # The next day: the resume reuses the walk's own edge.
-    _ShiftingNow.offset_days = 1
-    try:
-        fake.queue_page("primary", "p2", {"items": [_instance1()], "nextSyncToken": "sync-9"})
-        resumed = conn.fetch(result.next_cursor, limit=10)
-    finally:
-        _ShiftingNow.offset_days = 0
+    monkeypatch.setattr(_ShiftingNow, "offset_days", 1)  # auto-reverts
+    fake.queue_page("primary", "p2", {"items": [_instance1()], "nextSyncToken": "sync-9"})
+    resumed = conn.fetch(result.next_cursor, limit=10)
 
     resume_call = fake.calls[-1]
     assert resume_call["pageToken"] == "p2"

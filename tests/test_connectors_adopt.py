@@ -941,3 +941,44 @@ def test_format_report_caps_listed_rows_and_leads_with_totals(adopt_db):
     assert len(listed) == 20  # capped at 20 rows
     assert lines[new_section + 21] == "    … and 80 more"
     assert sum(1 for line in lines if line.startswith("    new-")) == 20
+
+
+def test_adopt_gcal_matches_a_real_google_web_ui_copy(adopt_db):
+    """End-to-end pasted-vs-google text shape (review round 3): a REAL
+    Google web-UI copy — title line, local time range, "Location: <room>"
+    line — pasted through the parser must adopt against the adapter-rendered
+    record of the SAME event (rule B). Fakes only: parse() + the pure
+    record_from_event renderer + FakeConnector; no live Google calls."""
+    from zoneinfo import ZoneInfo
+
+    from brain.connectors.google.calendar import record_from_event
+    from brain.services.paste import parse
+
+    pasted = parse(
+        "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nLocation: Room 3",
+        tz=ZoneInfo("Asia/Jerusalem"),
+    )
+    chunk = pasted.chunks[0]
+    h = Harness(adopt_db)
+    h.seed_legacy(
+        source="calendar",  # LEGACY_SOURCES["gcal"] == "calendar"
+        raw_text=chunk.raw_text,
+        occurred_at=chunk.occurred_at,
+        meta=dict(chunk.meta),
+    )
+    record = record_from_event(
+        {
+            "id": "evt_1",
+            "summary": "Team sync",
+            "start": {"dateTime": "2026-10-21T10:00:00+03:00"},
+            "end": {"dateTime": "2026-10-21T11:00:00+03:00"},
+            "location": "Room 3",
+            "etag": '"v1"',
+        },
+        ZoneInfo("Asia/Jerusalem"),
+    )
+
+    report = adopt_connector(FakeConnector(name="gcal", batches=[_batch(record)]), adopt_db)
+
+    assert report.rules == {"evt_1": "B"}
+    assert report.adopted and report.adopted[0][0][0] == "evt_1"
