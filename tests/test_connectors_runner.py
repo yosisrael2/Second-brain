@@ -960,3 +960,109 @@ def test_summary_carries_more_from_the_fetch_result(runner_db):
     plain = Harness(runner_db)
     plain_summary = plain.runner(FakeConnector(batches=[_batch(make_record("r2"))])).run()
     assert plain_summary.more is False
+
+# --- PR-c finding (6): a tombstone must be able to clear a quarantine --------
+
+def test_tombstone_clears_quarantine(runner_db):
+    """PR-c finding (6): a deletion whose application fails 3x is QUARANTINED
+    with the failing version recorded — for Gmail that version is None (all
+    gmail records are version=None by design). When the transient failure
+    heals and the source re-offers the SAME tombstone (version=None), the
+    version-equality skip at the quarantine gate holds it skipped forever and
+    the item stays visible despite the source deletion. A deleted=True record
+    must always reach the deletion path."""
+    h = Harness(runner_db)
+
+    # A transient repo hiccup on the deletion path: children_of raises while
+    # armed (a DB hiccup healing later — the tombstone is re-offered after).
+    real_children = h.repo.children_of
+
+    def flaky_children(item_id: Any) -> Any:
+        if getattr(flaky_children, "armed", False):
+            raise RuntimeError("simulated transient repo failure")
+        return real_children(item_id)
+
+    h.repo.children_of = flaky_children
+    tombstone = make_record(external_id="q1", version=None, deleted=True, text="")
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record(external_id="q1", version=None)),  # created
+            _batch(tombstone),  # deletion attempt 1: transient failure
+            _batch(tombstone),  # attempt 2
+            _batch(tombstone),  # attempt 3 -> quarantined, cursor advances
+            _batch(tombstone),  # healed: the tombstone must now apply
+        ]
+    )
+    runner = h.runner(connector)
+
+    runner.run()
+    assert h.item("q1") is not None  # created, visible
+
+    flaky_children.armed = True
+    h.tick(backoff_seconds(1) + 1)
+    runner.run()  # fail 1
+    h.tick(backoff_seconds(2) + 1)
+    runner.run()  # fail 2
+    h.tick(backoff_seconds(4) + 1)
+    s3 = runner.run()  # fail 3 -> quarantined (errors 0, cursor advances)
+    assert s3.errors == 0 and s3.cursor_saved is True
+    row = h.records.get("gcal", "q1")
+    assert row is not None and row.status == "failed"  # precondition: quarantined
+    assert row.version is None  # the None the re-offered tombstone carries
+    assert h.item("q1").meta.get("source_deleted") is not True  # type: ignore[union-attr]
+
+    flaky_children.armed = False  # the transient failure heals
+    s = runner.run()  # the healed tombstone is re-offered
+
+    assert s.deleted >= 1, "the healed tombstone must reach the deletion path"
+    row = h.records.get("gcal", "q1")
+    assert row is not None and row.status != "failed", "quarantine cleared"
+    assert row.fail_count == 0
+    item = h.item("q1")
+    assert item is not None
+    assert item.meta.get("source_deleted") is True, "the item is hidden"
+
+
+def test_quarantine_still_holds_same_version_content_record(runner_db):
+    """The OTHER half of the (6) rule: a CONTENT record (deleted=False) whose
+    version equals the quarantined row's is still skipped unattempted — the
+    quarantine keeps protecting against a poison record. Only tombstones
+    bypass the version-equality skip."""
+    h = Harness(runner_db)
+    real_create = h.ingest.create
+
+    def flaky_create(payload: Any) -> Any:
+        if payload.raw_text == "poison body":
+            raise RuntimeError("simulated ingest failure")
+        return real_create(payload)
+
+    h.ingest.create = flaky_create
+    # Quarantine via the REAL poison-create path (the item is never captured,
+    # the ledger row holds the failing version "v1").
+    connector = FakeConnector(
+        batches=[
+            _batch(make_record(external_id="q2", version="v1", text="poison body")),
+            _batch(make_record(external_id="q2", version="v1", text="poison body")),
+            _batch(make_record(external_id="q2", version="v1", text="poison body")),
+            _batch(make_record(external_id="q2", version="v1", text="still poison")),
+        ]
+    )
+    runner = h.runner(connector)
+    runner.run()  # fail 1: errors 1, cursor held
+    h.tick(backoff_seconds(1) + 1)
+    runner.run()  # fail 2
+    h.tick(backoff_seconds(2) + 1)
+    s3 = runner.run()  # fail 3 -> quarantined, cursor advances
+    assert s3.errors == 0 and s3.cursor_saved is True
+    row = h.records.get("gcal", "q2")
+    assert row is not None and row.status == "failed"  # precondition
+    assert row.version == "v1" and row.fail_count == 3
+
+    s = runner.run()  # same-version CONTENT record: must stay skipped
+
+    assert s.errors == 0
+    assert s.skipped >= 1
+    row = h.records.get("gcal", "q2")
+    assert row is not None and row.status == "failed", "still quarantined"
+    assert row.fail_count == 3
+    assert h.item("q2") is None  # never captured

@@ -324,9 +324,13 @@ class ConnectorRunner:
 
         if row is not None and row.status == "failed":
             # QUARANTINED: not attempted, not an error — the cursor advances.
-            if record.version == row.version:
+            # A TOMBSTONE always gets through: Gmail records (and Drive's
+            # payload-less tombstones) carry version=None — the same None the
+            # quarantined row stores — so version-equality alone would keep a
+            # deleted message's item visible forever (PR-c finding 6).
+            if record.version == row.version and not record.deleted:
                 return "skipped"
-            # The source bumped the version: one more chance.
+            # A tombstone — or a version bump: one more chance.
             self._records.clear_failure(name, record.external_id)
             row = self._records.get(name, record.external_id)
 
