@@ -1229,3 +1229,60 @@ def test_reset_reconcile_is_idempotent(runner_db):
     assert item is not None and item.meta.get("source_deleted") is True
 
 
+
+
+def test_reset_reconcile_excludes_already_source_deleted_items(runner_db):
+    """Review fix: the diff base must be the LIVE ledger set only. Rows whose
+    item is already source_deleted (earlier label removals / tombstones) are
+    legitimately absent from any sweep — counting them as missing would push
+    every future reconcile over the ceilings and hide real deletions behind
+    the refusal. 10 live + 5 already deleted; a sweep listing 9 live misses
+    exactly 1 → exactly 1 tombstone, no refusal (pre-fix: 6 of 15 = 40% ->
+    refused, deleted == 0)."""
+    h = Harness(runner_db)
+    live = [f"r{i}" for i in range(1, 11)]
+    gone = [f"d{i}" for i in range(1, 6)]
+    _seed_items(h, live + gone)
+    # Source-delete the 5 through the REAL deletion path (version bump).
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            _batch(
+                *[
+                    make_record(
+                        external_id=eid, source="email", version="v2", deleted=True, text=""
+                    )
+                    for eid in gone
+                ]
+            )
+        ],
+    )
+    h.runner(connector).run()
+    assert all(_email_item(h, eid).meta.get("source_deleted") is True for eid in gone)
+
+    # Reset: the sweep lists 9 of the 10 LIVE ids (r10 lost its label since).
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(records=[], next_cursor="h2", reset=True,
+                        full_listing_ids=tuple(live[:9])),
+        ],
+    )
+    from sqlalchemy import text as sql_text
+
+    # ops_events is never cleaned between tests: count the DELTA.
+    refused_before = h.session.execute(
+        sql_text("SELECT count(*) FROM ops_events WHERE kind = 'reset_reconcile_refused'")
+    ).scalar()
+
+    s = h.runner(connector).run()
+
+    assert s.deleted == 1, "exactly the one newly-missing live id is tombstoned"
+    item = _email_item(h, "r10")
+    assert item is not None and item.meta.get("source_deleted") is True
+    refused_after = h.session.execute(
+        sql_text("SELECT count(*) FROM ops_events WHERE kind = 'reset_reconcile_refused'")
+    ).scalar()
+    assert refused_after == refused_before, (
+        "no refusal: the already-deleted rows are not diff candidates"
+    )

@@ -16,10 +16,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from brain.db.models import ConnectorRecord, ConnectorState
+from brain.db.models import ConnectorRecord, ConnectorState, MemoryItem
 
 _LAST_ERROR_MAX = 2000  # keep the column small; errors are truncated
 
@@ -93,14 +93,26 @@ class ConnectorRecordRepo:
         return self._session.scalars(stmt).first()
 
     def external_ids(self, source: str) -> set[str]:
-        """Live-captured external ids for ONE source (rows with an item).
+        """LIVE captured external ids for ONE source (rows with an item that
+        is not already source-deleted).
 
-        The reset reconcile's diff base (PR-c finding 5). Rows whose item was
-        deleted by the USER (item_id NULL) are excluded — the sweep never
-        resurrects and never tombstones those.
+        The reset reconcile's diff base AND its 25% denominator (PR-c finding
+        5, review fix): rows whose item is already source_deleted (earlier
+        label removals / tombstones — the flag the runner's deletion path
+        writes, runner.py _apply_deletion) are legitimately absent from any
+        sweep; counting them as missing would push every future reconcile
+        over the ceilings and hide real deletions behind the refusal. Rows
+        whose item was deleted by the USER (item_id NULL) are excluded too —
+        the sweep never resurrects and never tombstones those.
         """
-        stmt = select(ConnectorRecord.external_id).where(
-            ConnectorRecord.source == source, ConnectorRecord.item_id.is_not(None)
+        deleted_flag = MemoryItem.meta["source_deleted"].as_boolean()
+        stmt = (
+            select(ConnectorRecord.external_id)
+            .join(MemoryItem, ConnectorRecord.item_id == MemoryItem.id)
+            .where(
+                ConnectorRecord.source == source,
+                or_(deleted_flag.is_(None), deleted_flag.is_(False)),
+            )
         )
         return set(self._session.scalars(stmt))
 
