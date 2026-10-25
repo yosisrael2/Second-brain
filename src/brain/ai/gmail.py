@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
+# The LABELER's scope set: readonly + gmail.modify (label writes). Used ONLY
+# by the labeler's client and `brain gmail-label --auth`; the sync/poller/
+# connector credential path keeps GMAIL_SCOPE (readonly) exactly as before —
+# the live token holds readonly only, and requesting modify at its refresh
+# would risk invalid_scope and break mail ingest before the user re-consents.
+GMAIL_LABEL_SCOPES = (
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
+)
+
 
 class GmailError(RuntimeError):
     """A Gmail call failed transiently (network, 5xx) — retry with backoff.
@@ -103,6 +113,18 @@ class GmailMessage:
     label_ids: list[str] = field(default_factory=list)
     body_text: str = ""
     attachments: list[GmailAttachmentRef] = field(default_factory=list)
+    # Every header (name -> value) — the labeler classifies on List-Id, which
+    # is not a GmailMessage field; bodies stay unparsed for metadata reads.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class GmailLabel:
+    """A Gmail label (users.labels): id + name ('SB/School' for ours)."""
+
+    id: str
+    name: str
+    type: str = "user"
 
 
 class GmailClient(Protocol):
@@ -371,6 +393,53 @@ class RestGmailClient:
         )
         return _message_from_payload(raw)
 
+    def get_message_metadata(self, message_id: str) -> GmailMessage:
+        """One message's HEADERS + labelIds (format=metadata, no body) — the
+        labeler classifies on sender/subject only, so it never pulls bodies."""
+        service = self._get_service()
+        raw = self._execute(
+            service.users().messages().get(
+                userId=self._user_id, id=message_id, format="metadata"
+            )
+        )
+        return _message_from_payload(raw)
+
+    def list_labels(self) -> list[GmailLabel]:
+        """All the account's labels (users.labels.list — readonly scope)."""
+        service = self._get_service()
+        result = self._execute(service.users().labels().list(userId=self._user_id))
+        return [
+            GmailLabel(id=lb["id"], name=lb.get("name", ""), type=lb.get("type", "user"))
+            for lb in (result.get("labels") or [])
+        ]
+
+    def create_label(self, name: str) -> GmailLabel:
+        """Create one user label (users.labels.create — WRITE: gmail.modify)."""
+        service = self._get_service()
+        result = self._execute(
+            service.users().labels().create(
+                userId=self._user_id,
+                body={"labelListVisibility": "labelShow", "messageListVisibility": "show",
+                      "name": name},
+            )
+        )
+        return GmailLabel(id=result["id"], name=result.get("name", name))
+
+    def modify_message_labels(
+        self, message_id: str, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None:
+        """Add/remove label ids on ONE message (users.messages.modify —
+        WRITE: gmail.modify). Label-only by contract: the labeler never
+        removes INBOX and never archives/trashes."""
+        service = self._get_service()
+        self._execute(
+            service.users().messages().modify(
+                userId=self._user_id,
+                id=message_id,
+                body={"addLabelIds": list(add), "removeLabelIds": list(remove)},
+            )
+        )
+
     def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
         service = self._get_service()
         raw = self._execute(
@@ -492,6 +561,10 @@ def _message_from_payload(raw: dict[str, Any]) -> GmailMessage:
         label_ids=list(raw.get("labelIds") or []),
         body_text=body_text,
         attachments=attachments,
+        extra_headers={
+            str(h.get("name")): str(h.get("value", ""))
+            for h in raw.get("payload", {}).get("headers", [])
+        },
     )
 
 

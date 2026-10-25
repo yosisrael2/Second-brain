@@ -56,20 +56,16 @@ def scopes_for(enabled: Sequence[str]) -> list[str]:
     return scopes
 
 
-def default_service_factory(
-    refresh_token: str, scopes: list[str], api_name: str, api_version: str
-) -> Any:
-    """Production service factory: the ONLY place google libs are imported.
-
-    Same client-secret file and keychain token as the email source (one OAuth
-    client, one refresh token); ``scopes`` is the union from :func:`scopes_for`.
-    """
+def oauth_client_config(settings: Any = None) -> dict[str, str]:
+    """The OAuth client (client_id/client_secret/token_uri) from the
+    configured secret file — the labeler's granted-scope check reuses the
+    SAME client the credential builders use (one OAuth client, one token)."""
     import json  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
 
     from brain.config import get_settings  # noqa: PLC0415
 
-    path = get_settings().gmail_credentials_path
+    path = (settings or get_settings()).gmail_credentials_path
     client_file = Path(path).expanduser() if path else None
     if not client_file or not client_file.is_file():
         raise ConnectorAuthError(
@@ -91,6 +87,21 @@ def default_service_factory(
             f"client secret file at {path!r} is not an OAuth client JSON "
             "(client_id/client_secret/token_uri missing)"
         )
+    return {"client_id": client_id, "client_secret": client_secret, "token_uri": token_uri}
+
+
+def default_service_factory(
+    refresh_token: str, scopes: list[str], api_name: str, api_version: str
+) -> Any:
+    """Production service factory: the ONLY place google libs are imported.
+
+    Same client-secret file and keychain token as the email source (one OAuth
+    client, one refresh token); ``scopes`` is the union from :func:`scopes_for`.
+    """
+    client = oauth_client_config()
+    client_id = client["client_id"]
+    client_secret = client["client_secret"]
+    token_uri = client["token_uri"]
     try:
         # Lazy + importlib: keeps mypy clean whether or not the gmail extra is
         # installed (warn_unused_ignores would make static ignores flaky).

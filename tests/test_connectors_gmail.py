@@ -146,6 +146,25 @@ class _FakeMessages:
             return _FakeRequest(error=_FakeHttpError(404, b"Requested entity was not found"))
         return _FakeRequest(result=msg)
 
+    def modify(self, userId, id, body):  # noqa: N803, A002
+        self._state.calls.append(
+            ("messages.modify", {"id": id, "body": dict(body)})
+        )
+        if self._state.modify_error is not None:
+            return _FakeRequest(error=self._state.modify_error)
+        msg = self._state.messages.get(id)
+        if msg is None:
+            return _FakeRequest(error=_FakeHttpError(404, b"Requested entity was not found"))
+        labels = list(msg.get("labelIds") or [])
+        for lid in body.get("addLabelIds") or []:
+            if lid not in labels:
+                labels.append(lid)
+        for lid in body.get("removeLabelIds") or []:
+            if lid in labels:
+                labels.remove(lid)
+        msg["labelIds"] = labels
+        return _FakeRequest(result={"id": id, "labelIds": labels})
+
     def attachments(self):
         # Real API shape: users.messages.attachments.get
         return _FakeAttachments(self._state)
@@ -198,9 +217,35 @@ class _FakeUsers:
     def history(self):
         return _FakeHistory(self._state)
 
+    def labels(self):
+        return _FakeLabels(self._state)
+
     def getProfile(self, userId):  # noqa: N803
         self._state.calls.append(("getProfile", {"userId": userId}))
         return _FakeRequest(result={"historyId": self._state.profile_history_id})
+
+
+class _FakeLabels:
+    def __init__(self, state):
+        self._state = state
+
+    def list(self, **kwargs):
+        self._state.calls.append(("labels.list", kwargs))
+        if self._state.list_labels_error is not None:
+            return _FakeRequest(error=self._state.list_labels_error)
+        return _FakeRequest(
+            result={"labels": list(self._state.list_labels_result.get("labels") or [])}
+        )
+
+    def create(self, **kwargs):
+        self._state.calls.append(("labels.create", kwargs))
+        if self._state.create_error is not None:
+            return _FakeRequest(error=self._state.create_error)
+        name = (kwargs.get("body") or {}).get("name")
+        lid = self._state.next_label_id
+        self._state.next_label_id += 1
+        self._state.list_labels_result["labels"].append({"id": lid, "name": name, "type": "user"})
+        return _FakeRequest(result={"id": lid, "name": name, "type": "user"})
 
 
 class _FakeService:
@@ -234,6 +279,13 @@ class _ServiceState:
         self.profile_history_id = "9002"
         self.attachment_blobs: dict[str, str] = {}
         self.attachment_error: Exception | None = None
+        # Labeler seams (PR: gmail-labeler v1).
+        self.labels: dict[str, str] = {}  # name -> label id (name-keyed view)
+        self.list_labels_result: dict = {"labels": []}
+        self.list_labels_error: Exception | None = None
+        self.create_error: Exception | None = None
+        self.modify_error: Exception | None = None
+        self.next_label_id = 1000
 
 
 def _connector(

@@ -209,6 +209,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Run one poll cycle and exit (also used by tests)",
     )
+    gmail_label = subparsers.add_parser(
+        "gmail-label",
+        help="Apply SB/ labels by rule (dry-run by default; --apply is "
+        "explicit and capped; label-only, undo-able, ops-audited)",
+    )
+    gmail_label.add_argument(
+        "--apply", action="store_true",
+        help="Actually write labels (default: dry-run, zero writes)",
+    )
+    gmail_label.add_argument(
+        "--max-apply", type=int, default=20,
+        help="Hard per-run cap on applied labels (default: 20)",
+    )
+    gmail_label.add_argument(
+        "--max-scan", type=int, default=100,
+        help="Bound on metadata GETs per run (quota hygiene; default: 100)",
+    )
+    gmail_label.add_argument(
+        "--auth", action="store_true",
+        help="One-time consent for the LABELER scope set (readonly + "
+        "gmail.modify); REPLACES the shared keychain refresh token the sync "
+        "also uses — a superset, so the readonly sync keeps working. The "
+        "sync path itself still requests readonly only",
+    )
+    gmail_label.add_argument("--undo", metavar="BATCH_ID", default=None,
+                             help="Remove exactly the labels ONE batch added")
+    gmail_label.add_argument("--audit", nargs="?", const="ALL", metavar="BATCH_ID",
+                             help="Print one batch's (or every batch's) applied labels")
     connectors = subparsers.add_parser(
         "connectors", help="Pluggable data sources (connectors ticket)"
     )
@@ -311,6 +339,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _gmail_auth(args)
     if args.command == "gmail-poll":
         return _gmail_poll(args)
+    if args.command == "gmail-label":
+        return _gmail_label(args)
     if args.command == "connectors":
         if args.connectors_command == "list":
             return _connectors_list()
@@ -1084,15 +1114,23 @@ def _normalize_calendar(
 # --- gmail (email source, F2) -------------------------------------------------
 
 
-def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs google libs
-    """Build the installed-app OAuth flow (the ONLY google import in the CLI)."""
+def _build_oauth_flow(
+    client_secret_path: str, scopes: list[str] | None = None
+):  # pragma: no cover - needs google libs
+    """Build the installed-app OAuth flow (the ONLY google import in the CLI).
+
+    ``scopes=None`` = the SYNC scope (GMAIL_SCOPE, readonly) — the poller/
+    connector path is untouched; the labeler passes GMAIL_LABEL_SCOPES.
+    """
     try:
         from google_auth_oauthlib.flow import InstalledAppFlow
     except ImportError as exc:
         raise SystemExit(
             "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=[GMAIL_SCOPE])
+    return InstalledAppFlow.from_client_secrets_file(
+        client_secret_path, scopes=scopes if scopes is not None else [GMAIL_SCOPE]
+    )
 
 
 def _gmail_auth(args: argparse.Namespace) -> int:
@@ -1318,6 +1356,225 @@ def _connectors_list() -> int:
     if records:
         print("records: " + ", ".join(f"{source}={n}" for source, n in sorted(records.items())))
     return 0
+
+
+def _gmail_label(args: argparse.Namespace) -> int:
+    """The SB/ labeler: rules over headers only (no Jev, no external LLM),
+    dry-run by default, label-only writes capped at --max-apply, undo-able,
+    ops-audited. Kid names come from CONFIRMED memory at runtime."""
+    import os
+    import uuid as _uuid
+
+    from brain.config import assert_not_live_store, get_settings
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+
+    if args.auth:
+        return _labeler_auth(settings)
+    if args.undo:
+        # Writes: behind the SAME consent gate as --apply (exit 78, zero
+        # calls) and a modify-scoped client.
+        if (gate := _labeler_gate(settings)) != 0:
+            return gate
+        from brain.services.gmail_labeler import undo_batch
+
+        with SessionLocal() as session:
+            undone = undo_batch(
+                _labeler_client(settings, modify=True), args.undo, session=session
+            )
+        print(f"gmail-label: undone {undone} label(s) for batch {args.undo}")
+        return 0
+    if args.audit:
+        _labeler_audit(args.audit)
+        return 0
+
+    from brain.services.gmail_labeler import load_rules
+
+    if args.apply:
+        # The consent check FIRST — before ANY Gmail call (reads included):
+        # a readonly-only token fails with the re-consent message and zero
+        # calls. The live token holds readonly only until `brain gmail-label
+        # --auth` is run by the USER.
+        if (gate := _labeler_gate(settings)) != 0:
+            return gate
+
+    from brain.repositories.memory import MemoryRepository
+    from brain.services.gmail_labeler import plan_labels
+    from brain.services.memory import MemoryService
+    from brain.services.triage import confirmed_kid_names
+
+    rules = load_rules(settings.gmail_labeler_rules_path)
+    with SessionLocal() as session:
+        kid_names = confirmed_kid_names(
+            MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
+        )
+    client = _labeler_client(settings, modify=False)
+    plans = plan_labels(
+        client, rules=rules, kid_names=kid_names,
+        label_id=settings.gmail_label_id, query=settings.gmail_query,
+        max_scan=args.max_scan,
+    )
+    print(f"gmail-label: {len(plans)} message(s) to label "
+          f"(kids: {len(kid_names)}, scan cap {args.max_scan})")
+    for plan in plans:
+        print(f"  {plan.gmail_id} -> {plan.label_path} ({plan.source})")
+    if not args.apply:
+        print("gmail-label: dry-run — zero writes (pass --apply, capped at "
+              f"--max-apply {args.max_apply})")
+        return 0
+    from brain.services.gmail_labeler import apply_labels
+
+    batch_id = _uuid.uuid4().hex[:12]
+    applied = apply_labels(
+        _labeler_client(settings, modify=True), plans,
+        max_apply=args.max_apply, batch_id=batch_id,
+    )
+    print(f"gmail-label: applied {applied} label(s), batch {batch_id} "
+          f"(undo: brain gmail-label --undo {batch_id})")
+    return 0
+
+
+def _labeler_gate(settings: Any) -> int:
+    """0 when the keychain token's GRANTED scopes include gmail.modify;
+    78 (with the re-consent message) otherwise. Runs before ANY Gmail call —
+    a revoked/invalid_grant token is a clean exit, never a traceback."""
+    from brain.ai.gmail import GmailAuthError
+    from brain.services.gmail_labeler import token_grants_modify
+
+    try:
+        ok = token_grants_modify(
+            _labeler_token(), client_config=_labeler_client_config(settings)
+        )
+    except GmailAuthError as exc:
+        print(f"gmail-label: {exc}", file=sys.stderr)
+        return 78
+    if ok:
+        return 0
+    print(
+        "gmail-label: the keychain token does not grant gmail.modify — "
+        "run `brain gmail-label --auth` to consent (readonly + labels); "
+        "nothing was read or written",
+        file=sys.stderr,
+    )
+    return 78
+
+
+def _labeler_token() -> str:
+    """The keychain refresh token (the labeler's own error when absent)."""
+    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+
+    token = Keychain().read(GMAIL_ACCOUNT)
+    if not token:
+        print(
+            "gmail-label: no Google refresh token in the keychain — run "
+            "`brain gmail-label --auth` first",
+            file=sys.stderr,
+        )
+        raise SystemExit(78)
+    return token
+
+
+def _labeler_client_config(settings: Any) -> dict[str, str]:
+    """The OAuth client config (id/secret/token_uri) from the secret file."""
+    from brain.connectors.google.base import oauth_client_config
+
+    return oauth_client_config(settings)
+
+
+def _labeler_auth(settings: Any) -> int:
+    """The LABELER's consent: GMAIL_LABEL_SCOPES (readonly + gmail.modify).
+
+    REPLACES the shared keychain refresh token the sync also uses — the new
+    grant is a SUPERSET, so the readonly sync keeps working (it still
+    requests readonly only). The user must know this before consenting.
+    The re-consent is a USER action.
+    """
+    from brain.ai.gmail import GMAIL_LABEL_SCOPES
+
+    path = settings.gmail_credentials_path
+    if not path:
+        print(
+            "gmail-label --auth: no client secret — set GMAIL_CREDENTIALS_PATH. "
+            "Keep the file OUTSIDE the repo.",
+            file=sys.stderr,
+        )
+        return 78
+    flow = _build_oauth_flow(path, scopes=list(GMAIL_LABEL_SCOPES))
+    print(
+        "gmail-label --auth: opening the browser for Google consent "
+        f"(scopes: {', '.join(GMAIL_LABEL_SCOPES)})…"
+    )
+    try:
+        flow.run_local_server(port=0)
+        token = flow.credentials.refresh_token
+    except Exception as exc:  # noqa: BLE001 — consent windows can be closed
+        print(f"gmail-label --auth: consent failed: {exc}", file=sys.stderr)
+        return 78
+    if not token:
+        print("gmail-label --auth: consent returned no refresh token", file=sys.stderr)
+        return 78
+    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+
+    Keychain().store(GMAIL_ACCOUNT, token)
+    print(
+        f"gmail-label --auth: refresh token stored in the login keychain "
+        f"(service second-brain-gmail, account {GMAIL_ACCOUNT}) for scopes: "
+        f"{', '.join(GMAIL_LABEL_SCOPES)}"
+    )
+    return 0
+
+
+def _labeler_client(settings: Any, *, modify: bool) -> Any:
+    """RestGmailClient over the shared keychain token, paced by the same
+    quota-hygiene interval as the connector. ``modify=False`` (the PLANNING
+    client — dry-run and the plan phase of --apply) requests [GMAIL_SCOPE]
+    readonly ONLY: the dry-run is the first thing the user runs and today's
+    token holds readonly only, so asking for modify at its refresh would
+    break it with invalid_scope. ``modify=True`` (the WRITE client — apply
+    and undo, both behind the gate) requests GMAIL_LABEL_SCOPES."""
+    from brain.ai.gmail import GMAIL_LABEL_SCOPES, GMAIL_SCOPE, RestGmailClient
+    from brain.connectors.google.base import default_service_factory
+
+    token = _labeler_token()
+    scopes = list(GMAIL_LABEL_SCOPES) if modify else [GMAIL_SCOPE]
+    service = default_service_factory(token, scopes, "gmail", "v1")
+    return RestGmailClient(
+        service=service,
+        min_interval_s=settings.gmail_min_call_interval_s,
+    )
+
+
+def _labeler_audit(batch: str) -> None:
+    from sqlalchemy import text
+
+    with SessionLocal() as session:
+        if batch == "ALL":
+            rows = session.execute(
+                text(
+                    "SELECT detail->>'batch' AS batch, kind, detail "
+                    "FROM ops_events WHERE component = 'gmail-label' "
+                    "AND kind IN ('apply', 'undo') ORDER BY ts"
+                )
+            ).all()
+        else:
+            rows = session.execute(
+                text(
+                    "SELECT detail->>'batch' AS batch, kind, detail "
+                    "FROM ops_events WHERE component = 'gmail-label' "
+                    "AND kind IN ('apply', 'undo') AND detail->>'batch' = :batch "
+                    "ORDER BY ts"
+                ),
+                {"batch": batch},
+            ).all()
+    for row in rows:
+        detail = row.detail or {}
+        print(f"  [{row.batch}] {row.kind}: {detail.get('gmail_id')} -> "
+              f"{detail.get('label_path', detail.get('label_id'))}")
 
 
 def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:
