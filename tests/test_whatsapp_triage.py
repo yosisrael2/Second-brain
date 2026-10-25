@@ -1131,7 +1131,8 @@ def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
         EntityAlias(entity_id=rona.id, alias="רונה", lang="he")
     )
     # the wired trier is built AFTER the alias exists (fresh read at build)
-    trier = _CountingTrier(_wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage")))
+    wired = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
+    trier = _CountingTrier(wired)
 
     # the unread marker already contains the filename (nothing else readable);
     # the SKIP is what keeps it unlabelled until the media is read.
