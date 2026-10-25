@@ -9,6 +9,8 @@ MemoryService + ItemsRepository over brain_w5_test.
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from sqlalchemy import text as sql_text
@@ -673,3 +675,752 @@ def test_health_reports_today_triage_counts(monkeypatch) -> None:
     relevant_after, noise_after = _counts()
     assert relevant_after == relevant_before + 1
     assert noise_after == noise_before + 1
+
+
+# --- fresh kid names per poll pass (step C) -------------------------------------
+# The poller holds ONE trier for the process lifetime; confirmed kid names and
+# aliases must be re-read once per POLL PASS (never per conversation — no extra
+# query in the hot loop). The refresh query is savepoint-scoped so a failure
+# cannot poison the pass transaction (pending captures survive), and a failed
+# refresh leaves the last-known names in place (never blank, never fatal).
+
+
+@pytest.fixture(name="triage_world")
+def triage_world_fixture(database: None) -> Iterator[Any]:
+    """One shared session with clean memory + whatsapp state per test."""
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.repositories.whatsapp import WhatsAppStateRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    assert_test_database(str(engine.url))
+    session = SessionLocal()
+    try:
+        for table in (
+            "whatsapp_poll_state",
+            "memory_items",
+            "memory_facts",
+            "entity_aliases",
+            "entities",
+        ):
+            session.execute(sql_text(f"DELETE FROM {table}"))
+        session.commit()
+        memory = MemoryService(MemoryRepository(session))
+        # The allowlist is the channel entities: 'Chat A' must be pollable.
+        memory.set_channel("Chat A", kind="teacher", applies_to="me")
+        yield SimpleNamespace(
+            session=session,
+            memory=MemoryService(MemoryRepository(session)),
+            memory_repo=MemoryRepository(session),
+            items=ItemsRepository(session),
+            state=WhatsAppStateRepository(session),
+        )
+    finally:
+        session.rollback()
+        session.close()
+
+
+def _confirmed_kid(memory: Any, name: str) -> Any:
+    """A confirmed kid (kind person + grade fact) — the ask/triage definition."""
+    memory.set_kid(name, grade="ג")
+    entity = memory._repo.find_entity(kind="person", name=name)
+    assert entity is not None
+    return entity
+
+
+def _wired_trier(world: Any, monkeypatch: Any, jev: Any, llm: Any) -> Any:
+    """cli._build_trier over the world's session with fake clients."""
+    from brain.cli import _build_trier  # noqa: PLC0415
+
+    monkeypatch.setattr("brain.api.deps.get_jev_client", lambda: jev)
+    monkeypatch.setattr("brain.api.deps.get_llm_client", lambda: llm)
+    return _build_trier(world.session)
+
+
+def _trier_poller(world: Any, bridge: Any, trier: Any) -> Any:
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        DEFAULT_GAP_MINUTES as INGEST_GAP,
+    )
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        ZONE,
+        FakeIndexer,
+    )
+
+    from brain.services.whatsapp import WhatsAppPoller  # noqa: PLC0415
+
+    return WhatsAppPoller(
+        bridge=bridge,
+        state=world.state,
+        items=world.items,
+        memory=world.memory_repo,
+        indexer=FakeIndexer(),
+        trier=trier,
+        zone_name=ZONE,
+        gap_minutes=INGEST_GAP,
+        commit=False,  # pending writes stay uncommitted: the savepoint test needs them
+    )
+
+
+def test_poller_refresh_honours_alias_added_after_trier_built(
+    triage_world: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """RED-first (step C): an alias added after the trier was built must be
+    honoured on the NEXT pass's conversations (kid_named), with no restart."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    trier = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
+    poller = _trier_poller(world, BridgeStore(path), trier)
+
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init at the live edge
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="מה צריך לארוז לרונה ליום ראשון?",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # creates conversation 1
+
+    world.memory_repo.add_alias(
+        EntityAlias(entity_id=rona.id, alias="רונה", lang="he")
+    )
+    _add_row(
+        path,
+        _bridge_row(
+            "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
+            content="רונה צריכה להביא כובע מחר",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))  # creates conversation 2
+
+    world.session.expire_all()
+    items = (
+        world.session.query(MemoryItem)
+        .order_by(MemoryItem.occurred_at.asc())
+        .all()
+    )
+    assert [i.triage_method for i in items] == [None, "kid_named"], (
+        "conversation 2 must be kid_named via the refreshed kid names "
+        "(the alias was added after the trier was built)"
+    )
+
+
+def test_alias_removed_between_passes_stops_matching(
+    triage_world: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """RED-first (step C): refresh REPLACES the kid-name list — an alias
+    deleted between passes stops matching on the next pass (no append-only
+    staleness in the other direction)."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    trier = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
+    poller = _trier_poller(world, BridgeStore(path), trier)
+
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="רונה צריכה להביא כובע מחר",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # conversation 1: kid_named
+
+    world.session.execute(sql_text("DELETE FROM entity_aliases"))
+    world.session.flush()
+    _add_row(
+        path,
+        _bridge_row(
+            "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
+            content="רונה ואיתמר חוזרים באוטובוס",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))  # conversation 2
+
+    world.session.expire_all()
+    items = (
+        world.session.query(MemoryItem)
+        .order_by(MemoryItem.occurred_at.asc())
+        .all()
+    )
+    assert items[0].triage_method == "kid_named", "precondition: the alias matched"
+    assert items[1].triage_method != "kid_named", (
+        "after the alias row was deleted, the refreshed kid names must not "
+        "match רונה anymore (replace, not append)"
+    )
+
+
+def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
+    triage_world: Any, tmp_path: Any, caplog: Any
+) -> None:
+    """A refresh that RAISES (DB hiccup) must: leave the pass running on the
+    last-known kid names, log one warning, record an ops event, roll back
+    ONLY the savepoint (pending captures of earlier passes survive), and
+    leave the session usable for the rest of the pass and the next one."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    class _PoisonedTrier(RefreshableTrier):
+        """Real savepoint exercise: the poisoned read executes deliberately
+        broken SQL on the shared session, so the abort happens inside the
+        savepoint on a real database, not in a mock."""
+
+        fail_next = False
+
+        def _read_kid_names(self) -> list[str]:
+            if self.fail_next:
+                self._session.execute(sql_text("SELECT * FROM __no_such_table_xyz__"))
+            return super()._read_kid_names()
+
+    world = triage_world
+    itamar = _confirmed_kid(world.memory, "Itamar")
+    # Hebrew alias seeded UP FRONT: the kid override matches איתמר from the
+    # very first pass, so the failure test isolates the refresh behaviour.
+    world.memory_repo.add_alias(
+        EntityAlias(entity_id=itamar.id, alias="איתמר", lang="he")
+    )
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    trier = _PoisonedTrier(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM("garbage"))
+    poller = _trier_poller(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init
+
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="מה צריך לאיתמר מחר?",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # conversation 1: kid_named
+
+    trier.fail_next = True
+    _add_row(
+        path,
+        _bridge_row(
+            "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
+            content="איתמר לא שכח את הכובע?",
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))  # refresh fails; pass continues
+    assert any("refresh failed" in rec.message for rec in caplog.records), (
+        "one warning must be logged on the failed refresh"
+    )
+    with engine.begin() as conn:
+        ops_count = conn.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component = 'triage' AND kind = 'refresh_failed'"
+            )
+        ).scalar_one()
+    assert ops_count == 1, "the failed refresh is recorded as an ops event"
+
+    world.session.expire_all()
+    items = (
+        world.session.query(MemoryItem).order_by(MemoryItem.occurred_at.asc()).all()
+    )
+    assert len(items) == 2, (
+        "the conversation captured BEFORE the failed refresh must survive "
+        "(savepoint rollback only — never a session rollback)"
+    )
+    assert items[0].triage_method == "kid_named"
+    assert items[1].triage_method == "kid_named", (
+        "the pass carries on with the LAST-KNOWN kid names — Itamar still matches"
+    )
+
+    trier.fail_next = False
+    _add_row(
+        path,
+        _bridge_row(
+            "m4", datetime(2026, 10, 22, 19, 0, tzinfo=UTC),
+            content="איתמר הגיע הביתה",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 19, 5, tzinfo=UTC))  # session usable, refresh works
+    world.session.expire_all()
+    assert world.session.query(MemoryItem).count() == 3
+
+
+def test_fresh_trier_instance_honours_aliases_without_refresh(
+    triage_world: Any,
+) -> None:
+    """The backfill CLI builds a FRESH trier per invocation: aliases already
+    in memory are honoured with zero refresh() calls."""
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    trier = RefreshableTrier(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM("garbage"))
+    item = _conversation("[WhatsApp · Chat A]\n[21/10/2026, 18:23] מעין: מה צריך לרונה?")
+    result = trier(item)
+    assert result is not None and result.method == "kid_named"
+    assert trier.refresh_calls == 0, "a fresh trier needs no refresh call"
+
+
+def test_build_trier_is_wired_refreshable(triage_world: Any, monkeypatch: Any) -> None:
+    """cli._build_trier returns the refreshable trier the poller hook expects."""
+    trier = _wired_trier(triage_world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
+    assert callable(trier)
+    assert callable(getattr(trier, "refresh", None)), (
+        "_build_trier must return a refreshable trier — poll() calls refresh() once per pass"
+    )
+
+
+# --- media-only conversations (step D) ------------------------------------------
+# A conversation whose every message is an UNREAD media marker has nothing
+# readable to triage: labelling a filename is how media-only conversations
+# landed NOISE on zero content. Skip while unread (both the poller AND the
+# backfill path — the backfill calls the trier directly), and re-triage ONCE
+# when the last marker is replaced, never touching user-acted items.
+
+
+class _CountingTrier:
+    """Delegates to a real/scripted trier and counts invocations."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls = 0
+
+    def __call__(self, item: Any) -> Any:
+        self.calls += 1
+        return self._inner(item)
+
+
+_MEDIA_ONLY_TEXT = (
+    "[WhatsApp · Chat A]\n"
+    "[22/10/2026, 13:00] Rinat: [image: photo.jpg — attachment not read yet]"
+)
+
+
+def _media_poller_for_triage(world: Any, bridge: Any, trier: Any) -> Any:
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        DEFAULT_GAP_MINUTES as INGEST_GAP,
+    )
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        ZONE,
+        FakeIndexer,
+    )
+
+    from brain.services.whatsapp import WhatsAppPoller  # noqa: PLC0415
+
+    return WhatsAppPoller(
+        bridge=bridge,
+        state=world.state,
+        items=world.items,
+        memory=world.memory_repo,
+        indexer=FakeIndexer(),
+        trier=trier,
+        zone_name=ZONE,
+        gap_minutes=INGEST_GAP,
+        commit=False,
+    )
+
+
+def _captured_media_only_conversation(
+    triage_world: Any, tmp_path: Any, trier: Any, *, filename: str = "photo.jpg"
+) -> Any:
+    """One captured conversation whose only message is an unread image."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _media_poller_for_triage(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # init at the live edge
+    _add_row(
+        path,
+        _bridge_row(
+            "m2",
+            datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="",  # caption-less: nothing readable but the marker
+            media_type="image",
+            filename=filename,
+            url="https://mmg.whatsapp.net/v/t62.7118-24/secret.enc",
+            media_key=b"k" * 8,
+            file_length=2048,
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # captures the media-only conv
+    world.session.expire_all()
+    return world, poller, world.session.query(MemoryItem).one()
+
+
+def test_media_only_conversation_is_skipped_while_unread(
+    triage_world: Any, tmp_path: Any
+) -> None:
+    """(a) An unread-media-only conversation is captured but NOT triaged:
+    no trier call, triage columns stay NULL."""
+    trier = _CountingTrier(lambda item: TriageResult("noise", 0.97, "jev", TRIAGE_VERSION))
+    world, poller, item = _captured_media_only_conversation(triage_world, tmp_path, trier)
+    assert "attachment not read yet" in item.raw_text
+    assert trier.calls == 0, "nothing readable: the trier must not run"
+    assert item.triage_label is None and item.triage_method is None
+
+
+def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
+    triage_world: Any, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """(b) When the media is read and the last marker is replaced, the
+    conversation is re-triaged through the normal update path."""
+    import uuid as uuid_mod  # noqa: PLC0415
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeMessage  # noqa: PLC0415
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    world.memory_repo.add_alias(
+        EntityAlias(entity_id=rona.id, alias="רונה", lang="he")
+    )
+    # the wired trier is built AFTER the alias exists (fresh read at build)
+    wired = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
+    trier = _CountingTrier(wired)
+
+    # the unread marker already contains the filename (nothing else readable);
+    # the SKIP is what keeps it unlabelled until the media is read.
+    world2, poller, item = _captured_media_only_conversation(
+        world, tmp_path, trier, filename="רונה כובע.jpg"
+    )
+    assert trier.calls == 0
+
+    # the media is read: the marker is replaced by the attachment link.
+    # The filename carries the kid's name, so the fresh re-triage resolves
+    # kid_named from the (now readable) text.
+    message = BridgeMessage(
+        id="m2",
+        chat_jid="jid-a@g.us",
+        sender="Rinat",
+        content="",
+        timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+        is_from_me=False,
+        media_type="image",
+        filename="רונה כובע.jpg",
+        file_length=2048,
+    )
+    poller._replace_media_marker(item.id, message, uuid_mod.uuid4())
+    # commit=False in these tests defers persistence to the poll's single
+    # commit point; flush here so the assertions read the written state
+    # (SessionLocal is autoflush=False, and expire_all would otherwise
+    # discard the pending in-memory columns).
+    world.session.flush()
+    world.session.expire_all()
+    item2 = world.session.query(MemoryItem).one()
+    assert trier.calls == 1, "the re-triage fires once, when the last marker is replaced"
+    assert item2.triage_method == "kid_named"
+    assert item2.triage_label == "relevant"
+
+
+def test_mixed_conversation_is_triaged_at_capture(triage_world: Any, tmp_path: Any) -> None:
+    """(c) A captioned image is a MIXED conversation: triaged at capture as usual."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    trier = _CountingTrier(lambda item: TriageResult("relevant", 0.95, "jev", TRIAGE_VERSION))
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _media_poller_for_triage(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))
+    _add_row(
+        path,
+        _bridge_row(
+            "m2",
+            datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="איזה כיף!!",
+            media_type="image",
+            filename="photo.jpg",
+            url="https://mmg.whatsapp.net/v/t62.7118-24/secret.enc",
+            media_key=b"k" * 8,
+            file_length=2048,
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+    world.session.expire_all()
+    item = world.session.query(MemoryItem).one()
+    assert trier.calls == 1, "a caption makes the conversation readable at capture"
+    assert item.triage_label == "relevant"
+
+
+def test_partially_read_conversation_stays_skipped(triage_world: Any, tmp_path: Any) -> None:
+    """(d) Two unread markers, one read: still nothing fully readable -> skip."""
+    import uuid as uuid_mod  # noqa: PLC0415
+
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.services.whatsapp import BridgeMessage, BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    trier = _CountingTrier(lambda item: TriageResult("noise", 0.97, "jev", TRIAGE_VERSION))
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _media_poller_for_triage(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))
+    _add_row(
+        path,
+        _bridge_row(
+            "m2",
+            datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="",
+            media_type="image",
+            filename="a.jpg",
+            url="https://mmg.whatsapp.net/v/t62.7118-24/a.enc",
+            media_key=b"k" * 8,
+            file_length=2048,
+        ),
+    )
+    _add_row(
+        path,
+        _bridge_row(
+            "m3",
+            datetime(2026, 10, 22, 13, 1, tzinfo=UTC),
+            content="",
+            media_type="image",
+            filename="b.jpg",
+            url="https://mmg.whatsapp.net/v/t62.7118-24/b.enc",
+            media_key=b"k" * 8,
+            file_length=2048,
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+    world.session.expire_all()
+    item = world.session.query(MemoryItem).one()
+    assert trier.calls == 0
+    assert item.raw_text.count("attachment not read yet") == 2
+
+    message = BridgeMessage(
+        id="m2",
+        chat_jid="jid-a@g.us",
+        sender="Rinat",
+        content="",
+        timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+        is_from_me=False,
+        media_type="image",
+        filename="a.jpg",
+        file_length=2048,
+    )
+    poller._replace_media_marker(item.id, message, uuid_mod.uuid4())
+    world.session.expire_all()
+    assert trier.calls == 0, "one marker still unread: the skip holds"
+    item2 = world.session.query(MemoryItem).one()
+    assert item2.triage_label is None
+
+
+def test_retriage_after_read_never_downgrades_relevant(
+    triage_world: Any, tmp_path: Any
+) -> None:
+    """(e) v3 guard through the post-read re-triage: a relevant conversation
+    stays relevant even when the fresh triage says noise (blocked, recorded)."""
+    import uuid as uuid_mod  # noqa: PLC0415
+
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,  # noqa: PLC0415
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.services.whatsapp import (
+        BridgeMessage,  # noqa: PLC0415
+        BridgeStore,  # noqa: PLC0415
+    )
+
+    world = triage_world
+    # mixed conversation (caption -> readable at capture), media read later
+    scripted = _CountingTrier(lambda item: iter_results.pop(0))
+    iter_results = [
+        TriageResult("relevant", 1.0, "kid_named", TRIAGE_VERSION),
+        TriageResult("noise", 0.97, "jev", TRIAGE_VERSION),
+    ]
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _media_poller_for_triage(world, BridgeStore(path), scripted)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))
+    _add_row(
+        path,
+        _bridge_row(
+            "m2",
+            datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="מה צריך לארוז לרונה?",
+            media_type="image",
+            filename="photo.jpg",
+            url="https://mmg.whatsapp.net/v/t62.7118-24/secret.enc",
+            media_key=b"k" * 8,
+            file_length=2048,
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+    world.session.expire_all()
+    item = world.session.query(MemoryItem).one()
+    assert item.triage_label == "relevant" and scripted.calls == 1
+
+    message = BridgeMessage(
+        id="m2",
+        chat_jid="jid-a@g.us",
+        sender="Rinat",
+        content="מה צריך לארוז לרונה?",
+        timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+        is_from_me=False,
+        media_type="image",
+        filename="photo.jpg",
+        file_length=2048,
+    )
+    poller._replace_media_marker(item.id, message, uuid_mod.uuid4())
+    world.session.expire_all()
+    item2 = world.session.query(MemoryItem).one()
+    assert scripted.calls == 2, "the re-triage ran after the read"
+    assert item2.triage_label == "relevant", (
+        "v3: relevant may never become noise, even through the post-read re-triage"
+    )
+    assert item2.triage_method == "kid_named"
+
+
+def test_backfill_skips_unread_media_only_items(monkeypatch: Any, capsys: Any) -> None:
+    """(f) The backfill command calls the trier DIRECTLY: the media-only skip
+    must hold there too — 0 trier/model calls, columns stay NULL, and the
+    summary counts it as skipped (unread media), not noise/relevant."""
+    from brain import cli
+
+    _wipe_items()
+    session = SessionLocal()
+    repo = ItemsRepository(session)
+    media_only = repo.add(_conversation(_MEDIA_ONLY_TEXT))
+    session.commit()
+
+    calls: list[MemoryItem] = []
+
+    def fake_trier(item: MemoryItem) -> TriageResult | None:
+        calls.append(item)
+        return TriageResult("noise", 0.97, "jev", TRIAGE_VERSION)
+
+    monkeypatch.setattr("brain.cli._build_trier", lambda session: fake_trier)
+    rc = cli.main(["whatsapp-triage", "--limit", "100"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "skipped (unread media) 1" in out, out
+    assert calls == [], "the trier must not even run for an unread-media-only item"
+    session.expire_all()
+    item = repo.get(media_only.id)
+    assert item.triage_label is None and item.triage_method is None
+    session.close()
+
+
+def test_post_read_retriage_never_touches_user_acted_items(
+    triage_world: Any, tmp_path: Any
+) -> None:
+    """(g) The user acted on the item (filed it) while it was still unread
+    media: the post-read re-triage must not touch it."""
+    import uuid as uuid_mod  # noqa: PLC0415
+
+    from brain.db.enums import ItemStatus  # noqa: PLC0415
+    from brain.services.whatsapp import (
+        BridgeMessage,  # noqa: PLC0415
+        )
+
+    world = triage_world
+    trier = _CountingTrier(lambda item: TriageResult("noise", 0.97, "jev", TRIAGE_VERSION))
+    world2, poller, item = _captured_media_only_conversation(triage_world, tmp_path, trier)
+    assert trier.calls == 0
+
+    item.status = ItemStatus.FILED  # the user filed it while it was unread media
+    world.items.commit()
+    world.session.expire_all()
+    item = world.session.query(MemoryItem).one()
+
+    message = BridgeMessage(
+        id="m2",
+        chat_jid="jid-a@g.us",
+        sender="Rinat",
+        content="",
+        timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+        is_from_me=False,
+        media_type="image",
+        filename="photo.jpg",
+        file_length=2048,
+    )
+    poller._replace_media_marker(item.id, message, uuid_mod.uuid4())
+    world.session.expire_all()
+    item2 = world.session.query(MemoryItem).one()
+    assert trier.calls == 0, "user-acted items are never re-triaged"
+    assert item2.triage_label is None

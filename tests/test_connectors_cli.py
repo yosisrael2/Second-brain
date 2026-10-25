@@ -58,7 +58,7 @@ class FakeFlow:
         self._token = token
         self.requested_scopes: list[str] | None = None
 
-    def from_client_secret_file(self, path: str, scopes: list[str]) -> "FakeFlow":
+    def from_client_secrets_file(self, path: str, scopes: list[str]) -> "FakeFlow":
         self.requested_scopes = list(scopes)
         return self
 
@@ -341,7 +341,7 @@ def test_auth_google_stores_only_the_refresh_token(settings_env, monkeypatch, tm
     monkeypatch.setattr(
         cli,
         "_build_connectors_oauth_flow",
-        lambda path, scopes: flow.from_client_secret_file(path, scopes),
+        lambda path, scopes: flow.from_client_secrets_file(path, scopes),
     )
     # The handler imports Keychain from the service module at call time, so
     # the seam is the module attribute (CI has no `security` binary).

@@ -448,6 +448,8 @@ def run_recon_eval(
                     end=_parse_eval_dt(row.get("end")),
                     applies_to=tuple(row.get("applies_to") or ()),
                     location=row.get("location"),
+                    amount=row.get("amount"),
+                    effective=_parse_eval_dt(row.get("effective")),
                 )
                 for row in case.get("existing_items", [])
             ]
@@ -461,6 +463,7 @@ def run_recon_eval(
                 applies_to=tuple(cand.get("applies_to") or ()),
                 location=cand.get("location"),
                 end=_parse_eval_dt(cand.get("end")),
+                amount=cand.get("amount"),
             )
             signal = signal_for([str(case.get("new_text_quote", ""))])
             # E5: a dated correction is judged inside ITS OWN window — the
@@ -689,25 +692,20 @@ def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
 
 
 def _build_trier(session):
-    """The real triage callable: kid override, then Jev, then the LLM (D2a)."""
+    """The real triage callable: kid override, then Jev, then the LLM (D2a).
+
+    Refreshable kid names: the poller holds this trier for the process
+    lifetime, so the confirmed kid names/aliases are re-read ONCE PER POLL
+    PASS (RefreshableTrier.refresh, savepoint-scoped) — never per
+    conversation. The backfill command builds a fresh trier per invocation,
+    which reads them at construction with no refresh call.
+    """
     from brain.api import deps  # noqa: PLC0415
-    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
-    from brain.services.memory import MemoryService  # noqa: PLC0415
-    from brain.services.triage import (  # noqa: PLC0415
-        confirmed_kid_names,
-        triage_conversation,
-    )
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
 
     jev = deps.get_jev_client()
     llm = deps.get_llm_client()
-    kid_names = confirmed_kid_names(
-        MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
-    )
-
-    def trier(item):
-        return triage_conversation(item.raw_text, jev=jev, llm=llm, kid_names=kid_names)
-
-    return trier
+    return RefreshableTrier(session, jev=jev, llm=llm)
 
 
 def _whatsapp_triage(*, limit: int) -> int:
@@ -722,6 +720,7 @@ def _whatsapp_triage(*, limit: int) -> int:
 
     from brain.config import assert_not_live_store  # noqa: PLC0415
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415
+    from brain.services.whatsapp import is_unread_media_only  # noqa: PLC0415
 
     settings = get_settings()
     assert_not_live_store(
@@ -731,11 +730,19 @@ def _whatsapp_triage(*, limit: int) -> int:
     )
     decided = 0
     failed = 0
+    skipped = 0
     with SessionLocal() as session:
         trier = _build_trier(session)
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:
+            if is_unread_media_only(item.raw_text):
+                # Same skip the poller's _triage_item applies: an unread-media-
+                # only conversation has nothing readable to triage, and this
+                # IS the run that must not label those NOISE. 0 trier/model
+                # calls, columns stay NULL; counted separately in the summary.
+                skipped += 1
+                continue
             result = trier(item)
             if result is None:
                 failed += 1
@@ -743,7 +750,10 @@ def _whatsapp_triage(*, limit: int) -> int:
             repo.apply_triage(item, result)
             decided += 1
         session.commit()
-    print(f"whatsapp-triage: decided {decided}, failed {failed} of limit {limit}")
+    print(
+        f"whatsapp-triage: decided {decided}, failed {failed}, "
+        f"skipped (unread media) {skipped} of limit {limit}"
+    )
     return 0
 
 
@@ -1031,7 +1041,7 @@ def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs goog
         raise SystemExit(
             "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=[GMAIL_SCOPE])
+    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=[GMAIL_SCOPE])
 
 
 def _gmail_auth(args: argparse.Namespace) -> int:
@@ -1174,7 +1184,10 @@ def _gmail_poll(
             raise
         except Exception as exc:  # noqa: BLE001 — one bad cycle never kills the agent
             logger.error("gmail-poll: cycle failed: %s", exc, exc_info=True)
-            time.sleep(stall_pause_s)
+            do_sleep(stall_pause_s)
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                return 0  # the test seam bounds this path too
             continue
         heartbeat_email_summary(summary)
         with SessionLocal() as session:
@@ -1552,7 +1565,7 @@ def _build_connectors_oauth_flow(client_secret_path: str, scopes: list[str]) -> 
         raise SystemExit(
             "connectors: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=scopes)
+    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=scopes)
 
 
 def _connectors_auth(args: argparse.Namespace) -> int:

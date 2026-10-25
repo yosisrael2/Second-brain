@@ -16,7 +16,7 @@ from typing import Any
 
 from brain.db.models import Entity, EntityAlias, MemoryFact
 from brain.repositories.memory import MemoryRepository, utcnow
-from brain.services.triage import mentions_name
+from brain.services.triage import is_name_token, mentions_name
 
 # Hebrew-letter numerals used in school emails ("כיתות ה-ו" = grades 5-6).
 # Note ל=30 and מ=40 in real Hebrew numerals — they are NOT grades here.
@@ -334,7 +334,32 @@ class MemoryService:
 
         named = audience.get("named_kids") or []
         if named:
-            known = [kid["name"] for kid in kids if kid["name"] in named]
+            # FULL-TOKEN match required (the searching mentions_name is not
+            # used here on purpose): an extracted classmate "רונה לוי" or
+            # "Rona Cohen" must stay ["unknown"] — zero wrong-child is the
+            # A2 bar, and unknown is always safer than a wrong kid. Hebrew
+            # prefix runs (ורונה) still match, case-insensitively for
+            # English; a name and its alias never double-count.
+            # Alias lookup is scoped to the kids only — never every person
+            # entity (teachers, parents are persons too and stay unqueried).
+            people_by_name = {
+                entity.name: entity
+                for entity in self._repo.list_entities(kinds=["person"])
+            }
+            alias_map = {
+                kid["name"]: self._repo.aliases_for(people_by_name[kid["name"]].id)
+                for kid in kids
+                if kid["name"] in people_by_name
+            }
+            known: list[str] = []
+            for kid in kids:
+                candidates = [kid["name"], *alias_map.get(kid["name"], [])]
+                if any(
+                    is_name_token(candidate, token)
+                    for token in named
+                    for candidate in candidates
+                ):
+                    known.append(kid["name"])
             return known if known else ["unknown"]
 
         raw_grades = audience.get("grades")

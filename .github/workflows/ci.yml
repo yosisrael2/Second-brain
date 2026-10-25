@@ -35,6 +35,16 @@ jobs:
       # below so conftest variants that expect it also work.
       DATABASE_URL: postgresql+psycopg://brain:brain@localhost:5432/brain_test
       QDRANT_URL: http://localhost:6333
+      # tests/eval/test_calendar_questions.py loads the REAL fastembed model
+      # on first use (incident 25 Oct: the unauthenticated HF fetch blew the
+      # 60s per-test timeout on a cold runner twice in one day). Pin the
+      # cache OUT of /tmp (wiped per runner) into the workspace so
+      # actions/cache can persist it. fastembed resolves the dir as
+      # FASTEMBED_CACHE_PATH -> <tempdir>/fastembed_cache
+      # (fastembed/common/utils.py define_cache_dir, fastembed 0.9.0) and
+      # hands it to huggingface_hub snapshot_download(cache_dir=...) —
+      # HF_HOME is never consulted on this path.
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
     services:
       postgres:
         image: postgres:16-alpine  # same tag as docker-compose.yml
@@ -62,6 +72,14 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the fastembed model
+        # The eval model (EVAL_MODEL in tests/eval/test_calendar_questions.py)
+        # downloads once into FASTEMBED_CACHE_PATH; the key rolls when the
+        # eval file (model name) or the dependency set changes.
+        uses: actions/cache@v4
+        with:
+          path: .fastembed-cache
+          key: fastembed-${{ runner.os }}-py3.11-${{ hashFiles('pyproject.toml', 'tests/eval/test_calendar_questions.py') }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

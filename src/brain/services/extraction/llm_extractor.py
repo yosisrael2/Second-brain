@@ -41,6 +41,7 @@ Return STRICT JSON only — no markdown, no commentary. Schema:
     "all_day": false,
     "location": null,
     "end": null,
+    "amount": null,
     "due": false,
     "derived_from": null,
     "recon": {{"change": false, "cancel": false, "detail_only": false}},
@@ -92,6 +93,8 @@ Rules (labeling rules from the design spec, plain words):
   "האולם בבית הספר") or null. Never infer from the title alone.
 - end: the event's stated END time for THIS child ("עד 18:00", "17:00-18:30"
   -> the later time) as "HH:MM", or null when the message states none.
+- amount: a stated SUM/QUANTITY for THIS child ("250", "3 הופעות" -> "3"),
+  digits kept as stated, or null when none.
 - recon: set a flag ONLY when the message states it about THIS child:
   change = it corrects/updates something already announced ("תיקון",
   "עדכון", "שינוי", "correction", a new time/place for it); cancel = it
@@ -326,6 +329,9 @@ class LLMExtractor:
             else None,
             end=(str(raw.get("end")).strip() or None)
             if raw.get("end") is not None
+            else None,
+            amount=(str(raw.get("amount")).strip() or None)
+            if raw.get("amount") is not None
             else None,
             due=bool(raw.get("due", False)),
             audience=audience,

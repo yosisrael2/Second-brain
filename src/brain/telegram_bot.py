@@ -52,7 +52,7 @@ import secrets
 import sys
 import time
 import uuid as uuid_mod
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -83,11 +83,15 @@ from brain.services.proposals import (
     render_source_card,
 )
 from brain.services.relations_view import (
+    CB_RECON_DISCARD,
     CB_REL_CONFIRM,
     CB_REL_KEEP_BOTH,
     CB_REL_RESTORE,
     CB_REL_UNDO,
+    conflict_notice,
     correction_notice,
+    details_notice,
+    recon_relation_of,
     relations_keyboard,
     replaced_by_notice,
     strike,
@@ -1008,8 +1012,26 @@ class TelegramBot:
         self._outbound = []
         return queued
 
-    def _proposal_reply_for(self, source) -> Reply | None:
-        """Render the source's proposal card (None when nothing is proposed)."""
+    def _recon_payload(self, session, children):
+        """(recon, blocks) for a proposal card: the verdict rows and the
+        CONFLICT both-versions blocks (D-recon-2a). The verdict rows carry
+        the relation ID in the callback data — nothing positional to
+        misalign."""
+        recon = self._recon_rows(session, children)
+        blocks = [
+            conflict_notice(session, rel)
+            for verdict, rel, _title in recon.values()
+            if verdict == "conflict"
+        ]
+        return recon, blocks
+
+    def _proposal_reply_for(self, source, *, notice: str | None = None) -> Reply | None:
+        """Render the source's proposal card (None when nothing is proposed).
+
+        Verdict children (D-recon-2a) get their verdict row instead of
+        Keep/Fix/Drop, and a CONFLICT child adds the both-versions block;
+        the verdict relations are parked aligned with the children so the
+        callbacks stay < 64 bytes."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         session = SessionLocal()
@@ -1017,13 +1039,42 @@ class TelegramBot:
             children = proposed_children_of(session, source.id)
             if not children:
                 return None
+            recon, blocks = self._recon_payload(session, children)
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
-            text = render_source_card(source, children, self._timezone.key)
-            return Reply(text=text, keyboard=proposal_keyboard(token, children))
+            parts = [part for part in (
+                notice,
+                render_source_card(source, children, self._timezone.key, recon=recon),
+                *blocks,
+            ) if part]
+            return Reply(
+                text="\n".join(parts),
+                keyboard=proposal_keyboard(token, children, recon=recon),
+            )
         finally:
             session.close()
+
+    def _recon_rows(self, session, children) -> dict[int, tuple[str, object, str | None]]:
+        """index -> (verdict, relation, matched_title) for the card's verdict
+        children (D-recon-2a); matched_title names a cancellation's target."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.services.relations_view import summary_of  # noqa: PLC0415
+
+        rows: dict[int, tuple[str, object, str | None]] = {}
+        for index, child in enumerate(children):
+            meta = child.extraction_meta or {}
+            verdict = meta.get("recon_verdict")
+            if not verdict:
+                continue
+            rel = recon_relation_of(session, child.id)
+            if rel is None:
+                continue
+            matched_title = None
+            if verdict == "cancellation" and session.get(MemoryItem, rel.to_id) is not None:
+                matched_title = summary_of(session, rel.to_id)
+            rows[index] = (verdict, rel, matched_title)
+        return rows
 
     def _proposal_child_ids(self, pending: Pending) -> list:
         """The child ids a card token refers to (ids[1:])."""
@@ -1088,22 +1139,38 @@ class TelegramBot:
                 for row in (session.get(MemoryItem, cid) for cid in pending.ids[1:])
                 if row is not None and row.child_state == "proposed"
             ]
+            if source is None or not children:
+                return Reply(f"{notice}\n ✓ all done here.", edit=True)
+            recon, blocks = self._recon_payload(session, children)
+            token = self.registry.put(
+                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
+            )
+            parts = [part for part in (
+                notice,
+                render_source_card(source, children, self._timezone.key, recon=recon),
+                *blocks,
+            ) if part]
+            return Reply(
+                text="\n".join(parts),
+                keyboard=proposal_keyboard(token, children, recon=recon),
+                edit=True,
+            )
         finally:
             session.close()
-        if source is None or not children:
-            return Reply(f"{notice}\n ✓ all done here.", edit=True)
-        token = self.registry.put(
-            Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
-        )
-        text = f"{notice}\n" + render_source_card(source, children, self._timezone.key)
-        return Reply(text=text, keyboard=proposal_keyboard(token, children), edit=True)
 
     # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
 
-    def _relation_transition(self, prefix: str, pending: Pending, index: int) -> Reply:
-        """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b)."""
+    def _relation_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
+        """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b);
+        a proposal card's verdict rows route to the D-recon-2a handler."""
+        if pending.kind == "proposal":
+            return self._recon_transition(prefix, pending, arg)
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
 
+        try:
+            index = int(arg)
+        except ValueError:
+            return Reply("Unknown action — the button is stale or invalid.")
         rel_ids = list(pending.ids[1:])
         if not 0 <= index < len(rel_ids):
             return Reply("⌛ That button expired — the card moved on.", edit=True)
@@ -1122,23 +1189,137 @@ class TelegramBot:
             return Reply(f"⌛ {_esc(str(exc))}", edit=True)
         return self._card_reply(pending, notice=notice)
 
-    def _relation_restore(self, pending: Pending) -> Reply:
-        """♻️ Restore a superseded item (D4): undo the relation that struck it."""
+    def _recon_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
+        """Verdict rows on a proposal card (D-recon-2a): ✅ confirm update /
+        keep new / confirm cancellation, ✖ keep both, ✅ keep existing /
+        ✖ not cancelled, ↩︎ undo. The callback carries the RELATION ID (not
+        a position), so a mixed card cannot misalign plain and verdict
+        rows; nothing ever applies without a tap, and a stale callback
+        after the relation changed answers "already handled" — every
+        action re-checks the relation's state."""
+        from brain.db.models import ItemRelation  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
+        from brain.services.extraction.reconciliation import (  # noqa: PLC0415
+            ReconciliationService,
+        )
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
-        from brain.services.relations_view import superseded_by_rel  # noqa: PLC0415
+
+        try:
+            rel_id = uuid_mod.UUID(str(arg))
+        except ValueError:
+            return Reply("Unknown action — the button is stale or invalid.")
+        already = "⌛ already handled — the card moved on."
+        notice = None
+        with SessionLocal() as session:
+            rel = session.get(ItemRelation, rel_id)
+            if rel is None:
+                return Reply(already, edit=True)
+            if rel.from_id not in pending.ids[1:]:
+                # a relation id from ANOTHER card must never resolve here
+                return Reply(already, edit=True)
+            child_id = rel.from_id  # the verdict child owns the relation
+            state = (rel.provenance or {}).get("state")
+            service = ReconciliationService(
+                session, _repo_of(session), tz_name=self._timezone.key,
+            )
+            try:
+                if prefix == CB_REL_CONFIRM:
+                    if rel.kind == "supersedes":
+                        if state != "proposed":
+                            return Reply(already, edit=True)
+                        RelationsService().confirm_supersede(rel_id)
+                        self._recon_child_kept(session, child_id)
+                        notice = "✅ Confirmed — the old version is struck through (undo anytime)."
+                    elif rel.kind == "conflicts":
+                        service.resolve_conflict(rel_id, keep="new")
+                        notice = (
+                            "✅ Keeping the new version — the old one is struck through"
+                            " (undo anytime)."
+                        )
+                    elif rel.kind == "cancels":
+                        if state != "proposed":
+                            return Reply(already, edit=True)
+                        service.apply_cancellation(rel_id)
+                        self._recon_child_kept(session, child_id)
+                        notice = "🗑 Cancelled — the item is struck through (restore anytime)."
+                elif prefix == CB_REL_KEEP_BOTH:  # ✖ Keep both on a proposed UPDATE
+                    RelationsService().discard_proposal(rel_id)
+                    self._recon_child_kept(session, child_id)
+                    notice = "✖ Keeping both — proposal discarded."
+                elif prefix == CB_RECON_DISCARD:
+                    if rel.kind == "conflicts":
+                        service.resolve_conflict(rel_id, keep="existing")
+                        notice = "✅ Keeping the existing version — proposal discarded."
+                    elif rel.kind == "cancels":
+                        service.discard_cancellation(rel_id)
+                        notice = "✖ Not cancelled — proposal discarded."
+                elif prefix == CB_REL_UNDO:
+                    if rel.kind == "cancels":
+                        if state != "applied":
+                            return Reply(already, edit=True)
+                        service.restore_cancellation(rel_id)
+                        notice = "♻️ Restored — back in /recent."
+                    else:
+                        if state != "applied":
+                            return Reply(already, edit=True)
+                        RelationsService().undo_supersede(rel_id)
+                        notice = "↩️ Undone — the earlier item is current again."
+            except (RelationsError, ValueError):
+                return Reply(already, edit=True)
+        if notice is None:
+            return Reply(already, edit=True)
+        return self._proposal_card_reply(pending, notice=notice)
+
+    def _recon_child_kept(self, session, child_id) -> None:
+        """The acted verdict child becomes kept (it stays visible; a re-run
+        never overwrites a user-acted child)."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+
+        child = session.get(MemoryItem, child_id)
+        if child is not None:
+            child.child_state = "kept"
+            session.commit()
+
+    def _relation_restore(self, pending: Pending) -> Reply:
+        """♻️ Restore a superseded (D4) or cancelled (D-recon-2a) item: undo
+        the relation that struck it."""
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+        from brain.services.extraction.reconciliation import (  # noqa: PLC0415
+            ReconciliationService,
+        )
+        from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
+        from brain.services.relations_view import (  # noqa: PLC0415
+            cancelled_by_rel,
+            resolved_conflict_by_rel,
+            superseded_by_rel,
+        )
 
         item_id = pending.ids[0]
         session = SessionLocal()
         try:
-            rel = superseded_by_rel(session, item_id)
+            rel = (
+                superseded_by_rel(session, item_id)
+                or cancelled_by_rel(session, item_id)
+                or resolved_conflict_by_rel(session, item_id)
+            )
         finally:
             session.close()
         if rel is None:
             return Reply("⌛ That button expired — the card moved on.", edit=True)
         try:
-            RelationsService().undo_supersede(rel.id)
-        except RelationsError as exc:
+            if rel.kind == "cancels":
+                with SessionLocal() as svc_session:
+                    ReconciliationService(
+                        svc_session, _repo_of(svc_session), tz_name=self._timezone.key,
+                    ).restore_cancellation(rel.id)
+            elif rel.kind == "conflicts":
+                with SessionLocal() as svc_session:
+                    ReconciliationService(
+                        svc_session, _repo_of(svc_session), tz_name=self._timezone.key,
+                    ).undo_resolution(rel.id)
+            else:
+                RelationsService().undo_supersede(rel.id)
+        except (RelationsError, ValueError) as exc:
             return Reply(f"⌛ {_esc(str(exc))}", edit=True)
         return self._card_reply(pending, notice="♻️ Restored — back in /recent.")
 
@@ -1282,6 +1463,7 @@ class TelegramBot:
                 CB_REL_UNDO,
                 CB_REL_CONFIRM,
                 CB_REL_KEEP_BOTH,
+                CB_RECON_DISCARD,
             ):
                 token, _, arg = rest.partition(":")
             elif prefix in (
@@ -1303,9 +1485,6 @@ class TelegramBot:
                 CB_PROPOSED_KEEP,
                 CB_PROPOSED_FIX,
                 CB_PROPOSED_DROP,
-                CB_REL_UNDO,
-                CB_REL_CONFIRM,
-                CB_REL_KEEP_BOTH,
             ):
                 index = int(arg)
         except ValueError:
@@ -1338,8 +1517,8 @@ class TelegramBot:
             return self._proposal_fix_start(user_id, pending, index)
         if prefix == CB_PROPOSED_KEEP_ALL:
             return self._proposal_keep_all(pending)
-        if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH):
-            return self._relation_transition(prefix, pending, index)
+        if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD):
+            return self._relation_transition(prefix, pending, arg)
         if prefix == CB_REL_RESTORE:
             return self._relation_restore(pending)
         if prefix == CB_UNDO:
@@ -1408,6 +1587,7 @@ class TelegramBot:
         try:
             replaced_by = replaced_by_notice(session, item.id)
             notice = correction_notice(session, item.id)
+            details = details_notice(session, item.id)
         finally:
             session.close()
         lines = [self._item_card(item)]
@@ -1415,22 +1595,32 @@ class TelegramBot:
             lines.append(replaced_by)
         if notice:
             lines.append(notice)
+        if details:
+            lines.append(details)
         keyboard = self._relations_rows_for(item.id)
         return Reply("\n".join(lines), keyboard=keyboard or None)
 
     def _relations_rows_for(self, item_id) -> list[list[tuple[str, str]]]:
-        """Relation action rows for one item (D4 Restore + 20a/b rows)."""
+        """Relation action rows for one item (D4 Restore + 20a/b rows + the
+        cancelled target's Restore, D-recon-2a)."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
         from brain.services.relations_view import (  # noqa: PLC0415
             applied_supersedes_of,
+            cancelled_by_rel,
             proposed_supersedes_of,
+            resolved_conflict_by_rel,
             superseded_by_rel,
         )
 
         rows: list[list[tuple[str, str]]] = []
         session = SessionLocal()
         try:
-            if superseded_by_rel(session, item_id) is not None:
+            struck = (
+                superseded_by_rel(session, item_id)
+                or cancelled_by_rel(session, item_id)
+                or resolved_conflict_by_rel(session, item_id)
+            )
+            if struck is not None:
                 token = self.registry.put(Pending(ids=(item_id,), kind="relation"))
                 rows.append([("♻️ Restore", f"{CB_REL_RESTORE}:{token}")])
             applied = applied_supersedes_of(session, item_id)
@@ -1704,16 +1894,18 @@ def _build_pass_service(settings: Any, session: Any) -> Any:
     )
 
 
-def _enrich_pass(service: Any) -> list:
+def _enrich_pass(service: Any, *, sources: Sequence[str] | None = None) -> list:
     """One ``run_once`` pass with a LOCAL completion collector (B2).
 
     The hook delivers one LIST of changed-source outcomes per call — they
     collect into a plain local list; core state is NEVER touched from the
     worker thread. The loop thread alone turns outcomes into proposal cards.
+    ``sources`` is the A2 step-2 week-1 filter: the worker drains only those
+    sources (empty/None = every source; the CLI is never filtered).
     """
     outcomes: list = []
     service.on_children_changed = outcomes.extend
-    service.run_once(datetime.now(tz=UTC), limit=20)
+    service.run_once(datetime.now(tz=UTC), limit=20, sources=sources or None)
     return outcomes
 
 
@@ -1731,7 +1923,10 @@ def _run_enrichment_pass() -> list:
 
     session = SessionLocal()
     try:
-        return _enrich_pass(_build_pass_service(settings, session))
+        return _enrich_pass(
+            _build_pass_service(settings, session),
+            sources=settings.worker_source_list or None,
+        )
     finally:
         session.close()
 
