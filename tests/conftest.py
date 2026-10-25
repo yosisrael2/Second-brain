@@ -7,6 +7,7 @@ fast, and the destructive fixtures double-check the engine URL before deleting.
 
 import hashlib
 import os
+import re
 
 from brain.config import test_collection_for
 
@@ -192,11 +193,17 @@ def memory_db_fixture(clean_memory: None) -> Iterator[None]:
 def _run_migrations() -> None:
     """Apply Alembic migrations up to head against the configured database.
 
-    brain_test is SHARED between worker checkouts: a sibling worker's
-    unmerged branch can leave it stamped at a revision this tree does not
-    know (ResolutionError on upgrade). The test database is disposable, so
-    in that case drop and recreate it, then migrate from scratch — guarded
-    by assert_test_database like every destructive fixture.
+    If the ``*_test`` database is stamped at a revision this checkout's
+    scripts do not know (ResolutionError on upgrade — almost always ANOTHER
+    checkout's branch, which added migrations), the session FAILS FAST
+    naming the database and the stamped revision: silently dropping the DB
+    here terminated every live connection of a RUNNING sibling suite and
+    rebuilt the DB under it (the 25 Oct incident — worker_7's
+    ``brain_w7_mem_test``, stamped ``7d90f6ea8407``, was dropped 4+ times
+    mid-suite by main-scripts sessions, ~40 failures each). The old
+    drop-and-rebuild behaviour stays available behind the explicit
+    ``BRAIN_TEST_DB_RESET=1`` opt-in, guarded by ``assert_test_database``
+    like every destructive fixture.
     """
     try:
         _upgrade_head()
@@ -204,6 +211,15 @@ def _run_migrations() -> None:
         unknown = "Can't locate revision" in str(exc) or "not a valid upgrade target" in str(exc)
         if not unknown:
             raise
+        if os.environ.get("BRAIN_TEST_DB_RESET") != "1":
+            identified = re.search(r"identified by '([^']+)'", str(exc))
+            stamped = identified.group(1) if identified else "(unparseable)"
+            raise RuntimeError(
+                f"test database {_database_name(_database_url())!r} is stamped at "
+                f"revision {stamped!r}, which this checkout's migrations do not "
+                "know; this *_test DB is stamped by a different checkout; set "
+                "BRAIN_TEST_DB_RESET=1 to drop and rebuild it"
+            ) from exc
         assert_test_database(_database_url())
         _drop_test_database()
         _ensure_test_database()
