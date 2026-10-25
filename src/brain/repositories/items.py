@@ -268,10 +268,13 @@ class ItemsRepository:
         """``(relation, other_item)`` for every conflicts relation touching
         the given items (PR-b, item 38's ask leg).
 
-        The counterpart is returned regardless of its state: a PROPOSED
-        child that contradicts a captured item is exactly what the user
-        needs to see next to it (the answer must quote both versions).
-        Only live relations are read — rows are never deleted, but undone
+        The counterpart is returned regardless of its PROPOSAL state: a
+        PROPOSED child that contradicts a captured item is exactly what the
+        user needs to see next to it (the answer must quote both versions).
+        But DEAD counterparts are excluded — dropped children (the A1
+        re-run diff rejected them), superseded (an applied newer version)
+        and confirmed-cancelled items are not live contradictions. Only
+        live relations are read — rows are never deleted, but undone
         applies_to/supersedes states do not exist for ``conflicts``.
         Bounded: newest relations first, ``limit`` pairs.
         """
@@ -296,6 +299,13 @@ class ItemsRepository:
             .where(ItemRelation.kind == "conflicts")
             .order_by(ItemRelation.created_at.desc(), ItemRelation.id.desc())
             .limit(limit)
+        )
+        # the JOINED row is the counterpart: superseded/cancelled hide via
+        # the shared predicate, dropped children are not live proposals.
+        for cond in default_hidden_conditions():
+            stmt = stmt.where(cond)
+        stmt = stmt.where(
+            MemoryItem.child_state.is_(None) | (MemoryItem.child_state != "dropped")
         )
         return [(rel, item) for rel, item in self._db.execute(stmt).all()]
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -14,6 +15,8 @@ from brain import ops
 from brain.ai.ask import LLMClient, answer
 from brain.db.models import MemoryItem
 from brain.services.search import SearchHit, SearchService
+
+logger = logging.getLogger(__name__)
 from brain.services.temporal import parse_question_ranges
 from brain.services.triage import mentions_name
 
@@ -190,9 +193,20 @@ class AskService:
                 # no kid named -> byte-identical to the pre-reservation cut
                 hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
-            conflict_hits, conflict_map = self._conflict_leg(
-                pool_ids, recording=recording
-            )
+            try:
+                conflict_hits, conflict_map = self._conflict_leg(
+                    pool_ids, recording=recording
+                )
+            except Exception as exc:  # noqa: BLE001 — the leg must never kill the ask
+                logger.warning(
+                    "ask: conflict leg failed; continuing without it (%s)", exc
+                )
+                if recording:
+                    ops.record_event(
+                        "ask", "conflict_leg_failed", ok=False,
+                        detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                    )
+                conflict_hits, conflict_map = [], {}
             span.detail = {
                 "kid_leg_fired": bool(kid_items),
                 "kid_leg_count": len(kid_items),
@@ -202,6 +216,15 @@ class AskService:
             }
         context_hits = self._temporal_hits(question, now) + hits + conflict_hits
         context_hits = _unique_by_text(self._unique_by_id(context_hits))
+        # MAJOR 3: the map may reference a counterpart the dedupe dropped —
+        # a "conflicts with [id]" for a source that is not in the context is
+        # a dangling citation. Rebuild the map against the FINAL ids only.
+        final_ids = {str(hit.item.id) for hit in context_hits}
+        conflict_map = {
+            item_id: [other for other in others if other in final_ids]
+            for item_id, others in conflict_map.items()
+            if item_id in final_ids and any(other in final_ids for other in others)
+        }
         context = [
             {
                 "id": str(hit.item.id),
