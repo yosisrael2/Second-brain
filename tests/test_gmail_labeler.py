@@ -489,6 +489,7 @@ class TestReviewRound2:
             "brain.config.get_settings",
             lambda: _FakeSettings(rules_path=str(rules)),
         )
+        monkeypatch.setattr(cli, "_labeler_token", lambda: "1//tok")
         self._readonly(monkeypatch)
         code, calls = self._run_with_factory_spy(monkeypatch, ["gmail-label"], state)
         assert code == 0
