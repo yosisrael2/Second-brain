@@ -1043,15 +1043,11 @@ class TelegramBot:
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
-            parts = [
-                part
-                for part in (
-                    notice,
-                    render_source_card(source, children, self._timezone.key, recon=recon),
-                    *blocks,
-                )
-                if part
-            ]
+            parts = [part for part in (
+                notice,
+                render_source_card(source, children, self._timezone.key, recon=recon),
+                *blocks,
+            ) if part]
             return Reply(
                 text="\n".join(parts),
                 keyboard=proposal_keyboard(token, children, recon=recon),
@@ -1149,15 +1145,11 @@ class TelegramBot:
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
-            parts = [
-                part
-                for part in (
-                    notice,
-                    render_source_card(source, children, self._timezone.key, recon=recon),
-                    *blocks,
-                )
-                if part
-            ]
+            parts = [part for part in (
+                notice,
+                render_source_card(source, children, self._timezone.key, recon=recon),
+                *blocks,
+            ) if part]
             return Reply(
                 text="\n".join(parts),
                 keyboard=proposal_keyboard(token, children, recon=recon),
@@ -1228,9 +1220,7 @@ class TelegramBot:
             child_id = rel.from_id  # the verdict child owns the relation
             state = (rel.provenance or {}).get("state")
             service = ReconciliationService(
-                session,
-                _repo_of(session),
-                tz_name=self._timezone.key,
+                session, _repo_of(session), tz_name=self._timezone.key,
             )
             try:
                 if prefix == CB_REL_CONFIRM:
@@ -1320,16 +1310,12 @@ class TelegramBot:
             if rel.kind == "cancels":
                 with SessionLocal() as svc_session:
                     ReconciliationService(
-                        svc_session,
-                        _repo_of(svc_session),
-                        tz_name=self._timezone.key,
+                        svc_session, _repo_of(svc_session), tz_name=self._timezone.key,
                     ).restore_cancellation(rel.id)
             elif rel.kind == "conflicts":
                 with SessionLocal() as svc_session:
                     ReconciliationService(
-                        svc_session,
-                        _repo_of(svc_session),
-                        tz_name=self._timezone.key,
+                        svc_session, _repo_of(svc_session), tz_name=self._timezone.key,
                     ).undo_resolution(rel.id)
             else:
                 RelationsService().undo_supersede(rel.id)

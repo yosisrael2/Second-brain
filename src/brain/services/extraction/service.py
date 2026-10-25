@@ -217,9 +217,7 @@ class EnrichmentService:
         # reconciled candidate and reused afterwards — production and
         # recon-eval cannot drift. Health/ops constructions never pay.
         self.recon = ReconciliationService(
-            session,
-            repo,
-            tz_name=self._tz_name,
+            session, repo, tz_name=self._tz_name,
             # B1: tests may inject a hermetic factory; production gets the
             # ONE shared builder.
             similarity_factory=similarity_factory or self._build_recon_similarity,
@@ -261,7 +259,11 @@ class EnrichmentService:
 
     def queue_depth(self) -> int:
         """Jobs waiting to run right now (ops: queue depth)."""
-        return self._session.query(EnrichmentJob).filter(EnrichmentJob.state == "queued").count()
+        return (
+            self._session.query(EnrichmentJob)
+            .filter(EnrichmentJob.state == "queued")
+            .count()
+        )
 
     def cap_used_today(self, now: datetime) -> int:
         """LLM extractions charged to TODAY's daily budget (D5 accounting)."""
@@ -511,7 +513,9 @@ class EnrichmentService:
             return None
 
     @staticmethod
-    def _narrow_audience(default: list[str] | None, item_level: list[str]) -> list[str]:
+    def _narrow_audience(
+        default: list[str] | None, item_level: list[str]
+    ) -> list[str]:
         """The item-level audience may only NARROW the source default (R1).
 
         - no default (no sender / no teacher match): item resolution stands.
@@ -618,11 +622,15 @@ class EnrichmentService:
             # the ONLY widening allowed past the source default.
             applies_to = item_level
         else:
-            applies_to = self._narrow_audience(self._source_default_audience(source), item_level)
+            applies_to = self._narrow_audience(
+                self._source_default_audience(source), item_level
+            )
         meta: dict[str, Any] = {
             "when_raw": candidate.when_raw,
             "model": getattr(self._extractor, "name", "stub"),
-            "prompt_version": getattr(self._extractor, "prompt_version", None),
+            "prompt_version": getattr(
+                self._extractor, "prompt_version", None
+            ),
             "run_id": None,  # set at storage time
         }
         if candidate.derived_from is not None:
@@ -679,15 +687,11 @@ class EnrichmentService:
     # --- storage + diff (item 18, item 30) ----------------------------------
 
     def _children_of(self, source_id: uuid.UUID) -> dict[uuid.UUID, MemoryItem]:
-        rows = (
-            self._session.execute(
-                select(MemoryItem)
-                .join(ItemSource, ItemSource.child_id == MemoryItem.id)
-                .where(ItemSource.source_id == source_id)
-            )
-            .scalars()
-            .all()
-        )
+        rows = self._session.execute(
+            select(MemoryItem)
+            .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+            .where(ItemSource.source_id == source_id)
+        ).scalars().all()
         return {row.id: row for row in rows}
 
     @staticmethod
@@ -925,7 +929,9 @@ class EnrichmentService:
             commit=False,  # F1: write() below owns the single commit
         )
         recon.write(result, source=source, child=verdict_child)
-        return ReconOutcome(verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id)))
+        return ReconOutcome(
+            verdict=result.verdict, matched_id=uuid.UUID(str(result.matched_id))
+        )
 
     def _link_existing_quote(
         self, matched_id: uuid.UUID, source: MemoryItem, resolved: _ResolvedChild
@@ -940,7 +946,9 @@ class EnrichmentService:
         }
         for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
             if quote and quote not in existing_quotes:
-                self._session.add(ItemSource(child_id=matched_id, source_id=source.id, quote=quote))
+                self._session.add(
+                    ItemSource(child_id=matched_id, source_id=source.id, quote=quote)
+                )
         self._repo.commit()
 
     def _index_child(self, child: MemoryItem) -> None:
@@ -978,7 +986,9 @@ class EnrichmentService:
         existing_quotes = {
             row.quote
             for row in self._session.query(ItemSource)
-            .filter(ItemSource.child_id == child.id, ItemSource.source_id == source.id)
+            .filter(
+                ItemSource.child_id == child.id, ItemSource.source_id == source.id
+            )
             .all()
         }
         self._add_quote_links(child, source, resolved, skip_quotes=existing_quotes)
@@ -1000,7 +1010,9 @@ class EnrichmentService:
         for quote in [resolved.candidate.quote, *resolved.extra_quotes]:
             if not quote or (skip_quotes and quote in skip_quotes):
                 continue
-            self._session.add(ItemSource(child_id=child.id, source_id=source.id, quote=quote))
+            self._session.add(
+                ItemSource(child_id=child.id, source_id=source.id, quote=quote)
+            )
 
 
 @dataclass(frozen=True)

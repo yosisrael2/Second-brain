@@ -40,7 +40,8 @@ assert_test_database(str(engine.url))
 SOURCE_BODY = "שלום,\nמחר כינוס הורים באמפי 22.10\nחולצה לבנה ליום חמישי 23.10\n"
 # a WhatsApp text that qualifies for extraction (2+ dateish expressions)
 WA_BODY = (
-    "[21/10] הודעה מהכיתה: מחר 22/10 איסוף ב-13:00 וביום חמישי 23/10 חולצה לבנה וכך גם ב-24/10"
+    "[21/10] הודעה מהכיתה: מחר 22/10 איסוף ב-13:00 "
+    "וביום חמישי 23/10 חולצה לבנה וכך גם ב-24/10"
 )
 
 
@@ -91,7 +92,9 @@ def _bot() -> TelegramBot:
 def _use_pass_service(monkeypatch, service) -> None:
     """Swap the pass's service construction (the test seam; B3 keeps the
     per-update factory untouched)."""
-    monkeypatch.setattr("brain.telegram_bot._build_pass_service", lambda settings, session: service)
+    monkeypatch.setattr(
+        "brain.telegram_bot._build_pass_service", lambda settings, session: service
+    )
 
 
 def _wipe(session) -> None:
@@ -146,7 +149,6 @@ async def _await_pass_done(core, timeout: float = 5.0) -> None:
 
 async def _await_started(fake, timeout: float = 5.0) -> None:
     """The pass runs in a worker thread: give it a beat to actually enter."""
-
     async def wait():
         while not fake.started.is_set():
             await asyncio.sleep(0.01)
@@ -226,7 +228,9 @@ def test_outcomes_become_exactly_one_card_per_changed_source(monkeypatch):
             )
         )
         repo.commit()
-        session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
+        session.add(
+            ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text)
+        )
         repo.commit()
     fake = _BlockingEnrichment(outcomes=_outcomes_for(*sources))
     _use_pass_service(monkeypatch, fake)
@@ -421,7 +425,9 @@ def test_shutdown_delivers_a_finished_unharvested_pass(monkeypatch):
     repo = ItemsRepository(session)
     source = repo.add(MemoryItem(raw_text=SOURCE_BODY, source="email"))
     repo.commit()
-    child = repo.add(MemoryItem(raw_text="child x", source="email", child_state="proposed"))
+    child = repo.add(
+        MemoryItem(raw_text="child x", source="email", child_state="proposed")
+    )
     repo.commit()
     session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
     repo.commit()
@@ -474,10 +480,14 @@ def test_shutdown_cancels_a_pass_past_the_grace(monkeypatch):
             await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
             await _await_started(fake)
             # a pass past the grace: shutdown does not hang on it
-            await asyncio.wait_for(_shutdown_enrichment(_Tg(), core, grace_s=0.05), timeout=2.0)
+            await asyncio.wait_for(
+                _shutdown_enrichment(_Tg(), core, grace_s=0.05), timeout=2.0
+            )
         finally:
             fake.release.set()
-        assert any(e["name"] == "worker_pass_cancelled_at_shutdown" for e in events)
+        assert any(
+            e["name"] == "worker_pass_cancelled_at_shutdown" for e in events
+        )
         assert core._enrich_task is None  # noqa: SLF001
 
     asyncio.run(go())
@@ -516,16 +526,13 @@ def _ops_events_of_kind(kind: str) -> list[dict]:
     from brain.ops import _get_engine
 
     with _get_engine().connect() as conn:
-        rows = (
-            conn.execute(
-                text(
-                    "SELECT component, kind, ok, detail FROM ops_events WHERE kind = :k ORDER BY ts"
-                ),
-                {"k": kind},
-            )
-            .mappings()
-            .all()
-        )
+        rows = conn.execute(
+            text(
+                "SELECT component, kind, ok, detail FROM ops_events "
+                "WHERE kind = :k ORDER BY ts"
+            ),
+            {"k": kind},
+        ).mappings().all()
     return [dict(r) for r in rows]
 
 
@@ -648,7 +655,9 @@ def test_finished_stalled_pass_still_delivers_its_cards(monkeypatch):
     repo = ItemsRepository(session)
     source = repo.add(MemoryItem(raw_text=SOURCE_BODY, source="email"))
     repo.commit()
-    child = repo.add(MemoryItem(raw_text="child x", source="email", child_state="proposed"))
+    child = repo.add(
+        MemoryItem(raw_text="child x", source="email", child_state="proposed")
+    )
     repo.commit()
     session.add(ItemSource(child_id=child.id, source_id=source.id, quote=source.raw_text))
     repo.commit()
@@ -841,7 +850,7 @@ def test_starvation_the_filter_is_in_sql(monkeypatch):
     )
     session.commit()
     # the premise, asserted: 51 queued jobs, 50 WhatsApp, ALL older than the
-    # email's job — if enqueue had skipped the fillers this test proves nothing
+    # email's job — if enqueue had skipped the fillers this would prove nothing
     counts = session.execute(
         text(
             "SELECT source, COUNT(*) FROM enrichment_jobs j "
@@ -894,11 +903,13 @@ def test_starvation_deferred_jobs_never_hide_a_due_job():
     due = _queued(session, source="email", text=SOURCE_BODY + " ד", sent_days_ago=1)
     # defer the 30 oldest (as D5 does), keep the newest due
     session.execute(
-        text("UPDATE enrichment_jobs SET not_before = :nb, queued_at = :q WHERE item_id <> :i"),
+        text(
+            "UPDATE enrichment_jobs SET not_before = :nb, queued_at = :q WHERE item_id <> :i"
+        ),
         {"nb": tomorrow, "q": datetime.now(tz=UTC) - timedelta(days=2), "i": str(due.id)},
     )
     session.commit()
-    # the premise: 31 queued jobs; the due one is strictly the newest
+    # the premise: 30 not-yet-due queued jobs ahead of the one due job
     counts = session.execute(
         text(
             "SELECT state, COUNT(*) FROM enrichment_jobs "

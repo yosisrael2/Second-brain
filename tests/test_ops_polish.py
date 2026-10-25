@@ -239,7 +239,7 @@ class TestEnrichmentWorkerSources:
         from datetime import UTC, datetime, timedelta
 
         from brain.config import Settings
-        from brain.db.models import EnrichmentJob, MemoryItem
+        from brain.db.models import MemoryItem
         from brain.db.session import SessionLocal
         from brain.repositories.items import ItemsRepository
         from brain.services.extraction.service import EnrichmentService

@@ -439,7 +439,9 @@ def assert_not_live_database(database_url: str, allow_live: str | None = None) -
         )
 
 
-def assert_not_live_collection(qdrant_collection: str, allow_live: str | None = None) -> None:
+def assert_not_live_collection(
+    qdrant_collection: str, allow_live: str | None = None
+) -> None:
     """Refuse the LIVE collection name unless BRAIN_ALLOW_LIVE=1 (construction guard).
 
     The other narrow half: called from the Qdrant vector store's __init__
