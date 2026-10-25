@@ -296,6 +296,11 @@ class GmailConnector(GoogleConnector):
         self._legacy_seed = legacy_seed
         self._is_known = is_known
         self._rfc_backstop = rfc_backstop
+        # adopt-only progress seam (finding-4 follow-up): adopt assigns a
+        # per-run set of ids it already collected; the query path skips them
+        # WITHOUT a GET — during adopt the ledger cannot know them yet (a
+        # dry-run writes nothing; a real adopt writes only after matching).
+        self.run_seen: set[str] | None = None
         self._client_overrides: dict[str, Any] = dict(client_overrides or {})
         self._client: RestGmailClient | None = None
 
@@ -371,6 +376,12 @@ class GmailConnector(GoogleConnector):
         label = self._label_id()
         client = self._gmail()
         query = getattr(self._settings, "gmail_query", "") or ""
+        # The resume point is taken BEFORE the listing: a message that arrives
+        # while pages are being read sits AFTER this historyId, so the next
+        # sync's history walk re-covers it (re-delivery is idempotent through
+        # the ledger). Taken after the listing, the saved cursor would be past
+        # arrivals the listing never saw — silently lost mail.
+        resume_history_id = self._current_history_id()
         # Bounded listing (quota hygiene): a page of max(limit, 50) stubs —
         # never the whole label just to fill a small --limit.
         page_size = min(500, max(limit, 50))
@@ -395,6 +406,8 @@ class GmailConnector(GoogleConnector):
                     break
                 if self._is_known is not None and self._is_known(stub.id):
                     continue  # fast path: the ledger knows this id — no GET
+                if self.run_seen is not None and stub.id in self.run_seen:
+                    continue  # adopt progress: this run already collected it — no GET
                 try:
                     record = self._record(stub.id)
                 except ConnectorError as exc:
@@ -410,9 +423,14 @@ class GmailConnector(GoogleConnector):
                 break
         next_cursor: str | None = None
         if not truncated:
-            # The whole listing fit: the current historyId is a safe resume point.
-            next_cursor = self._current_history_id()
-        return FetchResult(records=records, next_cursor=next_cursor, reset=reset)
+            # The whole listing fit: the PRE-listing historyId is a safe
+            # resume point — the next sync's history walk re-reports anything
+            # that arrived during the listing, and the ledger dedupes it.
+            next_cursor = resume_history_id
+        # more=True when the batch hit the limit: there are more records the
+        # source yields, and the resume cursor (None when truncated) cannot
+        # express it. The --drain loop and adopt._fetch_all keep going on it.
+        return FetchResult(records=records, next_cursor=next_cursor, reset=reset, more=truncated)
 
     def _current_history_id(self) -> str | None:
         client = self._gmail()

@@ -102,6 +102,10 @@ class SyncSummary:
     skipped: int = 0
     errors: int = 0
     reset: bool = False
+    # The source said this batch was truncated by the limit and has more
+    # records (FetchResult.more). The --drain loop keeps going on it even
+    # when the cursor did not move; irrelevant outside a drain loop.
+    more: bool = False
     cursor_saved: bool = False
     error: str | None = None
     # state == "backoff" only: seconds until the persisted backoff window
@@ -288,6 +292,7 @@ class ConnectorRunner:
             skipped=skipped,
             errors=errors,
             reset=result.reset,
+            more=result.more,
         )
         if errors == 0:
             # Whole batch succeeded: only now may the cursor move.
