@@ -43,11 +43,14 @@ DEFAULT_KID_RECALL_LOOKBACK_DAYS = 3
 # WA39 run 3, part 2: the rerank can rank school emails above the one
 # kid-channel conversation that answers the question, and the top_k cut
 # drops it even though the kid leg fetched it (the slippers case). When a
-# question names a confirmed kid, the final context reserves up to this
-# many top_k slots for the best-ranked kid-recall items (kid-channel
-# conversations first); unused reserved slots go back to the general
-# ranking. Settings.ask_kid_reserved_slots overrides; 0 disables.
-DEFAULT_KID_RESERVED_SLOTS = 3
+# question names a confirmed kid, the context is the general top_k PLUS up
+# to this many kid items — ADDITIONS, never displacing the general ranking
+# (run 4: carved-out slots went to unrelated chatter while the answering
+# item stayed out). Dated questions fill the additions by date relevance
+# (in-window kid-channel items first, then lookback by distance), undated
+# ones in rerank order. Settings.ask_kid_reserved_slots overrides; 0
+# disables.
+DEFAULT_KID_RESERVED_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,15 @@ class KidRecallRepoProto(Protocol):
 
     def by_text_any(self, needles: Sequence[str], *, limit: int) -> Sequence[MemoryItem]: ...
 
+    def conflict_counterparts(
+        self, item_ids: Sequence[uuid.UUID], *, limit: int
+    ) -> Sequence[tuple[Any, MemoryItem]]: ...
+
+
+# PR-b: at most this many conflict counterparts join the context (the plan's
+# cap — beyond four the answer drowns; the rest stay relations).
+DEFAULT_CONFLICT_LEG_LIMIT = 4
+
 
 class AskService:
     """Answers questions over the memory store: search top-k, then LLM.
@@ -110,6 +122,7 @@ class AskService:
         kid_recall_limit: int = DEFAULT_KID_RECALL_LIMIT,
         kid_recall_lookback_days: int = DEFAULT_KID_RECALL_LOOKBACK_DAYS,
         kid_reserved_slots: int = DEFAULT_KID_RESERVED_SLOTS,
+        conflict_leg_limit: int = DEFAULT_CONFLICT_LEG_LIMIT,
     ) -> None:
         self._search = search
         self._llm = llm
@@ -125,6 +138,8 @@ class AskService:
         self._kid_recall_limit = kid_recall_limit
         self._kid_recall_lookback_days = kid_recall_lookback_days
         self._kid_reserved_slots = kid_reserved_slots
+        # PR-b conflict leg: both must be present for the leg to run.
+        self._conflict_leg_limit = conflict_leg_limit
 
     def ask(
         self, question: str, *, now: datetime | None = None, record_ops: bool = True
@@ -167,24 +182,39 @@ class AskService:
             else:
                 pool = self._search.search(question, limit=self._recall_pool)
             if kid_items:
-                hits = self._top_k_with_reserved_slots(pool, kid_items)
+                ranges = parse_question_ranges(
+                    question, self._tz, now or datetime.now(UTC)
+                )
+                hits = self._top_k_with_kid_additions(pool, kid_items, ranges)
             else:
                 # no kid named -> byte-identical to the pre-reservation cut
                 hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
+            conflict_hits, conflict_map = self._conflict_leg(
+                pool_ids, recording=recording
+            )
             span.detail = {
                 "kid_leg_fired": bool(kid_items),
                 "kid_leg_count": len(kid_items),
+                "conflict_leg_count": len(conflict_hits),
                 "pool_size": len(pool_ids),
                 "pool_hash": hashlib.sha1(",".join(pool_ids).encode()).hexdigest()[:12],
             }
-        context_hits = self._temporal_hits(question, now) + hits
+        context_hits = self._temporal_hits(question, now) + hits + conflict_hits
         context_hits = _unique_by_text(self._unique_by_id(context_hits))
         context = [
             {
                 "id": str(hit.item.id),
                 "text": hit.item.raw_text[:SOURCE_PROMPT_MAX_CHARS],
                 "when": self._when_of(hit.item),
+                # PR-b: only set when the item participates in a conflicts
+                # relation inside the context — absent otherwise, so prompts
+                # without conflicts stay byte-identical.
+                **(
+                    {"conflict_with": conflict_map[str(hit.item.id)]}
+                    if str(hit.item.id) in conflict_map
+                    else {}
+                ),
             }
             for hit in context_hits
         ]
@@ -205,36 +235,54 @@ class AskService:
             model=result["model"],
         )
 
-    def _top_k_with_reserved_slots(
-        self, pool: list[SearchHit], kid_items: list[MemoryItem]
+    def _top_k_with_kid_additions(
+        self,
+        pool: list[SearchHit],
+        kid_items: list[MemoryItem],
+        ranges: list[tuple[datetime, datetime]] | None,
     ) -> list[SearchHit]:
-        """The top_k cut with kid-recall reservation (WA39 run 3 part 2).
+        """The context cut with kid additions (WA39 run 4 rework).
 
-        Up to ``ask_kid_reserved_slots`` of top_k are reserved for the
-        best-ranked kid-recall items — kid-channel conversations first (they
-        carry the structured meta.channel), then the leg's other items — in
-        the rerank's own order. The reserved slot comes out of the general
-        ranking (top_k is unchanged); unused reserved slots go back to it.
-        The final context keeps the rerank's order: reservation changes WHO
-        is in, not the order they appear in.
+        The general reranked top_k is NEVER displaced (run 4: carved-out
+        slots went to unrelated kid-channel chatter while the answering item
+        stayed out). The context is the general top_k PLUS up to
+        ``ask_kid_reserved_slots`` kid items not already in it. With a
+        resolved window the additions fill by DATE RELEVANCE before rerank
+        order: kid-channel items inside the window first, then the lookback
+        items ordered by distance to the window (nearest first) — the
+        announcement about day D outranks same-channel chatter the reranker
+        happened to rank higher. Undated questions fill in rerank order, as
+        before.
         """
+        general = pool[: self._top_k]
         if self._kid_reserved_slots <= 0 or not kid_items:
-            return pool[: self._top_k]
+            return general
+        general_ids = {h.item.id for h in general}
         kid_ids = {i.id for i in kid_items}
-        ranked_kid = [h for h in pool if h.item.id in kid_ids]
-        kid_channel = [h for h in ranked_kid if (h.item.meta or {}).get("channel")]
-        kid_other = [h for h in ranked_kid if h.item.id not in {x.item.id for x in kid_channel}]
-        reserved = (kid_channel + kid_other)[: self._kid_reserved_slots]
-        if not reserved:
-            return pool[: self._top_k]
-        reserved_ids = {h.item.id for h in reserved}
-        rest = [
-            h for h in pool if h.item.id not in reserved_ids
-        ][: self._top_k - len(reserved)]
-        position = {h.item.id: idx for idx, h in enumerate(pool)}
-        selected = reserved + rest
-        selected.sort(key=lambda h: position[h.item.id])
-        return selected
+        candidates = [
+            h for h in pool if h.item.id in kid_ids and h.item.id not in general_ids
+        ]
+        if not candidates:
+            return general
+        if ranges:
+            position = {h.item.id: idx for idx, h in enumerate(pool)}
+
+            def key(h: SearchHit) -> tuple[int, timedelta, int]:
+                occ = h.item.occurred_at
+                channel = bool((h.item.meta or {}).get("channel"))
+                if channel and occ is not None:
+                    for start, end in ranges:
+                        if start <= occ < end:
+                            return (0, timedelta(0), position[h.item.id])
+                    nearest = min(abs(occ - start) for start, _ in ranges)
+                    return (1, nearest, position[h.item.id])
+                if channel:  # kid-channel item without an occurred_at
+                    return (1, timedelta.max, position[h.item.id])
+                return (2, timedelta(0), position[h.item.id])
+
+            candidates.sort(key=key)
+        additions = candidates[: self._kid_reserved_slots]
+        return general + additions
 
     def _kid_recall_items(
         self,
@@ -382,6 +430,60 @@ class AskService:
                 },
             )
         return pool
+
+    def _conflict_leg(
+        self, pool_ids: list[str], *, recording: bool
+    ) -> tuple[list[SearchHit], dict[str, list[str]]]:
+        """PR-b (item 38's ask leg): pull conflict counterparts into the context.
+
+        Every conflicts relation touching a recalled item contributes its
+        OTHER side to the context — even when that side is only a PROPOSED
+        child (a contradiction the user has not confirmed yet is exactly
+        what the answer must quote next to the current version). Both ends
+        of every in-context relation are marked ``conflict_with`` so the
+        prompt renders the ⚠️ line and the answer quotes both versions.
+
+        Returns (counterpart hits, item_id -> [conflicting item ids]). With
+        no repository or no relations: ([], {}) — the pipeline is
+        byte-identical to the pre-leg one. An older repository without the
+        method (third-party fakes) gets no leg, no change.
+        """
+        if self._items_repo is None or not pool_ids:
+            return [], {}
+        repo_method = getattr(self._items_repo, "conflict_counterparts", None)
+        if repo_method is None:
+            return [], {}
+        try:
+            uuids = [uuid.UUID(item_id) for item_id in pool_ids]
+        except ValueError:
+            return [], {}
+        pairs = list(repo_method(uuids, limit=self._conflict_leg_limit))
+        if not pairs:
+            return [], {}
+        pool_set = set(uuids)
+        pulled: dict[uuid.UUID, MemoryItem] = {}
+        for _rel, other in pairs:
+            if other.id not in pool_set:
+                pulled.setdefault(other.id, other)
+        context_ids = pool_set | set(pulled)
+        conflict_map: dict[str, list[str]] = {}
+        for rel, _other in pairs:
+            a, b = rel.from_id, rel.to_id
+            if a in context_ids and b in context_ids:
+                conflict_map.setdefault(str(a), [])
+                if str(b) not in conflict_map[str(a)]:
+                    conflict_map[str(a)].append(str(b))
+                conflict_map.setdefault(str(b), [])
+                if str(a) not in conflict_map[str(b)]:
+                    conflict_map[str(b)].append(str(a))
+        if recording:
+            ops.record_event(
+                "ask",
+                "conflict_leg",
+                ok=True,
+                detail={"pulled": len(pulled), "relations": len(pairs)},
+            )
+        return [SearchHit(item=item, score=None) for item in pulled.values()], conflict_map
 
     def _temporal_hits(self, question: str, now: datetime | None) -> list[SearchHit]:
         """Fetch every item inside the question's resolved date ranges."""

@@ -733,6 +733,18 @@ def _whatsapp_triage(*, limit: int) -> int:
     skipped = 0
     with SessionLocal() as session:
         trier = _build_trier(session)
+        if not getattr(trier, "kid_names_loaded", True):
+            # Startup tolerance (worker_3's post-merge review of #111): the
+            # trier swallowed a failed first kid-names read for the POLLER's
+            # sake, but a ONE-SHOT backfill on [] names would silently miss
+            # kid mentions. Refuse loudly instead.
+            print(
+                "whatsapp-triage: initial kid-names read failed — refusing to "
+                "run a one-shot backfill with no kid names (kid mentions would "
+                "be missed silently). Re-run once the DB is reachable.",
+                file=sys.stderr,
+            )
+            return 1
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:

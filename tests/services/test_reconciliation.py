@@ -1073,7 +1073,7 @@ def test_a_verdict_is_one_transaction(db):
 
     original_write = ReconciliationService.write
 
-    def exploding_write(self, result, *, source, child):
+    def exploding_write(self, result, *, source, child, quotes=None):
         raise RuntimeError("boom between child and relation")
 
     ReconciliationService.write = exploding_write
