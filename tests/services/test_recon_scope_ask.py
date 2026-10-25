@@ -779,10 +779,9 @@ def test_ask_conflict_leg_failure_degrades_to_plain_answer(db):
         def close(self) -> None:
             return None
 
-    llm = RealStubLLM()
     ask = AskService(
         RecordingSearch([SearchHit(item=existing, score=0.9)]),
-        llm,
+        RealStubLLM(),
         items_repo=ExplodingRepo(session),
     )
     result = ask.ask("מתי הטיול?", now=NOW)  # must NOT raise
@@ -898,3 +897,67 @@ def test_answer_series_scope_with_a_missing_child_is_a_value_error(db):
     db.commit()
     with pytest.raises(ValueError):
         service.answer_series_scope(rel.id, "from_now_on")
+
+
+def test_ask_conflict_leg_survives_a_poisoned_query(db):
+    """MAJOR 2, round 2 (the #117 trap): a REAL db error inside the leg
+    aborts the ask's whole transaction — the catch alone only moves the
+    crash one step later, and the abort silently discards the session's
+    other uncommitted work. The leg's DB work must run in a SAVEPOINT so
+    only it rolls back: the ask answers, one ops event is recorded, and the
+    outer transaction's own work survives."""
+    existing = MemoryItem(
+        raw_text="טיול שנתי יוצא ב-16:00",
+        source="email",
+        type="event",
+        occurred_at=_jlm(10, 16, 0),
+        status="filed",
+    )
+    db.add(existing)
+    db.commit()
+
+    class PoisonedRepo(ItemsRepository):
+        def conflict_counterparts(self, item_ids, *, limit=4):
+            db.execute(text("SELECT * FROM no_such_table_reconfix"))
+            return []
+
+    class RealStubLLM:
+        """NOT synthetic: the leg-failure event must be recorded."""
+
+        synthetic = False
+
+        def complete(self, prompt: str):
+            from tests.test_ask_service import cite_every_source
+
+            from brain.ai.ask import Completion
+
+            return Completion(cite_every_source(prompt), model="real-stub")
+
+        def close(self) -> None:
+            return None
+
+    ask = AskService(
+        RecordingSearch([SearchHit(item=existing, score=0.9)]),
+        RealStubLLM(),
+        items_repo=PoisonedRepo(db),
+    )
+    # UNCOMMITTED outer-transaction work that must survive the failed leg:
+    # without the savepoint the poisoned statement aborts the WHOLE
+    # transaction and the rollback silently discards it
+    outer_write = MemoryItem(
+        raw_text="uncommitted outer work", source="email", type="fact"
+    )
+    db.add(outer_write)
+    db.flush()
+    result = ask.ask("מתי הטיול?", now=NOW)  # must NOT raise
+    assert result.answer
+    assert [s.item.id for s in result.sources] == [existing.id]
+    events = db.query(OpsEvent).filter_by(
+        component="ask", kind="conflict_leg_failed"
+    ).all()
+    assert len(events) == 1
+    # the outer transaction's own work SURVIVES the failed leg (the savepoint
+    # scopes the rollback to the leg; without it the abort eats this row)
+    assert db.get(MemoryItem, outer_write.id) is not None
+    db.commit()
+    assert db.get(MemoryItem, outer_write.id) is not None

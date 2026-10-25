@@ -480,7 +480,17 @@ class AskService:
             uuids = [uuid.UUID(item_id) for item_id in pool_ids]
         except ValueError:
             return [], {}
-        pairs = list(repo_method(uuids, limit=self._conflict_leg_limit))
+        # The leg runs SQL on the ask's session: a REAL db error aborts the
+        # whole transaction ("current transaction is aborted") — the catch
+        # one level up would only move the crash one step later. The
+        # savepoint scopes the rollback to the leg; the outer transaction
+        # and its uncommitted work survive (the #117 trap).
+        session = getattr(self._items_repo, "_db", None)
+        if session is not None and hasattr(session, "begin_nested"):
+            with session.begin_nested():
+                pairs = list(repo_method(uuids, limit=self._conflict_leg_limit))
+        else:  # a third-party fake without a session: no savepoint to take
+            pairs = list(repo_method(uuids, limit=self._conflict_leg_limit))
         if not pairs:
             return [], {}
         pool_set = set(uuids)
