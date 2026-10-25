@@ -4,20 +4,24 @@ Incident 25 Oct: `brain connectors auth google` crashed with
 ``AttributeError: type object 'InstalledAppFlow' has no attribute
 'from_client_secret_file'`` — the real method is ``from_client_secrets_file``
 (with an "s"). The test fakes had copied the typo, so the suite stayed green
-while both production call sites were broken. These tests pin the contract to
-the real library: the builders are called against a spy installed where the
-real class lives, and the real class itself is asserted to have the method
-(skipped when the gmail extra is not installed).
+while both production call sites were broken. These tests pin the contract:
+
+- the spy test runs WITHOUT the gmail extra (a stub package is injected into
+  ``sys.modules`` so the builders' lazy import resolves to the spy) — CI has
+  no google extra, so this test executes there; a typo'd call site fails the
+  suite instead of waiting for the next live consent;
+- the real-class test asserts the actual ``google_auth_oauthlib`` class has
+  the method, and stays skipped when the gmail extra is not installed.
 """
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 cli = pytest.importorskip("brain.cli")
-
-google_flow = pytest.importorskip("google_auth_oauthlib.flow")
-from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: E402
 
 
 class _SpyFlow:
@@ -31,7 +35,8 @@ class _SpyFlow:
 
 
 class _SpyFlowClass:
-    """Records the method name the builders actually call."""
+    """Records the method name the builders actually call (the real method
+    is a classmethod — the builders call it on the class)."""
 
     method: str | None = None
 
@@ -43,9 +48,23 @@ class _SpyFlowClass:
         return flow
 
 
+def _install_spy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ``google_auth_oauthlib.flow.InstalledAppFlow`` at the spy,
+    whether or not the real package is importable."""
+    flow_module = types.ModuleType("google_auth_oauthlib.flow")
+    flow_module.InstalledAppFlow = _SpyFlowClass
+    stub = types.ModuleType("google_auth_oauthlib")
+    stub.flow = flow_module
+    monkeypatch.setitem(sys.modules, "google_auth_oauthlib", stub)
+    monkeypatch.setitem(sys.modules, "google_auth_oauthlib.flow", flow_module)
+
+
 def test_real_installed_app_flow_has_the_method_we_call():
     """The real library name — the incident's root: a typo'd name that only
     the fakes answered. Skipped when the gmail extra is not installed."""
+    pytest.importorskip("google_auth_oauthlib")
+    from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+
     assert callable(getattr(InstalledAppFlow, "from_client_secrets_file", None)), (
         "google_auth_oauthlib.flow.InstalledAppFlow has no from_client_secrets_file"
     )
@@ -57,7 +76,8 @@ def test_real_installed_app_flow_has_the_method_we_call():
 def test_both_flow_builders_call_the_real_library_method(monkeypatch, tmp_path):
     """Both production builders must dispatch to from_client_secrets_file on
     whatever class lives at google_auth_oauthlib.flow.InstalledAppFlow — a
-    typo'd call site crashes here instead of at consent time."""
+    typo'd call site crashes here instead of at consent time. Runs without
+    the google extra (stub package in sys.modules), so CI executes it."""
     secret = tmp_path / "client_secret.json"
     secret.write_text("{}")
 
@@ -66,7 +86,7 @@ def test_both_flow_builders_call_the_real_library_method(monkeypatch, tmp_path):
         (cli._build_connectors_oauth_flow, (str(secret), ["email.readonly"]), ["email.readonly"]),
     ):
         _SpyFlowClass.method = None
-        monkeypatch.setattr(google_flow, "InstalledAppFlow", _SpyFlowClass)
+        _install_spy(monkeypatch)
         flow = builder(*args)
         assert _SpyFlowClass.method == "from_client_secrets_file", (
             "the builder called a method the real class does not have"
