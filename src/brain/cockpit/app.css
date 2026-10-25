@@ -550,8 +550,10 @@ h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
   }
   .build-card .sha { font-size: 11px; }
   .main { padding: 0 16px 32px; }
-  .topbar { padding-top: 12px; }
-  .page-title { font-size: 20px; line-height: 28px; }
+  .topbar { padding-top: 12px; flex-wrap: wrap; }
+  /* phone: the title gets its own row — beside the refresh/health controls
+     it was squeezed to "Mem" at 390px. */
+  .page-title { font-size: 20px; line-height: 28px; flex: 1 1 100%; }
   .topbar-actions { gap: 8px; }
   .btn { height: 44px; }
   .btn-sm { height: 44px; }

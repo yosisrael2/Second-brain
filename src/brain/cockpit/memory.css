@@ -140,6 +140,11 @@
   .mm-wrap[data-view="list"] .mm-right { display: none; }
   .mm-wrap[data-view="detail"] .mm-left { display: none; }
   .mm-wrap[data-view="detail"] .mm-backbar { display: block; }
+  /* phone: the header stacks — the name and its alias sub-line get the
+     full width; Edit/+ Add drop BELOW the name block instead of floating
+     over it (at 390px the sub-line ran under the buttons and was cut). */
+  .mm-dhead .mm-dhead-wrap { display: flex; flex-direction: column; }
+  .mm-dhead .mm-dhead-actions { position: static; margin-top: 2px; }
 }
 
 /* fact history drawer (kept from PR 0b) */
