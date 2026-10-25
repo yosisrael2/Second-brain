@@ -71,6 +71,15 @@ def _entity_dict(entity: Entity, aliases: list[str] | None = None) -> dict[str, 
     }
 
 
+# set_kid's profile fields are the SINGLE-VALUED kid predicates: a kid
+# carries at most one current value of each. add_fact supersedes on the
+# same set — this constant is the one source of truth for both, pinned
+# to set_kid's signature by test_single_valued_set_matches_set_kid_signature.
+SINGLE_VALUED_KID_PREDICATES: frozenset[str] = frozenset(
+    {"gender", "school", "grade", "class", "teacher"},
+)
+
+
 class MemoryService:
     """Confirmed-knowledge use cases over the memory repository."""
 
@@ -623,11 +632,31 @@ class MemoryService:
         status: str = "confirmed",
         provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Insert a fact row (PR A inserts proposals with the same call)."""
+        """Insert a fact row (PR A inserts proposals with the same call).
+
+        For the SINGLE-VALUED kid predicates (set_kid's field set) a
+        confirmed add supersedes the current fact instead of piling up
+        parallel current values: an unchanged value is a no-op returning
+        the existing row, a changed value closes the old row and chains
+        the new one via supersedes_id — the same semantics set_kid uses.
+        'note' and other multi-valued predicates stay additive.
+        """
         if self._repo.get_entity(subject_id) is None:
             raise KeyError(subject_id)
         if object_id is None and value is None:
             raise ValueError("a fact needs an object or a value")
+        supersedes = None
+        if (
+            status == "confirmed"
+            and predicate in SINGLE_VALUED_KID_PREDICATES
+            and value is not None
+        ):
+            current = self._current_confirmed_fact(subject_id, predicate)
+            if current is not None:
+                if current.value == value:
+                    return _fact_dict(current)  # unchanged: no history spam
+                self._repo.close_fact(current, at=utcnow())
+                supersedes = current.id  # keep the version chain queryable
         fact = self._repo.add_fact(
             MemoryFact(
                 subject_id=subject_id,
@@ -636,6 +665,7 @@ class MemoryService:
                 value=value,
                 status=status,
                 valid_from=valid_from or utcnow(),
+                supersedes_id=supersedes,
                 provenance=provenance or {"source": "user"},
             )
         )
