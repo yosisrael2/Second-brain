@@ -90,6 +90,9 @@ async function api(path, options) {
     try { detail = (await response.json()).detail || detail; } catch { /* keep */ }
     throw new Error(`${response.status}: ${detail}`);
   }
+  // 204 (the DELETE endpoints) has no body to parse — parsing it throws and
+  // the caller's success path (e.g. the Undo toast) never runs.
+  if (response.status === 204) return null;
   return response.json();
 }
 

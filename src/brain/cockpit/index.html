@@ -165,37 +165,32 @@
 
       <!-- MEMORY -->
       <section id="tab-memory" class="tab-panel">
-        <div class="memory-controls">
-          <label>show
-            <select id="memory-status">
-              <option value="confirmed">confirmed</option>
-              <option value="proposed">proposed inbox</option>
-            </select>
-          </label>
-          <input id="memory-q" type="text" placeholder="search name or alias…">
-          <button id="memory-add-entity-btn" class="btn btn-sm">＋ Entity</button>
-          <span id="memory-count" class="pageinfo"></span>
+        <div class="mm-wrap" id="memory-wrap" data-view="list">
+          <div class="mm-left" id="memory-left">
+            <div class="mm-left-head">
+              <span class="mm-title">People &amp; groups</span>
+              <select id="memory-status" class="mm-status">
+                <option value="confirmed">confirmed</option>
+                <option value="proposed">proposed inbox</option>
+              </select>
+            </div>
+            <div class="mm-search">
+              <input id="memory-q" type="text" placeholder="Search…">
+            </div>
+            <div class="mm-addrow">
+              <button id="memory-add-person-btn" class="btn btn-sm btn-pri">+ Add person</button>
+              <button id="memory-add-other-btn" class="btn btn-sm">+ Other</button>
+            </div>
+            <div id="memory-list" class="mm-list"></div>
+          </div>
+          <div class="mm-right" id="memory-detail">
+            <div class="mm-backbar">
+              <button id="memory-back" class="btn btn-sm btn-ghost">‹ Back to list</button>
+            </div>
+            <div id="memory-detail-head" class="mm-dhead"></div>
+            <div id="memory-detail-body" class="mm-stack"></div>
+          </div>
         </div>
-        <div id="memory-add-entity" class="memory-add-entity" hidden>
-          <label>kind
-            <select id="memory-entity-kind">
-              <option value="person">person</option>
-              <option value="group">group</option>
-              <option value="place">place</option>
-              <option value="org">org</option>
-              <option value="channel">channel</option>
-            </select>
-          </label>
-          <label>name
-            <input id="memory-entity-name" type="text" dir="auto" placeholder="e.g. Rona / ה' ספיר">
-          </label>
-          <label>aliases (comma-separated)
-            <input id="memory-entity-aliases" type="text" dir="auto" placeholder="רונה, Rona C.">
-          </label>
-          <button id="memory-entity-save" class="btn btn-sm">Save</button>
-          <button id="memory-entity-cancel" class="btn btn-sm">Cancel</button>
-        </div>
-        <div id="memory-list"></div>
         <aside id="memory-drawer" class="memory-drawer" hidden aria-label="fact history">
           <div class="drawer-head">
             <h3>Fact history</h3>
@@ -203,6 +198,67 @@
           </div>
           <div id="memory-drawer-body" class="drawer-body"></div>
         </aside>
+        <div id="memory-add-person" class="mm-modal" hidden>
+          <div class="mm-sheet">
+            <h3>Add person</h3>
+            <div class="mm-field"><label>name</label><input id="memory-person-name" type="text" dir="auto" placeholder="e.g. מיכל"></div>
+            <div class="mm-field"><label>aliases (comma-separated)</label><input id="memory-person-aliases" type="text" dir="auto" placeholder="רונה, Rona C."></div>
+            <div class="mm-grid2">
+              <div class="mm-field"><label>relation to the family</label>
+                <select id="memory-person-relation">
+                  <option value="">—</option>
+                  <option value="child">child</option>
+                  <option value="father">father</option>
+                  <option value="mother">mother</option>
+                  <option value="grandparent">grandparent</option>
+                  <option value="teacher">teacher</option>
+                  <option value="friend">friend / contact</option>
+                  <option value="other">other</option>
+                </select>
+              </div>
+              <div class="mm-field"><label>gender</label>
+                <select id="memory-person-gender">
+                  <option value="">—</option>
+                  <option value="girl">girl</option>
+                  <option value="boy">boy</option>
+                </select>
+              </div>
+            </div>
+            <div class="mm-grid2">
+              <div class="mm-field"><label>grade (kids)</label><input id="memory-person-grade" type="text" dir="auto" placeholder="ה"></div>
+              <div class="mm-field"><label>class</label><input id="memory-person-class" type="text" dir="auto" placeholder="ספיר"></div>
+            </div>
+            <div class="mm-grid2">
+              <div class="mm-field"><label>school / kindergarten</label><input id="memory-person-school" type="text" dir="auto"></div>
+              <div class="mm-field"><label>teacher</label><input id="memory-person-teacher" type="text" dir="auto"></div>
+            </div>
+            <div class="mm-sheet-actions">
+              <button id="memory-person-cancel" class="btn btn-sm btn-ghost">Cancel</button>
+              <button id="memory-person-save" class="btn btn-sm btn-pri">Add person</button>
+            </div>
+          </div>
+        </div>
+        <div id="memory-add-other" class="mm-modal" hidden>
+          <div class="mm-sheet">
+            <h3>Add group / place / org</h3>
+            <div class="mm-field"><label>kind</label>
+              <select id="memory-other-kind">
+                <option value="group">group</option>
+                <option value="place">place</option>
+                <option value="org">org</option>
+              </select>
+            </div>
+            <div class="mm-field"><label>name</label><input id="memory-other-name" type="text" dir="auto" placeholder="e.g. בית הספר / the Family unit"></div>
+            <div class="mm-sheet-actions">
+              <button id="memory-other-cancel" class="btn btn-sm btn-ghost">Cancel</button>
+              <button id="memory-other-save" class="btn btn-sm btn-pri">Add</button>
+            </div>
+          </div>
+        </div>
+        <div id="memory-undo" class="mm-undo" hidden>
+          <span id="memory-undo-text"></span>
+          <button id="memory-undo-btn" class="btn btn-sm">Undo</button>
+        </div>
       </section>
     </main>
   </div>

@@ -698,9 +698,12 @@ class MemoryService:
         Only a fact closed by DELETE (status 'rejected') is restorable — a
         fact superseded by PATCH is history, not something to undo, and an
         open fact has nothing to undo. A restore is ALSO refused while
-        another CURRENT fact exists for the same subject+predicate+status:
-        the user deleted "grade 5" and added "grade 6" — undoing the delete
-        must not put two current values next to each other.
+        another CURRENT fact exists for the same subject+predicate+status
+        (the user deleted "grade 5" and added "grade 6" — undoing the delete
+        must not put two current values next to each other) — EXCEPT for
+        'note' facts: free-text memories are additive by design (a person
+        carries many current notes), and blocking their Undo would make
+        every note delete-with-undo a trap.
         """
         fact = self._repo.get_fact(fact_id)
         if fact is None:
@@ -711,7 +714,8 @@ class MemoryService:
         prior = provenance.pop("deleted_from", "confirmed")
         for current in self._repo.current_facts(subject_ids=[fact.subject_id]):
             if (
-                current.id != fact.id
+                fact.predicate != "note"
+                and current.id != fact.id
                 and current.predicate == fact.predicate
                 and current.status == prior
             ):
