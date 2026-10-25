@@ -19,7 +19,7 @@ class FakeFlow:
         self._token = token
         self.requested_scopes: list[str] | None = None
 
-    def from_client_secret_file(self, path: str, scopes: list[str]) -> "FakeFlow":
+    def from_client_secrets_file(self, path: str, scopes: list[str]) -> "FakeFlow":
         self.requested_scopes = scopes
         return self
 
@@ -107,7 +107,7 @@ class TestGmailPoll:
         from brain.db.session import SessionLocal
 
         settings = config.Settings(
-            gmail_label_id="Label_1",
+            gmail_min_call_interval_s=0.0, gmail_label_id="Label_1",
             database_url="postgresql+psycopg://brain:brain@localhost:27432/brain_w8_test",
             qdrant_collection="brain_items_w8_test",
             _env_file=None,
@@ -150,7 +150,7 @@ class TestGmailPoll:
         import brain.config as config
 
         settings = config.Settings(
-            gmail_label_id="Label_1",
+            gmail_min_call_interval_s=0.0, gmail_label_id="Label_1",
             database_url="postgresql+psycopg://brain:brain@localhost:27432/brain_w8_test",
             qdrant_collection="brain_items_w8_test",
             _env_file=None,
@@ -188,7 +188,10 @@ class TestGmailPoll:
     def test_label_unset_is_config_error(self, monkeypatch, capsys, fake_keychain):
         import brain.config as config
 
-        settings = config.Settings(gmail_label_id="", gmail_credentials_path="", _env_file=None)
+        settings = config.Settings(
+            gmail_min_call_interval_s=0.0,
+                gmail_label_id="", gmail_credentials_path="", _env_file=None
+        )
         monkeypatch.setattr(cli, "get_settings", lambda: settings)
         code = cli.main(["gmail-poll", "--once"])
         assert code == 78
@@ -198,7 +201,8 @@ class TestGmailPoll:
         import brain.config as config
 
         settings = config.Settings(
-            gmail_label_id="Label_1", gmail_credentials_path="", _env_file=None
+            gmail_min_call_interval_s=0.0,
+                gmail_label_id="Label_1", gmail_credentials_path="", _env_file=None
         )
         monkeypatch.setattr(cli, "get_settings", lambda: settings)
         code = cli.main(["gmail-poll", "--once"])

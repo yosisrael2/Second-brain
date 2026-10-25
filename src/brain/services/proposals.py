@@ -101,8 +101,13 @@ def _date_part(moment: datetime) -> str:
     return moment.strftime("%a %d.%m")
 
 
-def child_line(child: MemoryItem, tz_name: str) -> str:
-    """One card line for one child (HTML-escaped)."""
+def child_line(child: MemoryItem, tz_name: str, *, state: str | None = None,
+               matched_title: str | None = None) -> str:
+    """One card line for one child (HTML-escaped).
+
+    ``state``/``matched_title`` come from the child's recon relation (the
+    card builders look it up): an applied UPDATE renders "↩︎ applied:
+    …" and a cancellation names its target."""
     tz = ZoneInfo(tz_name)
     emoji = CHILD_EMOJI.get(child.type.value if child.type else "", "•")
     warning = "⚠️ " if child.date_conflict else ""
@@ -118,7 +123,7 @@ def child_line(child: MemoryItem, tz_name: str) -> str:
     marker = superseded_marker(child)
     if marker:
         parts.append(marker)
-    recon = verdict_marker(child)
+    recon = verdict_marker(child, state=state, matched_title=matched_title)
     if recon:
         parts.append(_esc(recon))
     return " · ".join(parts)
@@ -132,9 +137,12 @@ def superseded_marker(child: MemoryItem) -> str:
     return ""
 
 
-def verdict_marker(child: MemoryItem) -> str:
+def verdict_marker(child: MemoryItem, *, state: str | None = None,
+                   matched_title: str | None = None) -> str:
     """PR D-recon (item 37) rendering hook: one short line per non-NEW
-    verdict stored on the child (D-recon-1: text only; buttons in -2)."""
+    verdict stored on the child. ``state`` is the recon relation's
+    provenance.state (an applied UPDATE says "applied", not "proposes");
+    ``matched_title`` names a cancellation's target."""
     meta = child.extraction_meta or {}
     verdict = meta.get("recon_verdict")
     if not verdict:
@@ -142,27 +150,103 @@ def verdict_marker(child: MemoryItem) -> str:
     fields = meta.get("recon_fields") or {}
     if verdict == "update":
         changes = "; ".join(f"{k}: {v[0]} → {v[1]}" for k, v in fields.items())
+        if state == "applied":
+            return f"↩︎ applied: {changes}"
         return f"↩︎ proposes: {changes}"
     if verdict == "conflict":
         return "⚠️ conflicts — both versions shown"
     if verdict == "cancellation":
+        if state == "applied":
+            return "🗑 cancelled"
+        if matched_title:
+            return f"🗑 cancels: {matched_title}"
         return "🗑 proposes cancelling"
     if verdict == "more_detail":
         return "➕ adds detail"
     return ""
 
 
-def render_source_card(source: MemoryItem, children: list[MemoryItem], tz_name: str) -> str:
-    """The whole card text for one source's proposed children (HTML-escaped)."""
+def render_source_card(
+    source: MemoryItem,
+    children: list[MemoryItem],
+    tz_name: str,
+    *,
+    recon: dict[int, tuple[str, object, str | None]] | None = None,
+) -> str:
+    """The whole card text for one source's proposed children (HTML-escaped).
+
+    ``recon`` (D-recon-2a) maps a child's index to (verdict, relation,
+    matched_title): verdict children render their state-aware marker line
+    (applied UPDATE, named cancellation target)."""
+    recon = recon or {}
+    lines = []
+    for index, child in enumerate(children):
+        entry = recon.get(index)
+        if entry is None:
+            lines.append(child_line(child, tz_name))
+            continue
+        verdict, rel, matched_title = entry
+        state = (rel.provenance or {}).get("state")
+        lines.append(child_line(
+            child, tz_name, state=state,
+            matched_title=matched_title if verdict == "cancellation" else None,
+        ))
     header = f"🧠 found {len(children)} items in {_esc(source_short_title(source))}"
-    lines = [child_line(child, tz_name) for child in children]
     return "\n".join([header, *lines])
 
 
-def proposal_keyboard(token: str, children: list[MemoryItem]) -> list[list[tuple[str, str]]]:
-    """Per-child ✅/✏️/🗑 rows + one 'Keep all' row (callback data < 64 bytes)."""
+def proposal_keyboard(
+    token: str,
+    children: list[MemoryItem],
+    *,
+    recon: dict[int, tuple[str, object, str | None]] | None = None,
+) -> list[list[tuple[str, str]]]:
+    """Per-child ✅/✏️/🗑 rows + one 'Keep all' row (callback data < 64 bytes).
+
+    ``recon`` (D-recon-2a) maps a child's index to (verdict, relation,
+    matched_title): the verdict owns that child's row — UPDATE proposes
+    ✅ Confirm update / ✖ Keep both (or ↩︎ Undo once auto-applied), CONFLICT
+    asks ✅ keep existing / ✅ keep new, CANCELLATION offers ✅ Confirm
+    cancellation / ✖ Not cancelled. The verdict rows carry the RELATION ID
+    (never a position), so a mixed card cannot misalign plain and verdict
+    rows; callback data stays < 64 bytes (prefix + token + uuid). MORE_DETAIL
+    children keep the default row (the 🔔 line lives on the matched item's
+    card, with no buttons)."""
+    from brain.services.relations_view import (  # noqa: PLC0415
+        CB_RECON_DISCARD,
+        CB_REL_CONFIRM,
+        CB_REL_KEEP_BOTH,
+        CB_REL_UNDO,
+    )
+
+    recon = recon or {}
     rows: list[list[tuple[str, str]]] = []
     for index, _child in enumerate(children):
+        entry = recon.get(index)
+        if entry is not None:
+            verdict, rel, _matched_title = entry
+            state = (rel.provenance or {}).get("state")
+            if verdict == "update" and state == "applied":
+                rows.append([("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{rel.id}")])
+                continue
+            if verdict == "update":
+                rows.append([
+                    ("✅ Confirm update", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{rel.id}"),
+                ])
+                continue
+            if verdict == "conflict":
+                rows.append([
+                    ("✅ keep existing", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
+                    ("✅ keep new", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                ])
+                continue
+            if verdict == "cancellation":
+                rows.append([
+                    ("✅ Confirm cancellation", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    ("✖ Not cancelled", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
+                ])
+                continue
         rows.append(
             [
                 ("✅ Keep", f"{CB_PROPOSED_KEEP}:{token}:{index}"),

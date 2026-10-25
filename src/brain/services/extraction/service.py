@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from brain import ops
@@ -281,17 +281,30 @@ class EnrichmentService:
 
     # --- the runner ------------------------------------------------------
 
-    def run_once(self, now: datetime, *, limit: int = 20, backfill: bool = False) -> RunReport:
+    def run_once(
+        self,
+        now: datetime,
+        *,
+        limit: int = 20,
+        backfill: bool = False,
+        sources: Sequence[str] | None = None,
+    ) -> RunReport:
         """Drain due jobs oldest-first, respecting the daily cap (D5).
 
         ``backfill=True`` processes backfill-budget jobs (D6: their own
         budget, so a one-off backfill never eats the live daily cap).
+        ``sources`` scopes the pass to parents from those sources (the A2
+        step-2 worker filter; the CLI passes nothing and drains every
+        source). The filter is applied IN SQL — a filtered-out job never
+        blocks the scan and is never deferred or counted against the cap;
+        it simply stays queued for a wider (week 2+) configuration.
         """
+        wanted = tuple(dict.fromkeys(s.strip().lower() for s in sources)) if sources else None
         report = RunReport()
         budget = "backfill" if backfill else "daily"
         job_outcomes: list[SourceOutcome] = []
         while report.processed < limit:
-            job = self._next_due_job(now, budget)
+            job = self._next_due_job(now, budget, wanted)
             if job is None:
                 break
             if not backfill and self.cap_used_today(now) >= self._daily_cap:
@@ -321,18 +334,28 @@ class EnrichmentService:
 
         return ZoneInfo(self._tz_name)
 
-    def _next_due_job(self, now: datetime, budget: str) -> EnrichmentJob | None:
+    def _next_due_job(
+        self, now: datetime, budget: str, sources: Sequence[str] | None = None
+    ) -> EnrichmentJob | None:
         stmt = (
             select(EnrichmentJob)
             .where(EnrichmentJob.state == "queued")
             .where(EnrichmentJob.budget == budget)
+            # DUE-ness is part of the SQL, not a post-fetch skip: deferred
+            # jobs (not_before = tomorrow) pile up oldest-first, and 25 of
+            # them ahead of the scan limit would hide every due job behind
+            # them — the same starvation the sources filter had.
+            .where(or_(EnrichmentJob.not_before.is_(None), EnrichmentJob.not_before <= now))
             .order_by(EnrichmentJob.queued_at.asc(), EnrichmentJob.id.asc())
             .limit(25)
         )
-        for job in self._session.scalars(stmt):
-            if job.not_before is None or job.not_before <= now:
-                return job
-        return None
+        if sources:
+            # IN SQL: 50 filtered-out jobs ahead must never starve the one
+            # job the worker wants (limit 25 could never reach it post-fetch).
+            stmt = stmt.join(MemoryItem, EnrichmentJob.item_id == MemoryItem.id).where(
+                MemoryItem.source.in_(sources)
+            )
+        return self._session.scalars(stmt).first()
 
     def _next_day_start(self, now: datetime) -> datetime:
         local = now.astimezone(self._tz)

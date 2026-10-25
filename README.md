@@ -25,13 +25,13 @@ to its section or doc.
 - **WhatsApp relevance triage:** every conversation is labeled `relevant | noise` — a confirmed kid's name decides deterministically (no model call), otherwise Jev, otherwise one strict LLM call; if both fail the item stays untriaged, never guessed. Noise stays stored and searchable but is hidden from the default listings and never spends the enrichment cap; an update can never downgrade `relevant` to `noise` — `src/brain/services/triage.py` (PR #49)
 - **Attachments:** photos and PDFs sent to the bot are stored once (sha256) outside the repo and read in the background — a PDF text layer locally, otherwise Claude in a single-file sandbox; 20 MB / 20 pages / 50 files per day; each attachment becomes its own searchable item. Email and WhatsApp attachment content is wired in the same pipeline — `src/brain/services/attachments.py` (PRs #38, #44)
 - **Recurring calendar pastes:** a pasted ICS VEVENT with an RRULE fans out into one item per occurrence inside a bounded window (`BRAIN_PASTE_RRULE_DAYS`, default 60 days, capped at 60 items per series), with a DST-stable wall clock (DTSTART's zone rides every occurrence), EXDATE/COUNT/UNTIL honoured, and a malformed rule falling back to a single item — `src/brain/services/recurrence.py` (PR #65)
-- **Gmail source** *(inactive: disabled by default)*: read-only OAuth, one immutable label, Message-ID backstop, attachments via the attachment pipeline — now one live Gmail path: the connector runner owns capture/dedupe/deletes and the `com.secondbrain.email` launchd agent drives the same connector on a schedule (a backoff cycle sleeps like a normal interval — no hammering, and the pause logic is under test); refresh token only in the login keychain, nothing in the plists — [docs/email-setup.md](docs/email-setup.md) (PRs #36, #43, #59, #94)
+- **Gmail source** *(inactive: disabled by default)*: read-only OAuth, one immutable label, Message-ID backstop, attachments via the attachment pipeline — now one live Gmail path: the connector runner owns capture/dedupe/deletes and the `com.secondbrain.email` launchd agent drives the same connector on a schedule (a backoff cycle sleeps like a normal interval — no hammering, and the pause logic is under test); refresh token only in the login keychain, nothing in the plists — [docs/email-setup.md](docs/email-setup.md) (PRs #36, #43, #59, #94, #101)
 
 **Retrieval**
 - Multilingual embeddings (local `fastembed`, `minishlab/potion-multilingual-128M`, 256 dims — Hebrew + English), Postgres FTS over raw text, reciprocal-rank fusion of the two — [AI layer](#ai-layer-and-the-brain-cli)
 - Temporal retrieval: English + Hebrew weekday names, `dd.mm` dates, today/tomorrow/yesterday — `src/brain/services/temporal.py`
 - Ask recall pool: rerank over 32 candidates, top 8 in the prompt — [Memory items API](#memory-items-api)
-- Kid-aware recall: a question that names a kid (whole word, Hebrew one-letter prefixes allowed) also recalls items from that kid's channels and class — the channel→kid facts in memory steer recall to the kid's own WhatsApp channels even when the conversations never mention the name, and the window is time-bounded instead of a newest-N cap that pushed mid-week conversations out — `src/brain/services/ask.py` (PRs #32, #42, #89)
+- Kid-aware recall: a question that names a kid (whole word, Hebrew one-letter prefixes allowed) also recalls items from that kid's channels and class — the channel→kid facts in memory steer recall to the kid's own WhatsApp channels even when the conversations never mention the name; announcements sent up to 3 days before the resolved window are recalled; the window is time-bounded instead of a newest-N cap that pushed mid-week conversations out; when a kid is named the kid's items get reserved slots in the ask context so general hits cannot crowd them out; the kid-channel query uses the same hidden-item rule as every other recall path, so superseded and confirmed-cancelled conversations stay out of recall (a restore brings them back) — `src/brain/services/ask.py` (PRs #32, #42, #89, #95, #98, #100)
 
 **Ask**
 - Grounded answers with item-id citations; model visible in the reply (`claude-sonnet-5-5` default) — [Memory items API](#memory-items-api), [docs/ai-layer.md](docs/ai-layer.md)
@@ -47,8 +47,9 @@ to its section or doc.
 - Extraction data model + durable enrichment queue (daily cap, backfill budget, grounded quotes, Hebrew-calendar dates, weekday/date conflict flag, re-run diffing) — *(inactive: the enrichment worker is off)* (PR #33)
 - LLM meaning extractor (A2): one call per source through the local Claude login client, versioned prompt (v6, recorded in every child's meta); the first pass parses strictly, the one error-fed retry parses leniently — valid candidates are kept, each invalid one is dropped with an `enrichment/candidate_invalid` ops event, and only a non-JSON reply or a missing candidates list fails the job; deterministic date resolution (never the model) with a quote_time backstop, derived tasks, multiple verbatim quote rows per child; scored against the frozen gold set through five offline eval runs — *(inactive: default stub extractor; `ENRICHMENT_EXTRACTOR=llm` + the worker flag activate it, pinned by a test)* — `src/brain/services/extraction/llm_extractor.py` (PRs #39, #68)
 - A2 in-bot worker: with `ENRICHMENT_WORKER_ENABLED=true` the Telegram bot process runs the enrichment pass on a schedule (`ENRICHMENT_WORKER_INTERVAL_S`, default 300) — one pass per tick on a fresh session, runs off the polling thread so slow LLM calls never stall the bot, a running pass is never overlapped, a failed pass is logged as an ops event and the bot survives; every pass whose sources created or changed children delivers the proposal card through the existing hook (the bot flushes queued cards right after the pass); default OFF — the switch false (current live state) schedules nothing; `brain enrich` stays the manual path and sends no cards; a pass that outlives `ENRICHMENT_PASS_TIMEOUT_S` (default 900) is declared stalled once (ops event `enrichment/worker_pass_timeout`, health degraded) and the bot stops waiting on it — the stalled thread cannot be killed, so no new pass starts until it finishes — `src/brain/telegram_bot.py` (PRs #84, #93)
-- **Reconciliation verdicts before proposals** *(inactive: runs inside the enrichment pass — off while extraction is off)*: every extracted child gets exactly one verdict before it can become a proposal — new / already known / update / more detail / conflict / cancellation; two matching windows (the same local day, plus a 30-day extended window for dateless or moved-date candidates that requires a change or cancel signal); two near-equal matches never silently pick one (they stay new, with an `enrichment/recon_ambiguous` ops event); auto-apply only when the match is in the same thread from the same sender — everything else stays proposed; a cancellation strikes the matched item through and is restorable; matching embeds with a local multilingual model loaded on first use (search keeps its own model, no vector-dim change anywhere) — `src/brain/services/extraction/reconciliation.py` (PR #73)
+- **Reconciliation verdicts before proposals** *(inactive: runs inside the enrichment pass — off while extraction is off)*: every extracted child gets exactly one verdict before it can become a proposal — new / already known / update / more detail / conflict / cancellation; two matching windows (the same local day, plus a 30-day extended window for dateless or moved-date candidates that requires a change or cancel signal); two near-equal matches never silently pick one (they stay new, with an `enrichment/recon_ambiguous` ops event); auto-apply only when the match is in the same thread from the same sender — everything else stays proposed; a cancellation strikes the matched item through and is restorable; more detail covers a fact's effective date and amount, with amounts compared as numbers (PR #103); matching embeds with a local multilingual model loaded on first use (search keeps its own model, no vector-dim change anywhere) — `src/brain/services/extraction/reconciliation.py` (PR #73)
 - Bot proposal cards: one card per source with Keep / Fix / Drop and 48 h pings for due tasks and reminders — *(inactive until extraction runs)* (PR #41)
+- **Reconciliation verdict cards on the proposal card** *(on main, inactive while extraction is off)*: each verdict child's proposed action rides the source's proposal card as tappable rows — update: ✅ Confirm update / ✖ Keep both; conflict: keep-new / keep-existing side by side; cancellation: confirm strikes the target through, ♻️ Restore revives; more detail renders a 🔔 detail line; every change is one explicit tap (double-tap idempotent, stale buttons answer gracefully) and nothing applies without a tap — `src/brain/telegram_bot.py` (PR #99)
 - Relations between items (`supersedes`, `corrects`, `derived_from`, `same_as`): same-thread corrections applied visibly and undoably, cross-thread matches only proposed; superseded items are hidden from lists, search and ask but restorable; duplicate key never merges items for different people — `src/brain/services/relations.py` (PR #48)
 - Bot relation cards: superseded items render struck-through with a ♻️ Restore button; applied corrections show a ↩︎ replaced notice with ↩︎ Undo; proposed cross-thread matches show ✅ Confirm replace / ✖ Keep both — `src/brain/services/relations_view.py` (PR #51)
 
@@ -74,14 +75,15 @@ to its section or doc.
 | Area | Status | PRs |
 | --- | --- | --- |
 | Capture pipeline (items, paste parsing, Jev, dedupe, recurring ICS fan-out, loud missing deps) | **Done** | #1, #7, #17, #19, #65, #77 |
-| Retrieval (embeddings, FTS fusion, temporal, recall pool, kid-aware recall incl. a kid's own channels) | **Done** | #20, #21, #24, #32, #42, #89 |
+| Retrieval (embeddings, FTS fusion, temporal, recall pool, kid-aware recall incl. a kid's own channels, lookback window, reserved kid slots, hidden-predicate channel queries) | **Done** | #20, #21, #24, #32, #42, #89, #95, #98, #100 |
 | Ask (citations, model config, conflict rule, one builder) | **Done** | #6, #27, #35 |
 | Memory layer (entities, versioned facts, channels, ask block, API, UI) | **Done** | #26, #28, #30 |
 | WhatsApp ingestion (24/7 agent, conversations, indexing) | **Done, live** | #37, #40, #47, #50 |
 | Attachments (Telegram, email, WhatsApp media) | **Done** | #38, #44 |
-| Gmail connector (`email`) + 24/7 email agent — one live Gmail path through the runner; the agent's loop treats a backoff cycle as a normal interval | **Done, opt-in** (needs Google consent) | #36, #43, #59, #83, #94 |
+| Gmail connector (`email`) + 24/7 email agent — one live Gmail path through the runner; the agent's loop treats a backoff cycle as a normal interval and a failing cycle sleeps through its stall window | **Done, opt-in** (needs Google consent) | #36, #43, #59, #83, #94, #101 |
 | Extraction data model + queue, LLM extractor (A2), proposal cards, activation seam, in-bot worker (per-pass deadline) | **Done, inactive** (default stub; `ENRICHMENT_EXTRACTOR=llm` + `ENRICHMENT_WORKER_ENABLED` + a bot restart activate) | #33, #41, #39, #68, #84, #93 |
-| WhatsApp reconciliation verdicts before proposals (new / already known / update / more detail / conflict / cancellation; auto-apply only same thread + same sender) | **Done, inactive** (runs inside the enrichment pass) | #73 |
+| WhatsApp reconciliation verdicts before proposals (new / already known / update / more detail / conflict / cancellation; auto-apply only same thread + same sender; a fact's effective date and amount are more-detail fields, amounts compared as numbers) | **Done, inactive** (runs inside the enrichment pass) | #73, #103 |
+| Reconciliation verdict cards on the proposal card (D-recon-2a: confirm / keep-both / keep-new / keep-existing / cancel / restore taps, one explicit tap per change) | **Done, on main, inactive** (off while extraction is off; not yet live) | #99 |
 | WhatsApp relevance triage (noise stays searchable, out of listings + enrichment) | **Done** | #49 |
 | Connectors framework (runner incl. persisted-backoff enforcement, idempotency ledger, state, Google OAuth union consent, dedupe counter, clean dry-run errors) + setup docs | **Done** (connectors disabled by default) | #53, #58, #76, #83, #90 |
 | Enabling connectors: enable runbook, one-time `adopt` ledger pass | **Done** (runs once per connector, before its first sync) | #79, #81, #85 |
@@ -91,24 +93,24 @@ to its section or doc.
 | Google Tasks connector (`gtasks`, read-only) | **Done, on main, inactive** (disabled by default) | #56 |
 | Google Drive connector (`gdrive`, read-only) | **Done, on main, inactive** (disabled by default) | #57 |
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
-| Telegram bot + launchd services | **Done** | #9-#12, #16, #18, #50, #67 |
+| Telegram bot + launchd services (incl. the `network_recovered` event after a failure streak) | **Done** | #9-#12, #16, #18, #50, #67, #96 |
 | Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, Connectors card, relations inspector) | **Done** | #13, #29, #46, #54, #80 |
 | Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts, tests never write the repo env file) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75, #92 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown) | **Done** | #4, #5, #25, #39, #61 |
 
-**In progress** (work in progress, 24 Oct 2026)
+**In progress** (24 Oct 2026; work paused by the user after the deploy)
 
-- Reconciliation cards (D-recon-2): verdict cards + buttons in the bot, recurring-series logic
-- Reconciliation judge (plan approved)
-- Kid-recall lookback (widening the kid-aware recall window)
-- Acceptance re-runs
+- Recon PR-b (PR #102, open): series scope (this time / from now on), cross-kind cancellation, ask conflict leg
+- Kid slots by date relevance (PR #104, open)
+- Reconciliation judge (branch local, not yet a PR)
+- WhatsApp acceptance re-run 5, after #104
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
-The live instance still runs `7936c55` — nothing has been deployed since.
+The live instance runs `a6ecc15` (deployed 24 Oct 2026; DB migration `e6b2d8f4a9c1` applied). The enrichment worker is OFF (the default stub extractor), every connector is registered but disabled, and the email + connectors launchd agents are not installed. The reconciliation verdict cards (PR #99) are merged on `main` but not yet live.
 
 **Planned**
 
-- Activate Gmail (one-time Google consent) and switch extraction on after the held-out score
+- Pending user decisions: one-time Google consent (activate Gmail) and switching extraction on after the held-out score
 - Then: actions — approved items become Google Calendar events / tasks
 
 **Quality check** (22-23 Oct 2026, real questions): calendar questions **10/10**,
@@ -380,7 +382,9 @@ the designed inert state) mirror `GET /ops/attachments` and `GET
 /ops/enrichment`; the cockpit renders their cards automatically. The telegram
 heartbeat threshold follows the bot's actual long-poll timeout
 (`telegram_poll_timeout_s` + margin), and the poll loop heartbeats on the
-conflict/network retry paths too — a quiet chat no longer flaps "degraded".
+conflict/network retry paths too — a quiet chat no longer flaps "degraded";
+a streak of network failures also records a `network_recovered` event when
+the connection comes back (PR #96).
 
 Privacy contract: the ops layer never records secrets (tokens appear only as
 `set`/`unset` + last 4 chars) and never note bodies — events/traces carry
@@ -463,6 +467,8 @@ requests the UNION of enabled connectors' scopes, so re-running
 scopes (never run consent from tests — the user does it once). All four
 connectors are registered on `main` (PRs #55, #56, #57, #59); a source that
 is enabled but not available reports "not available" instead of syncing.
+On the live instance all four are registered but disabled, and the email +
+connectors launchd agents are not installed.
 
 ```bash
 brain connectors list                    # name, enabled, last ok, cursor, last error
@@ -487,7 +493,7 @@ Shipped sources (all READ-ONLY; all disabled until enabled):
 
 | name (items.source) | module | scope | cursor | notes |
 | --- | --- | --- | --- | --- |
-| `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner |
+| `email` (alias `gmail`) | `connectors/google/gmail.py` | gmail.readonly | Gmail `historyId` (history.list, label-filtered); 404 on an expired id -> query fallback + `reset=True` | one immutable Gmail label (`GMAIL_LABEL_ID`, optional `GMAIL_QUERY`); the first sync SEEDS the ledger from the legacy `email_messages` seen-table so old captures never re-ingest; label removed -> deleted; attachments via `fetch_attachment`; the launchd agent (`brain gmail-poll`) drives the same connector through the runner; a cycle that keeps failing sleeps through its persisted stall window via the same seam as a normal interval (PR #101) |
 | `gcal` | `connectors/google/calendar.py` | calendar.readonly | per-calendar `nextSyncToken` (JSON cursor with the frozen past cutoff) | `singleEvents`+`showDeleted` = one item per occurrence; `BRAIN_GCAL_CALENDARS` allowlist (default `primary`); past reach bounded by `BRAIN_GCAL_PAST_DAYS` (default 60, frozen in the cursor, no future cap); a moved occurrence arrives as cancelled-old + new id |
 | `gtasks` | `connectors/google/tasks.py` | tasks.readonly | `updatedMin` watermark across the allowlisted lists (`BRAIN_GTASKS_LISTS`) | deleted tasks hide their item, completed tasks stay as items; date-only dues anchor at local midnight; subtasks carry their parent |
 | `gdrive` | `connectors/google/drive.py` | drive.readonly | `changes.list` `startPageToken` -> `newStartPageToken`; unknown token (404) or truncated window (410) -> `reset=True` | folder allowlist `BRAIN_GDRIVE_FOLDERS` (empty = zero API calls), depth-capped BFS (`BRAIN_GDRIVE_DEPTH`, default 1); Docs/Sheets/Slides -> text with a per-file cap (`BRAIN_GDRIVE_TEXT_CAP`), PDFs/images -> attachments, other binaries -> metadata-only; trashed/moved-out -> `deleted=True` |

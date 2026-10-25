@@ -48,6 +48,7 @@ the inbox for PR D2.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -57,6 +58,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from brain import ops
+from brain.db.enums import ItemStatus
 from brain.db.models import MemoryItem, WhatsAppPollState
 from brain.repositories.items import ItemsRepository
 from brain.repositories.memory import MemoryRepository
@@ -70,6 +72,57 @@ SOURCE_WHATSAPP = "whatsapp"
 DEFAULT_GAP_MINUTES = 60
 DEFAULT_OVERLAP_MINUTES = 5
 _NOT_READ_YET = " — attachment not read yet"
+# A media message renders as `[dd/mm/yyyy, hh:mm] Sender: [{type}: {file}{_NOT_READ_YET}]`
+# when it carries NO caption (see _message_line). This is the ONLY line shape
+# that means "unread media with nothing readable": a caption before the bracket
+# or any plain text fails the match, and a READ marker (attachment <id>) fails
+# it too, so the skip releases the moment the media is read.
+_UNREAD_MEDIA_LINE = re.compile(
+    r"^\[\d{2}/\d{2}/\d{4}, \d{2}:\d{2}\] .{1,80}?: \[[^:\]]+: [^\]]*attachment not read yet\]$"
+)
+
+
+def is_unread_media_only(raw_text: str) -> bool:
+    """True when every message line is an UNREAD media marker — no caption,
+    no text: there is nothing readable to triage yet. Labelling a filename is
+    how media-only conversations landed NOISE on zero content.
+
+    Scaffolding (the header line, blank lines) is ignored; any readable line
+    (plain text, or a caption before the marker) makes this False — a
+    captioned image is a MIXED conversation and gets triaged at capture.
+    Pure over the rendered text (no meta needed), so both triage paths — the
+    poller's _triage_item AND the backfill command, which calls the trier
+    directly — can check it before invoking any model.
+    """
+    saw_message = False
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("[WhatsApp · "):
+            continue
+        saw_message = True
+        if not _UNREAD_MEDIA_LINE.match(stripped):
+            return False
+    return saw_message
+
+
+def user_acted_on_item(item: MemoryItem) -> bool:
+    """True when the user touched this item — the post-read re-triage must
+    never overwrite their state (it fires only on machine-triaged inbox items).
+
+    Signals (db/models.py): status left INBOX (filed/needs_review; default
+    INBOX on capture), superseded_by set (user versioning via supersedes/
+    corrects relations), child_state kept/dropped (user review actions on
+    extracted children), or a triage label WITHOUT a triage method —
+    apply_triage (repositories/items.py) always writes label+method together,
+    so a label with no method was written by something outside triage.
+    """
+    if item.status != ItemStatus.INBOX:
+        return True
+    if item.superseded_by is not None:
+        return True
+    if item.child_state in ("kept", "dropped"):
+        return True
+    return item.triage_label is not None and item.triage_method is None
 # Offsets are bounded by ±14h (± Leo threshold); a lower SQL bound this far
 # below the wanted window keeps the string comparison safe across DST changes
 # (bridge timestamps carry varying offsets, so raw string comparison cannot
@@ -450,6 +503,24 @@ class WhatsAppPoller:
 
     def poll(self, *, now: datetime) -> list[ChannelPollResult]:
         """Poll every allowlisted channel once; per-channel failures are logged, not raised."""
+        # Fresh kid names once per pass (never per conversation — no extra
+        # query in the hot loop). The refresh is savepoint-scoped inside the
+        # trier, so a DB hiccup cannot poison this pass's transaction; on
+        # failure the pass carries on with the LAST-KNOWN names.
+        refresh = getattr(self._trier, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001 — a failed refresh never stops the pass
+                logger.warning(
+                    "whatsapp: kid-name refresh failed (%s); using last-known names", exc
+                )
+                ops.record_event(
+                    "triage",
+                    "refresh_failed",
+                    ok=False,
+                    detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                )
         started = datetime.now(UTC)
         allow = {
             entity.name for entity in self._memory.list_entities(kinds=["channel"]) if entity.name
@@ -693,6 +764,14 @@ class WhatsAppPoller:
                 entry["media"] = media
         meta["messages"] = messages
         item.meta = meta
+        if _NOT_READ_YET not in item.raw_text and not user_acted_on_item(item):
+            # Fully read: the conversation now carries its real text (the
+            # swapped-in attachment links are readable content). Re-triage
+            # through the normal update path — the v3 rules hold inside
+            # (_triage_item: relevant is never downgraded to noise, and a
+            # blocked downgrade is recorded). Fires ONCE, when the LAST
+            # unread marker is replaced; user-acted items are never touched.
+            self._triage_item(item)
 
     @staticmethod
     def _known_message_ids(item: MemoryItem | None) -> set[str]:
@@ -757,6 +836,13 @@ class WhatsAppPoller:
         blocked downgrade is recorded, never silent.
         """
         if self._trier is None:
+            return
+        if is_unread_media_only(item.raw_text):
+            # Nothing readable yet (only unread media markers): labelling a
+            # filename is how media-only conversations landed NOISE on zero
+            # content. The item stays untriaged (still listed) and is
+            # re-triaged when the last marker is replaced (see
+            # _replace_media_marker). A skip is not a failure — no ops event.
             return
         prior = item.triage_label
         try:

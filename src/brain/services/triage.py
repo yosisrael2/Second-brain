@@ -107,6 +107,64 @@ class TrierProto(Protocol):
     def __call__(self, item: Any) -> "TriageResult | None": ...
 
 
+class RefreshableTrier:
+    """Trier whose confirmed kid names are re-read once per POLL PASS.
+
+    The poller holds ONE trier for the process lifetime (cli._build_trier ->
+    WhatsAppPoller), so a kid name or alias added to memory after startup
+    must be picked up without a restart — and without a query per
+    conversation (the hot loop). The poller calls refresh() at the top of
+    every pass; __call__ always uses the last successfully read list: a
+    failed refresh never blanks it and never stops the pass.
+
+    The refresh query runs inside a SAVEPOINT (begin_nested) on the caller's
+    session: a DB hiccup rolls back ONLY the savepoint, so pending captures
+    of the pass transaction survive and the session stays usable.
+    """
+
+    def __init__(self, session: Any, *, jev: Any, llm: Any) -> None:
+        self._session = session
+        self._jev = jev
+        self._llm = llm
+        self.refresh_calls = 0
+        self._kid_names = self._read_kid_names()
+
+    def _read_kid_names(self) -> list[str]:
+        from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+        from brain.services.memory import MemoryService  # noqa: PLC0415
+
+        # Function-level import: memory.py imports THIS module (the shared
+        # matchers), so a module-level import would be a cycle.
+        return confirmed_kid_names(
+            MemoryService(MemoryRepository(self._session)).overview(
+                status="confirmed", q=None
+            )
+        )
+
+    def refresh(self) -> None:
+        """Re-read confirmed kid names; savepoint-scoped (class docstring).
+
+        The reassignment happens only after a successful read, so a failure
+        leaves the last-known names in place (never an empty list from an
+        error) and only the savepoint is rolled back.
+        """
+        self.refresh_calls += 1
+        # begin_nested + the with-block: a failure inside rolls back ONLY the
+        # savepoint (the outer transaction — pending captures — is untouched);
+        # the exception propagates so the poller logs one warning, records
+        # ops, and carries on with the last-known names. The reassignment
+        # happens only after a successful read, so a failure never blanks
+        # the list.
+        with self._session.begin_nested():
+            names = self._read_kid_names()
+        self._kid_names = names
+
+    def __call__(self, item: Any) -> "TriageResult | None":
+        return triage_conversation(
+            item.raw_text, jev=self._jev, llm=self._llm, kid_names=self._kid_names
+        )
+
+
 _HEBREW_LETTER = "[\u05d0-\u05ea]"
 # Hebrew words glue one-letter prefixes onto the word itself ('לאיתמר',
 # 'ואיתמר', 'שלאיתמר') — up to 3 of them, directly before the name.
@@ -128,6 +186,27 @@ def mentions_name(name: str, text: str) -> bool:
     if re.search(_HEBREW_LETTER, name):
         body = rf"{_HEBREW_PREFIX_RUN}{body}"
     return re.search(rf"(?<!\w){body}(?!\w)", text, re.IGNORECASE) is not None
+
+
+def is_name_token(name: str, token: str) -> bool:
+    """Full-TOKEN name match (audience resolution — the conservative sibling).
+
+    Unlike :func:`mentions_name` (a whole-word SEARCH inside longer text),
+    here the token must BE the name: an extracted "רונה לוי" or "Rona
+    Cohen" must NOT resolve to our Rona — zero wrong-child is the A2 bar,
+    and an "unknown" is always safer. Same normalisation as mentions_name:
+    case-insensitive, and for Hebrew-letter names an optional run of up to
+    3 Hebrew prefix letters directly before the name (ורונה still matches).
+    """
+    if not name or not token:
+        return False
+    token = token.strip()
+    if not token:
+        return False
+    body = re.escape(name)
+    if re.search(_HEBREW_LETTER, name):
+        body = rf"{_HEBREW_PREFIX_RUN}{body}"
+    return re.fullmatch(body, token, re.IGNORECASE) is not None
 
 
 def confirmed_kid_names(entities: Sequence[dict[str, Any]]) -> list[str]:
