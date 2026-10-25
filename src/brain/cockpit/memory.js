@@ -319,7 +319,8 @@ function detailHeader(entity) {
       // a kid's removal has a consequence beyond this screen: triage and
       // A2 key on these facts to recognise the child — say so BEFORE the
       // second click, not just "Sure?".
-      const armedLabel = isKid(entity)
+      const kid = isKid(entity);
+      const armedLabel = kid
         ? `Triage and A2 stop recognising ${entity.name} — sure?`
         : undefined;
       armConfirm(removeBtn, async () => {
@@ -327,7 +328,11 @@ function detailHeader(entity) {
           await api(`/memory/entities/${entity.id}/archive`, { method: "POST" });
           memoryState.selected = null;
           $("memory-wrap").dataset.view = "list";
-          undoToast(`removed ${entity.name} — items already captured stay`, async () => {
+          // the toast mirrors the consequence: the undo window is the only
+          // place left that still names it once the confirm is gone.
+          undoToast(kid
+            ? `removed ${entity.name} — Triage and A2 stop recognising them until you Undo`
+            : `removed ${entity.name} — items already captured stay`, async () => {
             try {
               await api(`/memory/entities/${entity.id}/restore`, { method: "POST" });
               memoryState.selected = entity.id;
