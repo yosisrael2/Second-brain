@@ -108,8 +108,11 @@ class GmailMessage:
 class GmailClient(Protocol):
     """What the email poller needs from Gmail (Strategy)."""
 
-    def list_messages(self, *, query: str, label_ids: Sequence[str]) -> list[GmailMessageStub]:
-        """List message stubs matching the query, scoped to the label ids."""
+    def list_messages_page(
+        self, *, query: str, label_ids: Sequence[str],
+        page_token: str | None = None, max_results: int | None = None,
+    ) -> tuple[list[GmailMessageStub], str | None]:
+        """ONE listing page: (stubs, next_page_token) — the caller walks."""
         ...
 
     def get_message(self, message_id: str) -> GmailMessage:
