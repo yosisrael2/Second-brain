@@ -39,6 +39,12 @@ JLM = ZoneInfo("Asia/Jerusalem")
 NOW = datetime(2026, 10, 22, 18, 30, tzinfo=JLM)
 EVAL_MODEL = "minishlab/potion-multilingual-128M"
 
+# These tests load the REAL fastembed model (EVAL_MODEL above): a cold-cache
+# HF fetch can take minutes (incident 25 Oct — two 60s per-test timeouts on
+# CI in one day). The 600s budget is scoped to THIS MODULE ONLY — the global
+# --timeout=60 stays for the rest of the suite (a hung test must still fail).
+pytestmark = pytest.mark.timeout(600)
+
 # --- fixture: the 18 dogfood events (verbatim VEVENT blocks) ------------------
 
 _EVENTS = """\
