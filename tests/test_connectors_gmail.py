@@ -243,6 +243,7 @@ def _connector(
         token_loader=lambda: "refresh-token",
         service_factory=lambda token, scopes, api_name, api_version: _FakeService(state),
         settings=Settings(
+            gmail_min_call_interval_s=0.0,
             gmail_label_id=label, gmail_query=query, gmail_credentials_path="", _env_file=None
         ),
         legacy_seed=legacy_seed,
@@ -611,7 +612,8 @@ class TestAttachments:
             token_loader=lambda: "refresh-token",
             service_factory=factory,
             settings=Settings(
-                gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
+                gmail_min_call_interval_s=0.0,
+                    gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
             ),
         )
         connector._service()
@@ -637,7 +639,8 @@ class TestAttachments:
             token_loader=lambda: "refresh-token",
             service_factory=factory,
             settings=Settings(
-                gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
+                gmail_min_call_interval_s=0.0,
+                    gmail_label_id=LABEL, gmail_credentials_path="", _env_file=None
             ),
         )
         first_client = connector._gmail()

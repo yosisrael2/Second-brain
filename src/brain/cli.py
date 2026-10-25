@@ -692,25 +692,20 @@ def _cli_attachment_service(settings: Any, indexer: Any = None) -> Any:
 
 
 def _build_trier(session):
-    """The real triage callable: kid override, then Jev, then the LLM (D2a)."""
+    """The real triage callable: kid override, then Jev, then the LLM (D2a).
+
+    Refreshable kid names: the poller holds this trier for the process
+    lifetime, so the confirmed kid names/aliases are re-read ONCE PER POLL
+    PASS (RefreshableTrier.refresh, savepoint-scoped) — never per
+    conversation. The backfill command builds a fresh trier per invocation,
+    which reads them at construction with no refresh call.
+    """
     from brain.api import deps  # noqa: PLC0415
-    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
-    from brain.services.memory import MemoryService  # noqa: PLC0415
-    from brain.services.triage import (  # noqa: PLC0415
-        confirmed_kid_names,
-        triage_conversation,
-    )
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
 
     jev = deps.get_jev_client()
     llm = deps.get_llm_client()
-    kid_names = confirmed_kid_names(
-        MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
-    )
-
-    def trier(item):
-        return triage_conversation(item.raw_text, jev=jev, llm=llm, kid_names=kid_names)
-
-    return trier
+    return RefreshableTrier(session, jev=jev, llm=llm)
 
 
 def _whatsapp_triage(*, limit: int) -> int:

@@ -117,7 +117,7 @@ class TestRestGmailClient:
     def test_list_passes_label_ids_through(self):
         result = {"messages": [{"id": "m1", "threadId": "t1"}]}
         client, calls = _client(result)
-        stubs = client.list_messages(query="", label_ids=["LABEL_1"])
+        stubs, _page_token = client.list_messages_page(query="", label_ids=["LABEL_1"])
         assert [s.id for s in stubs] == ["m1"]
         assert calls[0]["labelIds"] == ["LABEL_1"]
         assert calls[0]["userId"] == "me"
@@ -125,26 +125,26 @@ class TestRestGmailClient:
     def test_auth_error_on_401(self):
         client, _ = _client(None, _FakeHttpError(401))
         with pytest.raises(GmailAuthError):
-            client.list_messages(query="", label_ids=["L"])
+            client.list_messages_page(query="", label_ids=["L"])
 
     def test_label_error_on_404(self):
         client, _ = _client(None, _FakeHttpError(404))
         with pytest.raises(GmailLabelError):
-            client.list_messages(query="", label_ids=["GONE"])
+            client.list_messages_page(query="", label_ids=["GONE"])
 
     def test_transient_error_on_503(self):
         from brain.ai.gmail import GmailError
 
         client, _ = _client(None, _FakeHttpError(503))
         with pytest.raises(GmailError) as excinfo:
-            client.list_messages(query="", label_ids=["L"])
+            client.list_messages_page(query="", label_ids=["L"])
         assert not isinstance(excinfo.value, (GmailAuthError, GmailLabelError))
 
     def test_refresh_error_maps_to_auth_error(self):
         # google-auth raises RefreshError when the refresh token was revoked.
         client, _ = _client(None, type("RefreshError", (Exception,), {})("invalid_grant"))
         with pytest.raises(GmailAuthError):
-            client.list_messages(query="", label_ids=["L"])
+            client.list_messages_page(query="", label_ids=["L"])
 
 
 # --- production refresh needs the OAuth client fields --------------------------
@@ -241,52 +241,39 @@ class TestDefaultServiceFactory:
 
 
 class TestListPagination:
-    def test_follows_pagetoken_up_to_a_small_cap(self):
-        pages = [
-            {"messages": [{"id": "m1", "threadId": "t1"}], "nextPageToken": "p2"},
-            {"messages": [{"id": "m2", "threadId": "t1"}]},
-        ]
+    """The client returns ONE page per call; the CALLER (the connector's
+    _query_batch) decides whether to fetch the next page — a --limit run
+    never walks the whole label (quota hygiene, fix/gmail-quota-403)."""
 
-        class PagingMessages:
-            def __init__(self):
-                self.calls = []
+    def test_page_returns_stubs_and_the_next_token(self):
+        page = {"messages": [{"id": "m1", "threadId": "t1"}], "nextPageToken": "p2"}
+        client, calls = _client(page)
+        stubs, token = client.list_messages_page(query="", label_ids=["L"])
+        assert [s.id for s in stubs] == ["m1"]
+        assert token == "p2"
+        assert calls[0]["labelIds"] == ["L"]
 
-            def list(self, **kwargs):
-                self.calls.append(kwargs)
-                result = pages[min(len(self.calls) - 1, len(pages) - 1)]
-                return _FakeRequest(result=result)
-
-        paging = PagingMessages()
-        client = RestGmailClient(
-            token_loader=lambda: "refresh-token",
-            service_factory=lambda token, user_id: _FakeService(_FakeUsers(paging)),
+    def test_page_passes_page_token_through(self):
+        page = {"messages": [{"id": "m2", "threadId": "t1"}]}
+        client, calls = _client(page)
+        stubs, token = client.list_messages_page(
+            query="", label_ids=["L"], page_token="p2"
         )
-        stubs = client.list_messages(query="", label_ids=["L"])
-        assert [s.id for s in stubs] == ["m1", "m2"]
-        assert paging.calls[1].get("pageToken") == "p2"
+        assert [s.id for s in stubs] == ["m2"]
+        assert token is None  # the fake result carries no nextPageToken
+        assert calls[0].get("pageToken") == "p2"
 
-    def test_cap_stops_the_walk(self):
-        class EndlessMessages:
-            def __init__(self):
-                self.calls = 0
+    def test_page_carries_max_results_when_asked(self):
+        page = {"messages": [{"id": "m1", "threadId": "t1"}]}
+        client, calls = _client(page)
+        client.list_messages_page(query="", label_ids=["L"], max_results=50)
+        assert calls[0]["maxResults"] == 50
 
-            def list(self, **kwargs):
-                self.calls += 1
-                return _FakeRequest(
-                    result={
-                        "messages": [{"id": f"m{self.calls}", "threadId": "t"}],
-                        "nextPageToken": f"p{self.calls}",
-                    }
-                )
-
-        endless = EndlessMessages()
-        client = RestGmailClient(
-            token_loader=lambda: "refresh-token",
-            service_factory=lambda token, user_id: _FakeService(_FakeUsers(endless)),
-        )
-        stubs = client.list_messages(query="", label_ids=["L"])
-        assert endless.calls <= 5  # small cap: bounded walk per poll
-        assert len(stubs) == endless.calls
+    def test_page_without_max_results_sends_none(self):
+        page = {"messages": [{"id": "m1", "threadId": "t1"}]}
+        client, calls = _client(page)
+        client.list_messages_page(query="", label_ids=["L"])
+        assert "maxResults" not in calls[0]
 
 
 # --- C5 additions: history walk, profile cursor, injected service --------------
@@ -390,7 +377,7 @@ class TestInjectedService:
                 return _FakeUsers(_FakeMessages(calls, {"messages": []}, None))
 
         client = RestGmailClient(service=S())  # no token_loader at all
-        stubs = client.list_messages(query="", label_ids=["L"])
+        stubs, _page_token = client.list_messages_page(query="", label_ids=["L"])
         assert stubs == []
         assert calls  # the service was used directly
 

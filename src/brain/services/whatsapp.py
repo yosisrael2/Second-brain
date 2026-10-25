@@ -450,6 +450,24 @@ class WhatsAppPoller:
 
     def poll(self, *, now: datetime) -> list[ChannelPollResult]:
         """Poll every allowlisted channel once; per-channel failures are logged, not raised."""
+        # Fresh kid names once per pass (never per conversation — no extra
+        # query in the hot loop). The refresh is savepoint-scoped inside the
+        # trier, so a DB hiccup cannot poison this pass's transaction; on
+        # failure the pass carries on with the LAST-KNOWN names.
+        refresh = getattr(self._trier, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception as exc:  # noqa: BLE001 — a failed refresh never stops the pass
+                logger.warning(
+                    "whatsapp: kid-name refresh failed (%s); using last-known names", exc
+                )
+                ops.record_event(
+                    "triage",
+                    "refresh_failed",
+                    ok=False,
+                    detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+                )
         started = datetime.now(UTC)
         allow = {
             entity.name for entity in self._memory.list_entities(kinds=["channel"]) if entity.name

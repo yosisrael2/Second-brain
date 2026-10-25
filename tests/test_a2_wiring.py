@@ -14,10 +14,12 @@ import asyncio
 import inspect
 import threading
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import text
 
 from brain.config import Settings
@@ -36,6 +38,11 @@ from conftest import assert_test_database
 assert_test_database(str(engine.url))
 
 SOURCE_BODY = "שלום,\nמחר כינוס הורים באמפי 22.10\nחולצה לבנה ליום חמישי 23.10\n"
+# a WhatsApp text that qualifies for extraction (2+ dateish expressions)
+WA_BODY = (
+    "[21/10] הודעה מהכיתה: מחר 22/10 איסוף ב-13:00 "
+    "וביום חמישי 23/10 חולצה לבנה וכך גם ב-24/10"
+)
 
 
 def _flush(core, tg):
@@ -116,7 +123,7 @@ class _BlockingEnrichment:
         self.release = threading.Event()
         self.done = False
 
-    def run_once(self, now, *, limit=20, backfill=False):
+    def run_once(self, now, *, limit=20, backfill=False, sources=None):
         self.calls.append(now)
         if self.on_children_changed is not None and self._outcomes:
             self.on_children_changed(list(self._outcomes))
@@ -277,7 +284,7 @@ def test_worker_pass_error_is_recorded_and_bot_survives(monkeypatch):
             self.on_children_changed = None
             self.calls = 0
 
-        def run_once(self, now, *, limit=20, backfill=False):
+        def run_once(self, now, *, limit=20, backfill=False, sources=None):
             self.calls += 1
             raise RuntimeError("boom")
 
@@ -685,3 +692,264 @@ def test_finished_stalled_pass_still_delivers_its_cards(monkeypatch):
     asyncio.run(go())
     _wipe(session)
     session.close()
+
+
+# --- (step 2, week 1) the worker's source filter ------------------------------
+
+
+def _queued(session, *, source: str, text: str, sent_days_ago: int = 1):
+    """A captured parent + its production-queued enrichment job."""
+    repo = ItemsRepository(session)
+    item = repo.add(
+        MemoryItem(
+            raw_text=text,
+            source=source,
+            occurred_at=datetime.now(tz=UTC) - timedelta(days=sent_days_ago),
+        )
+    )
+    service = EnrichmentService(repo, session)
+    service.enqueue(item)
+    return item
+
+
+def _job_row(session, item_id):
+    return session.execute(
+        text("SELECT attempts, not_before, state FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(item_id)},
+    ).one()
+
+
+def test_worker_source_filter_processes_only_email(monkeypatch):
+    """Week 1: with ENRICHMENT_WORKER_SOURCES=email the worker pass runs the
+    email job ONLY — the WhatsApp job stays queued and its row is UNTOUCHED
+    (attempts / not_before / state identical)."""
+    session = SessionLocal()
+    _wipe(session)
+    email = _queued(session, source="email", text=SOURCE_BODY)
+    whatsapp = _queued(session, source="whatsapp", text=WA_BODY)
+    snapshot = _job_row(session, whatsapp.id)
+    service = EnrichmentService(ItemsRepository(session), session)
+    _use_pass_service(monkeypatch, service)
+    monkeypatch.setattr(
+        "brain.config.get_settings",
+        lambda: _settings(enrichment_worker_enabled=True, enrichment_worker_sources="email"),
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)
+        tg2 = _Tg()
+        await _flush_bot_jobs(tg2, core)
+        assert len(tg2.sent) == 1  # only the email's card
+
+    asyncio.run(go())
+    assert _job_row(session, email.id).state == "done"
+    assert _job_row(session, whatsapp.id) == snapshot  # attempts/not_before/state identical
+    _wipe(session)
+    session.close()
+
+
+def test_worker_without_filter_processes_all_sources(monkeypatch):
+    """Default (empty ENRICHMENT_WORKER_SOURCES): every source drains."""
+    session = SessionLocal()
+    _wipe(session)
+    _queued(session, source="email", text=SOURCE_BODY)
+    _queued(session, source="whatsapp", text=WA_BODY)
+    service = EnrichmentService(ItemsRepository(session), session)
+    _use_pass_service(monkeypatch, service)
+    monkeypatch.setattr(
+        "brain.config.get_settings", lambda: _settings(enrichment_worker_enabled=True)
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)
+        states = session.execute(text("SELECT state FROM enrichment_jobs")).scalars().all()
+        assert states and all(state == "done" for state in states)
+
+    asyncio.run(go())
+    _wipe(session)
+    session.close()
+
+
+def test_cli_run_once_stays_unfiltered():
+    """The filter is the WORKER's: a plain run_once (brain enrich) processes
+    every source — backfills are never silently skipped."""
+    session = SessionLocal()
+    _wipe(session)
+    _queued(session, source="email", text=SOURCE_BODY)
+    _queued(session, source="whatsapp", text=WA_BODY)
+    service = EnrichmentService(ItemsRepository(session), session)
+    report = service.run_once(datetime.now(tz=UTC), limit=20)
+    assert report.processed == 2, report
+    _wipe(session)
+    session.close()
+
+
+def test_cap_counts_only_executed_jobs(monkeypatch):
+    """Cap=1 with 2 email + 1 WhatsApp queued: one email runs, ONE email is
+    deferred per D5, the WhatsApp job is untouched (never deferred)."""
+    session = SessionLocal()
+    _wipe(session)
+    e1 = _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=3)
+    e2 = _queued(session, source="email", text=SOURCE_BODY + " א", sent_days_ago=2)
+    wa = _queued(session, source="whatsapp", text=WA_BODY, sent_days_ago=1)
+    # deterministic queue order: WhatsApp job OLDEST, then e1, then e2 —
+    # so on an unfiltered pass the WhatsApp job is reached first (this is
+    # what makes the test red without the filter, not lucky uuid order)
+    session.execute(
+        text(
+            "UPDATE enrichment_jobs SET queued_at = NOW() - "
+            "( INTERVAL '1 day' * CASE item_id "
+            "WHEN :wa THEN 3 WHEN :e1 THEN 2 ELSE 1 END )",
+            ),
+        {"wa": str(wa.id), "e1": str(e1.id)},
+    )
+    session.commit()
+    # the pass seam bypasses _build_pass_service: the cap lives on the
+    # service we inject (the real builder forwards settings.enrichment_daily_cap)
+    service = EnrichmentService(ItemsRepository(session), session, daily_cap=1)
+    _use_pass_service(monkeypatch, service)
+    monkeypatch.setattr(
+        "brain.config.get_settings",
+        lambda: _settings(
+            enrichment_worker_enabled=True,
+            enrichment_worker_sources="email",
+            enrichment_daily_cap=1,
+        ),
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)
+
+    asyncio.run(go())
+    rows = {
+        str(j["item_id"]): j
+        for j in session.execute(
+            text("SELECT item_id, state, not_before FROM enrichment_jobs")
+        ).mappings()
+    }
+    assert rows[str(e1.id)]["state"] == "done"
+    assert rows[str(e2.id)]["state"] == "queued"  # deferred over cap (D5)
+    assert rows[str(e2.id)]["not_before"] is not None  # pushed to tomorrow
+    assert rows[str(wa.id)]["state"] == "queued"
+    assert rows[str(wa.id)]["not_before"] is None  # never deferred, never touched
+    _wipe(session)
+    session.close()
+
+
+def test_starvation_the_filter_is_in_sql(monkeypatch):
+    """50 QUALIFYING old WhatsApp jobs ahead of ONE newer email job: the very
+    first filtered pass runs the email (limit 25 could never reach it if the
+    filter were a post-fetch skip)."""
+    session = SessionLocal()
+    _wipe(session)
+    for _ in range(50):
+        _queued(session, source="whatsapp", text=WA_BODY, sent_days_ago=10)
+    email = _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=1)
+    # deterministic queue order: the fillers enqueued strictly earlier than
+    # the email (same-second queued_at would fall back to random uuid order)
+    session.execute(
+        text("UPDATE enrichment_jobs SET queued_at = :q WHERE item_id <> :i"),
+        {"q": datetime.now(tz=UTC) - timedelta(days=2), "i": str(email.id)},
+    )
+    session.commit()
+    # the premise, asserted: 51 queued jobs, 50 WhatsApp, ALL older than the
+    # email's job — if enqueue had skipped the fillers this would prove nothing
+    counts = session.execute(
+        text(
+            "SELECT source, COUNT(*) FROM enrichment_jobs j "
+            "JOIN memory_items m ON m.id = j.item_id "
+            "WHERE j.state = 'queued' GROUP BY source"
+        )
+    ).all()
+    assert dict(counts) == {"whatsapp": 50, "email": 1}, counts
+    email_queued_at = session.execute(
+        text("SELECT queued_at FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(email.id)},
+    ).scalar()
+    older = session.execute(
+        text("SELECT COUNT(*) FROM enrichment_jobs WHERE item_id <> :i AND queued_at < :q"),
+        {"i": str(email.id), "q": email_queued_at},
+    ).scalar()
+    assert older == 50  # every filler is strictly ahead of the email job
+    service = EnrichmentService(ItemsRepository(session), session)
+    _use_pass_service(monkeypatch, service)
+    monkeypatch.setattr(
+        "brain.config.get_settings",
+        lambda: _settings(enrichment_worker_enabled=True, enrichment_worker_sources="email"),
+    )
+    core = _bot()
+    _fresh_bot_state(core)
+
+    async def go():
+        await asyncio.wait_for(_flush_bot_jobs(_Tg(), core), timeout=2.0)
+        await _await_pass_done(core)
+        state = session.execute(
+            text("SELECT state FROM enrichment_jobs WHERE item_id = :i"),
+            {"i": str(email.id)},
+        ).scalar()
+        assert state == "done"
+
+    asyncio.run(go())
+    _wipe(session)
+    session.close()
+
+
+def test_starvation_deferred_jobs_never_hide_a_due_job():
+    """Same post-fetch starvation class, not_before leg: 30 jobs deferred to
+    tomorrow (not_before) sit ahead of 1 DUE job in queue order. The 25-row
+    scan window must not fill up with not-yet-due rows — the due job runs."""
+    session = SessionLocal()
+    _wipe(session)
+    tomorrow = datetime.now(tz=UTC) + timedelta(days=1)
+    for _ in range(30):
+        _queued(session, source="email", text=SOURCE_BODY, sent_days_ago=10)
+    due = _queued(session, source="email", text=SOURCE_BODY + " ד", sent_days_ago=1)
+    # defer the 30 oldest (as D5 does), keep the newest due
+    session.execute(
+        text(
+            "UPDATE enrichment_jobs SET not_before = :nb, queued_at = :q WHERE item_id <> :i"
+        ),
+        {"nb": tomorrow, "q": datetime.now(tz=UTC) - timedelta(days=2), "i": str(due.id)},
+    )
+    session.commit()
+    # the premise: 30 not-yet-due queued jobs ahead of the one due job
+    counts = session.execute(
+        text(
+            "SELECT state, COUNT(*) FROM enrichment_jobs "
+            "WHERE not_before IS NOT NULL GROUP BY state"
+        )
+    ).all()
+    assert dict(counts) == {"queued": 30}, counts
+    service = EnrichmentService(ItemsRepository(session), session)
+    report = service.run_once(datetime.now(tz=UTC), limit=20)
+    assert report.processed == 1, report  # the due job ran DESPITE 30 deferred ahead
+    state = session.execute(
+        text("SELECT state FROM enrichment_jobs WHERE item_id = :i"),
+        {"i": str(due.id)},
+    ).scalar()
+    assert state == "done"
+    _wipe(session)
+    session.close()
+
+
+def test_worker_sources_parsing_and_domain_validation():
+    """Trimmed, lowercased, empties dropped; every value must be in the
+    source CHECK domain (taken from the model, never retyped); an unknown
+    value FAILS settings load — it must never silently match nothing."""
+    s = _settings(enrichment_worker_sources=" EMAIL , email , ")
+    assert s.worker_source_list == ("email",)
+    s = _settings(enrichment_worker_sources="calendar,whatsapp")
+    assert s.worker_source_list == ("calendar", "whatsapp")
+    with pytest.raises(ValueError):
+        Settings(enrichment_worker_sources="gmail", _env_file=None)
+    with pytest.raises(ValueError):
+        Settings(enrichment_worker_sources="emails", _env_file=None)

@@ -277,13 +277,16 @@ class GmailConnector(GoogleConnector):
         legacy_seed: Callable[[], int] | None = None,
         is_known: Callable[[str], bool] | None = None,
         rfc_backstop: Callable[[str, str], bool] | None = None,
+        client_overrides: dict[str, Any] | None = None,
     ) -> None:
         """``legacy_seed`` runs on every full resync (lazy ledger migration);
         ``is_known`` answers "is this gmail id already ledgered?" so the
         query path can skip the GET for known ids (the old fast path);
         ``rfc_backstop(rfc_message_id, gmail_id)`` is the Message-ID
         backstop: True = the re-delivery was ledgered against the existing
-        item, drop the record (never a second item for one Message-ID)."""
+        item, drop the record (never a second item for one Message-ID).
+        ``client_overrides`` injects the read client's test seams (sleep/
+        clock/max_retries for the pacing + rate-limit retry)."""
         super().__init__(
             token_loader=token_loader, service_factory=service_factory, user_id=user_id
         )
@@ -293,14 +296,20 @@ class GmailConnector(GoogleConnector):
         self._legacy_seed = legacy_seed
         self._is_known = is_known
         self._rfc_backstop = rfc_backstop
+        self._client_overrides: dict[str, Any] = dict(client_overrides or {})
         self._client: RestGmailClient | None = None
 
     # --- plumbing -------------------------------------------------------------
 
     def _gmail(self) -> RestGmailClient:
-        """The shared read client over the (cached) service object."""
+        """The shared read client over the (cached) service object, wired
+        with the configured pacing (quota hygiene) and the test seams."""
         if self._client is None:
-            self._client = RestGmailClient(service=self._service())
+            self._client = RestGmailClient(
+                service=self._service(),
+                min_interval_s=getattr(self._settings, "gmail_min_call_interval_s", None),
+                **self._client_overrides,
+            )
         return self._client
 
     def _label_id(self) -> str:
@@ -362,34 +371,43 @@ class GmailConnector(GoogleConnector):
         label = self._label_id()
         client = self._gmail()
         query = getattr(self._settings, "gmail_query", "") or ""
-        try:
-            stubs = self._boundary(
-                lambda: client.list_messages(query=query, label_ids=[label])
-            )
-        except ConnectorError as exc:
-            if reset and getattr(exc, "status", None) == 404:
-                # history expired AND the label is gone: terminal, not a loop.
-                raise ConnectorError(f"label lookup failed during resync: {exc}") from exc
-            raise
+        # Bounded listing (quota hygiene): a page of max(limit, 50) stubs —
+        # never the whole label just to fill a small --limit.
+        page_size = min(500, max(limit, 50))
         records: list[Any] = []
         truncated = False
-        for stub in stubs:
-            if len(records) >= limit:
-                truncated = True
-                break  # more remain: drop the cursor, next run re-lists
-            if self._is_known is not None and self._is_known(stub.id):
-                continue  # fast path: the ledger knows this id — no GET
+        page_token: str | None = None
+        while True:
             try:
-                record = self._record(stub.id)
+                stubs, page_token = self._boundary(
+                    lambda pt=page_token: client.list_messages_page(
+                        query=query, label_ids=[label], page_token=pt, max_results=page_size,
+                    )
+                )
             except ConnectorError as exc:
-                if getattr(exc, "status", None) == 404:
-                    # Listed then hard-deleted before the GET: gone is gone.
-                    logger.info("connectors: email message %s vanished (404)", stub.id)
-                    continue
+                if reset and getattr(exc, "status", None) == 404:
+                    # history expired AND the label is gone: terminal, not a loop.
+                    raise ConnectorError(f"label lookup failed during resync: {exc}") from exc
                 raise
-            if self._backstop_catches(record):
-                continue  # re-delivery under a new id: ledgered, no new item
-            records.append(record)
+            for stub in stubs:
+                if len(records) >= limit:
+                    truncated = True  # more stubs remain: drop the cursor
+                    break
+                if self._is_known is not None and self._is_known(stub.id):
+                    continue  # fast path: the ledger knows this id — no GET
+                try:
+                    record = self._record(stub.id)
+                except ConnectorError as exc:
+                    if getattr(exc, "status", None) == 404:
+                        # Listed then hard-deleted before the GET: gone is gone.
+                        logger.info("connectors: email message %s vanished (404)", stub.id)
+                        continue
+                    raise
+                if self._backstop_catches(record):
+                    continue  # re-delivery under a new id: ledgered, no new item
+                records.append(record)
+            if truncated or page_token is None:
+                break
         next_cursor: str | None = None
         if not truncated:
             # The whole listing fit: the current historyId is a safe resume point.
