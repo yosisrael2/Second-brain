@@ -1036,6 +1036,81 @@ def _break_kid_names_read(monkeypatch: Any, state: dict) -> None:
     monkeypatch.setattr(MemoryService, "overview", flaky_overview)
 
 
+def test_failed_first_read_does_not_abort_the_session(
+    triage_world: Any, tmp_path: Any
+) -> None:
+    """The FIRST read in __init__ must be savepoint-scoped exactly like
+    refresh(): a real DB error there aborts the session's transaction, and a
+    bare try/except only moves the crash one step later — the poller's first
+    pass would fail on EVERY query, refresh() included. Real broken SQL on the
+    real test DB (not a mocked raise, which never aborts Postgres):
+    construction survives, a normal query on the SAME session succeeds, and a
+    full poller pass runs (and recovers to kid_named)."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    class _PoisonedFirstRead(RefreshableTrier):
+        """Real abort: broken SQL on the shared session during __init__."""
+
+        poisoned = True
+
+        def _read_kid_names(self) -> list[str]:
+            if self.poisoned:
+                self._session.execute(sql_text("SELECT * FROM __no_such_table_xyz__"))
+            return super()._read_kid_names()
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+
+    # Construction hits the broken SQL — must survive (tolerance).
+    trier = _PoisonedFirstRead(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM(
+    '{"label": "noise", "confidence": 0.8}'
+    ))
+    trier.poisoned = False
+    assert trier._kid_names == [] and trier.kid_names_loaded is False
+
+    # The SAME session must still answer queries — the aborted-transaction
+    # hole made every later query fail with PendingRollbackError.
+    entities = world.session.execute(sql_text("SELECT count(*) FROM entities")).scalar()
+    assert entities >= 1
+
+    # And a full poller pass on that session must run: refresh() succeeds on
+    # the recovered DB, so the kid override fires from the first triage pass.
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _trier_poller(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # cursor init
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="רונה צריכה להביא כובע מחר",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+
+    world.session.expire_all()
+    items = world.session.query(MemoryItem).all()
+    assert len(items) == 1
+    assert items[0].triage_method == "kid_named", (
+        "the pass must run on the same session and the refreshed kid names "
+        "must apply — no aborted-transaction fallout"
+    )
+
+
 def test_trier_construction_survives_failed_kid_names_read(
     triage_world: Any, tmp_path: Any, monkeypatch: Any, caplog: Any
 ) -> None:
@@ -1063,6 +1138,12 @@ def test_trier_construction_survives_failed_kid_names_read(
     _break_kid_names_read(monkeypatch, state)
 
     with caplog.at_level(logging.WARNING, logger="brain.services.triage"):
+        ops_before = world.session.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component='triage' AND kind='kid_names_unavailable'"
+            )
+        ).scalar()
         # Construction itself hits the broken read — must survive.
         trier = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM(
             '{"label": "noise", "confidence": 0.8}'
@@ -1078,7 +1159,7 @@ def test_trier_construction_survives_failed_kid_names_read(
             "WHERE component='triage' AND kind='kid_names_unavailable'"
         )
     ).scalar()
-    assert ops_rows == 1, "construction must record exactly one ops event"
+    assert ops_rows == ops_before + 1, "construction must record exactly one ops event"
 
     # Pass 1: the first poll only initializes the cursor at the live edge.
     path = tmp_path / "messages.db"

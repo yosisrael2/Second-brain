@@ -139,7 +139,12 @@ class RefreshableTrier:
         # one-shot run on this state instead of silently missing kid mentions.
         self.kid_names_loaded = False
         try:
-            self._kid_names = self._read_kid_names()
+            # Savepoint-scoped like refresh(): a REAL db error during the
+            # first read aborts the transaction — without the savepoint the
+            # session stays dead ("current transaction is aborted") and the
+            # tolerance only moves the crash one step later.
+            with self._session.begin_nested():
+                self._kid_names = self._read_kid_names()
             self.kid_names_loaded = True
         except Exception as exc:  # noqa: BLE001 — startup must survive a hiccup
             self._kid_names = []
