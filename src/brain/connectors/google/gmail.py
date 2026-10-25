@@ -296,6 +296,11 @@ class GmailConnector(GoogleConnector):
         self._legacy_seed = legacy_seed
         self._is_known = is_known
         self._rfc_backstop = rfc_backstop
+        # adopt-only progress seam (finding-4 follow-up): adopt assigns a
+        # per-run set of ids it already collected; the query path skips them
+        # WITHOUT a GET — during adopt the ledger cannot know them yet (a
+        # dry-run writes nothing; a real adopt writes only after matching).
+        self.run_seen: set[str] | None = None
         self._client_overrides: dict[str, Any] = dict(client_overrides or {})
         self._client: RestGmailClient | None = None
 
@@ -401,6 +406,8 @@ class GmailConnector(GoogleConnector):
                     break
                 if self._is_known is not None and self._is_known(stub.id):
                     continue  # fast path: the ledger knows this id — no GET
+                if self.run_seen is not None and stub.id in self.run_seen:
+                    continue  # adopt progress: this run already collected it — no GET
                 try:
                     record = self._record(stub.id)
                 except ConnectorError as exc:

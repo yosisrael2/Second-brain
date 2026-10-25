@@ -147,12 +147,23 @@ def adopt_connector(
         report.refused_cursor = True
         return report
 
+    # Per-run progress set (finding-4 follow-up): during adopt the ledger
+    # cannot know records fetched in EARLIER batches (a dry-run writes
+    # nothing; a real adopt writes only after matching), so a truncated
+    # query batch's re-list (next_cursor=None, more=True) would re-GET the
+    # same first `limit` records forever. Connectors that opt in (Gmail:
+    # run_seen) skip these ids without a GET; connectors with resumable
+    # cursors never consult it.
+    seen: set[str] = set()
+    if hasattr(connector, "run_seen"):
+        connector.run_seen = seen  # type: ignore[attr-defined]
+
     candidates = _legacy_items(session, legacy_source)
     if not candidates:
         report.nothing_to_adopt = True
         return report
 
-    records = _fetch_all(connector, limit=limit)
+    records = _fetch_all(connector, limit=limit, seen=seen)
     report.fetched = len(records)
 
     index = _CandidateIndex(candidates)
@@ -371,7 +382,9 @@ def _prior_shas(session: Session, report: AdoptReport) -> dict[uuid.UUID, str | 
     return out
 
 
-def _fetch_all(connector: Connector, *, limit: int) -> list[Any]:
+def _fetch_all(
+    connector: Connector, *, limit: int, seen: set[str] | None = None
+) -> list[Any]:
     """Drain the connector in memory (batch cap = the sync --drain guard).
 
     The cursor is NEVER persisted: adopt is outside the sync bookkeeping and
@@ -379,15 +392,18 @@ def _fetch_all(connector: Connector, *, limit: int) -> list[Any]:
 
     ``more=True`` (the source truncated the batch without a resume cursor —
     the email query path) keeps the loop going even when next_cursor is
-    None: the re-fetch re-lists from the same cursor and the ledger/idempotency
-    machinery makes already-seen records cheap to skip. Bounded by
-    _MAX_ADOPT_BATCHES.
+    None: the re-fetch re-lists from the same cursor and every collected id
+    is added to ``seen`` — the connector consults it to skip already-
+    collected records WITHOUT a GET, so each record is fetched exactly once
+    and the loop terminates. Bounded by _MAX_ADOPT_BATCHES.
     """
     records: list[Any] = []
     cursor: str | None = None
     for _ in range(_MAX_ADOPT_BATCHES):
         result = connector.fetch(cursor, limit=limit)
         records.extend(result.records)
+        if seen is not None:
+            seen.update(record.external_id for record in result.records)
         if result.more:
             # Truncated: advance only when the source returned a new cursor;
             # otherwise keep the current one (email's stays None — the
