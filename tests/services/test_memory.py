@@ -122,6 +122,60 @@ def test_named_kids_need_known_memory(memory: MemoryService):
     assert memory.resolve_applies_to({"named_kids": ["Yarden"]}) == ["unknown"]
 
 
+def _add_alias(memory: MemoryService, kid_name: str, alias: str) -> None:
+    """Give an existing kid a Hebrew alias via the repo's alias writer."""
+    from brain.db.models import EntityAlias
+
+    entity = memory._repo.find_entity(kind="person", name=kid_name)
+    assert entity is not None
+    memory._repo.add_alias(EntityAlias(entity_id=entity.id, alias=alias, lang="he"))
+    memory._repo.commit()
+
+
+def test_named_kids_match_hebrew_aliases(memory: MemoryService):
+    """A kid's Hebrew alias resolves the same kid (GO-A follow-up)."""
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Itamar", "איתמר")
+    assert memory.resolve_applies_to({"named_kids": ["רונה"]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["איתמר"]}) == ["Itamar"]
+
+
+def test_named_kids_match_case_insensitive_and_prefixed(memory: MemoryService):
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    # Case-insensitive English ...
+    assert memory.resolve_applies_to({"named_kids": ["rona"]}) == ["Rona"]
+    # ... and the Hebrew prefix run (לרונה = 'for Rona').
+    assert memory.resolve_applies_to({"named_kids": ["לרונה"]}) == ["Rona"]
+
+
+def test_named_kids_name_and_alias_do_not_double_count(memory: MemoryService):
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    assert memory.resolve_applies_to({"named_kids": ["Rona", "רונה"]}) == ["Rona"]
+
+
+def test_named_kids_unknown_name_stays_unknown_with_aliases_present(memory: MemoryService):
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    assert memory.resolve_applies_to({"named_kids": ["עלמה"]}) == ["unknown"]
+
+
+def test_aliases_do_not_change_structured_branches(memory: MemoryService):
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Itamar", "איתמר")
+    assert (
+        memory.resolve_applies_to({"school": "בראשית", "grades": "5-6"}) == ["Rona"]
+    )
+    assert (
+        memory.resolve_applies_to({"school": "בראשית", "gender": "boys"})
+        == ["Itamar"]
+    )
+    assert memory.resolve_applies_to({"school": "בראשית"}) == ["Rona", "Itamar"]
+
+
 def test_staff_role_applies_to_nobody(memory: MemoryService):
     _seed_world(memory)
     assert memory.resolve_applies_to({"school": "בראשית", "role": "staff"}) == ["nobody"]

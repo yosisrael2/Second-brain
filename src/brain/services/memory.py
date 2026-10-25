@@ -334,7 +334,25 @@ class MemoryService:
 
         named = audience.get("named_kids") or []
         if named:
-            known = [kid["name"] for kid in kids if kid["name"] in named]
+            # GO-A follow-up: match extracted names against the kid's stored
+            # aliases too, with the SAME whole-word matcher triage uses
+            # (services/triage.py mentions_name) — no second matcher. An
+            # extracted Hebrew "רונה" must resolve to Rona once the alias
+            # exists, case-insensitively for English, with Hebrew prefix runs
+            # (לרונה); a name and its alias together never double-count.
+            people = self._repo.list_entities(kinds=["person"])
+            alias_map = {
+                entity.name: self._repo.aliases_for(entity.id) for entity in people
+            }
+            known: list[str] = []
+            for kid in kids:
+                candidates = [kid["name"], *alias_map.get(kid["name"], [])]
+                if any(
+                    mentions_name(candidate, token)
+                    for token in named
+                    for candidate in candidates
+                ):
+                    known.append(kid["name"])
             return known if known else ["unknown"]
 
         raw_grades = audience.get("grades")
