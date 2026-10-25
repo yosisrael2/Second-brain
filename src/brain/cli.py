@@ -1034,7 +1034,7 @@ def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs goog
         raise SystemExit(
             "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=[GMAIL_SCOPE])
+    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=[GMAIL_SCOPE])
 
 
 def _gmail_auth(args: argparse.Namespace) -> int:
@@ -1558,7 +1558,7 @@ def _build_connectors_oauth_flow(client_secret_path: str, scopes: list[str]) -> 
         raise SystemExit(
             "connectors: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secret_file(client_secret_path, scopes=scopes)
+    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=scopes)
 
 
 def _connectors_auth(args: argparse.Namespace) -> int:
