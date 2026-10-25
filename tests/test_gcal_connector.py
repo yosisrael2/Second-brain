@@ -113,9 +113,23 @@ class _FakeCalendarService:
             return _FakeRequest(error)
         key = (calendar_id, str(params.get("pageToken") or ""))
         if key in self.pages_by_token:
-            return _FakeRequest(self.pages_by_token.pop(key))
-        queue = self.pages.get(calendar_id) or []
-        return _FakeRequest(queue.pop(0) if queue else {"items": []})
+            page = self.pages_by_token.pop(key)
+        else:
+            queue = self.pages.get(calendar_id) or []
+            page = queue.pop(0) if queue else {"items": []}
+        raw_max = params.get("timeMax")
+        if raw_max is not None and page.get("items"):
+            # events.list contract: instances starting beyond timeMax are
+            # never returned. (Keeps tokens; drops out-of-window items.)
+            bound = datetime.fromisoformat(str(raw_max))
+            kept = []
+            for item in page["items"]:
+                raw_start = str((item.get("start") or {}).get("dateTime") or "")
+                if raw_start and datetime.fromisoformat(raw_start) > bound:
+                    continue
+                kept.append(item)
+            page = {**page, "items": kept}
+        return _FakeRequest(page)
 
 
 class _FakeEventsApi:
@@ -765,6 +779,7 @@ def runner_db_fixture(database: None):
 def _sync(monkeypatch: pytest.MonkeyPatch, h: Harness, *pages: dict[str, Any]):
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", _OLD_ENOUGH)
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "36500")  # window-independent test
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue("primary", *pages)
@@ -934,6 +949,7 @@ def test_walk_bigger_than_the_limit_terminates_with_a_sync_token(
     h = Harness(runner_db)
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", _OLD_ENOUGH)
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "36500")  # window-independent test
     get_settings.cache_clear()
 
     def run_once() -> tuple[Any, str | None]:
@@ -1043,6 +1059,7 @@ def test_walk_stopped_at_a_page_boundary_produces_no_gaps_or_repeats(
     h = Harness(runner_db)
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
     monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", _OLD_ENOUGH)
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "36500")  # window-independent test
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue_page("primary", "", {"items": _instance_page(0, 250), "nextPageToken": "p2"})
@@ -1287,6 +1304,52 @@ class _ShiftingNow:
     def now(cls, tz=None):
         base = datetime.now(UTC) + timedelta(days=cls.offset_days)
         return base.astimezone(tz) if tz is not None else base
+
+
+def test_relist_page_retry_stays_a_full_windowed_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BLOCKING (review round 4): when a RELIST's first call raises 400/410
+    and a page token was stored, the fallback must retry as a token-less
+    WINDOWED walk — retrying with the held sync token would run incremental
+    (timeMax is illegal with syncToken), leak far-future instances through
+    the unfiltered relist branch, and stamp the edge as advanced without a
+    real re-list."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    far_future = {
+        "id": "far-future-event-1",
+        "summary": "Far future",
+        "start": {"dateTime": "2030-01-01T12:00:00+02:00"},
+        "end": {"dateTime": "2030-01-01T13:00:00+02:00"},
+        "etag": '"ff1"',
+    }
+    fake = _FakeCalendarService()
+    fake.fail_next("primary", _FakeHttpError(400))  # the relist call itself
+    fake.queue_page(
+        "primary", "", {"items": [_timed(), far_future], "nextSyncToken": "S-fresh"}
+    )
+    conn = _connector(fake)
+    stale = _jlm_edge(60)  # yesterday's walk stamped today+60 -> relist due
+    cursor = _cursor_with_edge("T0", stale, page_token="p2")
+
+    result = conn.fetch(cursor, limit=100)
+
+    assert result.reset is True
+    assert "syncToken" not in fake.calls[0]  # the relist started token-less
+    retry = fake.calls[1]
+    assert "syncToken" not in retry  # the retry is NOT incremental
+    assert "pageToken" not in retry  # restarted from page 1
+    assert datetime.fromisoformat(retry["timeMax"]) == _jlm_edge(61)
+    assert datetime.fromisoformat(retry["timeMin"]) == _FROZEN_CUTOVER
+    ids = [r.external_id for r in result.records]
+    assert "1q2w3e4r5t6y7u8i9o0p" in ids  # the in-window instance
+    assert "far-future-event-1" not in ids  # beyond the edge: never leaks
+    final = json.loads(result.next_cursor or "{}")["calendars"]["primary"]
+    assert datetime.fromisoformat(final["edge"]) == _jlm_edge(61)  # stamped
+    assert "walk_edge" not in final
 
 
 def test_page_token_retry_after_400_carries_the_window(

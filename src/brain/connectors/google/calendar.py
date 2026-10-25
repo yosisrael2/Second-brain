@@ -378,11 +378,17 @@ class GCalConnector(GoogleConnector):
                 # pageTokens are short-lived): restart THIS calendar's walk
                 # from page 1 with the same mode/params (the sync guide's
                 # consistency rule) and tell the runner this is a resync.
-                # A token-less walk's retry MUST carry the window too —
-                # timeMin alone would re-flood the future to 2040.
+                # A RELIST retry must stay a token-less full walk: retrying
+                # with the held sync token would run incremental (timeMax
+                # is illegal with syncToken), leak far-future instances
+                # through the unfiltered relist branch, and stamp the edge
+                # as advanced without a real re-list. A token-less walk's
+                # retry MUST carry the window too — timeMin alone would
+                # re-flood the future to 2040.
                 reset = True
                 events, next_state = self._walk_calendar(
-                    service, calendar_id, sync_token, None, cutoff, zone, remaining,
+                    service, calendar_id, None if relist else sync_token, None,
+                    cutoff, zone, remaining,
                     future_edge=bound,
                 )
             mapped = self._map_events(events, calendar_id, zone)
