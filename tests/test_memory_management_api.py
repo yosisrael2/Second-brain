@@ -680,3 +680,85 @@ def test_restore_note_fact_allowed_next_to_other_notes(
     assert response.status_code == 200, response.text
     values = sorted(f["value"] for f in client.get(_ENDPOINT).json()["entities"][0]["facts"])
     assert values == ["chess club maybe", "swims Fridays"]
+
+
+# --- 12. single-valued kid predicates supersede (one current value) -----------
+
+
+def test_add_fact_supersedes_current_grade_fact(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Posting a second current value for a single-valued kid predicate
+    (the set_kid field set) must leave ONE current fact: the old row is
+    closed and chained via supersedes_id, exactly as set_kid does. The
+    old behavior piled up parallel current facts (8 grade facts on one
+    person after repeated adds), which kids() then resolved arbitrarily
+    — the wrong-child axis."""
+    entity = _add_entity(client, name="Noa")
+    first = _add_fact(client, entity["id"], predicate="grade", value="ה")
+    second = _add_fact(client, entity["id"], predicate="grade", value="ד")
+
+    assert second["supersedes_id"] == first["id"]
+    grades = [
+        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if fact["predicate"] == "grade"
+    ]
+    assert len(grades) == 1
+    assert grades[0]["value"] == "ד"
+
+
+def test_add_fact_same_single_valued_value_is_idempotent(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Re-posting the value a single-valued predicate already carries is a
+    no-op (set_kid: an unchanged attribute keeps its row — no history
+    spam), returning the existing fact."""
+    entity = _add_entity(client, name="Noa")
+    first = _add_fact(client, entity["id"], predicate="grade", value="ה")
+
+    response = client.post(f"{_ENDPOINT}/facts", json={
+        "subject_id": entity["id"], "predicate": "grade", "value": "ה",
+    })
+
+    # 201 with the EXISTING row — the API's established idempotent style
+    # (add_entity returns 201 for a re-add of the same row too).
+    assert response.status_code == 201, response.text
+    assert response.json()["id"] == first["id"]
+    grades = [
+        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if fact["predicate"] == "grade"
+    ]
+    assert len(grades) == 1
+
+
+def test_note_facts_stay_additive(client: TestClient, clean_memory: None) -> None:
+    """'note' is not in the single-valued set: many current notes per
+    person are the norm (one card each)."""
+    entity = _add_entity(client, name="Noa")
+    _add_fact(client, entity["id"], predicate="note", value="swims Fridays")
+    _add_fact(client, entity["id"], predicate="note", value="chess club maybe")
+
+    notes = [
+        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if fact["predicate"] == "note"
+    ]
+    assert sorted(fact["value"] for fact in notes) == ["chess club maybe", "swims Fridays"]
+
+
+def test_single_valued_set_matches_set_kid_signature(
+    client: TestClient, clean_memory: None
+) -> None:
+    """The single-valued set must stay IDENTICAL to the profile fields
+    set_kid writes — one source of truth, pinned here via the signature
+    so a new set_kid field cannot silently miss the supersede behavior."""
+    import inspect
+
+    from brain.services.memory import MemoryService
+
+    # set_kid(name, *, gender, school, grade, class_, teacher): drop the
+    # positional 'name' and 'self'; class_ is the fact predicate 'class'.
+    params = set(inspect.signature(MemoryService.set_kid).parameters) - {"name", "self"}
+    params = {"class" if field == "class_" else field for field in params}
+    from brain.services.memory import SINGLE_VALUED_KID_PREDICATES
+
+    assert set(SINGLE_VALUED_KID_PREDICATES) == params
