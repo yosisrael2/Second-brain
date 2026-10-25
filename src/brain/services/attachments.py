@@ -251,6 +251,7 @@ class AttachmentService:
         session_factory: Any,
         daily_budget: int = 50,
         clock: Any = None,
+        on_read: Any = None,
     ) -> None:
         self._store = store
         self.pdf_reader = pdf_reader
@@ -260,6 +261,11 @@ class AttachmentService:
         self._daily_budget = daily_budget
         self._queue: asyncio.Queue[uuid.UUID] = asyncio.Queue()
         self._clock = clock or (lambda: datetime.now(UTC))
+        # Post-read hook (the #113 follow-up): called as
+        # on_read(session, att) on the SAME session _finish uses, only for
+        # successful reads of whatsapp attachments — the poller wires it to
+        # the post-read re-triage. Never set = no re-triage (tests, non-WA).
+        self._on_read = on_read
 
     # -- capture ------------------------------------------------------------
 
@@ -398,6 +404,21 @@ class AttachmentService:
                 if own is not None:
                     own.raw_text = f"{att.filename}\n{text}"
                     own.meta = {**(own.meta or {}), "description": description or ""}
+            if (
+                status == "done"
+                and text is not None
+                and att.source == "whatsapp"
+                and self._on_read is not None
+            ):
+                # The #113 follow-up trigger: a successful read is the ONLY
+                # re-triage point (never the marker swap — a filename + an id
+                # is not readable text). Same session, ONE commit covers the
+                # read AND the re-triage; failures are recorded, never raised
+                # into the reader.
+                try:
+                    self._on_read(session, att)
+                except Exception as exc:  # noqa: BLE001 — a triage failure must not fail the read
+                    logger.error("attachment %s re-triage failed: %s", attachment_id, exc)
             session.commit()
             if text is not None:
                 own = session.get(MemoryItem, att.item_id)
@@ -415,6 +436,20 @@ class AttachmentService:
             if att is not None:
                 session.expunge(att)
             return att
+
+    def attachment_text(self, attachment_item_id: uuid.UUID) -> str | None:
+        """The attachment's EXTRACTED text, by its own memory-item id — the
+        read-only lookup the media triage skip uses. None unless the read is
+        done and produced real text: a saved-but-unread file is not text."""
+        with self._sessions() as session:
+            att = (
+                session.query(Attachment)
+                .filter(Attachment.item_id == attachment_item_id)
+                .one_or_none()
+            )
+            if att is None or att.status != "done":
+                return None
+            return (att.text or "").strip() or None
 
     def own_item(self, attachment_id: uuid.UUID) -> MemoryItem | None:
         """The attachment's own searchable memory item."""
