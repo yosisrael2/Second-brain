@@ -80,6 +80,10 @@ class FetchResult:
     records: list[SourceRecord]
     next_cursor: str | None
     reset: bool = False
+    # Adapter-observed counters for this batch (e.g. gcal's "beyond_window":
+    # instances dropped because they start beyond the future window). The
+    # runner may surface them in ops detail; tests assert on them directly.
+    stats: dict[str, int] = field(default_factory=dict)
 
 
 class Connector(ABC):

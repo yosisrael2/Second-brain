@@ -97,6 +97,15 @@ class _FakeCalendarService:
 
     def _take(self, params: dict[str, Any]) -> Any:
         self.calls.append(params)
+        # The Google rule (events.list): timeMin/timeMax may ride ONLY on a
+        # syncToken-less (full) walk — a request combining them with a
+        # syncToken is malformed; the fake refuses it loudly.
+        if params.get("syncToken") is not None and (
+            "timeMin" in params or "timeMax" in params
+        ):
+            raise ValueError(
+                "events.list: timeMin/timeMax are illegal together with syncToken"
+            )
         calendar_id = str(params.get("calendarId"))
         error = self.errors.pop(calendar_id, None)
         if error is not None:
@@ -626,21 +635,25 @@ def test_fetch_never_drops_cancelled_records_without_an_end(
     assert [r.deleted for r in result.records] == [True]
 
 
-def test_fetch_has_no_future_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Decision (i): instances in the far future are NEVER dropped — a future
-    instance dropped today would never be re-delivered unless it changed."""
+def test_full_sync_future_is_bounded_by_time_max(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gcal-window ticket (supersedes the old no-future-cap decision): a
+    full walk sends timeMax = today + BRAIN_GCAL_FUTURE_DAYS, so the 2040
+    expansion never floods the first sync. Anything beyond the edge is picked
+    up by the rolling re-list once it enters the window (see the cursor's
+    future_edge and the window-advance tests)."""
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
-    far_future = _timed()
-    far_future["start"] = {"dateTime": "2028-06-01T17:00:00+03:00"}
-    far_future["end"] = {"dateTime": "2028-06-01T18:00:00+03:00"}
+    in_window = _timed()  # Nov 2026 fixture: inside [cutoff, today+60d]
     fake = _FakeCalendarService()
-    fake.queue("primary", {"items": [far_future], "nextSyncToken": "sync-1"})
+    fake.queue("primary", {"items": [in_window], "nextSyncToken": "sync-1"})
     conn = _connector(fake)
 
     result = conn.fetch(_frozen_cursor(), limit=50)
 
     assert [r.external_id for r in result.records] == ["1q2w3e4r5t6y7u8i9o0p"]
+    assert datetime.fromisoformat(fake.calls[0]["timeMax"]) == _jlm_edge(61)
 
 
 # ---- settings: allowlist + past days ---------------------------------------------
@@ -662,11 +675,13 @@ def test_gcal_allowlist_setting_parses_and_defaults(monkeypatch: pytest.MonkeyPa
         get_settings.cache_clear()
 
 
-def test_gcal_past_days_setting_defaults_to_60(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gcal_window_days_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BRAIN_GCAL_PAST_DAYS", raising=False)
+    monkeypatch.delenv("BRAIN_GCAL_FUTURE_DAYS", raising=False)
     get_settings.cache_clear()
     try:
-        assert get_settings().brain_gcal_past_days == 60
+        assert get_settings().brain_gcal_past_days == 7
+        assert get_settings().brain_gcal_future_days == 60
     finally:
         get_settings.cache_clear()
 
@@ -928,6 +943,10 @@ def test_incremental_walk_bigger_than_the_limit_resumes_without_replay(
     resumed call keeps the SAME syncToken + params and only the pageToken
     advances (sync guide consistency rule); the held token survives."""
     monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    # The synthetic instances start in 2027: widen the future window so they
+    # are in-window for this resumability test (the beyond-window drop is
+    # tested separately).
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "500")
     get_settings.cache_clear()
     fake = _FakeCalendarService()
     fake.queue_page(
@@ -1031,3 +1050,175 @@ def test_unwalked_calendars_keep_their_stored_state(monkeypatch: pytest.MonkeyPa
     # ...and secondary did NOT lose its held sync token.
     assert states["secondary"] == {"sync_token": "S_B", "page_token": None, "mode": "incr"}
     assert all(call["calendarId"] == "primary" for call in fake.calls)
+
+
+# ---- window: past default + rolling future cap (gcal-window ticket) -------------
+
+
+def _jlm_edge(days_from_today: int) -> datetime:
+    """End-of-window bound: midnight (Asia/Jerusalem) of today+N days, UTC.
+
+    ``timeMax`` is exclusive, so events STARTING through today+N are included.
+    """
+    zone = ZoneInfo("Asia/Jerusalem")
+    now_local = datetime.now(UTC).astimezone(zone)
+    day = now_local.date() + timedelta(days=days_from_today)
+    return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(UTC)
+
+
+def _cursor_with_edge(sync_token: str | None, edge: datetime) -> str:
+    return json.dumps(
+        {
+            "cutoff": _FROZEN_CUTOVER.isoformat(),
+            "future_edge": edge.isoformat(),
+            "calendars": {"primary": _state(sync_token)},
+        }
+    )
+
+
+def _event_payload(event_id: str, start_iso: str, *, summary: str = "Series X") -> dict[str, Any]:
+    return {
+        "id": event_id,
+        "summary": summary,
+        "start": {"dateTime": start_iso},
+        "end": {"dateTime": start_iso},
+    }
+
+
+def test_fake_rejects_sync_token_with_window_params() -> None:
+    """The Google rule (events.list): timeMin/timeMax may ride ONLY on a full
+    sync — never together with a syncToken. The fake enforces it so any future
+    request-builder regression fails loudly in the suite."""
+    fake = _FakeCalendarService()
+    with pytest.raises(ValueError):
+        fake.events().list(
+            calendarId="primary", syncToken="t", timeMin="2026-01-01T00:00:00Z"
+        )
+    with pytest.raises(ValueError):
+        fake.events().list(
+            calendarId="primary", syncToken="t", timeMax="2026-01-01T00:00:00Z"
+        )
+
+
+def test_first_full_sync_sends_time_max_and_stores_the_future_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First sync: the window is bounded on BOTH sides server-side — timeMin
+    (frozen past cutoff) AND timeMax (today + BRAIN_GCAL_FUTURE_DAYS) — and
+    the future edge is stored so the window can roll forward later."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_PAST_DAYS", "7")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue("primary", {"items": [_timed()], "nextSyncToken": "sync-1"})
+    conn = _connector(fake)
+
+    result = conn.fetch(None, limit=50)
+
+    call = fake.calls[0]
+    assert datetime.fromisoformat(call["timeMin"])  # past bound present
+    assert datetime.fromisoformat(call["timeMax"]) == _jlm_edge(61)
+    decoded = json.loads(result.next_cursor or "{}")
+    assert datetime.fromisoformat(decoded["future_edge"]) == _jlm_edge(61)
+    assert result.reset is False
+
+
+def test_fresh_cursor_default_past_days_is_7(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The past default shrank to 7 days: a first sync without explicit env
+    reaches a week back, not two months (the 10k-flood fix)."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.delenv("BRAIN_GCAL_PAST_DAYS", raising=False)
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue("primary", {"items": [_timed()], "nextSyncToken": "sync-1"})
+    conn = _connector(fake)
+
+    result = conn.fetch(None, limit=50)
+
+    time_min = datetime.fromisoformat(fake.calls[0]["timeMin"])
+    assert abs((datetime.now(UTC) - time_min).days - 7) <= 1
+    json.loads(result.next_cursor or "{}")  # cursor still valid JSON
+
+
+def test_incremental_beyond_window_instances_dropped_and_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incremental delivery (one edit to a weekly series) can return every
+    expanded instance out to 2040. Instances starting beyond the window edge
+    are DROPPED (never deletions) and counted in stats['beyond_window'] —
+    they are picked up by the rolling re-list once they enter the window."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    soon = (datetime.now(UTC) + timedelta(days=3)).isoformat()
+    far = "2040-01-30T16:45:00Z"
+    skeletal = {"id": "cancelled-no-start", "status": "cancelled"}  # no start: kept
+    fake = _FakeCalendarService()
+    fake.queue(
+        "primary",
+        {
+            "items": [
+                _event_payload("in-window", soon),
+                _event_payload("far-future", far),
+                skeletal,
+            ],
+            "nextSyncToken": "sync-2",
+        },
+    )
+    conn = _connector(fake)
+    cursor = _cursor_with_edge("sync-1", _jlm_edge(61))
+
+    result = conn.fetch(cursor, limit=500)
+
+    assert result.reset is False
+    assert [r.external_id for r in result.records] == ["in-window", "cancelled-no-start"]
+    assert result.stats == {"beyond_window": 1}
+
+
+def test_window_advance_forces_a_full_relist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored future edge is behind today's edge (a day passed): the sync
+    runs as a FULL re-list (reset=True semantics, deletions never inferred)
+    with timeMin+timeMax, so instances that entered the window are picked up
+    instead of being lost forever."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue("primary", {"items": [_timed()], "nextSyncToken": "fresh"})
+    conn = _connector(fake)
+    cursor = _cursor_with_edge("sync-1", _jlm_edge(56))  # 5 days stale
+
+    result = conn.fetch(cursor, limit=500)
+
+    assert result.reset is True
+    call = fake.calls[0]
+    assert "syncToken" not in call  # full walk
+    assert datetime.fromisoformat(call["timeMin"]) == _FROZEN_CUTOVER
+    assert datetime.fromisoformat(call["timeMax"]) == _jlm_edge(61)
+    decoded = json.loads(result.next_cursor or "{}")
+    assert datetime.fromisoformat(decoded["future_edge"]) == _jlm_edge(61)
+
+
+def test_incremental_within_window_does_not_relist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A held token with a CURRENT future edge stays incremental: no timeMin/
+    timeMax (illegal with syncToken), no reset, stats empty."""
+    monkeypatch.setenv("BRAIN_GCAL_CALENDARS", "primary")
+    monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
+    monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
+    get_settings.cache_clear()
+    fake = _FakeCalendarService()
+    fake.queue("primary", {"items": [], "nextSyncToken": "sync-2"})
+    conn = _connector(fake)
+    cursor = _cursor_with_edge("sync-1", _jlm_edge(61))
+
+    result = conn.fetch(cursor, limit=50)
+
+    assert result.reset is False
+    call = fake.calls[0]
+    assert call["syncToken"] == "sync-1"
+    assert "timeMin" not in call and "timeMax" not in call
+    assert result.stats == {"beyond_window": 0}

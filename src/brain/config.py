@@ -270,9 +270,16 @@ class Settings(BaseSettings):
     brain_gcal_calendars: str = "primary"
     # How far back the first gcal full sync reaches (instances that ENDED more
     # than this many days ago are never fetched; the cutoff is frozen at the
-    # first sync and persisted in the connector cursor). There is NO future
-    # cap: a dropped future instance would never be re-delivered.
-    brain_gcal_past_days: int = 60
+    # first sync and persisted in the connector cursor). Default 7: a first
+    # sync is hundreds of records, not a two-month flood.
+    brain_gcal_past_days: int = 7
+    # How far ahead the gcal window reaches (instances STARTING beyond
+    # today + this many days are excluded from full syncs via timeMax and
+    # dropped from incremental deliveries). The edge is date-quantized and
+    # persisted in the cursor; when it advances past the stored edge, the
+    # next sync re-lists the whole window (once a day at most), so anything
+    # that enters the window is picked up and nothing is silently lost.
+    brain_gcal_future_days: int = 60
 
     # Google Tasks connector (gtasks, scope tasks.readonly). Optional allowlist
     # of task lists to sync, comma-separated list IDs or titles (titles matched
