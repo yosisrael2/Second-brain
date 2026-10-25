@@ -14,6 +14,7 @@ event — best-effort by contract: the poll must never block on triage.
 """
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from typing import Any, Protocol
 
 from brain import ops
 from brain.ai.jev import JevError
+
+logger = logging.getLogger(__name__)
 
 TRIAGE_VERSION = "triage-v3"
 # Below this Jev confidence the LLM gets the final say (item 36: LLM only
@@ -127,7 +130,29 @@ class RefreshableTrier:
         self._jev = jev
         self._llm = llm
         self.refresh_calls = 0
-        self._kid_names = self._read_kid_names()
+        # Startup tolerance (worker_3's post-merge review of #111): a DB hiccup
+        # during the FIRST kid-names read must not kill the WhatsApp agent at
+        # construction. Start with NO kid names — the deterministic override
+        # simply does not fire until the first successful refresh() (the
+        # poller refreshes at the top of every pass); triage itself still
+        # runs. The backfill CLI checks kid_names_loaded and refuses a
+        # one-shot run on this state instead of silently missing kid mentions.
+        self.kid_names_loaded = False
+        try:
+            self._kid_names = self._read_kid_names()
+            self.kid_names_loaded = True
+        except Exception as exc:  # noqa: BLE001 — startup must survive a hiccup
+            self._kid_names = []
+            logger.warning(
+                "triage: initial kid-names read failed (%s); starting with no "
+                "kid names — the override stays off until the first "
+                "successful refresh()",
+                type(exc).__name__,
+            )
+            ops.record_event(
+                "triage", "kid_names_unavailable", ok=False,
+                detail={"error": type(exc).__name__, "reason": str(exc)[:120]},
+            )
 
     def _read_kid_names(self) -> list[str]:
         from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
@@ -158,6 +183,7 @@ class RefreshableTrier:
         with self._session.begin_nested():
             names = self._read_kid_names()
         self._kid_names = names
+        self.kid_names_loaded = True
 
     def __call__(self, item: Any) -> "TriageResult | None":
         return triage_conversation(
