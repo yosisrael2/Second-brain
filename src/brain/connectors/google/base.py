@@ -30,7 +30,12 @@ from brain.connectors.base import (
 # Canonical connector name -> its read-only scope(s). "gmail" resolves to the
 # "email" connector (registry alias; items.source keeps "email").
 SCOPE_BY_CONNECTOR: dict[str, tuple[str, ...]] = {
-    "email": ("https://www.googleapis.com/auth/gmail.readonly",),
+    # gmail.modify: the SB/ labeler's label writes (added in code only —
+    # the re-consent that grants it is a USER action at a later GO).
+    "email": (
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.modify",
+    ),
     "gcal": ("https://www.googleapis.com/auth/calendar.readonly",),
     "gdrive": ("https://www.googleapis.com/auth/drive.readonly",),
     "gtasks": ("https://www.googleapis.com/auth/tasks.readonly",),

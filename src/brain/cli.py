@@ -209,6 +209,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Run one poll cycle and exit (also used by tests)",
     )
+    gmail_label = subparsers.add_parser(
+        "gmail-label",
+        help="Apply SB/ labels by rule (dry-run by default; --apply is "
+        "explicit and capped; label-only, undo-able, ops-audited)",
+    )
+    gmail_label.add_argument(
+        "--apply", action="store_true",
+        help="Actually write labels (default: dry-run, zero writes)",
+    )
+    gmail_label.add_argument(
+        "--max-apply", type=int, default=20,
+        help="Hard per-run cap on applied labels (default: 20)",
+    )
+    gmail_label.add_argument(
+        "--max-scan", type=int, default=100,
+        help="Bound on metadata GETs per run (quota hygiene; default: 100)",
+    )
+    gmail_label.add_argument("--undo", metavar="BATCH_ID", default=None,
+                             help="Remove exactly the labels ONE batch added")
+    gmail_label.add_argument("--audit", nargs="?", const="ALL", metavar="BATCH_ID",
+                             help="Print one batch's (or every batch's) applied labels")
     connectors = subparsers.add_parser(
         "connectors", help="Pluggable data sources (connectors ticket)"
     )
@@ -311,6 +332,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _gmail_auth(args)
     if args.command == "gmail-poll":
         return _gmail_poll(args)
+    if args.command == "gmail-label":
+        return _gmail_label(args)
     if args.command == "connectors":
         if args.connectors_command == "list":
             return _connectors_list()
@@ -1092,7 +1115,9 @@ def _build_oauth_flow(client_secret_path: str):  # pragma: no cover - needs goog
         raise SystemExit(
             "gmail: google libraries not installed — run `pip install -e '.[gmail]'`"
         ) from exc
-    return InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes=[GMAIL_SCOPE])
+    return InstalledAppFlow.from_client_secrets_file(
+        client_secret_path, scopes=list(GMAIL_SCOPE)
+    )
 
 
 def _gmail_auth(args: argparse.Namespace) -> int:
@@ -1318,6 +1343,117 @@ def _connectors_list() -> int:
     if records:
         print("records: " + ", ".join(f"{source}={n}" for source, n in sorted(records.items())))
     return 0
+
+
+def _gmail_label(args: argparse.Namespace) -> int:
+    """The SB/ labeler: rules over headers only (no Jev, no external LLM),
+    dry-run by default, label-only writes capped at --max-apply, undo-able,
+    ops-audited. Kid names come from CONFIRMED memory at runtime."""
+    import os
+    import uuid as _uuid
+
+    from brain.config import assert_not_live_store, get_settings
+
+    settings = get_settings()
+    assert_not_live_store(
+        settings.database_url,
+        settings.qdrant_collection,
+        allow_live=os.environ.get("BRAIN_ALLOW_LIVE"),
+    )
+
+
+    if args.undo:
+        from brain.services.gmail_labeler import undo_batch
+
+        with SessionLocal() as session:
+            undone = undo_batch(_labeler_client(settings), args.undo, session=session)
+        print(f"gmail-label: undone {undone} label(s) for batch {args.undo}")
+        return 0
+    if args.audit:
+        _labeler_audit(args.audit)
+        return 0
+
+    from brain.repositories.memory import MemoryRepository
+    from brain.services.gmail_labeler import load_rules, plan_labels
+    from brain.services.memory import MemoryService
+    from brain.services.triage import confirmed_kid_names
+
+    rules = load_rules(settings.gmail_labeler_rules_path)
+    with SessionLocal() as session:
+        kid_names = confirmed_kid_names(
+            MemoryService(MemoryRepository(session)).overview(status="confirmed", q=None)
+        )
+    client = _labeler_client(settings)
+    plans = plan_labels(
+        client, rules=rules, kid_names=kid_names,
+        label_id=settings.gmail_label_id, query=settings.gmail_query,
+        max_scan=args.max_scan,
+    )
+    print(f"gmail-label: {len(plans)} message(s) to label "
+          f"(kids: {len(kid_names)}, scan cap {args.max_scan})")
+    for plan in plans:
+        print(f"  {plan.gmail_id} -> {plan.label_path} ({plan.source})")
+    if not args.apply:
+        print("gmail-label: dry-run — zero writes (pass --apply, capped at "
+              f"--max-apply {args.max_apply})")
+        return 0
+    from brain.services.gmail_labeler import apply_labels
+
+    batch_id = _uuid.uuid4().hex[:12]
+    applied = apply_labels(client, plans, max_apply=args.max_apply, batch_id=batch_id)
+    print(f"gmail-label: applied {applied} label(s), batch {batch_id} "
+          f"(undo: brain gmail-label --undo {batch_id})")
+    return 0
+
+
+def _labeler_client(settings: Any) -> Any:
+    """RestGmailClient over the shared keychain token + production factory,
+    paced by the same quota-hygiene interval as the connector."""
+    from brain.ai.gmail import RestGmailClient
+    from brain.connectors.google.base import default_service_factory
+    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+
+    token = Keychain().read(GMAIL_ACCOUNT)
+    if not token:
+        print(
+            "gmail-label: no Google refresh token in the keychain — run "
+            "`brain connectors auth google` first",
+            file=sys.stderr,
+        )
+        raise SystemExit(78)
+    service = default_service_factory(token, list(GMAIL_SCOPE), "gmail", "v1")
+    return RestGmailClient(
+        service=service,
+        min_interval_s=settings.gmail_min_call_interval_s,
+    )
+
+
+def _labeler_audit(batch: str) -> None:
+    from sqlalchemy import text
+
+    with SessionLocal() as session:
+        if batch == "ALL":
+            rows = session.execute(
+                text(
+                    "SELECT detail->>'batch' AS batch, kind, detail "
+                    "FROM ops_events WHERE component = 'gmail-label' "
+                    "AND kind IN ('apply', 'undo') ORDER BY ts"
+                )
+            ).all()
+        else:
+            rows = session.execute(
+                text(
+                    "SELECT detail->>'batch' AS batch, kind, detail "
+                    "FROM ops_events WHERE component = 'gmail-label' "
+                    "AND kind IN ('apply', 'undo') AND detail->>'batch' = :batch "
+                    "ORDER BY ts"
+                ),
+                {"batch": batch},
+            ).all()
+    for row in rows:
+        detail = row.detail or {}
+        print(f"  [{row.batch}] {row.kind}: {detail.get('gmail_id')} -> "
+              f"{detail.get('label_path', detail.get('label_id'))}")
 
 
 def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:

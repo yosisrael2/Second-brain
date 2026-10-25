@@ -228,6 +228,10 @@ class Settings(BaseSettings):
     # 60s) rides out a transient 403 and the runner's between-runs backoff
     # is the backstop.
     gmail_min_call_interval_s: float = 6.0
+    # The SB/ labeler's rules file (JSON: {"School": {"domains": [...],
+    # "list_ids": [...]}, ...}). Empty default = no domain/list rules (no
+    # personal domains committed); kid names come from confirmed memory.
+    gmail_labeler_rules_path: str = ""
 
     # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
     # comma-separated list of immutable Drive folder ids; EMPTY (the default)

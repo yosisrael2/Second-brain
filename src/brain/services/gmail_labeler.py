@@ -1,0 +1,311 @@
+"""The Gmail SB/ labeler (v1, plan approved 25 Oct): RULES ONLY.
+
+Privacy posture (the approved decision): Jev and every external LLM are OUT —
+classification is deterministic over headers only:
+- Kids: the message SUBJECT must BE a confirmed kid name/alias, full token
+  (``brain.services.triage.is_name_token`` — the same zero-wrong-child matcher
+  audience resolution uses; a classmate's full name or a substring never
+  matches). Kid names come from confirmed memory at runtime, never hardcoded.
+- School/Logistics/Bills/Noise: sender domain or List-Id patterns from a small
+  rules file (Settings.gmail_labeler_rules_path; empty default — no personal
+  domains are committed).
+- Anything else: SB/Unsorted. Precedence: Kids > School > Logistics > Bills >
+  Noise > Unsorted; a message gets ONE SB label.
+
+Safety rails:
+- dry-run is the DEFAULT: planning performs ZERO write calls (ids + metadata
+  GETs only); ``--apply`` is explicit and capped (``max_apply``, hard default
+  20 per run).
+- label-only: the labeler adds SB/ labels and never removes INBOX, never
+  archives/trashes/deletes. v1 creates NO Gmail filters (gmail.settings.basic
+  never enters the scope set).
+- consent gate: label writes need gmail.modify. The FIRST write-capable call
+  (label creation) happens before any message is modified; a 403 there aborts
+  the run with a re-consent message — zero message writes.
+- audit + undo: every applied label is an ops_event (component 'gmail-label',
+  kind 'apply', detail: batch, gmail id, label path + id). ``undo_batch``
+  removes exactly the label ids its batch added — user labels are untouched.
+- idempotent: a message already carrying ANY SB/ label is skipped.
+
+Message selection: the same scope the email connector syncs (the configured
+gmail label + query), so the labeler can never reach outside the pipeline's
+scope. The scan is bounded (``max_scan``, default 100) — each metadata GET
+costs ~5 quota units, paced by the client.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Any
+
+from brain.ai.gmail import GmailAuthError, GmailError
+from brain.ops import record_event
+from brain.services.triage import is_name_token
+
+logger = logging.getLogger(__name__)
+
+SB_PREFIX = "SB/"
+UNSORTED = "SB/Unsorted"
+# Precedence (high → low). Kids is memory-driven; the rest come from the
+# rules file. A message gets exactly ONE label — the first rule that wins.
+LABEL_ORDER = ("Kids", "School", "Logistics", "Bills", "Noise")
+
+COMPONENT = "gmail-label"
+
+
+@dataclass(frozen=True)
+class RuleSet:
+    """Parsed rules file: label -> sender domains / List-Id substrings."""
+
+    domains: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    list_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def load_rules(path: str | None) -> RuleSet:
+    """Load the rules JSON ({"School": {"domains": [...], "list_ids": [...]}}).
+
+    An empty/missing path means NO domain/list rules — everything that is not
+    a kid subject lands SB/Unsorted. Unknown labels in the file are ignored
+    (the taxonomy is the code's, not the file's).
+    """
+    if not path:
+        return RuleSet()
+    with open(path) as fh:
+        raw = json.load(fh)
+    domains: dict[str, tuple[str, ...]] = {}
+    list_ids: dict[str, tuple[str, ...]] = {}
+    for label, spec in (raw or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        domains[str(label)] = tuple(str(d).lower() for d in (spec.get("domains") or []))
+        list_ids[str(label)] = tuple(str(d).lower() for d in (spec.get("list_ids") or []))
+    return RuleSet(domains=domains, list_ids=list_ids)
+
+
+def _sender_domain(sender: str | None) -> str:
+    """The domain of 'Rinat <office@school.example>' — lowercase, no brackets."""
+    if not sender or "@" not in sender:
+        return ""
+    tail = sender.rsplit("@", 1)[1].strip().strip(">").lower()
+    return tail.split(">", 1)[0].strip()
+
+
+def classify(
+    *,
+    sender: str | None,
+    subject: str | None,
+    list_header: str | None,
+    kid_names: list[str],
+    rules: RuleSet | None,
+) -> str:
+    """One SB/ label path for one message's headers (pure; no I/O)."""
+    rules = rules or RuleSet()
+    # Kids first (precedence), subject-only, FULL token (zero wrong-child).
+    for name in kid_names:
+        if is_name_token(name, (subject or "").strip()):
+            return f"{SB_PREFIX}Kids/{name}"
+    lowered_list = (list_header or "").lower()
+    domain = _sender_domain(sender)
+    for label in LABEL_ORDER:
+        if label == "Kids":
+            continue
+        domain_hit = any(
+            domain == d or domain.endswith("." + d) for d in rules.domains.get(label, ())
+        ) if domain else False
+        list_hit = any(p in lowered_list for p in rules.list_ids.get(label, ()))
+        if domain_hit or list_hit:
+            return f"{SB_PREFIX}{label}"
+    return UNSORTED
+
+
+@dataclass(frozen=True)
+class LabelPlan:
+    """One planned labeling (dry-run row or apply unit)."""
+
+    gmail_id: str
+    label_path: str
+    label_id: str | None  # the existing Gmail label id, when already created
+    source: str  # "kid:<name>" | "domain" | "list-id" | "unsorted"
+
+
+def plan_labels(
+    client: Any,
+    *,
+    rules: RuleSet,
+    kid_names: list[str],
+    label_id: str,
+    query: str,
+    max_scan: int = 100,
+) -> list[LabelPlan]:
+    """Walk the sync scope (ids + metadata GETs ONLY — zero writes) and plan
+    one label per message that carries none yet. Bounded by ``max_scan``
+    metadata GETs; messages already carrying ANY SB/ label are skipped
+    (idempotence — no re-label churn)."""
+    plans: list[LabelPlan] = []
+    existing_names = {label.name: label for label in client.list_labels()}
+    page_token: str | None = None
+    scanned = 0
+    while scanned < max_scan:
+        stubs, page_token = client.list_messages_page(
+            query=query, label_ids=[label_id], page_token=page_token, max_results=100
+        )
+        for stub in stubs:
+            if scanned >= max_scan:
+                break
+            scanned += 1
+            msg = client.get_message_metadata(stub.id)
+            if any(lid.startswith("SB/") or lname.startswith(SB_PREFIX)
+                   for lid, lname in _label_names(msg, existing_names)):
+                continue  # already SB-labeled: idempotent skip
+            subject = msg.subject or ""
+            list_header = (msg.extra_headers or {}).get("List-Id")
+            path = classify(
+                sender=msg.sender,
+                subject=subject,
+                list_header=list_header,
+                kid_names=kid_names,
+                rules=rules,
+            )
+            label = existing_names.get(path)
+            source = "kid" if path.startswith(f"{SB_PREFIX}Kids") else (
+                "unsorted" if path == UNSORTED else "rules"
+            )
+            plans.append(
+                LabelPlan(
+                    gmail_id=stub.id,
+                    label_path=path,
+                    label_id=label.id if label else None,
+                    source=source,
+                )
+            )
+        if page_token is None:
+            break
+    return plans
+
+
+def _label_names(msg: Any, existing: dict[str, Any]) -> list[tuple[str, str]]:
+    by_id = {label.id: label.name for label in existing.values()}
+    return [(lid, by_id.get(lid, "")) for lid in (msg.label_ids or [])]
+
+
+def _consent_error(exc: Exception) -> GmailAuthError:
+    """A 403 from a write call = gmail.modify not consented (rate-limit 403s
+    are retried inside the client and never surface here)."""
+    raise GmailAuthError(
+        "gmail.modify is not consented — run `brain connectors auth email` to "
+        "re-consent (the labeler writes labels only)",
+    ) from exc
+
+
+def ensure_labels(client: Any, paths: list[str]) -> dict[str, str]:
+    """Map each SB/ path to a label id, CREATING the missing ones.
+
+    This is the run's FIRST write-capable call: a 403 here (gmail.modify not
+    consented) aborts before ANY message is modified.
+    """
+    try:
+        by_name = {label.name: label for label in client.list_labels()}
+        out: dict[str, str] = {}
+        for path in paths:
+            label = by_name.get(path)
+            if label is None:
+                label = client.create_label(path)
+            out[path] = label.id
+    except GmailAuthError as exc:
+        raise _consent_error(exc) from exc
+    except GmailError as exc:
+        if getattr(exc, "status", None) == 403:
+            raise _consent_error(exc) from exc
+        raise
+    return out
+
+
+def apply_labels(
+    client: Any,
+    plans: list[LabelPlan],
+    *,
+    max_apply: int,
+    batch_id: str,
+) -> int:
+    """Apply at most ``max_apply`` planned labelings; ops-audit each one.
+
+    Returns the applied count. The label ids are ensured FIRST (a 403 aborts
+    before any message write); the cap is hard — nothing past it is sent.
+    """
+    batch = plans[:max_apply] if max_apply >= 0 else list(plans)
+    if not batch:
+        return 0
+    label_ids = ensure_labels(client, sorted({p.label_path for p in batch}))
+    applied = 0
+    for plan in batch:
+        try:
+            client.modify_message_labels(plan.gmail_id, add=[label_ids[plan.label_path]])
+        except GmailAuthError as exc:
+            raise _consent_error(exc) from exc
+        except GmailError as exc:
+            if getattr(exc, "status", None) == 403:
+                raise _consent_error(exc) from exc
+            raise
+        record_event(
+            COMPONENT,
+            "apply",
+            ok=True,
+            detail={
+                "batch": batch_id,
+                "gmail_id": plan.gmail_id,
+                "label_path": plan.label_path,
+                "label_id": label_ids[plan.label_path],
+                "source": plan.source,
+            },
+        )
+        applied += 1
+    record_event(COMPONENT, "batch", ok=True, detail={"batch": batch_id, "applied": applied})
+    return applied
+
+
+def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
+    """Remove exactly the label ids ONE batch added (its own ops events).
+
+    A pre-existing user label on the same message is untouched: only the
+    batch's own label ids are removed, and only from the messages the batch
+    touched.
+    """
+    events = _batch_events(batch_id, session)
+    undone = 0
+    for detail in events:
+        gmail_id = detail.get("gmail_id")
+        label_id = detail.get("label_id")
+        if not gmail_id or not label_id:
+            continue
+        client.modify_message_labels(gmail_id, remove=[label_id])
+        record_event(
+            COMPONENT,
+            "undo",
+            ok=True,
+            detail={"batch": batch_id, "gmail_id": gmail_id, "label_id": label_id},
+        )
+        undone += 1
+    return undone
+
+
+def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
+    """The 'apply' events of ONE batch (the undo ledger), oldest first."""
+    from sqlalchemy import text  # noqa: PLC0415
+
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    own = session or SessionLocal()
+    try:
+        rows = own.execute(
+            text(
+                "SELECT detail FROM ops_events WHERE component = :component "
+                "AND kind = 'apply' AND detail->>'batch' = :batch ORDER BY ts"
+            ),
+            {"component": COMPONENT, "batch": batch_id},
+        ).all()
+        return [dict(row.detail) for row in rows]
+    finally:
+        if session is None:
+            own.close()
