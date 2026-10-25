@@ -1002,3 +1002,24 @@ def _guess_mime(media_type: str | None, filename: str) -> str | None:
     if mime == "image/jpeg" and ext in {".png", ".webp"}:
         return f"image/{ext.lstrip('.')}"
     return mime
+
+
+def bridge_group_options(
+    store: BridgeStore, *, allowlisted: set[str]
+) -> list[dict[str, str]]:
+    """Bridge-visible WhatsApp GROUP chats that are not allowlisted yet —
+    the '+ Add group' options (Memory Management screen).
+
+    READ-ONLY by construction: the only bridge access is ``store.chats()``
+    (a SELECT over the store opened mode=ro). The bridge's REST API (send /
+    download) is never touched here. Options are deduped by display name
+    (the allowlist keys on names — several jids may share one) and sorted.
+    """
+    seen: dict[str, str] = {}
+    for jid, name in sorted(store.chats().items()):
+        if not name or not jid.endswith("@g.us"):
+            continue  # groups only — direct chats are not allowlist material
+        if name in allowlisted or name in seen:
+            continue
+        seen[name] = jid
+    return [{"jid": jid, "name": name} for name, jid in sorted(seen.items())]

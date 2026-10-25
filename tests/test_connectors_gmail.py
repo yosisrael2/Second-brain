@@ -375,6 +375,82 @@ class TestQueryPath:
         assert excinfo.value.status == 400
 
 
+class _LateMailMessages(_FakeMessages):
+    """messages.list that injects a late arrival AFTER its page was read:
+    m2 lands in the mailbox and the mailbox historyId moves past the
+    listing — the exact race the resume cursor must survive."""
+
+    def list(self, **kwargs):
+        req = super().list(**kwargs)
+        state = self._state
+        if not getattr(state, "arrived", False):
+            state.arrived = True
+            state.messages["m2"] = _msg_fixture("m2")
+            state.profile_history_id = "9100"
+        return req
+
+
+class _LateMailUsers(_FakeUsers):
+    def messages(self):
+        return _LateMailMessages(self._state)
+
+
+class _LateMailService(_FakeService):
+    def users(self):
+        return _LateMailUsers(self._state)
+
+
+class TestResumeCursorOrder:
+    """Finding 1: the resume historyId must be taken BEFORE the listing.
+
+    Taken after (the old behavior), a message arriving between the last
+    list page and getProfile is in neither the listing nor the future
+    history walk (the saved cursor is past its labelsAdded) — silently
+    never captured. Taken before, the next sync's history walk re-covers
+    the window; the re-delivered m1 is skipped by the ledger.
+    """
+
+    def _connector(self, state: _ServiceState):
+        from brain.config import Settings
+        from brain.connectors.google.gmail import GmailConnector
+
+        return GmailConnector(
+            token_loader=lambda: "refresh-token",
+            service_factory=lambda token, scopes, api, ver: _LateMailService(state),
+            settings=Settings(
+                gmail_min_call_interval_s=0.0,
+                gmail_label_id=LABEL,
+                gmail_query="",
+                gmail_credentials_path="",
+                _env_file=None,
+            ),
+        )
+
+    def test_message_arriving_during_the_listing_is_recovered_by_the_next_sync(self):
+        state = _ServiceState()
+        state.arrived = False
+        state.messages = {"m1": _msg_fixture("m1")}
+        state.list_result = {"messages": [{"id": "m1"}]}  # single page, no token
+        connector = self._connector(state)
+
+        first = connector.fetch(None, limit=200)
+        # m2 arrived (and the mailbox historyId moved to 9100) AFTER the
+        # listing ran: the saved cursor must predate the arrival.
+        assert first.next_cursor == "9002", (
+            "resume cursor was taken after the listing — m2 is skipped forever"
+        )
+
+        # The next sync walks history from the saved cursor and captures m2.
+        state.history_pages = {
+            "first": {
+                "history": [{"id": "h1", "messagesAdded": [{"message": {"id": "m2"}}]}],
+                "historyId": "9100",
+            }
+        }
+        second = connector.fetch(first.next_cursor, limit=200)
+        assert "m2" in [r.external_id for r in second.records]
+
+
 # --- history path (incremental sync) ------------------------------------------
 
 
@@ -1250,3 +1326,153 @@ class TestRunnerSemantics:
         assert call["content"] == b"%PDF-fake"
         assert call["filename"] == "trip-form.pdf"
         assert att.submitted  # queued for the budgeted read
+
+
+# --- adopt progress over the REAL connector (finding-4 follow-up) --------------
+
+
+class TestAdoptDrainProgress:
+    """adopt._fetch_all over the REAL GmailConnector + real ledger seams.
+
+    During adopt the ledger cannot know records fetched in earlier batches
+    (dry-run writes nothing; a real adopt writes only after matching), so a
+    truncated query batch (next_cursor=None, more=True) must make progress
+    another way: a per-run seen-set the connector consults, skipping
+    already-collected ids WITHOUT a GET.
+    """
+
+    def test_adopt_dry_run_counts_every_record_once_and_terminates(
+        self, gmail_harness, monkeypatch
+    ):
+        import brain.connectors.adopt as adopt_module
+        from brain.connectors.adopt import adopt_connector
+        from brain.db.models import MemoryItem
+
+        # Bound the runaway guard so the RED form of this test is fast: the
+        # broken loop re-collects the same 200 records every pass.
+        monkeypatch.setattr(adopt_module, "_MAX_ADOPT_BATCHES", 3)
+
+        state = gmail_harness._state_service
+        for i in range(201):
+            raw = _msg_fixture(f"m{i}")
+            # Distinct bodies -> distinct ingest fingerprints: 201 real items.
+            raw["payload"]["parts"][0]["body"]["data"] = _b64(
+                f"Distinct school note number {i}."
+            )
+            state.messages[f"m{i}"] = raw
+        state.list_result = {"messages": [{"id": f"m{i}"} for i in range(201)]}
+
+        # One legacy email item that matches none of the records (distinct
+        # text + sent minute) -> every fetched record must land in NEW.
+        legacy = MemoryItem(
+            raw_text="totally unrelated legacy body text",
+            source="email",
+            type="event",
+            status="filed",
+            actionability="none",
+            importance=3,
+            confidence=0.8,
+            occurred_at=datetime(2020, 1, 1, tzinfo=UTC),
+            meta={"subject": "unrelated", "from": "x@y.z"},
+        )
+        gmail_harness.session.add(legacy)
+        gmail_harness.session.commit()
+
+        report = adopt_connector(gmail_harness.connector, gmail_harness.session,
+                                 dry_run=True, limit=200)
+
+        assert report.refused_cursor is False
+        # Every record counted EXACTLY once: the red form re-collects the
+        # same first 200 records every pass (fetched == 600 here).
+        assert report.fetched == 201
+        assert len(report.new) == 201
+        assert len(set(report.new)) == 201
+        # Each message GET exactly once — no repeat GETs across passes.
+        gets = [c for c in state.calls if c[0] == "messages.get"]
+        assert len(gets) == 201
+        # The loop terminated in 3 fetches (2 query passes + 1 history
+        # walk), not by the batch cap: 2 list pages + 1 empty history page.
+        assert sum(1 for c in state.calls if c[0] == "messages.list") == 2
+        assert sum(1 for c in state.calls if c[0] == "history.list") == 1
+
+    def test_drain_second_pass_gets_only_the_new_message(self, gmail_harness):
+        """The CLI --drain path on the REAL runner: run 1 fills the limit and
+        drops the cursor (more=True), run 2 re-lists and the is_known ledger
+        fast path makes the first 200 cost ZERO GETs."""
+        state = gmail_harness._state_service
+        for i in range(201):
+            raw = _msg_fixture(f"m{i}")
+            raw["payload"]["parts"][0]["body"]["data"] = _b64(
+                f"Distinct school note number {i}."
+            )
+            state.messages[f"m{i}"] = raw
+        state.list_result = {"messages": [{"id": f"m{i}"} for i in range(201)]}
+
+        first = gmail_harness.runner.run(limit=200)
+        assert first.created == 200
+        assert gmail_harness.runner.run(limit=200).created == 1
+
+        gets = [c for c in state.calls if c[0] == "messages.get"]
+        assert len(gets) == 201  # 200 + 1: the ledger fast path skipped the rest
+        ids_second_pass = [c[1]["id"] for c in state.calls if c[0] == "messages.get"][200:]
+        assert ids_second_pass == ["m200"]  # only the tail message was GET
+
+    def test_run_seen_is_cleared_after_adopt_so_a_later_sync_captures(
+        self, gmail_harness, monkeypatch
+    ):
+        """adopt (dry-run) then sync on the SAME connector instance: the seen
+        set is adopt-scoped — left set, the query path would skip every id
+        adopt collected (the NEW ones were never ledgered) and the sync would
+        capture nothing, forever."""
+        import brain.connectors.adopt as adopt_module
+        from brain.connectors.adopt import adopt_connector
+        from brain.db.models import MemoryItem
+
+        monkeypatch.setattr(adopt_module, "_MAX_ADOPT_BATCHES", 3)
+
+        state = gmail_harness._state_service
+        for i in range(201):
+            raw = _msg_fixture(f"m{i}")
+            raw["payload"]["parts"][0]["body"]["data"] = _b64(
+                f"Distinct school note number {i}."
+            )
+            state.messages[f"m{i}"] = raw
+        state.list_result = {"messages": [{"id": f"m{i}"} for i in range(201)]}
+
+        legacy = MemoryItem(
+            raw_text="totally unrelated legacy body text",
+            source="email",
+            type="event",
+            status="filed",
+            actionability="none",
+            importance=3,
+            confidence=0.8,
+            occurred_at=datetime(2020, 1, 1, tzinfo=UTC),
+            meta={"subject": "unrelated", "from": "x@y.z"},
+        )
+        gmail_harness.session.add(legacy)
+        gmail_harness.session.commit()
+
+        report = adopt_connector(gmail_harness.connector, gmail_harness.session,
+                                 dry_run=True, limit=200)
+        assert report.fetched == 201
+        assert gmail_harness.connector.run_seen is None  # cleared by adopt
+
+        # The SAME instance now syncs: dry-run ledgered nothing, so every
+        # record must be capturable. Red pre-fix: created == 0 (every stub
+        # still skipped by the stale run_seen set).
+        summary = gmail_harness.runner.run(limit=200)
+        assert summary.created == 200
+        assert gmail_harness.runner.run(limit=200).created == 1
+
+    def test_nothing_to_adopt_never_attaches_run_seen(self, gmail_harness):
+        """The early return before any fetch must leave run_seen untouched —
+        no early-return path may leak the set onto the connector."""
+        connector = gmail_harness.connector
+        assert connector.run_seen is None  # never attached pre-fetch
+        from brain.connectors.adopt import adopt_connector
+
+        report = adopt_connector(connector, gmail_harness.session,
+                                 dry_run=True, limit=200)
+        assert report.nothing_to_adopt is True  # gtasks/gdrive-shaped source
+        assert connector.run_seen is None

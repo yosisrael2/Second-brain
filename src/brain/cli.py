@@ -741,6 +741,18 @@ def _whatsapp_triage(*, limit: int) -> int:
     attachments = _cli_attachment_service(settings)
     with SessionLocal() as session:
         trier = _build_trier(session)
+        if not getattr(trier, "kid_names_loaded", True):
+            # Startup tolerance (worker_3's post-merge review of #111): the
+            # trier swallowed a failed first kid-names read for the POLLER's
+            # sake, but a ONE-SHOT backfill on [] names would silently miss
+            # kid mentions. Refuse loudly instead.
+            print(
+                "whatsapp-triage: initial kid-names read failed — refusing to "
+                "run a one-shot backfill with no kid names (kid mentions would "
+                "be missed silently). Re-run once the DB is reachable.",
+                file=sys.stderr,
+            )
+            return 1
         repo = ItemsRepository(session)
         items = repo.untriaged_whatsapp(limit=limit)
         for item in items:
@@ -1436,6 +1448,11 @@ def _connectors_sync(args: argparse.Namespace) -> int:
             # leaves the cursor unchanged means drained (or stuck); a failed/
             # re-authing batch stops the drain. 500 batches is a runaway
             # guard, not a knob.
+            # Exception (finding 4): a batch the source TRUNCATED without a
+            # resume cursor (email's query path: next_cursor=None, more=True)
+            # is not 'drained' — the source said it has more. The loop keeps
+            # going while summary.more is set, even when the cursor is
+            # None -> None (each re-list skips what the ledger already has).
             batches = 1
             previous_cursor = _cursor_of(state_repo, summary.connector)
             while summary.state == "ok" and summary.cursor_saved and batches < 500:
@@ -1443,8 +1460,8 @@ def _connectors_sync(args: argparse.Namespace) -> int:
                 summary = _merge_summary(summary, nxt)
                 batches += 1
                 current_cursor = _cursor_of(state_repo, summary.connector)
-                if current_cursor == previous_cursor:
-                    break  # no cursor movement: drained
+                if current_cursor == previous_cursor and not summary.more:
+                    break  # no cursor movement and nothing more: drained
                 previous_cursor = current_cursor
         connector.close()
     print(
@@ -1503,6 +1520,7 @@ def _merge_summary(acc: Any, nxt: Any) -> Any:
         skipped=acc.skipped + nxt.skipped,
         errors=acc.errors + nxt.errors,
         reset=nxt.reset,
+        more=nxt.more,
         cursor_saved=nxt.cursor_saved,
         error=nxt.error,
         retry_in_s=nxt.retry_in_s,

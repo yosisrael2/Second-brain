@@ -147,12 +147,33 @@ def adopt_connector(
         report.refused_cursor = True
         return report
 
+    # Per-run progress set (finding-4 follow-up): during adopt the ledger
+    # cannot know records fetched in EARLIER batches (a dry-run writes
+    # nothing; a real adopt writes only after matching), so a truncated
+    # query batch's re-list (next_cursor=None, more=True) would re-GET the
+    # same first `limit` records forever. Connectors that opt in (Gmail:
+    # run_seen) skip these ids without a GET; connectors with resumable
+    # cursors never consult it. The ONLY assignment is inside the guarded
+    # block below (try/finally clears it) — an early return must never
+    # leave the set attached.
+    seen: set[str] = set()
+
     candidates = _legacy_items(session, legacy_source)
     if not candidates:
         report.nothing_to_adopt = True
         return report
 
-    records = _fetch_all(connector, limit=limit)
+    if hasattr(connector, "run_seen"):
+        connector.run_seen = seen  # type: ignore[attr-defined]
+    try:
+        records = _fetch_all(connector, limit=limit, seen=seen)
+    finally:
+        # The seen set is adopt-SCOPED: a connector instance reused after
+        # adopt (a later sync in-process, a test, a future adopt-then-sync
+        # flow) must never keep skipping the ids adopt collected — the NEW
+        # ones were never ledgered and would never be captured.
+        if hasattr(connector, "run_seen"):
+            connector.run_seen = None  # type: ignore[attr-defined]
     report.fetched = len(records)
 
     index = _CandidateIndex(candidates)
@@ -371,17 +392,35 @@ def _prior_shas(session: Session, report: AdoptReport) -> dict[uuid.UUID, str | 
     return out
 
 
-def _fetch_all(connector: Connector, *, limit: int) -> list[Any]:
+def _fetch_all(
+    connector: Connector, *, limit: int, seen: set[str] | None = None
+) -> list[Any]:
     """Drain the connector in memory (batch cap = the sync --drain guard).
 
     The cursor is NEVER persisted: adopt is outside the sync bookkeeping and
     the next real sync starts from its own state.
+
+    ``more=True`` (the source truncated the batch without a resume cursor —
+    the email query path) keeps the loop going even when next_cursor is
+    None: the re-fetch re-lists from the same cursor and every collected id
+    is added to ``seen`` — the connector consults it to skip already-
+    collected records WITHOUT a GET, so each record is fetched exactly once
+    and the loop terminates. Bounded by _MAX_ADOPT_BATCHES.
     """
     records: list[Any] = []
     cursor: str | None = None
     for _ in range(_MAX_ADOPT_BATCHES):
         result = connector.fetch(cursor, limit=limit)
         records.extend(result.records)
+        if seen is not None:
+            seen.update(record.external_id for record in result.records)
+        if result.more:
+            # Truncated: advance only when the source returned a new cursor;
+            # otherwise keep the current one (email's stays None — the
+            # re-fetch re-lists from the start and skips what it already saw).
+            if result.next_cursor is not None:
+                cursor = result.next_cursor
+            continue
         nxt = result.next_cursor
         if nxt is None or nxt == cursor:
             break
@@ -502,33 +541,51 @@ def _last_adopt_event(session: Session, name: str) -> Any:
 # --- user-facing rendering ---------------------------------------------------------
 
 
+_REPORT_ROW_CAP = 20
+
+
+def _capped(rows: list[str]) -> list[str]:
+    """A section's rows, capped for readability at large N (a real recurring
+    first sync fetches 10k+ records): the first 20 rows, then one
+    "… and N more" line. The section header (total) and the report's totals
+    line stay unconditional."""
+    if len(rows) <= _REPORT_ROW_CAP:
+        return rows
+    return rows[:_REPORT_ROW_CAP] + [f"    … and {len(rows) - _REPORT_ROW_CAP} more"]
+
+
 def format_report(report: AdoptReport) -> str:
-    """The dry-run/real-run table the user reads (stable order, ids shortened)."""
+    """The dry-run/real-run table the user reads (stable order, ids shortened,
+    every section's total in its header, rows capped at 20 + a remainder)."""
     lines = [report.summary_line()]
     if report.refused_cursor or report.nothing_to_adopt:
         return "\n".join(lines)
     if report.adopted:
         verb = "ADOPTED" if report.wrote else "WOULD ADOPT"
         lines.append(f"  {verb} ({len(report.adopted)})")
-        for (external_id, version), item_id in report.adopted:
-            rule = report.rules.get(external_id, "?")
-            lines.append(
-                f"    {external_id} (v={version or '-'}) -> item {str(item_id)[:8]}… [{rule}]"
-            )
+        rows = [
+            f"    {external_id} (v={version or '-'}) -> item {str(item_id)[:8]}…"
+            f" [{report.rules.get(external_id, '?')}]"
+            for (external_id, version), item_id in report.adopted
+        ]
+        lines.extend(_capped(rows))
     if report.already:
         lines.append(f"  ALREADY ADOPTED ({len(report.already)})")
-        for external_id, item_id in report.already:
-            lines.append(f"    {external_id} -> item {str(item_id)[:8]}…")
+        lines.extend(
+            _capped(
+                [
+                    f"    {external_id} -> item {str(item_id)[:8]}…"
+                    for external_id, item_id in report.already
+                ]
+            )
+        )
     if report.ambiguous:
         lines.append(f"  AMBIGUOUS ({len(report.ambiguous)}) — skipped, never guessed")
-        for external_id in report.ambiguous:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.ambiguous]))
     if report.user_deleted:
         lines.append(f"  USER-DELETED ({len(report.user_deleted)}) — respected, never repointed")
-        for external_id in report.user_deleted:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.user_deleted]))
     if report.new:
         lines.append(f"  NEW ON FIRST SYNC ({len(report.new)})")
-        for external_id in report.new:
-            lines.append(f"    {external_id}")
+        lines.extend(_capped([f"    {external_id}" for external_id in report.new]))
     return "\n".join(lines)

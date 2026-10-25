@@ -27,6 +27,7 @@ from brain.ai.vectorstore import QdrantVectorStore
 from brain.connectors.adopt import (
     RULE_C_WINDOW,
     adopt_connector,
+    format_report,
     undo_adopt,
 )
 from brain.connectors.base import FetchResult
@@ -903,3 +904,107 @@ def test_adopt_undo_keeps_stamp_on_refused_rows(adopt_db):
     kept = h.repo.get(h.records.get("gcal", "evt_1").item_id)
     assert kept is not None
     assert "connector_text_sha" in (kept.meta or {})  # untouched
+
+
+# --- _fetch_all + FetchResult.more (finding 4) ----------------------------------
+
+
+def test_fetch_all_drains_while_more_even_when_the_cursor_does_not_move():
+    """The email query path cannot express a mid-listing resume cursor: a
+    truncated batch carries next_cursor=None AND more=True. _fetch_all must
+    keep fetching while more is set (the 201st record must be counted),
+    instead of silently stopping after the first truncated batch."""
+    from brain.connectors.adopt import _fetch_all
+    from brain.connectors.testing import make_record
+
+    connector = FakeConnector(
+        name="email",
+        batches=[
+            FetchResult(
+                records=[make_record(f"r{i}", text=f"body {i}") for i in range(200)],
+                next_cursor=None,
+                more=True,
+            ),
+            FetchResult(records=[make_record("r200", text="body 200")], next_cursor=None),
+        ],
+    )
+    records = _fetch_all(connector, limit=200)
+
+    assert len(records) == 201
+    assert connector.cursors == [None, None]  # the cursor never moved; still drained
+# --- gcal-window ticket: report readable at large N ------------------------------
+
+
+def test_format_report_caps_listed_rows_and_leads_with_totals(adopt_db):
+    """10k+ fetched records (a real recurring-series first sync) must produce
+    a READABLE report: the totals line first, counts per section, and at most
+    20 listed rows per section followed by a '… and N more' line."""
+    h = Harness(adopt_db)
+    for i in range(120):
+        h.seed_legacy(
+            source="calendar",
+            raw_text=f"event {i} — Thu 29 Oct 17:00–18:30",
+            occurred_at=datetime(2026, 10, 29, 14, 30, tzinfo=UTC),
+        )
+    records = [
+        make_record(
+            external_id=f"new-{i}",
+            version='"v1"',
+            text=f"totally unknown event {i} — Fri 30 Oct 10:00",
+            occurred_at=datetime(2026, 10, 30, 7, 0, tzinfo=UTC),
+        )
+        for i in range(100)
+    ]
+    report = adopt_connector(FakeConnector(name="gcal", batches=[_batch(*records)]), adopt_db)
+    lines = format_report(report).splitlines()
+
+    assert lines[0].startswith("adopt gcal:")  # totals first
+    assert "100 record(s) fetched" in lines[0] and "100 new on first sync" in lines[0]
+    new_section = next(
+        i for i, line in enumerate(lines) if line.startswith("  NEW ON FIRST SYNC (100)")
+    )
+    listed = lines[new_section + 1 : new_section + 21]
+    assert len(listed) == 20  # capped at 20 rows
+    assert lines[new_section + 21] == "    … and 80 more"
+    assert sum(1 for line in lines if line.startswith("    new-")) == 20
+
+
+def test_adopt_gcal_matches_a_real_google_web_ui_copy(adopt_db):
+    """End-to-end pasted-vs-google text shape (review round 3): a REAL
+    Google web-UI copy — title line, local time range, "Location: <room>"
+    line — pasted through the parser must adopt against the adapter-rendered
+    record of the SAME event (rule B). Fakes only: parse() + the pure
+    record_from_event renderer + FakeConnector; no live Google calls."""
+    from zoneinfo import ZoneInfo
+
+    from brain.connectors.google.calendar import record_from_event
+    from brain.services.paste import parse
+
+    pasted = parse(
+        "Team sync\nTuesday, October 21 · 10:00 – 11:00am\nLocation: Room 3",
+        tz=ZoneInfo("Asia/Jerusalem"),
+    )
+    chunk = pasted.chunks[0]
+    h = Harness(adopt_db)
+    h.seed_legacy(
+        source="calendar",  # LEGACY_SOURCES["gcal"] == "calendar"
+        raw_text=chunk.raw_text,
+        occurred_at=chunk.occurred_at,
+        meta=dict(chunk.meta),
+    )
+    record = record_from_event(
+        {
+            "id": "evt_1",
+            "summary": "Team sync",
+            "start": {"dateTime": "2026-10-21T10:00:00+03:00"},
+            "end": {"dateTime": "2026-10-21T11:00:00+03:00"},
+            "location": "Room 3",
+            "etag": '"v1"',
+        },
+        ZoneInfo("Asia/Jerusalem"),
+    )
+
+    report = adopt_connector(FakeConnector(name="gcal", batches=[_batch(record)]), adopt_db)
+
+    assert report.rules == {"evt_1": "B"}
+    assert report.adopted and report.adopted[0][0][0] == "evt_1"

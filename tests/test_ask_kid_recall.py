@@ -583,15 +583,18 @@ def _service2(
     search: RecordingSearch,
     *,
     top_k: int = 8,
-    kid_reserved_slots: int = 3,
+    kid_reserved_slots: int | None = None,
 ) -> AskService:
+    kwargs: dict = {}
+    if kid_reserved_slots is not None:
+        kwargs["kid_reserved_slots"] = kid_reserved_slots
     return AskService(
         search,
         FakeLLMClient(reply=cite_every_source),  # type: ignore[arg-type]
         memory=memory,
         items_repo=repo,
         top_k=top_k,
-        kid_reserved_slots=kid_reserved_slots,
+        **kwargs,
     )
 
 
@@ -604,12 +607,11 @@ def _email(repo: ItemsRepository, n: int) -> MemoryItem:
     )
 
 
-def test_kid_channel_item_survives_higher_ranked_flood(clean_items, memory_db) -> None:
-    """WA39 run-3 W4 miss, red-first: the rerank ranks 8+ emails above the one
-    kid-channel conversation that answers the question, and the top-8 cut
-    drops it even though the kid leg fetched it. The final context must
-    reserve up to ASK_KID_RESERVED_SLOTS of top_k for the best-ranked
-    kid-recall items (kid-channel conversations first)."""
+def test_kid_items_are_additions_not_carve_out(clean_items, memory_db) -> None:
+    """WA39 run 4: reserved kid slots used to DISPLACE the general ranking
+    (an email lost its slot). Kid slots are ADDITIONAL: the general top_k is
+    never displaced — the context is the general top_k PLUS up to
+    ask_kid_reserved_slots kid items (default 4)."""
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
     emails = [_email(repo, n) for n in range(10)]
@@ -623,29 +625,96 @@ def test_kid_channel_item_survives_higher_ranked_flood(clean_items, memory_db) -
     )
 
     ids = [str(hit.item.id) for hit in result.sources]
-    assert str(kid_item.id) in ids, (
-        "the reranked-out kid-channel item must be reserved a slot in the "
-        "final context when the question names a confirmed kid"
+    assert ids[:8] == [str(e.id) for e in emails[:8]], (
+        "the general reranked top_k must never be displaced by kid additions"
     )
-    email_ids = {str(e.id) for e in emails}
-    assert len(ids) == 8, "top_k stays 8"
-    assert len([i for i in ids if i in email_ids]) < 8, (
-        "reserved slot comes out of the general ranking — some email lost it"
+    assert str(kid_item.id) in ids, "the kid item joins the context as an addition"
+    assert len(ids) == 10, (
+        "general top_k (8) plus exactly two kid additions: the slippers "
+        "conversation and the class-needle item the kid leg also fetched"
     )
 
 
-def test_reservation_caps_at_reserved_slots(clean_items, memory_db) -> None:
-    """More kid items than slots: only the best ASK_KID_RESERVED_SLOTS
-    (kid-channel conversations first) are reserved; the rest fall back to
-    the general ranking."""
+def test_dated_question_adds_the_d_minus_1_announcement(clean_items, memory_db) -> None:
+    """WA39 run 4's core miss: 6 same-channel chats rank above the D-1
+    announcement AND above the top_k cut, so even additions in rerank order
+    pick the chats. With a resolved window the kid additions are filled by
+    DATE RELEVANCE: in-window kid-channel items first, then the lookback
+    items ordered by distance to the window — before rerank order."""
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
-    emails = [_email(repo, n) for n in range(10)]
+    chats = [
+        _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"שיחה חדשה מספר {n}")
+        for n in range(6)
+    ]
+    emails = [_email(repo, n) for n in range(4)]
+    # the announcement: sent Tue 20.10 18:00 UTC — inside the lookback of the
+    # 'Wednesday 21.10' window ([20.10 21:00Z, 21.10 21:00Z)), no kid name
+    announce = _whatsapp_item(
+        repo, _TEACHER, 20, 18, "מחר (יום ד') הכיתה בחווה החקלאית — צריך כובע ומים",
+        captured=20,
+    )
+    hits = [SearchHit(item=i, score=0.9) for i in chats + emails]
+    search = RecordingSearch(hits)
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    general = [str(i.id) for i in (chats + emails)[:8]]  # the undisturbed top_k
+    assert ids[:8] == general, (
+        "the general top_k set is identical with a kid named — only additions"
+    )
+    assert str(announce.id) in ids, (
+        "the D-1 announcement must join the context by date relevance, "
+        "ahead of same-channel chats the reranker ranked higher"
+    )
+    assert len(ids) == 10, (
+        "general top_k plus the date-relevant additions (announcement + the "
+        "class-needle item), never fewer general items"
+    )
+
+
+def test_dated_additions_order_in_window_before_lookback(clean_items, memory_db) -> None:
+    """In-window kid-channel items come before lookback items; lookback items
+    order by distance to the window, nearest first."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(8)]
+    far = _whatsapp_item(repo, _TEACHER, 17, 12, "לפני שבוע: סרגל לכיתה", captured=17)
+    near = _whatsapp_item(repo, _TEACHER, 20, 12, "מחר צריך סרגל לכיתה", captured=20)
+    in_window = _whatsapp_item(repo, _TEACHER, 21, 12, "היום בכיתה: קלמר עם סרגל", captured=21)
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
+    service = _service2(memory, repo, search, top_k=8)
+
+    result = service.ask(
+        "Where was Itamar's class on Wednesday 21.10?",
+        now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
+    )
+
+    ids = [str(hit.item.id) for hit in result.sources]
+    assert ids[:8] == [str(e.id) for e in emails], "general top_k untouched"
+    additions = [i for i in ids[8:] if i in {str(x.id) for x in (far, near, in_window)}]
+    assert additions[:3] == [str(in_window.id), str(near.id), str(far.id)], (
+        "in-window first, then lookback by distance to the window (nearest first)"
+    )
+
+
+def test_undated_question_adds_by_rerank_order(clean_items, memory_db) -> None:
+    """No resolved window: the kid additions fill in rerank order, as before
+    — the reranked-out kid items still join the general top_k."""
+    memory, repo = _world()
+    _seed_itamar_world(memory, repo)
+    emails = [_email(repo, n) for n in range(8)]
     kid_items = [
         _whatsapp_item(repo, _TEACHER, 18, 15, "נעלי בית לכיתה — מי שרוצה מוזמן"),
         _whatsapp_item(repo, _TEACHER, 19, 15, "מחר יום כיפות — להביא כיפה ממוספרת"),
         _whatsapp_item(repo, _TEACHER, 19, 16, "מחר הכיתה בחווה החקלאית"),
         _whatsapp_item(repo, _TEACHER, 20, 16, "היום סיום הסדרה עם פירות בתשלום"),
+        _whatsapp_item(repo, _TEACHER, 20, 17, "אל תשכחו את כובע השמש לטיול"),
     ]
     search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
     service = _service2(memory, repo, search, top_k=8)
@@ -656,9 +725,11 @@ def test_reservation_caps_at_reserved_slots(clean_items, memory_db) -> None:
     )
 
     ids = [str(hit.item.id) for hit in result.sources]
-    kid_in = [i for i in ids if i in {str(k.id) for k in kid_items}]
-    assert len(kid_in) == 3, "at most ASK_KID_RESERVED_SLOTS kid items are reserved"
-    assert len(ids) == 8, "top_k unchanged"
+    kid_ids = {str(k.id) for k in kid_items}
+    assert len([i for i in ids if i in kid_ids]) == 4, (
+        "default ask_kid_reserved_slots=4: four kid additions"
+    )
+    assert ids[:8] == [str(e.id) for e in emails], "general top_k never displaced"
 
 
 def test_no_kid_named_context_byte_identical(clean_items, memory_db) -> None:
@@ -679,13 +750,15 @@ def test_no_kid_named_context_byte_identical(clean_items, memory_db) -> None:
 
 
 def test_reservation_never_touches_other_kids_channels(clean_items, memory_db) -> None:
-    """An Itamar question reserves only Itamar-pool items: a Rona-channel
-    item ranked below the cut stays out even when slots go unused."""
+    """An Itamar question adds only Itamar-pool items: a Rona-channel item
+    ranked below the cut stays out even when slots go unused."""
     memory, repo = _world()
     _seed_itamar_world(memory, repo)
-    emails = [_email(repo, n) for n in range(10)]
+    emails = [_email(repo, n) for n in range(8)]
     rona_item = _whatsapp_item(repo, "רונה כדורגל", 18, 15, "אימון כדורגל מחר בבנימינה")
-    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails[:7]]
+    # rona ranks 9th — below the top-8 cut — so only the ADDITION path could
+    # ever bring it in
+    search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails]
                              + [SearchHit(item=rona_item, score=0.5)])
     service = _service2(memory, repo, search, top_k=8)
 
@@ -696,5 +769,5 @@ def test_reservation_never_touches_other_kids_channels(clean_items, memory_db) -
 
     ids = [str(hit.item.id) for hit in result.sources]
     assert str(rona_item.id) not in ids, (
-        "Rona's channel item is not in Itamar's kid pool -> never reserved"
+        "Rona's channel item is not in Itamar's kid pool -> never added"
     )

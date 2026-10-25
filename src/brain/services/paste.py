@@ -711,6 +711,11 @@ def _parse_calendar_text(
         for line in lines[time_range_end + 1 :]:
             if line.lower().startswith(("attendees:", "participants:", "משתתפים:")):
                 meta["attendees"] = _EMAIL_ADDRESS_RE.findall(line)
+            elif line.lower().startswith(("location:", "מקום:")):
+                # A labeled location line is field syntax: store the VALUE
+                # (same as the pre-range loop above) — a Google web-UI copy
+                # puts "Location: <room>" after the time range.
+                meta["location"] = line.split(":", 1)[1].strip()
             elif "location" not in meta:
                 meta["location"] = line
     if title:

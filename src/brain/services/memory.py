@@ -13,6 +13,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from brain.db.models import Entity, EntityAlias, MemoryFact
 from brain.repositories.memory import MemoryRepository, utcnow
@@ -34,6 +35,13 @@ BLOCK_MAX_CHARS = 6000  # ~1500 tokens; hard cap, truncated with a marker
 
 class MemoryError(Exception):
     """A memory use case could not be completed (bad state transition)."""
+
+
+def _ops(kind: str, **detail: Any) -> None:
+    """One ops marker for a user-initiated memory mutation (never raises)."""
+    from brain import ops  # noqa: PLC0415 — import inside: tests patch freely
+
+    ops.record_event(component="memory", kind=kind, ok=True, detail=detail)
 
 
 def _fact_dict(fact: MemoryFact) -> dict[str, Any]:
@@ -59,6 +67,7 @@ def _entity_dict(entity: Entity, aliases: list[str] | None = None) -> dict[str, 
         "name": entity.name,
         "created_at": entity.created_at.isoformat() if entity.created_at else None,
         "aliases": aliases or [],
+        "archived": entity.archived_at is not None,
     }
 
 
@@ -91,6 +100,8 @@ class MemoryService:
                 continue
             kid: dict[str, Any] = {"name": entity.name}
             kid.update(attrs)
+            # Added AFTER attrs so a fact predicate can never shadow the id.
+            kid["entity_id"] = entity.id
             kids.append(kid)
         return kids
 
@@ -340,16 +351,13 @@ class MemoryService:
             # A2 bar, and unknown is always safer than a wrong kid. Hebrew
             # prefix runs (ורונה) still match, case-insensitively for
             # English; a name and its alias never double-count.
-            # Alias lookup is scoped to the kids only — never every person
-            # entity (teachers, parents are persons too and stay unqueried).
-            people_by_name = {
-                entity.name: entity
-                for entity in self._repo.list_entities(kinds=["person"])
-            }
+            # Aliases come from each kid's OWN entity (the id kids() already
+            # resolved via the kid's confirmed grade fact) — never a
+            # name-keyed person lookup: a second person entity sharing the
+            # kid's name (parent, classmate) must not lend its aliases.
             alias_map = {
-                kid["name"]: self._repo.aliases_for(people_by_name[kid["name"]].id)
+                kid["name"]: self._repo.aliases_for(kid["entity_id"])
                 for kid in kids
-                if kid["name"] in people_by_name
             }
             known: list[str] = []
             for kid in kids:
@@ -493,9 +501,17 @@ class MemoryService:
     def add_entity(
         self, kind: str, name: str, *, aliases: list[str] | None = None
     ) -> dict[str, Any]:
-        """Create an entity (409-dupes are the route's call; find first here)."""
-        existing = self._repo.find_entity(kind=kind, name=name)
+        """Create an entity (409-dupes are the route's call; find first here).
+
+        An exact match on an ARCHIVED entity unarchives the same row (its
+        facts and aliases are intact) — re-adding a removed WhatsApp group
+        must never create a second channel.
+        """
+        existing = self._repo.find_entity_any(kind=kind, name=name)
         if existing is not None:
+            if existing.archived_at is not None:
+                existing.archived_at = None
+                self._repo.commit()
             return _entity_dict(existing, self._repo.aliases_for(existing.id))
         entity = self._repo.add_entity(Entity(kind=kind, name=name))
         for alias in aliases or []:
@@ -515,12 +531,76 @@ class MemoryService:
         self._repo.commit()
         return _entity_dict(entity, self._repo.aliases_for(entity.id))
 
+    # -- aliases on an existing entity (Memory Management screen) ---------------
+
+    def add_alias(
+        self, entity_id: uuid.UUID, alias: str, *, lang: str | None = None
+    ) -> dict[str, Any]:
+        """Add one alias to an existing entity; re-adding is a no-op."""
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        stripped = alias.strip()
+        if not stripped:
+            raise ValueError("alias must not be blank")
+        if stripped not in self._repo.aliases_for(entity_id):
+            self._repo.add_alias(EntityAlias(entity_id=entity_id, alias=stripped, lang=lang))
+            self._repo.commit()
+            _ops("alias_add", entity_id=entity_id, alias=stripped, lang=lang)
+        return _entity_dict(entity, self._repo.aliases_for(entity_id))
+
+    def remove_alias(self, entity_id: uuid.UUID, alias: str) -> None:
+        """Remove one alias; unknown aliases are a 404 (the route's call)."""
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        if alias not in self._repo.aliases_for(entity_id):
+            raise KeyError(alias)
+        self._repo.delete_alias(entity_id, alias)
+        self._repo.commit()
+        _ops("alias_remove", entity_id=entity_id, alias=alias)
+
+    def channel_names(self) -> list[str]:
+        """The allowlist, verbatim: every live channel entity's name (what
+        the WhatsApp poller polls). For the bridge-groups options leg."""
+        return [
+            entity.name
+            for entity in self._repo.list_entities(kinds=["channel"])
+            if entity.name
+        ]
+
+    # -- archive/restore (soft removal; the Undo of "remove group") -------------
+
+    def archive_entity(self, entity_id: uuid.UUID) -> dict[str, Any]:
+        """Soft-remove: the entity leaves every listing (the poller's
+        allowlist included) while its facts and aliases stay put. Idempotent."""
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        if entity.archived_at is None:
+            entity.archived_at = utcnow()
+            self._repo.commit()
+            _ops("entity_archive", entity_id=entity.id, name=entity.name)
+        return {**_entity_dict(entity, self._repo.aliases_for(entity.id)), "archived": True}
+
+    def restore_entity(self, entity_id: uuid.UUID) -> dict[str, Any]:
+        """Undo an archive: the exact same row comes back (facts, aliases)."""
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        if entity.archived_at is not None:
+            entity.archived_at = None
+            self._repo.commit()
+            _ops("entity_restore", entity_id=entity.id, name=entity.name)
+        return {**_entity_dict(entity, self._repo.aliases_for(entity.id)), "archived": False}
+
     def delete_entity(self, entity_id: uuid.UUID) -> None:
         """Hard-delete an entity (aliases + closed-fact history cascade).
 
         Refuses while the entity still has ANY current fact (valid_to NULL,
         any status): the user soft-deletes facts first — delete-with-history
-        (design item 31a), never a silent wipe of live memory.
+        (design item 31a), never a silent wipe of live memory. The Memory
+        Management screen's "remove" is archive_entity above, not this.
         """
         entity = self._repo.get_entity(entity_id)
         if entity is None:
@@ -592,14 +672,57 @@ class MemoryService:
         return _fact_dict(created)
 
     def delete_fact(self, fact_id: uuid.UUID) -> dict[str, Any]:
-        """Soft-delete: status 'rejected', valid_to=now; history is kept."""
+        """Soft-delete: status 'rejected', valid_to=now; history is kept.
+
+        The prior status is captured in provenance (``deleted_from``) so the
+        Undo (:meth:`restore_fact`) reopens the fact as exactly what it was —
+        confirmed stays confirmed, proposed stays proposed.
+        """
         fact = self._repo.get_fact(fact_id)
         if fact is None:
             raise KeyError(fact_id)
         if fact.valid_to is not None:
             raise MemoryError("fact is already closed")
+        provenance = dict(fact.provenance or {})
+        provenance["deleted_from"] = fact.status
+        fact.provenance = provenance
         fact.status = "rejected"
         fact.valid_to = utcnow()
+        self._repo.commit()
+        return _fact_dict(fact)
+
+    def restore_fact(self, fact_id: uuid.UUID) -> dict[str, Any]:
+        """Undo a soft delete: reopen the SAME row (id kept) with the status
+        it had when it was deleted.
+
+        Only a fact closed by DELETE (status 'rejected') is restorable — a
+        fact superseded by PATCH is history, not something to undo, and an
+        open fact has nothing to undo. A restore is ALSO refused while
+        another CURRENT fact exists for the same subject+predicate+status:
+        the user deleted "grade 5" and added "grade 6" — undoing the delete
+        must not put two current values next to each other.
+        """
+        fact = self._repo.get_fact(fact_id)
+        if fact is None:
+            raise KeyError(fact_id)
+        if fact.valid_to is None or fact.status != "rejected":
+            raise MemoryError("only a deleted fact can be restored")
+        provenance = dict(fact.provenance or {})
+        prior = provenance.pop("deleted_from", "confirmed")
+        for current in self._repo.current_facts(subject_ids=[fact.subject_id]):
+            if (
+                current.id != fact.id
+                and current.predicate == fact.predicate
+                and current.status == prior
+            ):
+                raise MemoryError(
+                    f"cannot restore: a current {fact.predicate!r} fact already "
+                    "exists for this entity — delete or edit it first"
+                )
+        provenance["restored_at"] = utcnow().isoformat()
+        fact.provenance = provenance
+        fact.status = prior
+        fact.valid_to = None
         self._repo.commit()
         return _fact_dict(fact)
 
@@ -639,12 +762,91 @@ class MemoryService:
         ordered = sorted(chain.values(), key=lambda f: (f.valid_from, f.created_at))
         return [_fact_dict(fact) for fact in ordered]
 
+    # -- family summary (deterministic; stored facts only, no LLM) ----------------
+
+    def family_summary(self, *, on: datetime | None = None) -> dict[str, Any]:
+        """The Family page's read-only summary — computed, never invented.
+
+        One line per person: profile facts (grade/class/school/teacher),
+        their channels, the week's items (occurred_at within the ISO week
+        containing ``on``, linked by item id), and the open (proposed) facts
+        per member. Every value is read from stored facts/items; ``inferred``
+        stays empty — anything not directly stored would be labelled there.
+        """
+        import datetime as dt  # noqa: PLC0415
+
+        from brain.config import get_settings  # noqa: PLC0415
+
+        anchor = on or datetime.now(ZoneInfo(get_settings().timezone)).date()
+        week_start = anchor - dt.timedelta(days=anchor.weekday())  # Monday
+        # Local Monday 00:00 -> UTC: Israel is UTC+2/+3, so UTC-midnight
+        # bounds would push local-Monday-morning items (Sunday evening UTC)
+        # into the previous week.
+        start = (
+            dt.datetime.fromisoformat(week_start.isoformat())
+            .replace(tzinfo=ZoneInfo(get_settings().timezone))
+            .astimezone(dt.UTC)
+        )
+        end = start + dt.timedelta(days=7)
+
+        people = self._repo.list_entities(kinds=["person"])
+        if not people:
+            return {
+                "week_start": week_start.isoformat(),
+                "week_end": (week_start + dt.timedelta(days=6)).isoformat(),
+                "members": [],
+            }
+        facts = self._repo.current_facts(subject_ids=[p.id for p in people])
+        confirmed_by_subject: dict[uuid.UUID, dict[str, str]] = {}
+        proposed_by_subject: dict[uuid.UUID, list[dict[str, Any]]] = {}
+        for fact in facts:
+            if fact.status == "confirmed" and fact.value is not None:
+                confirmed_by_subject.setdefault(fact.subject_id, {})[fact.predicate] = fact.value
+            elif fact.status == "proposed":
+                proposed_by_subject.setdefault(fact.subject_id, []).append(
+                    {"id": str(fact.id), "predicate": fact.predicate, "value": fact.value}
+                )
+        week_items = self._repo.items_in_week(start, end, hidden=False)
+
+        members: list[dict[str, Any]] = []
+        for person in people:
+            attrs = confirmed_by_subject.get(person.id, {})
+            member: dict[str, Any] = {"name": person.name}
+            for predicate in ("grade", "class", "school", "teacher", "gender", "relation"):
+                if predicate in attrs:
+                    member[predicate] = attrs[predicate]
+            member["channels"] = self.channel_names_for_kid(person.name)
+            member["week_items"] = [
+                {
+                    "item_id": str(item.id),
+                    "occurred_at": item.occurred_at.isoformat() if item.occurred_at else None,
+                    "source": item.source,
+                    "title": (item.raw_text or "")[:80],
+                }
+                for item in week_items
+                if item.applies_to and person.name in item.applies_to
+            ]
+            member["proposed_facts"] = proposed_by_subject.get(person.id, [])
+            member["inferred"] = []
+            members.append(member)
+        return {
+            "week_start": week_start.isoformat(),
+            "week_end": (week_start + dt.timedelta(days=6)).isoformat(),
+            "members": members,
+        }
+
     # -- internals -----------------------------------------------------------------
 
     def _ensure_entity(self, *, kind: str, name: str) -> Entity:
-        entity = self._repo.find_entity(kind=kind, name=name)
+        entity = self._repo.find_entity_any(kind=kind, name=name)
         if entity is None:
             entity = self._repo.add_entity(Entity(kind=kind, name=name))
+        elif entity.archived_at is not None:
+            # The seed paths (set_kid / set_channel) never duplicate an
+            # archived entity: the SAME row comes back (its facts and
+            # aliases are intact — exactly what add_entity's re-add does).
+            entity.archived_at = None
+            self._repo.commit()
         return entity
 
     def _current_confirmed_fact(self, subject_id: uuid.UUID, predicate: str) -> MemoryFact | None:

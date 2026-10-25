@@ -1014,6 +1014,235 @@ def test_build_trier_is_wired_refreshable(triage_world: Any, monkeypatch: Any) -
     )
 
 
+# --- startup tolerance (worker_3's post-merge review of #111) --------------------
+# RefreshableTrier.__init__ must NOT read kid names eagerly-to-death: a DB
+# hiccup at poller startup used to kill the WhatsApp agent. Construction now
+# survives a failed first read (warning + ops event, NO kid names — the
+# deterministic override stays off until the first successful refresh()), and
+# the backfill CLI refuses a one-shot run on that state (exit non-zero: with no
+# kid names it would silently miss kid mentions).
+
+
+def _break_kid_names_read(monkeypatch: Any, state: dict) -> None:
+    """Make MemoryService.overview raise while state['broken'] is True."""
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    real_overview = MemoryService.overview
+
+    def flaky_overview(self: Any, **kwargs: Any) -> Any:
+        if state["broken"]:
+            raise RuntimeError("db hiccup")
+        return real_overview(self, **kwargs)
+
+    monkeypatch.setattr(MemoryService, "overview", flaky_overview)
+
+
+def test_failed_first_read_does_not_abort_the_session(
+    triage_world: Any, tmp_path: Any
+) -> None:
+    """The FIRST read in __init__ must be savepoint-scoped exactly like
+    refresh(): a real DB error there aborts the session's transaction, and a
+    bare try/except only moves the crash one step later — the poller's first
+    pass would fail on EVERY query, refresh() included. Real broken SQL on the
+    real test DB (not a mocked raise, which never aborts Postgres):
+    construction survives, a normal query on the SAME session succeeds, and a
+    full poller pass runs (and recovers to kid_named)."""
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+    from brain.services.triage import RefreshableTrier  # noqa: PLC0415
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    class _PoisonedFirstRead(RefreshableTrier):
+        """Real abort: broken SQL on the shared session during __init__."""
+
+        poisoned = True
+
+        def _read_kid_names(self) -> list[str]:
+            if self.poisoned:
+                self._session.execute(sql_text("SELECT * FROM __no_such_table_xyz__"))
+            return super()._read_kid_names()
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+
+    # Construction hits the broken SQL — must survive (tolerance).
+    trier = _PoisonedFirstRead(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM(
+    '{"label": "noise", "confidence": 0.8}'
+    ))
+    trier.poisoned = False
+    assert trier._kid_names == [] and trier.kid_names_loaded is False
+
+    # The SAME session must still answer queries — the aborted-transaction
+    # hole made every later query fail with PendingRollbackError.
+    entities = world.session.execute(sql_text("SELECT count(*) FROM entities")).scalar()
+    assert entities >= 1
+
+    # And a full poller pass on that session must run: refresh() succeeds on
+    # the recovered DB, so the kid override fires from the first triage pass.
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _trier_poller(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))  # cursor init
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="רונה צריכה להביא כובע מחר",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+
+    world.session.expire_all()
+    items = world.session.query(MemoryItem).all()
+    assert len(items) == 1
+    assert items[0].triage_method == "kid_named", (
+        "the pass must run on the same session and the refreshed kid names "
+        "must apply — no aborted-transaction fallout"
+    )
+
+
+def test_trier_construction_survives_failed_kid_names_read(
+    triage_world: Any, tmp_path: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    """RED-first: the first kid-names read raising must not kill construction.
+    The trier starts with NO kid names (override inert, triage still runs via
+    jev/llm), logs one warning + one ops event, and the next pass after the DB
+    recovers fills the names (kid_named fires again)."""
+    import logging  # noqa: PLC0415
+
+    from tests.services.test_whatsapp_ingest import (  # noqa: PLC0415
+        CHAT_A_JID,
+        _add_row,
+        _bridge_row,
+        _write_bridge,
+    )
+
+    from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
+
+    world = triage_world
+    rona = _confirmed_kid(world.memory, "Rona")
+    from brain.db.models import EntityAlias  # noqa: PLC0415
+
+    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    state = {"broken": True}
+    _break_kid_names_read(monkeypatch, state)
+
+    with caplog.at_level(logging.WARNING, logger="brain.services.triage"):
+        ops_before = world.session.execute(
+            sql_text(
+                "SELECT count(*) FROM ops_events "
+                "WHERE component='triage' AND kind='kid_names_unavailable'"
+            )
+        ).scalar()
+        # Construction itself hits the broken read — must survive.
+        trier = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM(
+            '{"label": "noise", "confidence": 0.8}'
+        ))
+    assert trier._kid_names == [], "a failed first read must start with no kid names"
+    assert trier.kid_names_loaded is False
+    assert any(
+        "kid-names" in rec.message.lower() for rec in caplog.records
+    ), caplog.text
+    ops_rows = world.session.execute(
+        sql_text(
+            "SELECT count(*) FROM ops_events "
+            "WHERE component='triage' AND kind='kid_names_unavailable'"
+        )
+    ).scalar()
+    assert ops_rows == ops_before + 1, "construction must record exactly one ops event"
+
+    # Pass 1: the first poll only initializes the cursor at the live edge.
+    path = tmp_path / "messages.db"
+    _write_bridge(
+        path,
+        [(CHAT_A_JID, "Chat A")],
+        [_bridge_row("m1", datetime(2026, 10, 22, 12, 0, tzinfo=UTC), content="שלום")],
+    )
+    poller = _trier_poller(world, BridgeStore(path), trier)
+    poller.poll(now=datetime(2026, 10, 22, 12, 1, tzinfo=UTC))
+
+    # Pass 2 (read still broken): the conversation NAMES the kid, but with no
+    # kid names the override must stay OFF — triage falls through to jev/llm.
+    _add_row(
+        path,
+        _bridge_row(
+            "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
+            content="רונה צריכה להביא כובע מחר",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
+
+    world.session.expire_all()
+    items = world.session.query(MemoryItem).order_by(MemoryItem.occurred_at.asc()).all()
+    got = [(i.triage_method, i.raw_text[:60]) for i in items]
+    assert len(items) == 1, f"expected 1 conversation, got {got}"
+    assert items[0].triage_method == "llm", (
+        "with no kid names (failed startup read) the override must not fire — "
+        "the conversation is still triaged, via the model fallback"
+    )
+
+    # Pass 3 (DB recovered): refresh() fills the names — kid_named fires.
+    state["broken"] = False
+    _add_row(
+        path,
+        _bridge_row(
+            "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
+            content="מה צריך לארוז לרונה ליום ראשון?",
+        ),
+    )
+    poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))
+
+    world.session.expire_all()
+    items = world.session.query(MemoryItem).order_by(MemoryItem.occurred_at.asc()).all()
+    assert [i.triage_method for i in items] == ["llm", "kid_named"], (
+        "after the DB recovers, the next pass's refresh() must restore the "
+        "kid_named override"
+    )
+
+
+def test_backfill_refuses_to_run_when_kid_names_read_fails(
+    triage_world: Any, monkeypatch: Any, capsys: Any
+) -> None:
+    """RED-first: the backfill CLI on a failed first kid-names read must exit
+    NON-ZERO with a clear message (a one-shot pass on [] names would silently
+    miss kid mentions), triaging nothing and calling no model."""
+    from brain import cli  # noqa: PLC0415
+
+    world = triage_world
+    _confirmed_kid(world.memory, "Rona")
+    item = world.items.add(_conversation(
+        "[WhatsApp · Chat A]\n[21/10/2026, 18:23] מעין: מה צריך לרונה?"
+    ))
+    world.session.commit()
+
+    state = {"broken": True}
+    _break_kid_names_read(monkeypatch, state)
+    jev = FakeJev(JevChoice(option="relevant", confidence=0.97))
+    llm = FakeLLM('{"label": "relevant", "confidence": 0.9}')
+    monkeypatch.setattr("brain.api.deps.get_jev_client", lambda: jev)
+    monkeypatch.setattr("brain.api.deps.get_llm_client", lambda: llm)
+
+    rc = cli.main(["whatsapp-triage", "--limit", "100"])
+
+    assert rc != 0, "a one-shot backfill must not run on a failed kid-names read"
+    err = capsys.readouterr().err
+    assert "kid-names" in err.lower(), err
+    world.session.expire_all()
+    assert world.items.get(item.id).triage_label is None, "nothing may be triaged"
+    assert jev.calls == 0 and llm.prompts == [], "no model calls on refusal"
+
+
 # --- media-only conversations (step D) ------------------------------------------
 # A conversation whose every message is an UNREAD media marker has nothing
 # readable to triage: labelling a filename is how media-only conversations

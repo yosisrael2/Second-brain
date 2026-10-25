@@ -75,11 +75,24 @@ class FetchResult:
     The runner persists ``next_cursor`` ONLY after the whole batch succeeded
     (at-least-once + idempotent by external_id/version). ``reset=True`` means
     the source invalidated the cursor and this batch is a full resync.
+
+    ``more=True`` means the batch was TRUNCATED by the limit and the source
+    has more records — even when ``next_cursor`` is None (a source that
+    cannot express a mid-stream resume, like the email query path, drops the
+    cursor when it truncates). Consumers that loop over batches (the CLI
+    ``--drain`` loop, ``adopt._fetch_all``) keep fetching while it is set;
+    the ledger makes each re-fetch skip what was already applied. The
+    default False keeps every other connector's stop rules unchanged.
     """
 
     records: list[SourceRecord]
     next_cursor: str | None
     reset: bool = False
+    more: bool = False
+    # Adapter-observed counters for this batch (e.g. gcal's "beyond_window":
+    # instances dropped because they start beyond the future window). The
+    # runner may surface them in ops detail; tests assert on them directly.
+    stats: dict[str, int] = field(default_factory=dict)
 
 
 class Connector(ABC):
