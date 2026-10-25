@@ -688,3 +688,27 @@ def test_sender_default_hebrew_teacher_prefix_rule(memory: MemoryService):
         "Rona",
     ]
     assert memory.default_audience_for_sender("משפחת קרינת") is None
+
+
+def test_named_kids_same_named_nonkid_aliases_never_attach(memory: MemoryService):
+    """RED-first: a second person entity sharing a kid's exact name must never
+    lend its aliases to that kid (the old people_by_name lookup is last-wins
+    on the name, so a same-named non-kid person's alias could resolve the
+    kid). Zero wrong-child: the classmate-like alias stays unknown, and the
+    real kid's own alias still resolves."""
+    from brain.db.models import Entity, EntityAlias  # noqa: PLC0415
+
+    _seed_world(memory)
+    _add_alias(memory, "Rona", "רונה")
+    # A second person entity named "Rona" — NOT a kid (no grade fact), e.g. a
+    # parent or classmate entered with the same first name — carrying the
+    # classmate-like alias. Inserted after the kid, so a name-keyed person
+    # lookup resolves to THIS entity (last-wins).
+    impostor = memory._repo.add_entity(Entity(kind="person", name="Rona"))
+    memory._repo.add_alias(
+        EntityAlias(entity_id=impostor.id, alias="רונה לוי", lang="he")
+    )
+    memory._repo.commit()
+
+    assert memory.resolve_applies_to({"named_kids": ["רונה לוי"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["רונה"]}) == ["Rona"]
