@@ -1224,8 +1224,8 @@ def test_avatar_renders_the_photo_and_falls_back_on_load_error() -> None:
         Boolean(personWith) && personWith.tagName === 'IMG',
         personWith ? personWith.outerHTML.slice(0, 120) : 'no img found');
       if (personWith) {
-        check('the img points at the photo endpoint',
-          personWith.getAttribute('src') === '/memory/entities/e-photo/photo',
+        check('the img points at the photo endpoint with ?v=',
+          personWith.getAttribute('src') === '/memory/entities/e-photo/photo?v=abc123',
           `src=${personWith.getAttribute('src')}`);
         check('the img is lazy with alt = name',
           personWith.getAttribute('loading') === 'lazy'
@@ -1251,7 +1251,7 @@ def test_avatar_renders_the_photo_and_falls_back_on_load_error() -> None:
       }
     """, AVATAR_FIXTURES)
     assert_check(payload, "the person with a photo renders an img avatar")
-    assert_check(payload, "the img points at the photo endpoint")
+    assert_check(payload, "the img points at the photo endpoint with ?v=")
     assert_check(payload, "the img is lazy with alt = name")
     assert_check(payload, "the person without a photo keeps the initials avatar")
     assert_check(payload, "a channel keeps the group icon (no img)")
@@ -1334,3 +1334,86 @@ def test_channel_profile_has_no_photo_control() -> None:
     """, AVATAR_FIXTURES)
     assert_check(payload, "the channel profile has no photo upload control")
     assert_check(payload, "the channel profile has no photo remove control")
+
+
+# --- review R2: B1 (cache-busting src) + B2 (the sha never shows as text) -----
+
+LEAK_FIXTURES = {
+    "entities": [
+        {"id": "e1", "kind": "person", "name": "Dana", "aliases": [], "facts": [
+            {"id": "f-photo", "subject_id": "e1", "predicate": "photo",
+             "value": "497790947d4666760ce38f3c00e852c71f",
+             "object_id": None, "status": "confirmed", "provenance": {"source": "upload"}},
+        ]},
+        {"id": "e2", "kind": "person", "name": "Noa", "aliases": [], "facts": [
+            {"id": "f-photo2", "subject_id": "e2", "predicate": "photo",
+             "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+             "object_id": None, "status": "confirmed", "provenance": {"source": "upload"}},
+        ]},
+    ],
+    "proposed": [{
+        "id": "e1", "kind": "person", "name": "Dana", "aliases": [], "facts": [
+            {"id": "f-prop-photo", "subject_id": "e1", "predicate": "photo",
+             "value": "aaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccdddd",
+             "object_id": None, "status": "proposed", "provenance": {}},
+        ],
+    }],
+}
+
+
+def test_avatar_src_is_cache_busted_by_the_fact_value() -> None:
+    """B1: every photo shares ONE URL, and GET sends max-age=3600 — after a
+    change (or an undo) the browser would serve the OLD bytes from its
+    cache. The src carries ?v=<the fact's sha256> so a new value is a new
+    URL; the server ignores v."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      const img1 = document.querySelector('[data-entity="e1"] img.mm-av-photo');
+      const img2 = document.querySelector('[data-entity="e2"] img.mm-av-photo');
+      const want1 = '/memory/entities/e1/photo?v=497790947d4666760ce38f3c00e852c71f';
+      check('the avatar src carries the sha as ?v=',
+        Boolean(img1) && img1.getAttribute('src') === want1,
+        img1 ? img1.getAttribute('src') : 'no img');
+      check('a different photo value yields a different src', Boolean(img2)
+        && img2.getAttribute('src') !== img1.getAttribute('src'),
+        `${img1 && img1.getAttribute('src')} vs ${img2 && img2.getAttribute('src')}`);
+    """, LEAK_FIXTURES)
+    assert_check(payload, "the avatar src carries the sha as ?v=")
+    assert_check(payload, "a different photo value yields a different src")
+
+
+def test_the_photo_sha_never_renders_as_text() -> None:
+    """B2: the profile's basic-info rows, the review inbox and the history
+    drawer must not print the sha. The history drawer shows a photo row as
+    'photo' plus its dates."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e1"]').click();
+      await settle(150);
+      const detail = document.getElementById('memory-detail');
+      const detailText = detail ? detail.textContent : '';
+      check('the basic-info rows never show the sha',
+        !detailText.includes('497790947d4666760ce38f3c00e852c71f'),
+        detailText.slice(0, 200));
+      document.getElementById('memory-review-btn').click();
+      await settle(150);
+      const review = document.getElementById('memory-review-list');
+      const reviewText = review ? review.textContent : '';
+      check('the review inbox never shows a proposed photo sha',
+        reviewText && !reviewText.includes('aaaabbbbccccdddd'),
+        reviewText.slice(0, 200));
+      // the history drawer for the CONFIRMED photo fact (opened directly —
+      // the profile's History buttons belong to valued basic fields)
+      window.__mem.openMemoryDrawer('f-photo');
+      await settle(300);
+      const drawer = document.getElementById('memory-drawer-body');
+      const drawerText = drawer ? drawer.textContent : '';
+      const hasSha = drawerText.includes('497790947d4666760ce38f3c00e852c71f');
+      check('the history drawer shows the photo row without the sha',
+        drawerText.includes('photo') && !hasSha, drawerText.slice(0, 240));
+    """, LEAK_FIXTURES)
+    assert_check(payload, "the basic-info rows never show the sha")
+    assert_check(payload, "the review inbox never shows a proposed photo sha")
+    assert_check(payload, "the history drawer shows the photo row without the sha")

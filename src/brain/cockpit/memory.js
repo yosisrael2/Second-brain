@@ -453,9 +453,12 @@ function avatar(entity, size = "md") {
   }
   const photo = photoFactOf(entity);
   if (photo) {
+    // ?v=<sha> busts the browser cache: every photo shares ONE URL and GET
+    // sends max-age=3600 — without v, a Change (or an undo) would keep
+    // showing the OLD bytes for up to an hour. The server ignores v.
     const img = el("img", {
       class: `mm-av mm-av-${size} mm-av-photo`,
-      src: `/memory/entities/${entity.id}/photo`,
+      src: `/memory/entities/${entity.id}/photo?v=${photo.value}`,
       alt: entity.name, loading: "lazy",
     });
     // a failed image load (no file on disk, a removed fact, a fetch error)
@@ -1096,9 +1099,11 @@ function basicInfoCard(entity) {
     list.append(el("dt", { text: label }), basicValue(entity, predicate, label));
   }
   // any other typed fact this entity carries (e.g. 'activity') still shows
+  // — except 'photo': the avatar renders it; a row here would print the sha
   const extra = new Map();
   for (const fact of entity.facts || []) {
     const predicate = fact.predicate.toLowerCase();
+    if (predicate === "photo") continue;
     if (known.has(predicate) || isMemoryFact(fact) || isConnectionFact(fact)) continue;
     extra.set(predicate, fact.predicate);
   }
@@ -1106,7 +1111,8 @@ function basicInfoCard(entity) {
     list.append(el("dt", { text: capitalize(original) }), basicValue(entity, predicate, capitalize(original)));
   }
   card.append(list);
-  const stamps = (entity.facts || []).filter((fact) => !isMemoryFact(fact) && !isConnectionFact(fact))
+  const stamps = (entity.facts || []).filter((fact) => fact.predicate.toLowerCase() !== "photo"
+    && !isMemoryFact(fact) && !isConnectionFact(fact))
     .map((fact) => fact.valid_from).filter(Boolean).sort();
   if (stamps.length) {
     const last = new Date(stamps[stamps.length - 1]);
@@ -1808,7 +1814,12 @@ function reviewItems() {
   const items = [];
   for (const entity of memoryState.proposed) {
     const subject = mm.byId.get(entity.id) || entity;
-    for (const fact of entity.facts || []) items.push({ subject, fact, kind: reviewKind(fact) });
+    for (const fact of entity.facts || []) {
+      // 'photo' is never proposed through the product; a hand-made proposal
+      // must not print its sha in the inbox — skip it.
+      if (fact.predicate.toLowerCase() === "photo") continue;
+      items.push({ subject, fact, kind: reviewKind(fact) });
+    }
   }
   return items.sort((a, b) => (b.fact.valid_from || "").localeCompare(a.fact.valid_from || ""));
 }
@@ -2157,7 +2168,12 @@ async function openMemoryDrawer(factId) {
     const top = el("div", { class: "hrow-main" });
     top.append(
       el("span", { class: "mpred", text: version.predicate }),
-      el("span", { class: "mval", text: version.value ?? "", dir: "auto" }),
+      // a photo version's value IS the sha — show the word, the row's dates
+      // (validity line below) carry the when; the sha never prints
+      el("span", {
+        class: "mval", dir: "auto",
+        text: version.predicate.toLowerCase() === "photo" ? "photo" : version.value ?? "",
+      }),
       el("span", { class: `chip ${version.status}`, text: version.status }),
     );
     row.append(top);

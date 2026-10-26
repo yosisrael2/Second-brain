@@ -302,6 +302,8 @@ class MemoryService:
             subject = entities.get(fact.subject_id)
             if subject is None:
                 continue
+            if fact.predicate == PHOTO_PREDICATE:
+                continue  # the avatar never feeds the ask prompt (sha is noise)
             if fact.predicate.startswith(CONNECTION_PREFIX):
                 target = entities.get(fact.object_id) if fact.object_id else None
                 if target is not None:
@@ -1022,6 +1024,8 @@ class MemoryService:
         confirmed_by_subject: dict[uuid.UUID, dict[str, str]] = {}
         proposed_by_subject: dict[uuid.UUID, list[dict[str, Any]]] = {}
         for fact in facts:
+            if fact.predicate == PHOTO_PREDICATE:
+                continue  # the avatar never shows as text (the sha is noise)
             if fact.status == "confirmed" and fact.value is not None:
                 confirmed_by_subject.setdefault(fact.subject_id, {})[fact.predicate] = fact.value
             elif fact.status == "proposed":

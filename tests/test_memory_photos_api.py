@@ -25,6 +25,7 @@ import base64
 import hashlib
 import uuid
 from collections.abc import Iterator
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -68,6 +69,15 @@ def _upload(client: TestClient, entity_id: str, data: bytes, name: str = "photo.
         f"{_ENDPOINT}/entities/{entity_id}/photo",
         files={"file": (name, data, mime)},
     )
+
+
+def _add_fact(client: TestClient, subject_id: str, *, predicate: str, value: str) -> dict:
+    response = client.post(
+        f"{_ENDPOINT}/facts",
+        json={"subject_id": subject_id, "predicate": predicate, "value": value},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
 
 
 def _photo_fact(client: TestClient, entity_id: str) -> dict | None:
@@ -240,3 +250,72 @@ def test_get_photo_honors_if_none_match(photo_client: TestClient) -> None:
                                 headers={"If-None-Match": etag})
     assert response.status_code == 304, response.text
     assert response.content == b""
+
+
+# --- review B2: the photo fact must never surface as text ----------------------
+
+
+def test_compact_block_excludes_the_photo_fact(photo_client: TestClient) -> None:
+    """compact_block feeds the ask prompt: a photo fact must not appear as
+    '- Dana: photo 4977…sha' — noise for the model + BLOCK_MAX_CHARS."""
+    from brain.db.session import SessionLocal
+    from brain.repositories.memory import MemoryRepository
+    from brain.services.memory import MemoryService
+
+    entity = _add_entity(photo_client, "Dana")
+    _upload(photo_client, entity["id"], PNG_1PX)
+    _add_fact(photo_client, entity["id"], predicate="note", value="prefers WhatsApp")
+    sha = hashlib.sha256(PNG_1PX).hexdigest()
+    with SessionLocal() as db:
+        block = MemoryService(MemoryRepository(db)).compact_block()
+    assert "photo" not in block, block
+    assert sha not in block, block
+    assert "prefers WhatsApp" in block  # the other facts still render
+
+
+def test_bot_profile_excludes_the_photo_fact(photo_client: TestClient) -> None:
+    """The bot's /profile renders facts as 'predicate: value' lines with
+    remove buttons — a photo row would print the sha (and offer a delete
+    that bypasses the screen's undo flow). It must be absent."""
+    from contextlib import contextmanager
+
+    from brain.db.session import SessionLocal
+    from brain.repositories.memory import MemoryRepository
+    from brain.services.memory import MemoryService
+    from brain.telegram_bot import BotServices, TelegramBot
+
+    entity = _add_entity(photo_client, "Dana")
+    _upload(photo_client, entity["id"], PNG_1PX)
+    _add_fact(photo_client, entity["id"], predicate="note", value="likes turtles")
+    sha = hashlib.sha256(PNG_1PX).hexdigest()
+
+    @contextmanager
+    def factory():
+        db = SessionLocal()
+        try:
+            yield BotServices(
+                ingest=None, items=None, search=None, ask=None,
+                memory=MemoryService(MemoryRepository(db)),
+            )
+        finally:
+            db.close()
+
+    core = TelegramBot(services_factory=factory, allowed_ids=frozenset({111}),
+                       timezone=ZoneInfo("Asia/Jerusalem"))
+    text = core.route("/profile", 111).text
+    assert sha not in text, text
+    assert "photo" not in text, text
+    assert "likes turtles" in text  # the other facts still render
+
+
+def test_overview_search_does_not_match_a_photo_sha(photo_client: TestClient) -> None:
+    """search_facts matches fact VALUE substrings — a hex fragment must not
+    summon the person via their avatar's sha."""
+    entity = _add_entity(photo_client, "Dana")
+    _upload(photo_client, entity["id"], PNG_1PX)
+    sha = hashlib.sha256(PNG_1PX).hexdigest()
+    fragment = sha[4:16]
+    hit = photo_client.get(f"{_ENDPOINT}", params={"q": fragment}).json()
+    assert hit["entities"] == [], hit["entities"]
+    still = photo_client.get(f"{_ENDPOINT}", params={"q": "Dana"}).json()
+    assert [e["name"] for e in still["entities"]] == ["Dana"]

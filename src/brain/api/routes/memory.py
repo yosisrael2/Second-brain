@@ -189,11 +189,11 @@ def upload_photo(
     A second upload supersedes (response.replaced) — Undo is the existing
     /facts/{id}/undo-supersede op.
     """
-    _get_entity_or_404(service, entity_id)
-    entity = service.get_entity(entity_id)
+    entity = _get_entity_or_404(service, entity_id)
     if entity["kind"] != "person":
         raise HTTPException(status_code=409, detail="only a person entity can have a photo")
-    data = file.file.read()
+    # read at most cap+1: a huge upload must never sit fully in memory
+    data = file.file.read(PHOTO_MAX_BYTES + 1)
     if len(data) > PHOTO_MAX_BYTES:
         raise HTTPException(status_code=413, detail="photo must be 2 MB or smaller")
     sniffed = _sniff_image(data)

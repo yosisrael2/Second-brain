@@ -170,6 +170,21 @@ window.fetch = async (path, options) => {
     prev.open = true;
     return respond(200, prev.fact);
   }
+  const historyMatch = url.match(/^\/memory\/facts\/([^/]+)\/history$/);
+  if (method === 'GET' && historyMatch) {
+    // the version chain of ONE fact: walk the supersedes_id chain, oldest first
+    const start = rowById(historyMatch[1]);
+    if (!start) return respond(404, { detail: 'fact not found' });
+    const chain = [start.fact];
+    let cursor = start;
+    while (cursor.fact.supersedes_id) {
+      const prev = rowById(cursor.fact.supersedes_id);
+      if (!prev) break;
+      chain.unshift(prev.fact);
+      cursor = prev;
+    }
+    return respond(200, chain);
+  }
   const photoMatch = url.match(/^\/memory\/entities\/([^/]+)\/photo$/);
   if (method === 'POST' && photoMatch) {
     // multipart upload: the stub cannot see bytes; it mirrors the FACT side
@@ -219,7 +234,7 @@ document.addEventListener = (type, fn, opts) => {
 window.eval(__APP_JS__ + "\n" + __MEMORY_JS__ + `
 ;window.__mem = { memoryState, refreshMemory, reloadMemory, renderMemory,
   renderDetail, buildModel, confirmProposal, undoToast, memoryComposer,
-  armConfirm, postFact, patchFact, mm: () => mm,
+  armConfirm, postFact, patchFact, mm: () => mm, openMemoryDrawer,
   init: typeof init === "function" ? init : null, initMemoryTab };`);
 document.addEventListener = origAddEventListener;
 for (const listener of dclListeners) listener();
