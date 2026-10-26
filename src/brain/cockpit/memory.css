@@ -255,6 +255,9 @@ body[data-tab="memory"] #refresh-in { display: none; }
 }
 .mm-mem-top { display: flex; gap: 12px; align-items: flex-start; }
 .mm-memtext { flex: 1; margin: 0; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+.mm-mem-title { flex: 1; font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
+.mm-mem-title + .mm-memtext, .mm-mem-title + .mm-mention { flex: 2; }
+.mm-composer-title { flex: 1; min-width: 0; }
 .mm-mention {
   display: inline; border: 0; border-radius: 6px; padding: 1px 6px; margin: 0 1px;
   font: inherit; font-weight: 600; cursor: pointer;

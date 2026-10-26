@@ -174,6 +174,10 @@ class FactRead(BaseModel):
     supersedes_id: uuid.UUID | None = None
     provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+    # Populated only by supersede responses (confirm/add of a single-valued
+    # predicate): the rows the server closed, so the client can offer an
+    # Undo without deleting anything itself.
+    replaced: list["FactRead"] = Field(default_factory=list)
 
 
 class EntityRead(BaseModel):
@@ -243,6 +247,10 @@ class FactCreate(BaseModel):
     object_id: uuid.UUID | None = None
     value: str | None = Field(default=None, max_length=FACT_VALUE_MAX_LENGTH)
     valid_from: datetime | None = None
+    # Optional display title for memory facts (the composer's Title field).
+    # memory_facts has no title column; provenance is a JSONB dict every row
+    # already carries (and PATCH copies forward), so no migration is needed.
+    title: str | None = Field(default=None, max_length=200)
     # confirmed (default) or proposed (the inbox); rejected is reached via DELETE only
     status: Literal["confirmed", "proposed"] = "confirmed"
 

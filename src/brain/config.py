@@ -218,6 +218,13 @@ class Settings(BaseSettings):
     gmail_query: str = ""
     gmail_poll_interval_s: int = 60
     gmail_credentials_path: str = ""
+    # The Gmail account the connector syncs, as an email address. The SB/
+    # labeler's `--auth` REFUSES to run without it (no browser, nothing
+    # stored) and stores its token ONLY after users.getProfile reports this
+    # address (case/whitespace-insensitive) — a consent on the WRONG account
+    # must never be storable. Dry-run/--apply do not need it (env: the same
+    # GMAIL_* convention as gmail_label_id above, i.e. GMAIL_ACCOUNT).
+    gmail_account: str | None = None
     # Quota hygiene (gmail 'Total Query Cost' is 100 units/min/user, ~5 per
     # call): a minimum interval between the client's consecutive API calls.
     # 6s keeps one client at <= 10 calls/minute (<= 50 units) with headroom

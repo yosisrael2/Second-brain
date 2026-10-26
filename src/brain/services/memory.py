@@ -86,6 +86,16 @@ SINGLE_VALUED_KID_PREDICATES: frozenset[str] = frozenset(
     {"gender", "school", "grade", "class", "teacher"},
 )
 
+# The full single-valued rule (PR #136 review): birthday and anniversary
+# carry one current value each, like the kid fields. add_fact/confirm_fact
+# supersede exactly this set; restore_fact refuses a second current value
+# for exactly this set. phone/email/work/relation and every other
+# predicate stay additive (notes, memories, links).
+SINGLE_VALUED_PREDICATES: frozenset[str] = SINGLE_VALUED_KID_PREDICATES | {
+    "birthday",
+    "anniversary",
+}
+
 
 class MemoryService:
     """Confirmed-knowledge use cases over the memory repository."""
@@ -546,12 +556,33 @@ class MemoryService:
         return _entity_dict(entity, self._repo.aliases_for(entity.id))
 
     def patch_entity(self, entity_id: uuid.UUID, *, name: str | None = None) -> dict[str, Any]:
-        """Rename an entity (identity stays — facts keep pointing here)."""
+        """Rename an entity (identity stays — facts keep pointing here).
+
+        A rename to a name another live entity already carries is refused:
+        the screen's duplicate-open rule relies on names staying unique.
+        Renaming a KID also migrates that kid's applies_to values (channel
+        facts store the kid NAME — the ask kid-recall leg matches on it) in
+        the same transaction: the fact VALUES only, closed history rows and
+        item text untouched — a rename is identity, not a fact edit.
+        """
         entity = self._repo.get_entity(entity_id)
         if entity is None:
             raise KeyError(entity_id)
-        if name:
+        if name and name != entity.name:
+            clash = next(
+                (
+                    other
+                    for other in self._repo.list_entities()
+                    if other.id != entity.id and other.name == name
+                ),
+                None,
+            )
+            if clash is not None:
+                raise MemoryError(f"the name {name!r} is already taken by another entity")
+            old_name = entity.name
             entity.name = name
+            if any(kid["entity_id"] == entity.id for kid in self.kids()):
+                self._repo.retarget_applies_to(old_name, name)
         self._repo.commit()
         return _entity_dict(entity, self._repo.aliases_for(entity.id))
 
@@ -646,24 +677,38 @@ class MemoryService:
         valid_from: datetime | None = None,
         status: str = "confirmed",
         provenance: dict[str, Any] | None = None,
+        title: str | None = None,
     ) -> dict[str, Any]:
         """Insert a fact row (PR A inserts proposals with the same call).
 
-        For the SINGLE-VALUED kid predicates (set_kid's field set) a
-        confirmed add supersedes the current fact instead of piling up
-        parallel current values: an unchanged value is a no-op returning
-        the existing row, a changed value closes the old row and chains
-        the new one via supersedes_id — the same semantics set_kid uses.
-        'note' and other multi-valued predicates stay additive.
+        For the SINGLE-VALUED predicates (the kid fields plus birthday/
+        anniversary) a confirmed add supersedes the current fact instead of
+        piling up parallel current values: an unchanged value is a no-op
+        returning the existing row, a changed value closes the old row and
+        chains the new one via supersedes_id — the same semantics set_kid
+        uses. Everything else stays additive. The closed row rides back to
+        the client as ``replaced`` so the screen can offer an Undo without
+        deleting anything itself.
         """
         if self._repo.get_entity(subject_id) is None:
             raise KeyError(subject_id)
         if object_id is None and value is None:
             raise ValueError("a fact needs an object or a value")
-        supersedes = None
         if (
             status == "confirmed"
-            and predicate in SINGLE_VALUED_KID_PREDICATES
+            and predicate.startswith(CONNECTION_PREFIX)
+            and object_id is not None
+        ):
+            for fact in self._repo.current_facts(subject_ids=[subject_id], status="confirmed"):
+                if fact.predicate == predicate and fact.object_id == object_id:
+                    raise MemoryError(
+                        f"this {predicate.removeprefix(CONNECTION_PREFIX)} link already exists"
+                    )  # the same link twice is the same fact, not two facts
+        supersedes = None
+        replaced: list[dict[str, Any]] = []
+        if (
+            status == "confirmed"
+            and predicate in SINGLE_VALUED_PREDICATES
             and value is not None
         ):
             current = self._current_confirmed_fact(subject_id, predicate)
@@ -672,6 +717,7 @@ class MemoryService:
                     return _fact_dict(current)  # unchanged: no history spam
                 self._repo.close_fact(current, at=utcnow())
                 supersedes = current.id  # keep the version chain queryable
+                replaced = [_fact_dict(current)]
         fact = self._repo.add_fact(
             MemoryFact(
                 subject_id=subject_id,
@@ -681,23 +727,50 @@ class MemoryService:
                 status=status,
                 valid_from=valid_from or utcnow(),
                 supersedes_id=supersedes,
-                provenance=provenance or {"source": "user"},
+                provenance={
+                    **(provenance or {"source": "user"}),
+                    # Optional memory title (no dedicated column — see
+                    # FactCreate.title): rides in provenance, which PATCH
+                    # copies forward so edits keep it.
+                    **({"title": title} if title else {}),
+                },
             )
         )
         self._repo.commit()
-        return _fact_dict(fact)
+        saved = _fact_dict(fact)
+        saved["replaced"] = replaced
+        return saved
 
     def patch_fact(self, fact_id: uuid.UUID, **changes: Any) -> dict[str, Any]:
         """Edit a fact = close the old version + open a new one (never in-place).
 
         A CLOSED fact (superseded, or soft-deleted/rejected) must not be
         edited: that would silently resurrect history. Raise instead.
+        A connection link may not be retargeted onto a person the same
+        predicate already links to — the same duplicate rule POST enforces.
         """
         old = self._repo.get_fact(fact_id)
         if old is None:
             raise KeyError(fact_id)
         if old.valid_to is not None:
             raise MemoryError("cannot edit a closed fact (superseded or deleted)")
+        new_predicate = changes.get("predicate", old.predicate)
+        new_object_id = changes.get("object_id", old.object_id)
+        if (
+            new_predicate.startswith(CONNECTION_PREFIX)
+            and new_object_id is not None
+            and new_object_id != old.object_id
+        ):
+            for current in self._repo.current_facts(subject_ids=[old.subject_id]):
+                if (
+                    current.id != old.id
+                    and current.predicate == new_predicate
+                    and current.object_id == new_object_id
+                ):
+                    raise MemoryError(
+                        f"this {new_predicate.removeprefix(CONNECTION_PREFIX)} link "
+                        "already exists"
+                    )
         now = utcnow()
         self._repo.close_fact(old, at=now)
         new = MemoryFact(
@@ -742,13 +815,14 @@ class MemoryService:
 
         Only a fact closed by DELETE (status 'rejected') is restorable — a
         fact superseded by PATCH is history, not something to undo, and an
-        open fact has nothing to undo. A restore is ALSO refused while
-        another CURRENT fact exists for the same subject+predicate+status
-        (the user deleted "grade 5" and added "grade 6" — undoing the delete
-        must not put two current values next to each other) — EXCEPT for
-        'note' facts: free-text memories are additive by design (a person
-        carries many current notes), and blocking their Undo would make
-        every note delete-with-undo a trap.
+        open fact has nothing to undo. The restore is refused ONLY where a
+        second current value would be wrong: the single-valued predicates
+        (SINGLE_VALUED_PREDICATES — the kid fields plus birthday/
+        anniversary) refuse while any current fact of the same predicate
+        exists, and connection:* links refuse only a same-object_id
+        duplicate (a link to a different person is a different fact).
+        Everything else — notes, the memory categories, phone/email/work/
+        relation, unknown predicates — is additive and restores freely.
         """
         fact = self._repo.get_fact(fact_id)
         if fact is None:
@@ -757,16 +831,26 @@ class MemoryService:
             raise MemoryError("only a deleted fact can be restored")
         provenance = dict(fact.provenance or {})
         prior = provenance.pop("deleted_from", "confirmed")
+        single_valued = fact.predicate in SINGLE_VALUED_PREDICATES
+        is_connection = fact.predicate.startswith(CONNECTION_PREFIX)
         for current in self._repo.current_facts(subject_ids=[fact.subject_id]):
-            if (
-                fact.predicate != "note"
-                and current.id != fact.id
-                and current.predicate == fact.predicate
-                and current.status == prior
-            ):
+            if current.id == fact.id or current.predicate != fact.predicate:
+                continue
+            if current.status != prior:
+                continue
+            if single_valued:
                 raise MemoryError(
                     f"cannot restore: a current {fact.predicate!r} fact already "
                     "exists for this entity — delete or edit it first"
+                )
+            if (
+                is_connection
+                and current.object_id is not None
+                and current.object_id == fact.object_id
+            ):
+                raise MemoryError(
+                    f"cannot restore: a current {fact.predicate!r} link to the "
+                    "same person already exists — delete or edit it first"
                 )
         provenance["restored_at"] = utcnow().isoformat()
         fact.provenance = provenance
@@ -775,13 +859,78 @@ class MemoryService:
         self._repo.commit()
         return _fact_dict(fact)
 
+    def undo_supersede(self, fact_id: uuid.UUID) -> dict[str, Any]:
+        """Undo a supersede (one op): close the current row and reopen the
+        one it replaced, in a single transaction.
+
+        Allowed only while the superseding row is still CURRENT, carries
+        ``supersedes_id``, and the replaced row is closed and NOT rejected —
+        a soft-deleted row is undone via ``/restore`` instead, and 'rejected'
+        never means 'replaced by history' (a replaced grade is history, not a
+        user rejection). Anything else is a 409.
+        """
+        fact = self._repo.get_fact(fact_id)
+        if fact is None:
+            raise KeyError(fact_id)
+        previous_id = fact.supersedes_id
+        if fact.valid_to is not None or previous_id is None:
+            raise MemoryError("only a current superseding fact can be undone")
+        previous = self._repo.get_fact(previous_id)
+        if (
+            previous is None
+            or previous.valid_to is None
+            or previous.status == "rejected"
+        ):
+            raise MemoryError(
+                "the replaced fact is not undoable (deleted or already current)"
+            )
+        self._repo.close_fact(fact, at=utcnow())
+        previous.valid_to = None
+        self._repo.commit()
+        _ops("fact_undo_supersede", fact_id=fact.id, restored_id=previous.id)
+        return _fact_dict(previous)
+
     def confirm_fact(self, fact_id: uuid.UUID) -> dict[str, Any]:
-        """proposed -> confirmed (one tap from the Proposed inbox)."""
+        """proposed -> confirmed (one tap from the Proposed inbox).
+
+        For a single-valued predicate (SINGLE_VALUED_PREDICATES) the confirm
+        supersedes, like add_fact: an equal value is a no-op that closes the
+        redundant proposal and returns the surviving current row; a changed
+        value closes the current row and chains the confirmed proposal to it
+        via supersedes_id. The closed row rides back to the client as
+        ``replaced`` so the screen can offer an Undo without deleting
+        anything itself (Undo = POST /facts/{id}/undo-supersede).
+        """
         fact = self._repo.get_fact(fact_id)
         if fact is None:
             raise KeyError(fact_id)
         if fact.status != "proposed":
             raise MemoryError(f"only proposed facts can be confirmed (status={fact.status})")
+        if fact.predicate.startswith(CONNECTION_PREFIX) and fact.object_id is not None:
+            for current in self._repo.current_facts(subject_ids=[fact.subject_id]):
+                if (
+                    current.id != fact.id
+                    and current.predicate == fact.predicate
+                    and current.object_id == fact.object_id
+                ):
+                    raise MemoryError(
+                        f"this {fact.predicate.removeprefix(CONNECTION_PREFIX)} link "
+                        "already exists"
+                    )
+        if fact.predicate in SINGLE_VALUED_PREDICATES and fact.value is not None:
+            current = self._current_confirmed_fact(fact.subject_id, fact.predicate)
+            if current is not None and current.id != fact.id:
+                if current.value == fact.value:
+                    fact.valid_to = utcnow()  # subsumed by the identical current row
+                    self._repo.commit()
+                    return _fact_dict(current)
+                self._repo.close_fact(current, at=utcnow())
+                fact.status = "confirmed"
+                fact.supersedes_id = current.id
+                self._repo.commit()
+                saved = _fact_dict(fact)
+                saved["replaced"] = [_fact_dict(current)]
+                return saved
         fact.status = "confirmed"
         self._repo.commit()
         return _fact_dict(fact)

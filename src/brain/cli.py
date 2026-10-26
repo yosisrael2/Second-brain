@@ -219,8 +219,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Actually write labels (default: dry-run, zero writes)",
     )
     gmail_label.add_argument(
-        "--max-apply", type=int, default=20,
-        help="Hard per-run cap on applied labels (default: 20)",
+        "--max-apply", type=_max_apply_value, default=20,
+        help="Hard per-run cap on applied labels (1..100; default: 20) — "
+        "anything outside the range is refused before any call",
     )
     gmail_label.add_argument(
         "--max-scan", type=int, default=100,
@@ -229,9 +230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     gmail_label.add_argument(
         "--auth", action="store_true",
         help="One-time consent for the LABELER scope set (readonly + "
-        "gmail.modify); REPLACES the shared keychain refresh token the sync "
-        "also uses — a superset, so the readonly sync keeps working. The "
-        "sync path itself still requests readonly only",
+        "gmail.modify). Stores the token in the labeler's OWN keychain item "
+        "(never the sync token's item the poller uses). Requires "
+        "GMAIL_ACCOUNT: after consent the consented profile's address is "
+        "checked against it and NOTHING is stored on a mismatch",
     )
     gmail_label.add_argument("--undo", metavar="BATCH_ID", default=None,
                              help="Remove exactly the labels ONE batch added")
@@ -1358,6 +1360,27 @@ def _connectors_list() -> int:
     return 0
 
 
+def _max_apply_value(text_value: str) -> int:
+    """--max-apply accepts 1..MAX_APPLY_CEILING only: a cap you can exceed by
+    typo (or a stray ``-1``) is no cap. Argparse turns the failure into
+    usage + exit 2 before any Gmail call happens. The range shares the
+    service's MAX_APPLY_CEILING constant so the two can never drift."""
+    from brain.services.gmail_labeler import MAX_APPLY_CEILING
+
+    try:
+        value = int(text_value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid int value: {text_value!r}"
+        ) from None
+    if not 1 <= value <= MAX_APPLY_CEILING:
+        raise argparse.ArgumentTypeError(
+            f"--max-apply must be in 1..{MAX_APPLY_CEILING} (got {value}) — "
+            "the per-run cap has no unlimited mode"
+        )
+    return value
+
+
 def _gmail_label(args: argparse.Namespace) -> int:
     """The SB/ labeler: rules over headers only (no Jev, no external LLM),
     dry-run by default, label-only writes capped at --max-apply, undo-able,
@@ -1465,14 +1488,22 @@ def _labeler_gate(settings: Any) -> int:
 
 
 def _labeler_token() -> str:
-    """The keychain refresh token (the labeler's own error when absent)."""
-    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+    """The LABELER'S OWN keychain refresh token (its own keychain item —
+    never the sync token's item; a missing item is an error, never a
+    fallback)."""
+    from brain.services.gmail_labeler import (
+        LABELER_KEYCHAIN_ACCOUNT,
+        LABELER_KEYCHAIN_SERVICE,
+    )
+    from brain.services.keychain import Keychain
 
-    token = Keychain().read(GMAIL_ACCOUNT)
+    token = Keychain(service=LABELER_KEYCHAIN_SERVICE).read(LABELER_KEYCHAIN_ACCOUNT)
     if not token:
         print(
-            "gmail-label: no Google refresh token in the keychain — run "
-            "`brain gmail-label --auth` first",
+            "gmail-label: no refresh token in the labeler's own keychain item "
+            f"(service {LABELER_KEYCHAIN_SERVICE}, account "
+            f"{LABELER_KEYCHAIN_ACCOUNT}) — run `brain gmail-label --auth` "
+            "first (the sync token's item is never used)",
             file=sys.stderr,
         )
         raise SystemExit(78)
@@ -1489,13 +1520,27 @@ def _labeler_client_config(settings: Any) -> dict[str, str]:
 def _labeler_auth(settings: Any) -> int:
     """The LABELER's consent: GMAIL_LABEL_SCOPES (readonly + gmail.modify).
 
-    REPLACES the shared keychain refresh token the sync also uses — the new
-    grant is a SUPERSET, so the readonly sync keeps working (it still
-    requests readonly only). The user must know this before consenting.
+    The token goes in the LABELER'S OWN keychain item (service
+    ``second-brain-gmail-labeler``) — the sync token's item is never read,
+    written or overwritten here. Before the browser opens, GMAIL_ACCOUNT
+    (``settings.gmail_account``) must name the expected mailbox; after
+    consent, the profile's emailAddress must match it (case- and
+    whitespace-insensitive) or NOTHING is stored — a consent for the wrong
+    Google account must never be able to relabel the wrong mailbox.
     The re-consent is a USER action.
     """
     from brain.ai.gmail import GMAIL_LABEL_SCOPES
 
+    expected = (settings.gmail_account or "").strip()
+    if not expected:
+        print(
+            "gmail-label --auth: GMAIL_ACCOUNT is not set — add the Gmail "
+            "address the connector syncs to .env (e.g. "
+            "GMAIL_ACCOUNT=you@gmail.com) and re-run. Nothing was consented "
+            "or stored.",
+            file=sys.stderr,
+        )
+        return 78
     path = settings.gmail_credentials_path
     if not path:
         print(
@@ -1518,20 +1563,62 @@ def _labeler_auth(settings: Any) -> int:
     if not token:
         print("gmail-label --auth: consent returned no refresh token", file=sys.stderr)
         return 78
-    from brain.services.keychain import GMAIL_ACCOUNT, Keychain
+    # Account check BEFORE anything is stored: the profile of the JUST-
+    # consented credentials must be the configured account.
+    try:
+        profile_email = _labeler_profile_email(flow.credentials)
+    except Exception as exc:  # noqa: BLE001 — any profile failure refuses
+        print(
+            f"gmail-label --auth: could not verify the consented account "
+            f"(getProfile failed: {exc}); expected GMAIL_ACCOUNT={expected}. "
+            "Nothing was stored.",
+            file=sys.stderr,
+        )
+        return 78
+    if profile_email.strip().lower() != expected.strip().lower():
+        print(
+            f"gmail-label --auth: the consented account is {profile_email!r} "
+            f"but GMAIL_ACCOUNT is {expected!r} — refusing to store the "
+            "token (re-run with the matching account). Nothing was stored.",
+            file=sys.stderr,
+        )
+        return 78
+    from brain.services.gmail_labeler import (
+        LABELER_KEYCHAIN_ACCOUNT,
+        LABELER_KEYCHAIN_SERVICE,
+    )
+    from brain.services.keychain import Keychain
 
-    Keychain().store(GMAIL_ACCOUNT, token)
+    Keychain(service=LABELER_KEYCHAIN_SERVICE).store(LABELER_KEYCHAIN_ACCOUNT, token)
     print(
-        f"gmail-label --auth: refresh token stored in the login keychain "
-        f"(service second-brain-gmail, account {GMAIL_ACCOUNT}) for scopes: "
-        f"{', '.join(GMAIL_LABEL_SCOPES)}"
+        f"gmail-label --auth: refresh token stored in the labeler's OWN "
+        f"keychain item (service {LABELER_KEYCHAIN_SERVICE}, account "
+        f"{LABELER_KEYCHAIN_ACCOUNT}; the sync token's item was not "
+        f"touched) for scopes: {', '.join(GMAIL_LABEL_SCOPES)}"
     )
     return 0
 
 
+def _labeler_profile_email(credentials: Any) -> str:
+    """users.getProfile().emailAddress over the JUST-CONSENTED credentials
+    (the consent's own grant — never a stored token). Test seam: tests
+    monkeypatch this instead of touching Google."""
+    import googleapiclient.discovery  # noqa: PLC0415 (lazy, like the flow)
+
+    service = googleapiclient.discovery.build(
+        "gmail", "v1", credentials=credentials, cache_discovery=False
+    )
+    try:
+        raw = service.users().getProfile(userId="me").execute()
+    finally:
+        service.close()
+    return str((raw or {}).get("emailAddress") or "")
+
+
 def _labeler_client(settings: Any, *, modify: bool) -> Any:
-    """RestGmailClient over the shared keychain token, paced by the same
-    quota-hygiene interval as the connector. ``modify=False`` (the PLANNING
+    """RestGmailClient over the LABELER'S OWN keychain token (never the
+    sync token's item), paced by the same quota-hygiene interval as the
+    connector. ``modify=False`` (the PLANNING
     client — dry-run and the plan phase of --apply) requests [GMAIL_SCOPE]
     readonly ONLY: the dry-run is the first thing the user runs and today's
     token holds readonly only, so asking for modify at its refresh would
