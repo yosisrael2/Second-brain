@@ -550,8 +550,9 @@ function openSourceItem(fact) {
 let memoryRefreshSeq = 0;
 
 function memoryBusy() {
-  if (memoryState.editingField || memoryState.editingFact || memoryState.addingConnection
-    || memoryState.addingAlias || memoryState.promoting || memoryState.reviewEditing) return true;
+  // Only an ACTIVE focus blocks the poll's re-render (mid-typing caret
+  // protection). Forms that are open but blurred re-render — their typed
+  // text survives via the drafts store (mmTrackDraft on every form input).
   const active = document.activeElement;
   const panel = $("tab-memory");
   return Boolean(active && panel && panel.contains(active)
@@ -863,9 +864,12 @@ function profileHeader(entity) {
     const input = el("input", {
       type: "text", value: entity.name, dir: "auto", class: "mm-rename", "aria-label": "name",
     });
+    let saved = false;
     const save = async () => {
       const name = input.value.trim();
+      if (saved) return; // Enter AND change both land here — one PATCH only
       if (!name || name === entity.name) return;
+      saved = true;
       try {
         await api(`/memory/entities/${entity.id}`, {
           method: "PATCH",
@@ -873,7 +877,10 @@ function profileHeader(entity) {
           body: JSON.stringify({ name }),
         });
         toast("renamed");
-      } catch (error) { toast(`rename failed: ${error.message}`); }
+      } catch (error) {
+        saved = false; // a failed rename must stay retryable
+        toast(`rename failed: ${error.message}`);
+      }
       reloadMemory();
     };
     input.addEventListener("keydown", (event) => { if (event.key === "Enter") save(); });
@@ -1060,6 +1067,7 @@ function basicValue(entity, predicate, label) {
 
 function basicEditor(entity, predicate, label, fact) {
   const form = el("span", { class: "mm-form" });
+  const draftKey = `field:${entity.id}:${predicate}`;
   let input;
   if (predicate === "channel_kind" || predicate === "applies_to" || predicate === "gender") {
     input = el("select", { "aria-label": label });
@@ -1072,16 +1080,21 @@ function basicEditor(entity, predicate, label, fact) {
       if (fact && fact.value === option) node.selected = true;
       input.append(node);
     }
+    if (mmDraft(draftKey) && input.querySelector(`option[value="${CSS.escape(mmDraft(draftKey))}"]`)) {
+      input.value = mmDraft(draftKey);
+    }
   } else {
     input = el("input", {
-      type: "text", value: fact ? fact.value ?? "" : "", dir: "auto", "aria-label": label,
+      type: "text", value: mmDraft(draftKey, fact ? fact.value ?? "" : ""), dir: "auto", "aria-label": label,
       placeholder: predicate === "birthday" ? "dd.mm.yyyy" : label,
     });
   }
+  mmTrackDraft(input, draftKey);
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   const close = () => {
     memoryState.editingField = null;
+    mmClearDraft(draftKey);
     renderDetail();
   };
   cancel.addEventListener("click", close);
@@ -1090,9 +1103,29 @@ function basicEditor(entity, predicate, label, fact) {
     if (!value) { toast(`${label} must not be empty`); return; }
     if (fact && value === fact.value) { close(); return; }
     try {
-      if (fact) await patchFact(fact.id, { value });
-      else await postFact({ subject_id: entity.id, predicate, value });
+      if (fact) {
+        await patchFact(fact.id, { value });
+      } else {
+        const made = await postFact({ subject_id: entity.id, predicate, value });
+        const replaced = (made && made.replaced) || [];
+        if (replaced.length) {
+          undoToast(`replaced the previous ${label} — Undo brings it back`, async () => {
+            // Order matters: the new row must be soft-deleted BEFORE the old
+            // ones restore (restore refuses a second current value).
+            if (made && made.id) {
+              try { await api(`/memory/facts/${made.id}`, { method: "DELETE" }); }
+              catch (error) { toast(`undo failed: ${error.message}`); }
+            }
+            for (const old of replaced) {
+              try { await api(`/memory/facts/${old.id}/restore`, { method: "POST" }); }
+              catch (error) { toast(`restore failed: ${error.message}`); }
+            }
+            reloadMemory();
+          });
+        }
+      }
       memoryState.editingField = null;
+      mmClearDraft(draftKey);
       toast(`${label} saved`);
     } catch (error) { toast(`save failed: ${error.message}`); }
     reloadMemory();
@@ -1147,11 +1180,15 @@ function aliasValue(entity, dd) {
 
 function aliasAddForm(entity) {
   const form = el("span", { class: "mm-form" });
+  const draftKey = `alias:${entity.id}`;
   const input = el("input", { type: "text", placeholder: "alias (Hebrew or English)", dir: "auto", "aria-label": "alias" });
+  input.value = mmDraft(draftKey);
+  mmTrackDraft(input, draftKey);
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   cancel.addEventListener("click", () => {
     memoryState.addingAlias = false;
+    mmClearDraft(draftKey);
     renderDetail();
   });
   const submit = async () => {
@@ -1164,6 +1201,7 @@ function aliasAddForm(entity) {
         body: JSON.stringify({ alias }),
       });
       memoryState.addingAlias = false;
+      mmClearDraft(draftKey);
       toast("alias added");
     } catch (error) { toast(`add failed: ${error.message}`); }
     reloadMemory();
@@ -1230,11 +1268,15 @@ function connectionRow(row) {
 
 function connectionAddForm(entity) {
   const form = el("div", { class: "mm-form mm-conn-form" });
+  const typeKey = `conn:${entity.id}:type`;
+  const targetKey = `conn:${entity.id}:target`;
   const lead = el("span", { class: "mm-form-lead", text: `${entity.name} is the` });
   const typeSelect = el("select", { "aria-label": "connection type" });
   for (const type of CONNECTION_CHOICES) {
     typeSelect.append(el("option", { value: type, text: CONNECTION_TYPES[type].label.toLowerCase() }));
   }
+  if (mmDraft(typeKey)) typeSelect.value = mmDraft(typeKey);
+  typeSelect.addEventListener("change", () => { memoryState.drafts[typeKey] = typeSelect.value; });
   const ofLead = el("span", { class: "mm-form-lead", text: "of" });
   // "other" is not a noun: the sentence must read "A is connected to B",
   // not "A is the connected of B".
@@ -1251,22 +1293,39 @@ function connectionAddForm(entity) {
     if (candidate.id === entity.id || candidate.kind === "channel") continue;
     targetSelect.append(el("option", { value: candidate.id, text: candidate.name }));
   }
+  if (mmDraft(targetKey) && targetSelect.querySelector(`option[value="${mmDraft(targetKey)}"]`)) {
+    targetSelect.value = mmDraft(targetKey);
+  }
+  targetSelect.addEventListener("change", () => { memoryState.drafts[targetKey] = targetSelect.value; });
   form.append(targetSelect);
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   cancel.addEventListener("click", () => {
     memoryState.addingConnection = false;
+    mmClearDraft(typeKey);
+    mmClearDraft(targetKey);
     renderDetail();
   });
   save.addEventListener("click", async () => {
     if (!targetSelect.value) { toast("pick who they are connected to"); return; }
-    // a link that already exists would just be the same fact twice
-    const duplicate = (mm.links || []).some((link) => link.from === entity.id
-      && link.to === targetSelect.value
-      && (link.type === typeSelect.value || inverseType(link.type) === typeSelect.value));
+    // A link that already exists would just be the same fact twice — in
+    // EITHER storage direction: stored here (from===me, type===selected) or
+    // stored on the other profile (from===them, type===the inverse of
+    // selected). An inverse-typed link stored HERE (them is my <inverse>)
+    // is a contradiction, not a duplicate — not this guard's call.
+    const selected = typeSelect.value;
+    const isDuplicate = (link) => Boolean(link) && (
+      (link.from === entity.id && link.to === targetSelect.value && link.type === selected)
+      || (link.from === targetSelect.value && link.to === entity.id
+        && link.type === inverseType(selected)));
+    const duplicate = (mm.links || []).find(isDuplicate);
     if (duplicate) {
       const other = mm.byId.get(targetSelect.value);
-      toast(`already connected to ${other ? other.name : "them"} — edit or delete the existing link instead`);
+      // A derived link (fact: null — from the Role field) has no row to
+      // edit or delete; pointing at one would dead-end the user.
+      toast(duplicate.fact
+        ? `already connected to ${other ? other.name : "them"} — edit or delete the existing link instead`
+        : `already connected to ${other ? other.name : "them"} — that link comes from their Role field`);
       return;
     }
     try {
@@ -1276,6 +1335,8 @@ function connectionAddForm(entity) {
         object_id: targetSelect.value,
       });
       memoryState.addingConnection = false;
+      mmClearDraft(typeKey);
+      mmClearDraft(targetKey);
       toast("connection added — it shows on both profiles");
     } catch (error) { toast(`add failed: ${error.message}`); }
     reloadMemory();
@@ -1346,6 +1407,13 @@ function memoriesCard(entity) {
 function memoryComposer(entity) {
   const form = el("div", { class: "mm-composer" });
   const draftKey = `composer:${entity.id}`;
+  const titleKey = `composer:${entity.id}:title`;
+  const titleInput = el("input", {
+    type: "text", dir: "auto", class: "mm-composer-title",
+    placeholder: "Title (optional)", "aria-label": "title",
+    value: mmDraft(titleKey),
+  });
+  mmTrackDraft(titleInput, titleKey);
   const input = el("input", {
     id: "memory-new", type: "text", dir: "auto",
     placeholder: "Add a memory…",
@@ -1366,11 +1434,17 @@ function memoryComposer(entity) {
   const submit = async () => {
     const value = input.value.trim();
     if (!value) { toast("write the memory first"); return; }
+    const title = titleInput.value.trim();
     try {
-      await postFact({ subject_id: entity.id, predicate: category.value, value });
+      await postFact({
+        subject_id: entity.id, predicate: category.value, value,
+        ...(title ? { title } : {}),
+      });
       mmClearDraft(draftKey);
+      mmClearDraft(titleKey);
       mmClearDraft(`${draftKey}:category`);
       input.value = "";
+      titleInput.value = "";
       category.value = "note";
       input.blur();
       toast("remembered");
@@ -1379,7 +1453,7 @@ function memoryComposer(entity) {
   };
   save.addEventListener("click", submit);
   input.addEventListener("keydown", (event) => { if (event.key === "Enter") submit(); });
-  form.append(input, category, save);
+  form.append(titleInput, input, category, save);
   return form;
 }
 
@@ -1391,6 +1465,8 @@ function memoryCard(entity, fact, owner) {
     return card;
   }
   const top = el("div", { class: "mm-mem-top" });
+  const factTitle = fact.provenance && fact.provenance.title;
+  if (factTitle) top.append(el("span", { class: "mm-mem-title", text: factTitle, dir: "auto" }));
   top.append(mentionText(fact.value));
   const more = el("button", {
     type: "button", class: "mm-more-btn", "aria-label": "More actions",
@@ -1458,18 +1534,25 @@ function memoryActions(fact) {
 
 function memoryEditForm(fact) {
   const form = el("div", { class: "mm-form mm-mem-edit" });
+  const draftKey = `edit:${fact.id}`;
   const input = el("textarea", { dir: "auto", rows: "2", "aria-label": "memory text" });
-  input.value = fact.value ?? "";
+  input.value = mmDraft(draftKey, fact.value ?? "");
+  mmTrackDraft(input, draftKey);
   const category = el("select", { "aria-label": "category" });
   for (const key of MEMORY_CATEGORIES) {
     const option = el("option", { value: key, text: CATEGORY_LABEL[key] });
-    if (key === fact.predicate.toLowerCase()) option.selected = true;
+    if (key === mmDraft(`${draftKey}:cat`, fact.predicate.toLowerCase())) option.selected = true;
     category.append(option);
   }
+  category.addEventListener("change", () => {
+    memoryState.drafts[`${draftKey}:cat`] = category.value;
+  });
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   cancel.addEventListener("click", () => {
     memoryState.editingFact = null;
+    mmClearDraft(draftKey);
+    mmClearDraft(`${draftKey}:cat`);
     renderDetail();
   });
   save.addEventListener("click", async () => {
@@ -1478,6 +1561,8 @@ function memoryEditForm(fact) {
     try {
       await patchFact(fact.id, { value, predicate: category.value });
       memoryState.editingFact = null;
+      mmClearDraft(draftKey);
+      mmClearDraft(`${draftKey}:cat`);
     } catch (error) { toast(`edit failed: ${error.message}`); }
     reloadMemory();
   });
@@ -1490,16 +1575,21 @@ function memoryEditForm(fact) {
 // on the people it mentions), then the memory is retired (Undo-able).
 function promoteForm(owner, fact) {
   const form = el("div", { class: "mm-form mm-promote-form" });
+  const fieldKey = `promote:${fact.id}:field`;
+  const valueKey = `promote:${fact.id}:value`;
   const field = el("select", { "aria-label": "basic info field" });
   const fields = [["birthday", "Birthday"], ["anniversary", "Anniversary"], ["relation", "Role"],
     ["work", "Work"], ["phone", "Phone"], ["email", "Email"], ["school", "School"], ["teacher", "Teacher"]];
   for (const [predicate, label] of fields) field.append(el("option", { value: predicate, text: label }));
-  if (/anniversar/i.test(fact.value || "")) field.value = "anniversary";
+  if (mmDraft(fieldKey)) field.value = mmDraft(fieldKey);
+  else if (/anniversar/i.test(fact.value || "")) field.value = "anniversary";
+  field.addEventListener("change", () => { memoryState.drafts[fieldKey] = field.value; });
   const dateMatch = String(fact.value || "").match(/\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b/);
   const value = el("input", {
     type: "text", dir: "auto", "aria-label": "value",
-    value: dateMatch ? dateMatch[0] : fact.value || "",
+    value: mmDraft(valueKey, dateMatch ? dateMatch[0] : fact.value || ""),
   });
+  mmTrackDraft(value, valueKey);
   form.append(field, value);
   const others = [...mentionedIds(fact.value)].filter((id) => id !== owner.id)
     .map((id) => mm.byId.get(id)).filter((entity) => entity && entity.kind === "person");
@@ -1511,24 +1601,30 @@ function promoteForm(owner, fact) {
     const label = el("label", { class: "mm-check" });
     const box = el("input", { type: "checkbox" });
     box.checked = false;
-    boxes.push([box, other]);
+    boxes.push([box, other, label]);
     label.append(box, document.createTextNode(` also on ${other.name}'s profile`));
     label.hidden = !/^(birthday|anniversary)$/.test(field.value);
     form.append(label);
     field.addEventListener("change", () => {
-      label.hidden = !/^(birthday|anniversary)$/.test(field.value);
+      const hidden = !/^(birthday|anniversary)$/.test(field.value);
+      label.hidden = hidden;
+      if (hidden) box.checked = false; // hidden-but-checked still writes
     });
   }
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Move" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   cancel.addEventListener("click", () => {
     memoryState.promoting = null;
+    mmClearDraft(fieldKey);
+    mmClearDraft(valueKey);
     renderDetail();
   });
   save.addEventListener("click", async () => {
     const text = value.value.trim();
     if (!text) { toast("the value must not be empty"); return; }
-    const subjects = [owner, ...boxes.filter(([box]) => box.checked).map(([, other]) => other)];
+    const subjects = [owner, ...boxes
+      .filter(([box, , label]) => box.checked && !label.hidden)
+      .map(([, other]) => other)];
     const created = [];
     const patched = [];
     const errors = [];
@@ -1539,30 +1635,51 @@ function promoteForm(owner, fact) {
       const existing = factsOf(subject, field.value);
       try {
         if (existing.length) {
-          await patchFact(existing[0].id, { value: text });
-          patched.push({ id: existing[0].id, value: existing[0].value });
+          const edited = await patchFact(existing[0].id, { value: text });
+          // patch_fact closes the old row and opens a NEW one — the undo
+          // must retarget the row the server created, or it edits a closed
+          // row and 409s. (Legacy duplicates: only existing[0] is patched.)
+          patched.push({ id: (edited && edited.id) || existing[0].id, value: existing[0].value });
         } else {
           const made = await postFact({ subject_id: subject.id, predicate: field.value, value: text });
-          created.push(made ? made.id : null);
+          created.push({ id: made ? made.id : null });
         }
       } catch (error) {
         errors.push(`${subject.name}: ${error.message}`);
+        break; // atomic: stop at the first failure and roll back below
       }
     }
     if (errors.length) {
-      // never leave half-written state silently: report exactly what
-      // happened and KEEP the memory so nothing is lost.
-      toast(`move failed (${errors.join("; ")})${created.length ? ` — ${created.length} value(s) were written` : ""}`);
+      // atomic with rollback: whatever was already written to earlier
+      // subjects is undone (created rows deleted, patched rows restored),
+      // and the source memory is KEPT — nothing is lost.
+      for (const row of created) {
+        if (!row.id) continue;
+        try { await api(`/memory/facts/${row.id}`, { method: "DELETE" }); }
+        catch (error) { toast(`rollback failed: ${error.message}`); }
+      }
+      for (const previous of patched) {
+        try { await patchFact(previous.id, { value: previous.value }); }
+        catch (error) { toast(`rollback failed: ${error.message}`); }
+      }
+      toast(`move failed (${errors.join("; ")}) — the writes were rolled back`);
       memoryState.promoting = null;
       reloadMemory();
       return;
     }
+    // A MOVE, not a copy: once every basic-info write succeeded the source
+    // memory is soft-deleted (history kept), so the Undo below can restore
+    // it — a memory that stayed would duplicate the value forever.
+    try { await api(`/memory/facts/${fact.id}`, { method: "DELETE" }); }
+    catch (error) { toast(`could not remove the memory: ${error.message}`); }
     memoryState.promoting = null;
+    mmClearDraft(fieldKey);
+    mmClearDraft(valueKey);
     const names = subjects.map((s2) => s2.name).join(" and ");
     undoToast(`moved to basic info on ${names} — Undo puts it back`, async () => {
-      for (const id of created) {
-        if (!id) continue;
-        try { await api(`/memory/facts/${id}`, { method: "DELETE" }); }
+      for (const row of created) {
+        if (!row.id) continue;
+        try { await api(`/memory/facts/${row.id}`, { method: "DELETE" }); }
         catch (error) { toast(`undo failed: ${error.message}`); }
       }
       for (const previous of patched) {
@@ -1722,11 +1839,15 @@ function reviewCard({ subject, fact, kind }) {
 
 function reviewEditForm(fact) {
   const form = el("div", { class: "mm-form" });
-  const input = el("input", { type: "text", dir: "auto", value: fact.value ?? "", "aria-label": "corrected value" });
+  const draftKey = `review:${fact.id}`;
+  const input = el("input", { type: "text", dir: "auto", "aria-label": "corrected value" });
+  input.value = mmDraft(draftKey, fact.value ?? "");
+  mmTrackDraft(input, draftKey);
   const save = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Save & confirm" });
   const cancel = el("button", { type: "button", class: "btn btn-sm btn-ghost", text: "Cancel" });
   cancel.addEventListener("click", () => {
     memoryState.reviewEditing = null;
+    mmClearDraft(draftKey);
     renderReview();
   });
   save.addEventListener("click", async () => {
@@ -1735,6 +1856,7 @@ function reviewEditForm(fact) {
     try {
       const edited = await patchFact(fact.id, { value });
       memoryState.reviewEditing = null;
+      mmClearDraft(draftKey);
       const subject = mm.byId.get(fact.subject_id) || { id: fact.subject_id, name: "" };
       await confirmProposal(subject, edited, reviewKind(edited));
     } catch (error) {
@@ -1748,36 +1870,28 @@ function reviewEditForm(fact) {
   return form;
 }
 
-// Basic-info supersede whitelist: only these fields carry ONE current
-// value (PERSON_BASIC + KID_BASIC minus the multi-valued aliases).
-// Everything else (applies_to, activity, allergy, connection:*, ...) is
-// multi-valued — confirming one proposal must never delete its siblings.
-const SINGLE_VALUED_BASIC = new Set(
-  [...PERSON_BASIC, ...KID_BASIC].map(([predicate]) => predicate).filter((p) => p !== "aliases"),
-);
-
-// Confirm in place; for single-valued basic fields the value it replaces is
-// closed (soft delete, history kept) with an Undo toast; multi-valued
-// fields keep every existing entry.
+// Confirm in place. The server supersedes single-valued basic fields
+// itself (SINGLE_VALUED_PREDICATES in services/memory.py) and returns the
+// rows it closed as `replaced`; the Undo toast restores them. The client
+// never deletes siblings on its own — multi-valued fields keep every
+// existing entry.
 async function confirmProposal(subject, fact, kind) {
   try {
-    await api(`/memory/facts/${fact.id}/confirm`, { method: "POST" });
-    if (kind === "basic" && SINGLE_VALUED_BASIC.has(fact.predicate)) {
-      const entity = mm.byId.get(subject.id);
-      const previous = entity ? factsOf(entity, fact.predicate).filter((old) => old.id !== fact.id) : [];
-      for (const old of previous) {
-        try { await api(`/memory/facts/${old.id}`, { method: "DELETE" }); } catch { /* already closed */ }
-      }
-      if (previous.length) {
-        const label = fact.predicate;
-        undoToast(`replaced the previous ${label} — Undo brings it back`, async () => {
-          for (const old of previous) {
-            try { await api(`/memory/facts/${old.id}/restore`, { method: "POST" }); }
-            catch (error) { toast(`restore failed: ${error.message}`); }
-          }
-          reloadMemory();
-        });
-      }
+    const saved = await api(`/memory/facts/${fact.id}/confirm`, { method: "POST" });
+    const replaced = (saved && saved.replaced) || [];
+    if (replaced.length) {
+      undoToast(`replaced the previous ${fact.predicate} — Undo brings it back`, async () => {
+        // Order matters: restore refuses a second current single-valued
+        // fact, so the confirmed replacement is soft-deleted BEFORE the old
+        // rows come back — restoring first 409s on the real server.
+        try { await api(`/memory/facts/${saved.id}`, { method: "DELETE" }); }
+        catch (error) { toast(`undo failed: ${error.message}`); }
+        for (const old of replaced) {
+          try { await api(`/memory/facts/${old.id}/restore`, { method: "POST" }); }
+          catch (error) { toast(`restore failed: ${error.message}`); }
+        }
+        reloadMemory();
+      });
     }
     toast(`saved to ${subject.name || "memory"}`);
   } catch (error) { toast(`confirm failed: ${error.message}`); }

@@ -2,9 +2,18 @@
 // then runs one scenario and prints ONE JSON line with its checks.
 // Placeholders (replaced by tests/_jsdom_screen.py before execution):
 // are replaced by tests/_jsdom_screen.py before execution.
+// A missing jsdom is a loud FAILURE under CI=1 — a silent skip let the
+// screen-behavior suite "pass" in CI without running a single check.
 let JSDOMCtor = null;
 try { ({ JSDOM: JSDOMCtor } = await import('jsdom')); }
-catch { console.log(JSON.stringify({ skipped: 'jsdom not installed' })); process.exit(0); }
+catch {
+  if (process.env.CI) {
+    console.log(JSON.stringify({ failed: 'jsdom not installed (CI requires it — npm install --prefix . jsdom)' }));
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ skipped: 'jsdom not installed' }));
+  process.exit(0);
+}
 
 const JSDOM = JSDOMCtor;
 
@@ -12,17 +21,52 @@ const dom = new JSDOM(__HTML__, { url: 'http://localhost/cockpit', runScripts: '
 const { window } = dom;
 const { document } = window;
 
-// ---- fetch stub with call log ----
+// ---- fetch stub: a small HONEST backend, not an echo ----
+// It mirrors services/memory.py so the client cannot pass on a lie:
+//   • add/confirm of a single-valued predicate supersedes the current row
+//     and the response carries the displaced rows as `replaced`;
+//   • PATCH closes the old row and opens a NEW id — editing a closed row 409s;
+//   • DELETE soft-deletes (status 'rejected'); POST /restore refuses to run
+//     while a second current single-valued fact would result, and refuses
+//     rows that were not soft-deleted (superseded history stays history);
+//   • connection links refuse exact duplicates on add/patch/confirm.
 const fixtures = __FIXTURES__;
 const calls = [];
+const SINGLE_VALUED = new Set(['gender', 'school', 'grade', 'class', 'teacher', 'birthday', 'anniversary']);
+const CONN = 'connection:';
+const rows = new Map();   // id -> { fact, open, status, deletedFrom }
+for (const group of [...(fixtures.entities ?? []), ...(fixtures.proposed ?? [])]) {
+  for (const f of group.facts ?? []) {
+    rows.set(f.id, {
+      fact: { ...f },
+      open: !f.valid_to,   // a row already closed in the fixture stays closed
+      status: f.status ?? 'confirmed',
+      deletedFrom: null,
+    });
+  }
+}
+let seq = 0;
+const nextId = () => `new-${++seq}`;
+const rowById = (id) => rows.get(id) ?? null;
+const openRows = (subjectId, predicate) => [...rows.values()].filter((r) => r.open
+  && r.fact.subject_id === subjectId && r.fact.predicate === predicate);
+const supersedeClose = (row) => {
+  row.open = false;
+  row.deletedFrom = row.status;   // displaced rows stay undoable (restorable)
+  row.status = 'rejected';
+};
 window.fetch = async (path, options) => {
   const url = String(path);
-  calls.push({ url, method: (options?.method ?? 'GET'), body: options?.body ? JSON.parse(options.body) : null });
-  const respond = (status, payload) => ({
-    ok: status < 400, status,
-    json: async () => payload,
-    text: async () => JSON.stringify(payload),
-  });
+  const method = options?.method ?? 'GET';
+  const body = options?.body ? JSON.parse(options.body) : null;
+  const respond = (status, payload) => {
+    calls.push({ url, method, body, status });
+    return {
+      ok: status < 400, status,
+      json: async () => payload,
+      text: async () => JSON.stringify(payload),
+    };
+  };
   if (url.startsWith('/memory?status=proposed')) return respond(200, { entities: fixtures.proposed ?? [] });
   if (url === '/memory' || url.startsWith('/memory?')) return respond(200, { entities: fixtures.entities ?? [] });
   if (url.startsWith('/ops/health')) return respond(200, fixtures.health ?? { overall: 'ok', degraded: [], components: { api: { details: { version: 'jsdom' } } } });
@@ -30,21 +74,94 @@ window.fetch = async (path, options) => {
   if (url.startsWith('/ops/stats')) return respond(200, fixtures.stats ?? {});
   if (url.startsWith('/ops/events')) return respond(200, []);
   if (url.startsWith('/ops/')) return respond(200, {});
-  // mutations echo a plausible fact/entity
-  const body = options?.body ? JSON.parse(options.body) : null;
-  if (options?.method === 'DELETE') return respond(204, null);
-  return respond(201, { id: 'new-1', ...body });
+  if (method === 'POST' && url === '/memory/facts') {
+    if (body.predicate?.startsWith(CONN) && body.object_id
+      && openRows(body.subject_id, body.predicate).some((r) => r.fact.object_id === body.object_id)) {
+      return respond(409, { detail: 'this link already exists' });
+    }
+    const made = { id: nextId(), ...body, supersedes_id: null, provenance: { source: 'user' } };
+    if (body.status !== 'proposed' && SINGLE_VALUED.has(body.predicate) && body.value) {
+      const cur = openRows(body.subject_id, body.predicate).find((r) => r.status === 'confirmed');
+      if (cur) {
+        if (cur.fact.value === body.value) return respond(200, { ...cur.fact, replaced: [] });
+        supersedeClose(cur);
+        made.supersedes_id = cur.fact.id;
+        made.replaced = [cur.fact];
+      }
+    }
+    rows.set(made.id, { fact: made, open: true, status: made.status ?? 'confirmed', deletedFrom: null });
+    return respond(201, made);
+  }
+  const patchMatch = url.match(/^\/memory\/facts\/([^/]+)$/);
+  if (method === 'PATCH' && patchMatch) {
+    const row = rowById(patchMatch[1]);
+    if (!row || !row.open) return respond(409, { detail: 'cannot edit a closed fact (superseded or deleted)' });
+    if (row.fact.predicate?.startsWith(CONN) && body.object_id && body.object_id !== row.fact.object_id
+      && openRows(row.fact.subject_id, row.fact.predicate)
+        .some((r) => r.fact.id !== row.fact.id && r.fact.object_id === body.object_id)) {
+      return respond(409, { detail: 'this link already exists' });
+    }
+    row.open = false;   // superseded by PATCH: history, NOT restorable
+    const made = { ...row.fact, ...body, id: nextId(), supersedes_id: row.fact.id };
+    rows.set(made.id, { fact: made, open: true, status: row.status, deletedFrom: null });
+    return respond(200, made);
+  }
+  if (method === 'DELETE' && patchMatch) {
+    const row = rowById(patchMatch[1]);
+    if (!row || !row.open) return respond(409, { detail: 'fact is already closed' });
+    row.open = false;
+    row.deletedFrom = row.status;
+    row.status = 'rejected';
+    return respond(204, null);
+  }
+  const confirmMatch = url.match(/^\/memory\/facts\/([^/]+)\/confirm$/);
+  if (method === 'POST' && confirmMatch) {
+    const row = rowById(confirmMatch[1]);
+    if (!row || !row.open || row.status !== 'proposed') {
+      return respond(409, { detail: 'only proposed facts can be confirmed' });
+    }
+    if (SINGLE_VALUED.has(row.fact.predicate) && row.fact.value) {
+      const cur = openRows(row.fact.subject_id, row.fact.predicate)
+        .find((r) => r.status === 'confirmed' && r.fact.id !== row.fact.id);
+      if (cur) {
+        if (cur.fact.value === row.fact.value) {
+          row.open = false; row.status = 'rejected';   // subsumed by the current row
+          return respond(200, { ...cur.fact, replaced: [] });
+        }
+        supersedeClose(cur);
+        row.status = 'confirmed';
+        row.fact.supersedes_id = cur.fact.id;
+        return respond(200, { ...row.fact, status: 'confirmed', replaced: [cur.fact] });
+      }
+    }
+    row.status = 'confirmed';
+    return respond(200, { ...row.fact, status: 'confirmed', replaced: [] });
+  }
+  const restoreMatch = url.match(/^\/memory\/facts\/([^/]+)\/restore$/);
+  if (method === 'POST' && restoreMatch) {
+    const row = rowById(restoreMatch[1]);
+    if (!row || row.open || row.status !== 'rejected') {
+      return respond(409, { detail: 'only a deleted fact can be restored' });
+    }
+    const prior = row.deletedFrom ?? 'confirmed';
+    const others = openRows(row.fact.subject_id, row.fact.predicate).filter((r) => r.fact.id !== row.fact.id);
+    if (SINGLE_VALUED.has(row.fact.predicate) && others.some((r) => r.status === prior)) {
+      return respond(409, { detail: `cannot restore: a current ${row.fact.predicate} fact already exists for this entity` });
+    }
+    if (row.fact.predicate?.startsWith(CONN)
+      && others.some((r) => r.status === prior && r.fact.object_id && r.fact.object_id === row.fact.object_id)) {
+      return respond(409, { detail: `cannot restore: a current ${row.fact.predicate} link to the same person already exists` });
+    }
+    row.open = true;
+    row.status = prior;
+    return respond(200, row.fact);
+  }
+  if (method === 'DELETE') return respond(204, null);
+  return respond(200, { id: url.split('/').filter(Boolean).pop(), ...body });
 };
 
 // jsdom does no layout: report desktop (>=721px) so the screen's own
 // matchMedia gates behave like the desktop browser the screen targets.
-window.matchMedia = (query) => ({
-  matches: query.includes("min-width") && !query.includes("max-width"),
-  media: query,
-  addEventListener() {}, removeEventListener() {},
-  addListener() {}, removeListener() {}, onchange: null, dispatchEvent: () => false,
-});
-
 window.matchMedia = (query) => ({
   matches: query.includes("min-width") && !query.includes("max-width"),
   media: query,

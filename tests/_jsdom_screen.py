@@ -8,6 +8,7 @@ unavailable, so CI without jsdom still runs the service/API tests.
 """
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,6 +30,11 @@ def screen_behavior(scenario: str, fixtures: dict) -> dict:
     """
     node = shutil.which("node")
     if node is None:
+        if os.environ.get("CI"):
+            raise AssertionError(
+                "node not available but CI is set — the screen-behavior tests "
+                "must never silently skip in CI"
+            )
         pytest.skip("node not available")
     client = TestClient(create_app())
     html = client.get("/cockpit").text
@@ -42,7 +48,10 @@ def screen_behavior(scenario: str, fixtures: dict) -> dict:
     script = script.replace("__SCENARIO__", scenario)
     result = subprocess.run(
         [node, "--input-type=module", "-"],
-        input=script, capture_output=True, text=True, timeout=120,
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if result.returncode != 0:
         tail = result.stdout[-2000:]
@@ -55,7 +64,14 @@ def screen_behavior(scenario: str, fixtures: dict) -> dict:
         raise AssertionError(f"runner printed no JSON: {out} {errs}")
     payload = json.loads(lines[-1])
     if payload.get("skipped"):
+        if os.environ.get("CI"):
+            raise AssertionError(
+                f"jsdom missing but CI is set — the screen-behavior tests "
+                f"must never silently skip in CI ({payload['skipped']})"
+            )
         pytest.skip(payload["skipped"])
+    if payload.get("failed"):
+        raise AssertionError(payload["failed"])
     return payload
 
 

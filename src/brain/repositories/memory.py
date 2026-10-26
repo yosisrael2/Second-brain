@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from brain.db.models import Entity, EntityAlias, MemoryFact, MemoryItem
@@ -78,6 +78,22 @@ class MemoryRepository:
         self._flush(alias)
         return alias
 
+    def retarget_applies_to(self, old_name: str, new_name: str) -> int:
+        """Point current applies_to facts at a renamed kid (a rename is
+        identity, not a fact edit: the values migrate in place, closed
+        history rows keep the old name). Returns the row count."""
+        result = self._db.execute(
+            update(MemoryFact)
+            .where(
+                MemoryFact.valid_to.is_(None),
+                MemoryFact.predicate == "applies_to",
+                MemoryFact.value == old_name,
+            )
+            .values(value=new_name)
+        )
+        self._db.flush()
+        return int(result.rowcount or 0)
+
     def delete_alias(self, entity_id: uuid.UUID, alias: str) -> None:
         self._db.query(EntityAlias).filter(
             EntityAlias.entity_id == entity_id, EntityAlias.alias == alias
@@ -139,9 +155,7 @@ class MemoryRepository:
     def search_entities(self, needle: str) -> list[Entity]:
         """Entities whose name or one of whose aliases matches the needle."""
         pattern = f"%{needle}%"
-        alias_match = select(EntityAlias.entity_id).where(
-            EntityAlias.alias.ilike(pattern)
-        )
+        alias_match = select(EntityAlias.entity_id).where(EntityAlias.alias.ilike(pattern))
         stmt = (
             select(Entity)
             .where(Entity.name.ilike(pattern) | Entity.id.in_(alias_match))

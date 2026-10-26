@@ -78,11 +78,13 @@ def rename_entity(
     data: schemas.EntityPatch,
     service: MemoryService = Depends(get_memory_service),
 ) -> schemas.EntityRead:
-    """Rename an entity; 404 when missing."""
+    """Rename an entity; 404 when missing, 409 when the name is taken."""
     try:
         entity = service.patch_entity(entity_id, **data.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"entity '{entity_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     return schemas.EntityRead.model_validate(entity)
 
 
@@ -218,12 +220,11 @@ def remove_alias(
     """Remove one alias; 404 when the entity or the alias is unknown.
 
     ``:path`` so an alias containing "/" (percent-encoded by the client)
-    still routes here instead of 404ing on the extra segment. Clients may
-    deliver it single- or double-encoded (httpx re-encodes '%'); unquote
-    accepts both."""
-    from urllib.parse import unquote  # noqa: PLC0415 — stdlib, per-call fine
-
-    alias = unquote(alias).rstrip("/")
+    still routes here instead of 404ing on the extra segment. The framework
+    decodes the path parameter exactly once — a second unquote here mangled
+    aliases containing a literal '%' ('R%41' became 'RA'), and the old
+    rstrip('/') corrupted aliases that genuinely end in a slash.
+    """
     if not alias:
         raise HTTPException(status_code=404, detail="empty alias")
     try:

@@ -19,12 +19,14 @@ brain.main:app, so it inherits the production binding (uvicorn --host
 127.0.0.1, scripts/run-server.sh) — no new exposure.
 """
 
+import asyncio
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -533,9 +535,7 @@ def test_restore_fact_refused_when_a_current_fact_exists(
 # --- review round 1: family summary week bounds follow the local clock (4) ----
 
 
-def test_family_summary_week_starts_local_monday_midnight(
-    clean_memory: None, monkeypatch
-) -> None:
+def test_family_summary_week_starts_local_monday_midnight(clean_memory: None, monkeypatch) -> None:
     """An item at local Monday 00:30 (Jerusalem) belongs to THIS week even
     though its UTC instant falls on Sunday evening. The timezone is pinned
     (CI hosts run UTC — the bound must come from settings, not the host)."""
@@ -586,21 +586,15 @@ def _seed_item_raw(**overrides) -> uuid.UUID:
     return item_id
 
 
-def test_family_summary_hides_noise_and_superseded(
-    client: TestClient, clean_memory: None
-) -> None:
+def test_family_summary_hides_noise_and_superseded(client: TestClient, clean_memory: None) -> None:
     """Superseded and triage-noise items in the week are absent — the same
     default-hidden conditions every other listing uses (#98)."""
     noa = _add_entity(client, name="Noa")
     _add_fact(client, noa["id"], predicate="grade", value="ה")
     _visible = _seed_item_raw(raw_text="visible item")  # kept
     replacement = _seed_item_raw(raw_text="current wording")
-    superseded = _seed_item_raw(
-        raw_text="old wording", superseded_by=str(replacement)
-    )
-    noise = _seed_item_raw(
-        raw_text="triage noise", extraction_meta='{"cancelled": true}'
-    )
+    superseded = _seed_item_raw(raw_text="old wording", superseded_by=str(replacement))
+    noise = _seed_item_raw(raw_text="triage noise", extraction_meta='{"cancelled": true}')
 
     response = client.get(f"{_ENDPOINT}/family-summary?on=2025-10-22")
 
@@ -685,9 +679,7 @@ def test_restore_note_fact_allowed_next_to_other_notes(
 # --- 12. single-valued kid predicates supersede (one current value) -----------
 
 
-def test_add_fact_supersedes_current_grade_fact(
-    client: TestClient, clean_memory: None
-) -> None:
+def test_add_fact_supersedes_current_grade_fact(client: TestClient, clean_memory: None) -> None:
     """Posting a second current value for a single-valued kid predicate
     (the set_kid field set) must leave ONE current fact: the old row is
     closed and chained via supersedes_id, exactly as set_kid does. The
@@ -700,7 +692,8 @@ def test_add_fact_supersedes_current_grade_fact(
 
     assert second["supersedes_id"] == first["id"]
     grades = [
-        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        fact
+        for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
         if fact["predicate"] == "grade"
     ]
     assert len(grades) == 1
@@ -716,16 +709,22 @@ def test_add_fact_same_single_valued_value_is_idempotent(
     entity = _add_entity(client, name="Noa")
     first = _add_fact(client, entity["id"], predicate="grade", value="ה")
 
-    response = client.post(f"{_ENDPOINT}/facts", json={
-        "subject_id": entity["id"], "predicate": "grade", "value": "ה",
-    })
+    response = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "grade",
+            "value": "ה",
+        },
+    )
 
     # 201 with the EXISTING row — the API's established idempotent style
     # (add_entity returns 201 for a re-add of the same row too).
     assert response.status_code == 201, response.text
     assert response.json()["id"] == first["id"]
     grades = [
-        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        fact
+        for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
         if fact["predicate"] == "grade"
     ]
     assert len(grades) == 1
@@ -739,7 +738,8 @@ def test_note_facts_stay_additive(client: TestClient, clean_memory: None) -> Non
     _add_fact(client, entity["id"], predicate="note", value="chess club maybe")
 
     notes = [
-        fact for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        fact
+        for fact in client.get(_ENDPOINT).json()["entities"][0]["facts"]
         if fact["predicate"] == "note"
     ]
     assert sorted(fact["value"] for fact in notes) == ["chess club maybe", "swims Fridays"]
@@ -767,9 +767,7 @@ def test_single_valued_set_matches_set_kid_signature(
 # --- 13. Undo of delete: multi-valued classes stay restorable -----------------
 
 
-def test_restore_connection_to_other_child_allowed(
-    client: TestClient, clean_memory: None
-) -> None:
+def test_restore_connection_to_other_child_allowed(client: TestClient, clean_memory: None) -> None:
     """connection:* facts are multi-valued (one per related person, keyed by
     object_id): deleting the link to Itamar must be Undo-able even though a
     connection:child to Rona still exists. The single-value guard must
@@ -778,12 +776,18 @@ def test_restore_connection_to_other_child_allowed(
     rona = _add_entity(client, name="Rona")
     itamar = _add_entity(client, name="Itamar")
     _add_fact(
-        client, entity["id"], predicate="connection:child",
-        object_id=rona["id"], value=None,
+        client,
+        entity["id"],
+        predicate="connection:child",
+        object_id=rona["id"],
+        value=None,
     )
     to_itamar = _add_fact(
-        client, entity["id"], predicate="connection:child",
-        object_id=itamar["id"], value=None,
+        client,
+        entity["id"],
+        predicate="connection:child",
+        object_id=itamar["id"],
+        value=None,
     )
     client.delete(f"{_ENDPOINT}/facts/{to_itamar['id']}")
 
@@ -858,9 +862,313 @@ def test_restore_memory_category_facts_stay_additive(
     assert values == ["library Tuesdays", "swims Fridays"]
 
 
-def test_alias_containing_a_slash_can_be_removed(
+# --- 14. review-round follow-ups (PR #136): confirm supersede, one set, rename --
+
+
+def test_confirm_proposed_grade_supersedes_current(client: TestClient, clean_memory: None) -> None:
+    """Confirming a PROPOSED single-valued fact next to a current one must
+    supersede, not pile a second current value: the new value is confirmed
+    with supersedes_id chained to the closed one."""
+    entity = _add_entity(client, name="Noa")
+    old = _add_fact(client, entity["id"], predicate="grade", value="2")
+    proposed = _add_fact(
+        client,
+        entity["id"],
+        predicate="grade",
+        value="3",
+        status="proposed",
+    )
+
+    response = client.post(f"{_ENDPOINT}/facts/{proposed['id']}/confirm")
+
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["id"] == proposed["id"]
+    assert saved["supersedes_id"] == old["id"], saved
+    current = [
+        f for f in client.get(_ENDPOINT).json()["entities"][0]["facts"] if f["predicate"] == "grade"
+    ]
+    assert [f["value"] for f in current] == ["3"], current
+
+
+def test_confirm_proposed_equal_value_adds_no_duplicate(
     client: TestClient, clean_memory: None
 ) -> None:
+    """Confirming a proposal whose value equals the current one is a no-op:
+    one current fact survives (the existing row), the proposal leaves the
+    inbox, and the response names the surviving row."""
+    entity = _add_entity(client, name="Noa")
+    current = _add_fact(client, entity["id"], predicate="grade", value="2")
+    proposed = _add_fact(
+        client,
+        entity["id"],
+        predicate="grade",
+        value="2",
+        status="proposed",
+    )
+
+    response = client.post(f"{_ENDPOINT}/facts/{proposed['id']}/confirm")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == current["id"], response.text
+    grades = [
+        f for f in client.get(_ENDPOINT).json()["entities"][0]["facts"] if f["predicate"] == "grade"
+    ]
+    assert [f["value"] for f in grades] == ["2"], grades
+    inbox = client.get(f"{_ENDPOINT}?status=proposed").json()["entities"]
+    assert inbox == [], inbox
+
+
+def test_confirm_proposed_note_stays_additive(client: TestClient, clean_memory: None) -> None:
+    """Notes are free-text memories: confirming one never closes another."""
+    entity = _add_entity(client, name="Noa")
+    _add_fact(client, entity["id"], predicate="note", value="likes libraries")
+    proposed = _add_fact(
+        client,
+        entity["id"],
+        predicate="note",
+        value="swims Fridays",
+        status="proposed",
+    )
+
+    response = client.post(f"{_ENDPOINT}/facts/{proposed['id']}/confirm")
+
+    assert response.status_code == 200, response.text
+    notes = [
+        f["value"]
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "note"
+    ]
+    assert sorted(notes) == ["likes libraries", "swims Fridays"], notes
+
+
+def test_restore_phone_with_another_current_phone_is_additive(
+    client: TestClient, clean_memory: None
+) -> None:
+    """phone/email/work/relation are multi-valued: deleting one of two
+    current phones must be Undo-able (the pre-#136 guard 409'd everything
+    not note/memory-category/connection)."""
+    entity = _add_entity(client, name="Noa")
+    home = _add_fact(client, entity["id"], predicate="phone", value="050-1")
+    work = _add_fact(client, entity["id"], predicate="phone", value="050-2")
+    client.delete(f"{_ENDPOINT}/facts/{home['id']}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{home['id']}/restore")
+
+    assert response.status_code == 200, response.text
+    phones = sorted(
+        f["value"]
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "phone"
+    )
+    assert phones == ["050-1", "050-2"], phones
+    assert work["id"]
+
+
+def test_restore_birthday_with_current_birthday_refused(
+    client: TestClient, clean_memory: None
+) -> None:
+    """birthday/anniversary are single-valued like the kid fields: a deleted
+    birthday may not be restored next to a current one (state built through
+    the repo — add_fact supersedes, so the API cannot create the pair)."""
+    import uuid as _uuid
+
+    from brain.db.models import MemoryFact
+
+    entity = _add_entity(client, name="Noa")
+    with _memory_service_for_tests() as service:
+        for value in ("1.1.2010", "2.2.2011"):
+            service._repo.add_fact(
+                MemoryFact(
+                    subject_id=_uuid.UUID(entity["id"]),
+                    predicate="birthday",
+                    object_id=None,
+                    value=value,
+                    status="confirmed",
+                    valid_from=datetime.now(ZoneInfo("UTC")),
+                    supersedes_id=None,
+                    provenance={"source": "user"},
+                )
+            )
+        service._repo.commit()
+    duo = [
+        f
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "birthday"
+    ]
+    assert len(duo) == 2, duo
+    victim = duo[0]
+    client.delete(f"{_ENDPOINT}/facts/{victim['id']}")
+
+    response = client.post(f"{_ENDPOINT}/facts/{victim['id']}/restore")
+
+    assert response.status_code == 409, response.text
+
+
+def test_add_second_birthday_supersedes_and_chains(client: TestClient, clean_memory: None) -> None:
+    """Posting a second birthday closes the old one and chains the new row
+    via supersedes_id — one current value, history queryable."""
+    entity = _add_entity(client, name="Noa")
+    old = _add_fact(client, entity["id"], predicate="birthday", value="1.1.2010")
+
+    response = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "birthday",
+            "value": "2.2.2011",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    assert saved["supersedes_id"] == old["id"], saved
+    birthdays = [
+        f
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "birthday"
+    ]
+    assert [f["value"] for f in birthdays] == ["2.2.2011"], birthdays
+
+
+def test_superseded_birthday_restores_after_the_replacement_is_deleted(
+    client: TestClient, clean_memory: None
+) -> None:
+    """The undo of a superseding add must WORK on the real server: the
+    displaced row is soft-deleted (deleted_from captured), so after the
+    replacement is deleted the old value restores (200) and is current
+    again — not the 409 'only a deleted fact can be restored'."""
+    entity = _add_entity(client, name="Noa")
+    old = _add_fact(client, entity["id"], predicate="birthday", value="1.1.2010")
+    made = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "birthday",
+            "value": "2.2.2011",
+        },
+    )
+    assert made.status_code == 201, made.text
+    new_fact = made.json()
+    assert [r["id"] for r in new_fact["replaced"]] == [old["id"]], new_fact
+
+    deleted = client.delete(f"{_ENDPOINT}/facts/{new_fact['id']}")
+    assert deleted.status_code == 204, deleted.text
+
+    restored = client.post(f"{_ENDPOINT}/facts/{old['id']}/restore")
+
+    assert restored.status_code == 200, restored.text
+    birthdays = [
+        f["value"]
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "birthday"
+    ]
+    assert birthdays == ["1.1.2010"], birthdays
+
+
+def test_restoring_superseded_birthday_while_replacement_is_current_refused(
+    client: TestClient, clean_memory: None
+) -> None:
+    """The restore guard holds for displaced rows too: while the replacement
+    is still current, restoring the old birthday would create a second
+    current value — refused with 409 (the client's undo deletes the
+    replacement FIRST, then restores)."""
+    entity = _add_entity(client, name="Noa")
+    old = _add_fact(client, entity["id"], predicate="birthday", value="1.1.2010")
+    made = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "birthday",
+            "value": "2.2.2011",
+        },
+    )
+    assert made.status_code == 201, made.text
+
+    response = client.post(f"{_ENDPOINT}/facts/{old['id']}/restore")
+
+    assert response.status_code == 409, response.text
+
+
+def test_rename_kid_migrates_applies_to_values(client: TestClient, clean_memory: None) -> None:
+    """applies_to facts store the kid NAME, so renaming a kid must migrate
+    that entity's applies_to values in the same transaction — otherwise the
+    ask kid-recall leg silently loses every channel."""
+    kid = _add_entity(client, name="Noa")
+    _add_fact(client, kid["id"], predicate="grade", value="4")
+    channel = _add_entity(client, name="דמו: קבוצה א׳", kind="channel")
+    _add_fact(
+        client,
+        channel["id"],
+        predicate="applies_to",
+        value="Noa",
+    )
+
+    response = client.patch(
+        f"{_ENDPOINT}/entities/{kid['id']}",
+        json={"name": "Noa Levi"},
+    )
+
+    assert response.status_code == 200, response.text
+    links = [
+        f["value"]
+        for f in client.get(_ENDPOINT).json()["entities"]
+        if f["id"] == channel["id"]
+        for f in f["facts"]
+        if f["predicate"] == "applies_to"
+    ]
+    assert links == ["Noa Levi"], links
+    with _memory_service_for_tests() as service:
+        assert "דמו: קבוצה א׳" in service.channel_names_for_kid("Noa Levi")
+
+
+def test_rename_refuses_an_existing_name(client: TestClient, clean_memory: None) -> None:
+    """A rename to a name another entity already carries is refused (409):
+    the screen's duplicate-open rule relies on names staying unique."""
+    noa = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+
+    response = client.patch(
+        f"{_ENDPOINT}/entities/{noa['id']}",
+        json={"name": "Rona"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert rona["id"]
+
+
+def test_add_memory_with_a_title_stores_it_in_provenance(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Minor a (PR #136 review): the add-memory form gains an optional Title.
+    memory_facts has NO title column — the smallest no-migration storage is
+    provenance['title'] (a JSONB dict every row already carries, and which
+    PATCH copies forward, so edits keep the title)."""
+    entity = _add_entity(client, name="Noa")
+
+    response = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "note",
+            "value": "She danced all evening",
+            "title": "Dance recital",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    saved = response.json()
+    assert saved["provenance"].get("title") == "Dance recital", saved
+
+    edited = client.patch(
+        f"{_ENDPOINT}/facts/{saved['id']}",
+        json={"value": "She danced twice"},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["provenance"].get("title") == "Dance recital", edited.json()
+
+
+def test_alias_containing_a_slash_can_be_removed(client: TestClient, clean_memory: None) -> None:
     """An alias like 'a/b' must be removable: the path segment arrives
     percent-encoded and the route must decode it (it 404'd before)."""
     entity = _add_entity(client, name="Noa")
@@ -876,24 +1184,138 @@ def test_alias_containing_a_slash_can_be_removed(
     assert "a/b" not in names
 
 
-def test_add_fact_refuses_a_duplicate_connection(
+def test_alias_with_a_percent_sequence_is_not_double_decoded(
     client: TestClient, clean_memory: None
 ) -> None:
+    """A literal '%' in an alias must survive the round trip ('R%41' must
+    not arrive as 'RA'). The route's extra unquote was one offender; the
+    other is TestClient itself, which unquotes scope['path'] a second time
+    (httpx's url.path is already decoded). uvicorn delivers scope['path']
+    decoded EXACTLY once (ASGI spec), so the honest boundary is
+    httpx.ASGITransport, which passes url.path through untouched."""
+    entity = _add_entity(client, name="Noa")
+    added = client.post(
+        f"{_ENDPOINT}/entities/{entity['id']}/aliases",
+        json={"alias": "R%41"},
+    )
+    assert added.status_code == 201, added.text
+    stored = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "R%41" in stored, f"alias not stored: {stored}"
+
+    async def remove() -> httpx.Response:
+        transport = httpx.ASGITransport(app=create_app())
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as asgi:
+            return await asgi.delete(
+                f"{_ENDPOINT}/entities/{entity['id']}/aliases/R%2541",
+            )
+
+    removed = asyncio.run(remove())
+
+    assert removed.status_code == 204, removed.text
+    names = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "R%41" not in names, names
+
+
+def test_alias_ending_in_a_slash_is_removable(client: TestClient, clean_memory: None) -> None:
+    """The route's rstrip('/') corrupted aliases that genuinely end in a
+    slash ('kids/' removed 'kids' or 404'd) — a trailing slash is part of
+    the name, not noise."""
+    entity = _add_entity(client, name="Noa")
+    added = client.post(
+        f"{_ENDPOINT}/entities/{entity['id']}/aliases",
+        json={"alias": "kids/"},
+    )
+    assert added.status_code == 201, added.text
+    stored = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "kids/" in stored, f"alias not stored: {stored}"
+
+    removed = client.delete(f"{_ENDPOINT}/entities/{entity['id']}/aliases/kids%2F")
+
+    assert removed.status_code == 204, removed.text
+    names = client.get(_ENDPOINT).json()["entities"][0]["aliases"]
+    assert "kids/" not in names, names
+
+
+def test_add_fact_refuses_a_duplicate_connection(client: TestClient, clean_memory: None) -> None:
     """Two identical connection:child links to the same person are the same
     fact twice — the second must be refused (409), not silently doubled."""
     entity = _add_entity(client, name="Noa")
     rona = _add_entity(client, name="Rona")
     _add_fact(client, entity["id"], predicate="connection:child", object_id=rona["id"])
-
-    response = client.post(f"{_ENDPOINT}/facts", json={
-        "subject_id": entity["id"], "predicate": "connection:child",
-        "object_id": rona["id"],
-    })
+    response = client.post(
+        f"{_ENDPOINT}/facts",
+        json={
+            "subject_id": entity["id"],
+            "predicate": "connection:child",
+            "object_id": rona["id"],
+        },
+    )
 
     assert response.status_code == 409, response.text
     links = [
-        f for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        f
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
         if f["predicate"] == "connection:child" and f["object_id"] == rona["id"]
     ]
     assert len(links) == 1
 
+
+def test_patch_fact_refuses_a_duplicate_connection_link(
+    client: TestClient, clean_memory: None
+) -> None:
+    """PATCHing a link's object_id onto a person already linked by the same
+    predicate creates the same fact twice — refused (409), like a second
+    POST would be."""
+    entity = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+    dan = _add_entity(client, name="Dan")
+    _add_fact(client, entity["id"], predicate="connection:child", object_id=rona["id"])
+    to_dan = _add_fact(
+        client,
+        entity["id"],
+        predicate="connection:child",
+        object_id=dan["id"],
+    )
+
+    response = client.patch(
+        f"{_ENDPOINT}/facts/{to_dan['id']}",
+        json={"object_id": rona["id"]},
+    )
+
+    assert response.status_code == 409, response.text
+    rona_links = [
+        f
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "connection:child" and f["object_id"] == rona["id"]
+    ]
+    assert len(rona_links) == 1, rona_links
+
+
+def test_confirming_a_duplicate_connection_link_is_refused(
+    client: TestClient, clean_memory: None
+) -> None:
+    """Confirming a proposed link that duplicates a current one would stack
+    the same fact twice — refused (409); the proposal can be deleted instead."""
+    entity = _add_entity(client, name="Noa")
+    rona = _add_entity(client, name="Rona")
+    _add_fact(client, entity["id"], predicate="connection:child", object_id=rona["id"])
+    duplicate = _add_fact(
+        client,
+        entity["id"],
+        predicate="connection:child",
+        object_id=rona["id"],
+        status="proposed",
+    )
+
+    response = client.post(f"{_ENDPOINT}/facts/{duplicate['id']}/confirm")
+
+    assert response.status_code == 409, response.text
+    links = [
+        f
+        for f in client.get(_ENDPOINT).json()["entities"][0]["facts"]
+        if f["predicate"] == "connection:child" and f["object_id"] == rona["id"]
+    ]
+    assert len(links) == 1, links
