@@ -752,6 +752,7 @@ class ReconciliationService:
             now=now,
             tz_name=self._tz_name,
             signal=signal or ReconSignal(),
+            judge=judge,
         )
         result = self._gate_unapproved(result, matches, candidate)
         if (

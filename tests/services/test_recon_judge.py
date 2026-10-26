@@ -8,18 +8,21 @@ pass, in-process cache, RECON_JUDGE_ENABLED default FALSE.
 """
 
 from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy.orm import Session
 
-from brain.db.models import OpsEvent
+from brain.db.models import MemoryItem, OpsEvent
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
 from brain.services.extraction.reconciliation import (
     RECON_JUDGE_FLOOR,
     ExistingItem,
     ReconCandidate,
+    ReconSignal,
     classify,
 )
 from brain.services.extraction.service import EnrichmentService
@@ -291,3 +294,176 @@ def test_production_wiring_builds_judge_only_when_enabled(db):
         judge_factory=lambda: "sentinel-judge",
     )
     assert service.recon._judge is None  # nothing built before a candidate
+
+
+# --- review fixes 1-4 (feature/recon-judge) -----------------------------------
+
+
+def _judge_service(db: Session, judge: Any, *, similarity: float = 0.70) -> Any:
+    """An enrichment service whose matching is pinned to one similarity and
+    whose judge factory returns the given double, plus one source item."""
+    from tests.services.test_recon_scope_ask import (  # noqa: PLC0415
+        _make_source,
+    )
+
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None, daily_cap=100,
+        timezone="Asia/Jerusalem",
+        similarity_factory=lambda: (lambda a, b: similarity),
+        judge_factory=lambda: judge,
+    )
+    source = _make_source(db, text="טיול שנתי בפארק — הטיול יוצא ב-18:00")
+    return service, source
+
+
+def test_wiring_the_service_consults_the_judge_on_a_band_pair(db):
+    """Review fix 1, RED FIRST: with RECON_JUDGE_ENABLED-style injection the
+    service must pass the BUILT judge into classify — a gray-band pair
+    (similarity 0.70 < 0.80) is consulted, and a judge 'same' turns the
+    pre-judge NEW into a real matched verdict. On the cherry-picked code
+    (judge built, never passed) this is red: the judge is never called and
+    the outcome stays NEW."""
+    from tests.services.test_recon_scope_ask import _candidate_child
+
+    fake = FakeJudge(default=True)
+    service, source = _judge_service(db, fake)
+    resolved = service._validate(
+        _candidate_child(kind="event", title="טיול שנתי בפארק",
+                         when_raw="10.11 18:00", quote="הטיול יוצא ב-18:00"),
+        source, NOW,
+    )
+    assert resolved is not None
+    # the band pair in the DB: same kind, same audience, same local day,
+    # title pinned equal (the similarity stub, not the text, drives the band)
+    member = _member_for(db, title="טיול שנתי בפארק")
+    outcome = service._reconcile_child(resolved, source, {}, uuid4(), NOW)
+    assert fake.calls, (
+        "the service must CONSULT the judge for a gray-band pair — built but "
+        "never passed is the gap this test pins"
+    )
+    assert outcome is not None, "a judge 'same' must produce a matched verdict"
+    assert outcome.verdict.value == "already_known"
+    assert outcome.matched_id == member.id
+
+
+def _member_for(db: Session, *, title: str) -> MemoryItem:
+    item = MemoryItem(
+        raw_text=title, source="email", type="event",
+        occurred_at=datetime(2026, 11, 10, 16, 0, tzinfo=UTC),  # 18:00 JLM
+        applies_to=["unknown"], status="filed",
+    )
+    db.add(item)
+    db.commit()
+    return item
+
+
+def test_flag_off_constructs_no_clients_and_caches_the_none(db, monkeypatch):
+    """Review fix 2: with the flag OFF the flag is checked BEFORE the client
+    constructors (patched to raise — they must never run), and the None
+    build is CACHED: the factory runs exactly once even across candidates."""
+    from brain import config as brain_config
+    from brain.api import deps
+    from brain.config import Settings
+
+    monkeypatch.setattr(brain_config, "get_settings", lambda: Settings())
+
+    def _no_client(*a: Any, **k: Any) -> Any:
+        raise AssertionError("a disabled judge must never construct a client")
+
+    monkeypatch.setattr(deps, "get_jev_client", _no_client)
+    monkeypatch.setattr(deps, "get_llm_client", _no_client)
+    assert EnrichmentService._build_recon_judge() is None
+
+    calls = {"n": 0}
+
+    def _counting_factory() -> Any:
+        calls["n"] += 1
+        return None
+
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None, daily_cap=100,
+        timezone="Asia/Jerusalem",
+        similarity_factory=lambda: None,
+        judge_factory=_counting_factory,
+    )
+    service.recon._ensure_judge()
+    service.recon._ensure_judge()
+    service.recon._ensure_judge()
+    assert calls["n"] == 1, "a None build is final: the factory never re-runs"
+    assert service.recon._judge is None
+
+
+def test_recon_eval_judge_flag_off_by_default(tmp_path, monkeypatch, capsys):
+    """Review fix 3: `brain recon-eval` never builds a judge (byte-identical
+    default); --judge passes the built judge into run_recon_eval."""
+    import json as _json
+
+    from brain import cli
+
+    case = {
+        "case_id": "c1",
+        "existing_items": [{"id": "e1", "type": "event", "title": "טיול שנתי",
+                            "start": "2026-11-10T16:00:00+00:00",
+                            "applies_to": ["unknown"]}],
+        "new_text_quote": "הטיול בוטל",
+        "candidate": {"kind": "event", "title": "טיול שנתי",
+                      "start": "2026-11-10T16:00:00+00:00",
+                      "applies_to": ["unknown"]},
+        "verdict": "new",
+    }
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text(_json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli.EnrichmentService if hasattr(cli, "EnrichmentService") else EnrichmentService,
+        "_build_recon_judge",
+        lambda: (_ for _ in ()).throw(AssertionError("no judge without --judge")),
+    )
+    code = cli.main(["recon-eval", "--cases", str(cases)])
+    assert code == 0
+    assert "cases: 1" in capsys.readouterr().out
+
+    fake = FakeJudge(default=True)
+    monkeypatch.setattr(EnrichmentService, "_build_recon_judge", lambda: fake)
+    seen: dict[str, Any] = {}
+
+    def _spy(cases_path: Any, **kwargs: Any) -> dict[str, Any]:
+        seen["judge"] = kwargs.get("judge")
+        return {"cases": 1, "per_verdict": {}, "confusion": {}}
+
+    monkeypatch.setattr(cli, "run_recon_eval", _spy)
+    code = cli.main(["recon-eval", "--cases", str(cases), "--judge"])
+    assert code == 0
+    assert seen["judge"] is fake, "--judge must pass the built judge through"
+    assert fake.calls == [], "building the judge must not call it by itself"
+
+
+def test_off_path_verdicts_are_byte_identical():
+    """Review fix 4: with judge=None the verdict table is exactly the
+    pre-judge behavior — the band stays CLOSED at 0.80, cross-kind cancels
+    stay CANCELLATION, nothing consults anything."""
+    cand, existing = _band_pair()  # similarity 0.70 territory
+    # same-title pair scores 1.0 -> ABOVE the threshold: unchanged by the judge
+    same, existing_same = _band_pair(existing_title="כותרת אחרת לגמרי")
+    result_same = classify(
+        same, [existing_same], similarity=_pair(1.0), now=NOW,
+        tz_name="Asia/Jerusalem", judge=None,
+    )
+    assert result_same.verdict.value == "already_known"
+    # a band pair with judge=None stays NEW (the 0.80 gate, byte-identical)
+    result_band = classify(
+        cand, [existing], similarity=_pair(0.70), now=NOW,
+        tz_name="Asia/Jerusalem", judge=None,
+    )
+    assert result_band.verdict.value == "new"
+    assert result_band.ambiguous is False
+    # cross-kind + cancel: main's rule, untouched by the judge plumbing
+    cross = ReconCandidate(kind="reminder", title=cand.title,
+                           start=cand.start, applies_to=("unknown",))
+    result_cross = classify(
+        cross, [existing], similarity=_pair(1.0), now=NOW,
+        tz_name="Asia/Jerusalem",
+        signal=ReconSignal(cancel=True), relax_type=True, judge=None,
+    )
+    assert result_cross.verdict.value == "cancellation"
+    assert result_cross.cross_kind is True

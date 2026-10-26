@@ -858,12 +858,14 @@ class EnrichmentService:
         the reconciliation service; see ReconciliationService.answer_series_scope)."""
         return self.recon.answer_series_scope(relation_id, scope)
 
-    def _build_recon_judge(self) -> Any:
+    @staticmethod
+    def _build_recon_judge() -> Any:
         """The judge builds through the ONE builder (build_judge) with the
         SAME app-lifetime Jev/LLM clients triage uses (never a second
         client). The flag is checked FIRST (review fix 2): OFF — the
         default — constructs NO client at all; build_judge returns None and
-        that disables the stage entirely."""
+        that disables the stage entirely. Static so recon-eval reuses the
+        ONE builder without constructing a service."""
         from brain.config import get_settings  # noqa: PLC0415
 
         if not get_settings().recon_judge_enabled:
