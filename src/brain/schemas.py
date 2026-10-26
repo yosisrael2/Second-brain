@@ -52,7 +52,9 @@ class ItemCreate(BaseModel):
         500 on live the moment the CHECK migration runs (PR #53 review).
         """
         if value not in ITEM_SOURCE_DOMAIN:
-            raise ValueError(f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}")
+            raise ValueError(
+                f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}"
+            )
         return value
 
 
@@ -73,7 +75,9 @@ class ItemUpdate(BaseModel):
     def _source_in_domain(cls, value: str | None) -> str | None:
         """Same closed domain as ItemCreate (absent stays absent)."""
         if value is not None and value not in ITEM_SOURCE_DOMAIN:
-            raise ValueError(f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}")
+            raise ValueError(
+                f"source must be one of {', '.join(ITEM_SOURCE_DOMAIN)}"
+            )
         return value
 
 

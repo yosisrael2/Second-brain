@@ -1110,15 +1110,13 @@ function basicEditor(entity, predicate, label, fact) {
         const replaced = (made && made.replaced) || [];
         if (replaced.length) {
           undoToast(`replaced the previous ${label} — Undo brings it back`, async () => {
-            // Order matters: the new row must be soft-deleted BEFORE the old
-            // ones restore (restore refuses a second current value).
+            // One server op (the replaced row is history, not deleted):
+            // /undo-supersede closes the new row and reopens the old one.
             if (made && made.id) {
-              try { await api(`/memory/facts/${made.id}`, { method: "DELETE" }); }
-              catch (error) { toast(`undo failed: ${error.message}`); }
-            }
-            for (const old of replaced) {
-              try { await api(`/memory/facts/${old.id}/restore`, { method: "POST" }); }
-              catch (error) { toast(`restore failed: ${error.message}`); }
+              try {
+                await api(`/memory/facts/${made.id}/undo-supersede`, { method: "POST" });
+                toast("the previous value is back");
+              } catch (error) { toast(`undo failed: ${error.message}`); }
             }
             reloadMemory();
           });
@@ -1881,15 +1879,13 @@ async function confirmProposal(subject, fact, kind) {
     const replaced = (saved && saved.replaced) || [];
     if (replaced.length) {
       undoToast(`replaced the previous ${fact.predicate} — Undo brings it back`, async () => {
-        // Order matters: restore refuses a second current single-valued
-        // fact, so the confirmed replacement is soft-deleted BEFORE the old
-        // rows come back — restoring first 409s on the real server.
-        try { await api(`/memory/facts/${saved.id}`, { method: "DELETE" }); }
-        catch (error) { toast(`undo failed: ${error.message}`); }
-        for (const old of replaced) {
-          try { await api(`/memory/facts/${old.id}/restore`, { method: "POST" }); }
-          catch (error) { toast(`restore failed: ${error.message}`); }
-        }
+        // One server op: close the new row, reopen the replaced one. The
+        // replaced row is closed HISTORY (never 'rejected'), so /restore
+        // would 409 it — only /undo-supersede can bring it back.
+        try {
+          await api(`/memory/facts/${saved.id}/undo-supersede`, { method: "POST" });
+          toast("the previous value is back");
+        } catch (error) { toast(`undo failed: ${error.message}`); }
         reloadMemory();
       });
     }

@@ -120,6 +120,28 @@ def create_fact(
     return schemas.FactRead.model_validate(fact)
 
 
+@router.post("/facts/{fact_id}/undo-supersede", response_model=schemas.FactRead)
+def undo_supersede(
+    fact_id: uuid.UUID,
+    service: MemoryService = Depends(get_memory_service),
+) -> schemas.FactRead:
+    """Undo a supersede: close the current row, reopen the one it replaced.
+
+    One op for the screen's supersede-Undo (confirm/add of a single-valued
+    field): the replaced row was closed as HISTORY, not deleted, so /restore
+    refuses it — this op closes the new row and reopens the old one in one
+    transaction. 409 unless the new row is current, chained via
+    supersedes_id, and the replaced row is closed history (not rejected).
+    """
+    try:
+        fact = service.undo_supersede(fact_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"fact '{fact_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return schemas.FactRead.model_validate(fact)
+
+
 @router.patch("/facts/{fact_id}", response_model=schemas.FactRead)
 def edit_fact(
     fact_id: uuid.UUID,

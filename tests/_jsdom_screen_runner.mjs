@@ -51,9 +51,8 @@ const rowById = (id) => rows.get(id) ?? null;
 const openRows = (subjectId, predicate) => [...rows.values()].filter((r) => r.open
   && r.fact.subject_id === subjectId && r.fact.predicate === predicate);
 const supersedeClose = (row) => {
-  row.open = false;
-  row.deletedFrom = row.status;   // displaced rows stay undoable (restorable)
-  row.status = 'rejected';
+  row.open = false;   // superseded = closed HISTORY (status untouched),
+                      // restorable only via /undo-supersede on the new row
 };
 window.fetch = async (path, options) => {
   const url = String(path);
@@ -155,6 +154,20 @@ window.fetch = async (path, options) => {
     row.open = true;
     row.status = prior;
     return respond(200, row.fact);
+  }
+  const undoSupersedeMatch = url.match(/^\/memory\/facts\/([^/]+)\/undo-supersede$/);
+  if (method === 'POST' && undoSupersedeMatch) {
+    const row = rowById(undoSupersedeMatch[1]);
+    if (!row || !row.open || !row.fact.supersedes_id) {
+      return respond(409, { detail: 'only a current superseding fact can be undone' });
+    }
+    const prev = rowById(row.fact.supersedes_id);
+    if (!prev || prev.open || prev.status === 'rejected') {
+      return respond(409, { detail: 'the replaced fact is not undoable (deleted or already current)' });
+    }
+    row.open = false;
+    prev.open = true;
+    return respond(200, prev.fact);
   }
   if (method === 'DELETE') return respond(204, null);
   return respond(200, { id: url.split('/').filter(Boolean).pop(), ...body });

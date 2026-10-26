@@ -155,7 +155,9 @@ class MemoryRepository:
     def search_entities(self, needle: str) -> list[Entity]:
         """Entities whose name or one of whose aliases matches the needle."""
         pattern = f"%{needle}%"
-        alias_match = select(EntityAlias.entity_id).where(EntityAlias.alias.ilike(pattern))
+        alias_match = select(EntityAlias.entity_id).where(
+            EntityAlias.alias.ilike(pattern)
+        )
         stmt = (
             select(Entity)
             .where(Entity.name.ilike(pattern) | Entity.id.in_(alias_match))
