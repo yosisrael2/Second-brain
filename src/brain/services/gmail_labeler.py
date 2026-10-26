@@ -15,8 +15,9 @@ classification is deterministic over headers only:
 Safety rails:
 - dry-run is the DEFAULT: planning performs ZERO write calls (ids + metadata
   GETs only); ``--apply`` is explicit and capped (``max_apply``, valid range
-  1..100, default 20 per run — argparse refuses anything outside the range;
-  the service raises ValueError below 1; there is NO unlimited).
+  1..MAX_APPLY_CEILING (100), default 20 per run — argparse refuses anything
+  outside the range; the service raises ValueError outside it too; there is
+  NO unlimited).
 - own credentials: the labeler's refresh token lives in its OWN keychain item
   (``LABELER_KEYCHAIN_SERVICE``, distinct from the sync token's item) and is
   stored by ``--auth`` ONLY after the consented profile's email address
@@ -32,10 +33,13 @@ Safety rails:
   kind 'apply') is committed with detail state 'intent' BEFORE its Gmail
   modify call, then updated to 'applied' or 'failed'. An intent row that
   cannot be committed means the label is NOT applied (no unaudited writes).
-  ``undo_batch`` treats intent+applied rows as its candidates (removing a
-  label that was never applied is harmless) and removes exactly the label
-  ids its batch added — user labels are untouched. The prune EXEMPTS these
-  rows from the 7-day retention (they are the undo ledger).
+  ``undo_batch`` treats EVERY 'apply' row of the batch as its undo
+  candidate — 'failed' included, because a GmailError never proves the
+  label is absent (a 5xx/timeout can fire after Google committed the
+  write), and removing a label that was never applied is harmless — and
+  removes exactly the label ids its batch added — user labels are
+  untouched. The prune EXEMPTS these rows from the 7-day retention (they
+  are the undo ledger).
 - idempotent: a message already carrying ANY SB/ label is skipped.
 
 Message selection: the same scope the email connector syncs (the configured
@@ -115,6 +119,10 @@ logger = logging.getLogger(__name__)
 
 SB_PREFIX = "SB/"
 UNSORTED = "SB/Unsorted"
+# The per-run apply cap ceiling (M1/R2): ONE constant shared by the argparse
+# type (cli._max_apply_value) and the service's own check, so the CLI range
+# and the defense in depth can never drift apart.
+MAX_APPLY_CEILING = 100
 # Precedence (high → low). Kids is memory-driven; the rest come from the
 # rules file. A message gets exactly ONE label — the first rule that wins.
 LABEL_ORDER = ("Kids", "School", "Logistics", "Bills", "Noise")
@@ -322,8 +330,8 @@ def apply_labels(
 
     Returns the applied count. The label ids are ensured FIRST (a 403 aborts
     before any message write); the cap is hard — nothing past it is sent, and
-    ``max_apply < 1`` raises ValueError (there is no unlimited; argparse
-    already pins the CLI to 1..100).
+    ``max_apply`` outside 1..MAX_APPLY_CEILING raises ValueError (there is no
+    unlimited; argparse already pins the CLI to the same range).
 
     Per label: the audit row (state 'intent') is COMMITTED before the Gmail
     modify call; after the call it is updated to 'applied' or 'failed'. An
@@ -331,10 +339,10 @@ def apply_labels(
     there are no unaudited writes. ``session`` (optional) hosts the audit
     writes; when None a short-lived session is opened per write.
     """
-    if max_apply < 1:
+    if not 1 <= max_apply <= MAX_APPLY_CEILING:
         raise ValueError(
-            f"max_apply must be >= 1 (got {max_apply!r}) — the per-run cap "
-            "has no unlimited mode"
+            f"max_apply must be in 1..{MAX_APPLY_CEILING} (got {max_apply!r}) "
+            "— the per-run cap has no unlimited mode"
         )
     batch = plans[:max_apply]
     if not batch:
@@ -492,14 +500,15 @@ def _audit_detail(detail: dict[str, Any]) -> dict[str, Any]:
 def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
     """Remove exactly the label ids ONE batch added (its own ops events).
 
-    The undo candidates are the batch's rows with detail state 'intent' or
-    'applied' — an 'intent' row's label may never have reached Gmail (the
-    run died between the audit commit and the modify), and removing a label
-    that was never applied is a harmless no-op that must not error. Rows
-    marked 'failed' are skipped (their modify did not complete). A
-    pre-existing user label on the same message is untouched: only the
-    batch's own label ids are removed, and only from the messages the batch
-    touched.
+    The undo candidates are EVERY 'apply' row of the batch, whatever its
+    state (intent, applied, failed): a GmailError from the modify does NOT
+    prove the label never landed — a 5xx, a timeout or a connection reset
+    can fire AFTER Google committed the write, and then the row says
+    'failed' while the label is on the message. The state is audit truth
+    only; undo does not trust it. Removing a label that was never applied is
+    a harmless no-op that must not error. A pre-existing user label on the
+    same message is untouched: only the batch's own label ids are removed,
+    and only from the messages the batch touched.
     """
     events = _batch_events(batch_id, session)
     undone = 0
@@ -520,10 +529,11 @@ def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
 
 
 def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
-    """The undo ledger of ONE batch: its 'apply' rows in state 'intent' or
-    'applied', oldest first ('failed' rows are not candidates — their
-    modify did not complete; an intent row that never got its modify is
-    still safe to remove, harmlessly)."""
+    """The undo ledger of ONE batch: EVERY of its 'apply' rows, oldest
+    first — 'intent', 'applied' and 'failed' alike. The state is audit
+    truth only, never an undo filter: a 'failed' row's label MAY be on the
+    message (a 5xx/timeout can fire after Google committed the write), and
+    removing a label that was never applied is a harmless no-op."""
     from sqlalchemy import text  # noqa: PLC0415
 
     from brain.db.session import SessionLocal  # noqa: PLC0415
@@ -533,8 +543,7 @@ def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
         rows = own.execute(
             text(
                 "SELECT detail FROM ops_events WHERE component = :component "
-                "AND kind = 'apply' AND detail->>'batch' = :batch "
-                "AND detail->>'state' IN ('intent', 'applied') ORDER BY ts"
+                "AND kind = 'apply' AND detail->>'batch' = :batch ORDER BY ts"
             ),
             {"component": COMPONENT, "batch": batch_id},
         ).all()

@@ -1361,19 +1361,22 @@ def _connectors_list() -> int:
 
 
 def _max_apply_value(text_value: str) -> int:
-    """--max-apply accepts 1..100 only: a cap you can exceed by typo (or a
-    stray ``-1``) is no cap. Argparse turns the failure into usage + exit 2
-    before any Gmail call happens."""
+    """--max-apply accepts 1..MAX_APPLY_CEILING only: a cap you can exceed by
+    typo (or a stray ``-1``) is no cap. Argparse turns the failure into
+    usage + exit 2 before any Gmail call happens. The range shares the
+    service's MAX_APPLY_CEILING constant so the two can never drift."""
+    from brain.services.gmail_labeler import MAX_APPLY_CEILING
+
     try:
         value = int(text_value)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"invalid int value: {text_value!r}"
         ) from None
-    if not 1 <= value <= 100:
+    if not 1 <= value <= MAX_APPLY_CEILING:
         raise argparse.ArgumentTypeError(
-            f"--max-apply must be in 1..100 (got {value}) — the per-run cap "
-            "has no unlimited mode"
+            f"--max-apply must be in 1..{MAX_APPLY_CEILING} (got {value}) — "
+            "the per-run cap has no unlimited mode"
         )
     return value
 

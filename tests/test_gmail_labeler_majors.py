@@ -15,6 +15,12 @@ Each test first FAILED on origin/main (26f77ea) for the stated reason:
       audit write still let the label through (unaudited writes) and a
       crash mid-batch left rows that could not be told apart.
 
+Review round 1 adds: R1 — a GmailError from modify does NOT prove the label
+never landed (a 5xx/timeout/reset can fire AFTER Google committed), so EVERY
+apply row of the batch (intent, applied, failed) is an undo candidate; the
+state is audit truth only. R2 — the service also refuses max_apply > 100
+(MAX_APPLY_CEILING, shared with argparse).
+
 Fakes only: no Google (fake service/flow/profile seam), no real keychain (a
 recording fake), no real ``security``. The DB is this worker's
 brain_w21_labeler_test via the ``database`` fixture; the Qdrant collection is
@@ -84,6 +90,25 @@ class _ModifySpy:
         return self._inner.modify_message_labels(message_id, add=add, remove=remove)
 
 
+class _ApplyThenFail:
+    """Delegating client wrapper whose ADD-modify commits the label at the
+    fake (Google accepted the write) and THEN raises — a 5xx/timeout after
+    the server-side commit. Remove-modifies (undo) are delegated intact."""
+
+    def __init__(self, inner: Any, exc: Exception) -> None:
+        self._inner = inner
+        self._exc = exc
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def modify_message_labels(self, message_id: str, *, add=(), remove=()) -> None:
+        if add:
+            self._inner.modify_message_labels(message_id, add=add)
+            raise self._exc
+        return self._inner.modify_message_labels(message_id, add=add, remove=remove)
+
+
 class _FailOnModify:
     """Delegating client wrapper whose modify raises for chosen message ids
     (per-message failure scripting the shared fake does not support)."""
@@ -97,17 +122,28 @@ class _FailOnModify:
         return getattr(self._inner, name)
 
     def modify_message_labels(self, message_id: str, *, add=(), remove=()) -> None:
-        if message_id in self._fail_ids:
+        if add and message_id in self._fail_ids:
             raise self._exc
         return self._inner.modify_message_labels(message_id, add=add, remove=remove)
 
 
 def _audit_states(gmail_id: str, batch: str | None = None) -> list[str]:
     """The state values of the labeler's apply rows for one message."""
+    rows = _audit_rows(gmail_id, batch)
+    return [row.get("state") for row in rows]
+
+
+def _audit_label_id(gmail_id: str, batch: str | None = None) -> str | int | None:
+    """The label id recorded in the labeler's apply row for one message."""
+    rows = _audit_rows(gmail_id, batch)
+    return rows[0].get("label_id") if rows else None
+
+
+def _audit_rows(gmail_id: str, batch: str | None = None) -> list[dict[str, Any]]:
     from brain.db.session import engine
 
     sql = (
-        "SELECT detail->>'state' FROM ops_events WHERE component = 'gmail-label' "
+        "SELECT detail FROM ops_events WHERE component = 'gmail-label' "
         "AND kind = 'apply' AND detail->>'gmail_id' = :g"
     )
     params: dict[str, Any] = {"g": gmail_id}
@@ -115,7 +151,15 @@ def _audit_states(gmail_id: str, batch: str | None = None) -> list[str]:
         sql += " AND detail->>'batch' = :b"
         params["b"] = batch
     with engine.connect() as conn:
-        return [row[0] for row in conn.execute(text(sql), params).all()]
+        return [dict(row.detail) for row in conn.execute(text(sql), params).all()]
+
+
+def _fake_label_landed(state: _ServiceState, gmail_id: str,
+                       label_id: str | int | None) -> bool:
+    """True when the fake mailbox's message currently carries the label id
+    (the fake stores created ids as ints; compare loosely)."""
+    labels = state.messages[gmail_id].get("labelIds") or []
+    return any(str(lid) == str(label_id) for lid in labels)
 
 
 def _insert_apply_row(batch: str, gmail_id: str, state: str, *, label_id: str = "L_1") -> None:
@@ -325,6 +369,21 @@ def _plan_labels(state: _ServiceState, tmp_path: Any, count: int) -> list[Any]:
 
 
 class TestM1MaxApplyCap:
+    def test_service_rejects_max_apply_above_ceiling(self, tmp_path, database):
+        """R2: apply_labels also refuses max_apply > 100 (the argparse range
+        and the service share MAX_APPLY_CEILING — defense in depth against a
+        caller bypassing the CLI). On dadd54a the service accepted 101."""
+        from brain.services.gmail_labeler import MAX_APPLY_CEILING, apply_labels
+
+        assert MAX_APPLY_CEILING == 100
+        state = _ServiceState()
+        plans = _plan_labels(state, tmp_path, 3)
+        client = _client(state)
+        with pytest.raises(ValueError):
+            apply_labels(client, plans, max_apply=MAX_APPLY_CEILING + 1, batch_id="c1")
+        writes = [c for c in state.calls if c[0] == "messages.modify"]
+        assert writes == [], "a rejected max_apply must leave zero write calls"
+
     def test_service_rejects_max_apply_below_one(self, tmp_path, database):
         """M1 (defense in depth): apply_labels refuses max_apply < 1 with
         ValueError and writes nothing. On main, 0 silently applied nothing
@@ -601,8 +660,10 @@ class TestM4WriteAheadAudit:
 
     def test_modify_failure_marks_failed_and_undo_still_works(self, tmp_path, database):
         """A Gmail modify failure after the intent row: state=failed, the run
-        aborts (current semantics), and --undo still works on the applied
-        rows while skipping the failed one."""
+        aborts (current semantics), and --undo still works — the failed row
+        is ALSO an undo candidate (R1: a 5xx/timeout can fire AFTER Google
+        committed the write, so 'failed' never proves the label is absent;
+        removing a label that is not there is a harmless no-op)."""
         from brain.ai.gmail import GmailError
         from brain.services.gmail_labeler import apply_labels, undo_batch
 
@@ -620,18 +681,70 @@ class TestM4WriteAheadAudit:
             "the modify that failed must leave state=failed"
         )
         undone = undo_batch(client, "mf1")
-        assert undone == 1, "undo treats only intent+applied rows as candidates"
+        assert undone == 2, "undo treats EVERY apply row of the batch as a candidate"
         removed = [c[1]["id"] for c in state.calls
                    if c[0] == "messages.modify" and c[1]["body"].get("removeLabelIds")]
-        assert removed == ["m00"], (
-            f"undo must remove only the applied label (removed {removed!r})"
+        assert removed == ["m00", "m01"], (
+            "undo must remove the applied AND the failed row's label "
+            f"(removed {removed!r})"
         )
 
-    def test_undo_treats_intent_and_applied_rows_as_candidates(self, database):
-        """Rows from a run that died between the intent commit and the
-        modify are still undo candidates (removing a never-applied label is
-        harmless and must not error); failed rows are skipped. On main,
-        _batch_events had no state filter and returned every row."""
+    def test_undo_removes_a_failed_row_whose_label_landed(self, tmp_path, database):
+        """R1 (blocking): the modify raised AFTER Google committed the label
+        (timeout/5xx post-commit) — the row says failed but the label IS on
+        the message, and --undo MUST remove it (the un-undoable write is
+        exactly what M4 exists to close)."""
+        from brain.ai.gmail import GmailError
+        from brain.services.gmail_labeler import apply_labels, undo_batch
+
+        state = _ServiceState()
+        plans = _plan_labels(state, tmp_path, 1)
+        client = _ApplyThenFail(_client(state), GmailError("timeout after commit"))
+        with pytest.raises(GmailError):
+            apply_labels(client, plans, max_apply=1, batch_id="fl1")
+        assert _audit_states("m00", batch="fl1") == ["failed"], (
+            "the post-commit failure must be recorded as state=failed"
+        )
+        label_id = _audit_label_id("m00", batch="fl1")
+        undone = undo_batch(client, "fl1")
+        assert undone == 1, "a failed row whose label LANDED must be undoable"
+        assert not _fake_label_landed(state, "m00", label_id), (
+            "the label Google committed must be gone after --undo"
+        )
+
+    def test_undo_removes_a_failed_row_whose_label_never_landed(self, database):
+        """R1 (reverse): a failed row whose label never reached Gmail — undo
+        still issues the remove, and removing a never-applied label is a
+        harmless no-op that must not error."""
+        from brain.services.gmail_labeler import undo_batch
+
+        state = _ServiceState()
+        state.messages["m9"] = _msg_with_headers(
+            "m9", sender="office@school.example", subject="never labeled"
+        )
+        from brain.db.session import engine
+
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO ops_events (component, kind, ok, detail) "
+                    "VALUES ('gmail-label', 'apply', false, CAST(:d AS jsonb))"
+                ),
+                {"d": json.dumps({"batch": "fr1", "gmail_id": "m9",
+                                  "label_path": "SB/School", "label_id": "L_9",
+                                  "source": "rules", "state": "failed"})},
+            )
+        undone = undo_batch(_client(state), "fr1")
+        assert undone == 1, (
+            "a failed row is an undo candidate even when the label never "
+            "landed (the remove is then a harmless no-op)"
+        )
+
+    def test_undo_treats_every_apply_row_as_a_candidate(self, database):
+        """R1: rows from a run that died mid-flight — intent (label maybe
+        never sent), applied, failed (label maybe landed) — are ALL undo
+        candidates; the state is audit truth only. On dadd54a the failed row
+        was excluded and the post-commit-failure write was un-undoable."""
         from brain.services.gmail_labeler import undo_batch
 
         state = _ServiceState()
@@ -656,7 +769,7 @@ class TestM4WriteAheadAudit:
                                       "source": "rules", "state": row_state})},
                 )
         undone = undo_batch(_client(state), "ix1")
-        assert undone == 2, (
-            "undo candidates are the intent+applied rows; the failed row is "
-            "skipped and removing a never-applied label must not error"
+        assert undone == 3, (
+            "undo candidates are EVERY apply row of the batch (intent, "
+            "applied, failed); removing a never-applied label must not error"
         )
