@@ -157,12 +157,12 @@ class TestCliRefusesWhenLabelUnset:
         (["--apply"], "   "),
     ])
     def test_scan_paths_refuse(self, argv, label, state, tmp_path, monkeypatch, capsys):
-        """The planning paths (dry-run AND --apply) refuse with exit 78, a
+        """The SCANNING paths (dry-run AND --apply) refuse with exit 78, a
         message naming GMAIL_LABEL_ID, and ZERO Gmail calls when the label
         id is unset or blank. On main, the dry-run reached Gmail with
         label_ids [''] (and --apply would have gone on to label the
         mailbox; it exited 78 only via the later token gate, with the wrong
-        message)."""
+        message). --undo/--audit are deliberately NOT guarded (R1)."""
         import brain.cli as cli
 
         settings = _GuardSettings(gmail_label_id=label)
@@ -212,9 +212,13 @@ class TestCliRefusesWhenLabelUnset:
             f"(on main it sent {list_calls!r} — the blank label id)"
         )
 
-    def test_undo_refuses(self, state, monkeypatch, capsys, database):
-        """--undo refuses too (exit 78, GMAIL_LABEL_ID named, zero Gmail
-        calls). On main it ran the gate and the DB undo, exit 0."""
+    def test_undo_is_not_guarded(self, state, monkeypatch, capsys, database):
+        """--undo with an unset label PROCEEDS to its usual path (consent
+        gate → audit ledger): it never scans the label scope, and undo must
+        keep working even if the user later unsets/changes GMAIL_LABEL_ID
+        (the escape hatch). With the gate granted and a labeler token
+        present, the batch ledger is empty → undone 0, exit 0, and no
+        label-related refusal anywhere."""
         import brain.cli as cli
 
         monkeypatch.setattr("brain.config.get_settings",
@@ -222,27 +226,23 @@ class TestCliRefusesWhenLabelUnset:
         monkeypatch.setattr(cli, "_labeler_client",
                             lambda s, modify=False: _client(state))
         _granted_scope(monkeypatch)
-        try:
-            code = cli.main(["gmail-label", "--undo", "deadbeef1234"])
-        except SystemExit as exc:  # main's token-gate exit shape
-            code = exc.code
-        assert code == 78
-        assert "GMAIL_LABEL_ID" in capsys.readouterr().err, (
-            "the refusal must name GMAIL_LABEL_ID (on main --undo hit the "
-            "token gate first, with the wrong message)"
-        )
-        assert state.calls == [], "the refusal must happen before ANY Gmail call"
+        _patch_keychain(monkeypatch,
+                        items={("second-brain-gmail-labeler", "default"): "1//tok"})
+        code = cli.main(["gmail-label", "--undo", "deadbeef1234"])
+        assert code == 0, "--undo must not be guarded by GMAIL_LABEL_ID"
+        assert "GMAIL_LABEL_ID" not in capsys.readouterr().err
 
-    def test_audit_refuses(self, monkeypatch, capsys, database):
-        """--audit refuses too (per the review decision: every subcommand
-        except --auth). On main it exited 0."""
+    def test_audit_is_not_guarded(self, monkeypatch, capsys, database):
+        """--audit with an unset label PROCEEDS to the ledger (it reads
+        ops_events, never scans). On the empty ledger it prints nothing and
+        exits 0, with no label-related refusal."""
         import brain.cli as cli
 
         monkeypatch.setattr("brain.config.get_settings",
                             lambda: _GuardSettings(gmail_label_id=""))
         code = cli.main(["gmail-label", "--audit"])
-        assert code == 78
-        assert "GMAIL_LABEL_ID" in capsys.readouterr().err
+        assert code == 0, "--audit must not be guarded by GMAIL_LABEL_ID"
+        assert "GMAIL_LABEL_ID" not in capsys.readouterr().err
 
     @pytest.mark.parametrize("label", [LABEL, "Label_123"])
     def test_a_set_label_proceeds_as_before(self, label, state, tmp_path,
