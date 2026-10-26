@@ -1417,3 +1417,99 @@ def test_the_photo_sha_never_renders_as_text() -> None:
     assert_check(payload, "the basic-info rows never show the sha")
     assert_check(payload, "the review inbox never shows a proposed photo sha")
     assert_check(payload, "the history drawer shows the photo row without the sha")
+
+
+# --- WhatsApp groups on a kid's profile (B1+B3) --------------------------------
+
+GROUPS_FIXTURES = {
+    "entities": [
+        {"id": "e-kid", "kind": "person", "name": "Noa", "aliases": [], "facts": [
+            {"id": "f-grade", "subject_id": "e-kid", "predicate": "grade",
+             "value": "5", "object_id": None, "status": "confirmed", "provenance": {}},
+        ]},
+        {"id": "e-lonely", "kind": "person", "name": "Itamar", "aliases": [], "facts": [
+            {"id": "f-grade2", "subject_id": "e-lonely", "predicate": "grade",
+             "value": "2", "object_id": None, "status": "confirmed", "provenance": {}},
+        ]},
+        {"id": "e-adult", "kind": "person", "name": "אבא", "aliases": [], "facts": []},
+    ],
+    "proposed": [],
+    "groupsByEntity": {
+        "e-kid": {"groups": [{
+            "channel": "ה' ספיר - הורים", "applies_to": "Noa",
+            "conversations": [
+                {"item_id": "i-1", "occurred_at": "2026-10-25T09:00:00+00:00",
+                 "preview": "מחר פעילות מים — להביא מגבת", "kept_fact_id": None},
+                {"item_id": "i-2", "occurred_at": "2026-10-24T09:00:00+00:00",
+                 "preview": "ההצגה נדחית ליום ראשון", "kept_fact_id": "f-kept"},
+            ],
+        }]},
+        "e-adult": {"groups": []},
+    },
+}
+
+
+def test_groups_section_renders_keep_and_kept_states() -> None:
+    """A kid's profile lists her groups' relevant conversations with Open +
+    Keep; a kept conversation shows 'Kept ✓' disabled; keeping POSTs the
+    keep endpoint (the response's fact rides the undo stack)."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e-kid"]').click();
+      await settle(300);
+      const section = document.querySelector('#memory-detail .mm-groups-body');
+      check('the kid profile has a groups section', Boolean(section));
+      if (!section) return;
+      check('the channel header renders', section.textContent.includes("ה' ספיר - הורים"));
+      const row1 = [...section.querySelectorAll('.mm-group-row')]
+        .find((r) => r.textContent.includes('להביא מגבת'));
+      check('the open conversation has a keep button', Boolean(row1)
+        && [...row1.querySelectorAll('button')].some((b) => b.textContent === 'Keep as memory'));
+      const row2 = [...section.querySelectorAll('.mm-group-row')]
+        .find((r) => r.textContent.includes('ההצגה נדחית'));
+      const keptBtn = row2 && [...row2.querySelectorAll('button')]
+        .find((b) => b.textContent === 'Kept ✓');
+      check('the kept conversation shows Kept disabled', Boolean(keptBtn && keptBtn.disabled));
+      if (!row1) return;
+      [...row1.querySelectorAll('button')]
+        .find((b) => b.textContent === 'Keep as memory').click();
+      await settle(400);
+      const keeps = calls.filter((c) => c.method === 'POST' && c.url.endsWith('/groups/keep'));
+      check('the keep POSTs the keep endpoint', keeps.length === 1 && keeps[0].status === 201,
+        JSON.stringify(keeps.map((k) => [k.url, k.status])));
+      check('the keep offers an Undo', !document.getElementById('memory-undo').hidden);
+      document.getElementById('memory-undo-btn').click();
+      await settle(400);
+      const undos = calls.filter((c) => c.method === 'DELETE' && c.url.includes('/memory/facts/'));
+      check('the undo soft-deletes the kept note', undos.length === 1,
+        JSON.stringify(undos.map((u) => u.url)));
+    """, GROUPS_FIXTURES)
+    assert_check(payload, "the kid profile has a groups section")
+    assert_check(payload, "the channel header renders")
+    assert_check(payload, "the open conversation has a keep button")
+    assert_check(payload, "the kept conversation shows Kept disabled")
+    assert_check(payload, "the keep POSTs the keep endpoint")
+    assert_check(payload, "the keep offers an Undo")
+    assert_check(payload, "the undo soft-deletes the kept note")
+
+
+def test_groups_empty_state_and_hidden_for_non_kid() -> None:
+    """A kid with no groups shows the empty state + hint; a non-kid person
+    has no groups section at all."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e-lonely"]').click();
+      await settle(300);
+      let section = document.querySelector('#memory-detail .mm-groups-body');
+      check('the empty state names the kid', Boolean(section)
+        && section.textContent.includes('No WhatsApp groups linked to Itamar'),
+        section ? section.textContent.slice(0, 120) : 'no section');
+      document.querySelector('[data-entity="e-adult"]').click();
+      await settle(300);
+      check('a non-kid profile has no groups section',
+        !document.querySelector('#memory-detail .mm-groups-body'));
+    """, GROUPS_FIXTURES)
+    assert_check(payload, "the empty state names the kid")
+    assert_check(payload, "a non-kid profile has no groups section")

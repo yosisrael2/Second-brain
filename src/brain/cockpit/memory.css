@@ -472,3 +472,13 @@ img.mm-av-photo { object-fit: cover; }
 .chip.confirmed { color: var(--ok); }
 .chip.proposed { color: var(--degraded); border: 1px solid var(--degraded); }
 .chip.rejected { color: var(--text-muted); }
+
+/* WhatsApp groups on a kid's profile (B1+B3) */
+.mm-groups-body { display: flex; flex-direction: column; gap: 6px; }
+.mm-group-name { margin: 8px 0 2px; font-size: 13px; }
+.mm-group-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border: 1px solid var(--border, #e2e2e2); border-radius: 8px;
+}
+.mm-group-date { flex: none; font-size: 11px; opacity: 0.7; white-space: nowrap; }
+.mm-group-preview { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

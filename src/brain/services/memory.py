@@ -11,11 +11,12 @@ insert proposals without a schema change.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from brain.db.models import Entity, EntityAlias, MemoryFact
+from brain.repositories.items import is_hidden_by_default
 from brain.repositories.memory import MemoryRepository, utcnow
 from brain.services.triage import is_name_token, mentions_name
 
@@ -814,6 +815,126 @@ class MemoryService:
         """
         fact = self._current_confirmed_fact(entity_id, PHOTO_PREDICATE)
         return _fact_dict(fact) if fact is not None else None
+
+    # --- WhatsApp groups on a profile (B1 projection + B3 keep) ------------------
+
+    GROUP_PREVIEW_CHARS = 280
+    GROUP_SNIPPET_CHARS = 600
+    GROUPS_PER_KID = 5  # newest conversations per group
+
+    def entity_groups(self, entity_id: uuid.UUID, *, items_repo: Any) -> dict[str, Any]:
+        """A kid's own WhatsApp groups with their newest relevant conversations.
+
+        The projection composes the TWO existing pieces (no new SQL beyond
+        by_channels' opt-in triage filter): channel_names_for_kid (THE
+        channel→kid mapping, 'family' expanded) + ItemsRepository.by_channels
+        (relevant_only=True — strictly triage_label 'relevant', so noise AND
+        untriaged stay out; superseded/cancelled/dropped via the shared
+        hidden predicate). A person that is not a kid (and no kid at all)
+        gets {"groups": []}; a non-person raises MemoryError (409).
+        """
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        if entity.kind != "person":
+            raise MemoryError("only a person entity has WhatsApp groups")
+        kid_names = {kid["name"] for kid in self.kids()}
+        if entity.name not in kid_names:
+            return {"groups": []}
+        channels = self._repo.list_entities(kinds=["channel"])
+        facts = self._repo.current_facts(
+            subject_ids=[c.id for c in channels], status="confirmed"
+        )
+        applies: dict[uuid.UUID, list[str]] = {}
+        for fact in facts:
+            if fact.predicate == "applies_to" and fact.value is not None:
+                applies.setdefault(fact.subject_id, []).append(fact.value)
+        # the CURRENT note facts of this person, by provenance.item_id —
+        # the projection's kept_fact_id
+        kept_by_item: dict[str, str] = {}
+        for fact in self._repo.current_facts(subject_ids=[entity.id], status="confirmed"):
+            if fact.predicate == "note" and (fact.provenance or {}).get("item_id"):
+                kept_by_item[str(fact.provenance["item_id"])] = str(fact.id)
+        groups: list[dict[str, Any]] = []
+        for channel in channels:
+            values = applies.get(channel.id, [])
+            if entity.name not in values and "family" not in values:
+                continue
+            items = list(items_repo.by_channels(
+                [channel.name], limit=self.GROUPS_PER_KID, relevant_only=True,
+            ))
+            if not items:
+                continue
+            conversations = [
+                {
+                    "item_id": str(item.id),
+                    "occurred_at": item.occurred_at,
+                    "preview": " ".join((item.raw_text or "").split())[:self.GROUP_PREVIEW_CHARS],
+                    "kept_fact_id": kept_by_item.get(str(item.id)),
+                }
+                for item in items
+            ]
+            groups.append({
+                "channel": channel.name,
+                "applies_to": values[0],
+                "conversations": conversations,
+            })
+        groups.sort(
+            key=lambda g: max((c["occurred_at"] or datetime.min.replace(tzinfo=UTC)
+                               for c in g["conversations"]), default=None),
+            reverse=True,
+        )
+        return {"groups": groups}
+
+    def keep_group_item(
+        self, entity_id: uuid.UUID, item_id: uuid.UUID, *, items_repo: Any
+    ) -> dict[str, Any]:
+        """Keep a group conversation as a confirmed note on THIS profile (B3).
+
+        value = the conversation's first 600 chars, whitespace-collapsed,
+        ending with an ellipsis when cut; provenance {how: 'group-keep',
+        item_id, channel, chat_jid}. Refused (409 via MemoryError) when the
+        person already has a CURRENT note kept from this item (no double
+        keep) or the item is not in this person's groups' relevant set —
+        right channel, WhatsApp source, triaged relevant, not hidden, not a
+        dropped child (a Keep cannot be pointed at an arbitrary item).
+        """
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            raise KeyError(entity_id)
+        if entity.kind != "person":
+            raise MemoryError("only a person entity can keep a group memory")
+        item = items_repo.get(item_id)
+        if item is None:
+            raise KeyError(item_id)
+        names = self.channel_names_for_kid(entity.name)
+        child_dropped = item.child_state == "dropped"
+        if (
+            item.source != "whatsapp"
+            or (item.meta or {}).get("channel") not in names
+            or item.triage_label != "relevant"
+            or is_hidden_by_default(item)
+            or child_dropped
+        ):
+            raise MemoryError("this conversation is not in this person's groups")
+        for fact in self._repo.current_facts(subject_ids=[entity_id], status="confirmed"):
+            if fact.predicate == "note" and (fact.provenance or {}).get("item_id") == str(item_id):
+                raise MemoryError("this conversation is already kept as a memory")
+        text = " ".join((item.raw_text or "").split())
+        snippet = text[:self.GROUP_SNIPPET_CHARS]
+        if len(text) > self.GROUP_SNIPPET_CHARS:
+            snippet += "…"
+        return self.add_fact(
+            entity_id,
+            "note",
+            value=snippet,
+            provenance={
+                "how": "group-keep",
+                "item_id": str(item.id),
+                "channel": (item.meta or {}).get("channel"),
+                "chat_jid": (item.meta or {}).get("chat_jid"),
+            },
+        )
 
     def delete_fact(self, fact_id: uuid.UUID) -> dict[str, Any]:
         """Soft-delete: status 'rejected', valid_to=now; history is kept.
