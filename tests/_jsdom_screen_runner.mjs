@@ -32,7 +32,7 @@ const { document } = window;
 //   • connection links refuse exact duplicates on add/patch/confirm.
 const fixtures = __FIXTURES__;
 const calls = [];
-const SINGLE_VALUED = new Set(['gender', 'school', 'grade', 'class', 'teacher', 'birthday', 'anniversary']);
+const SINGLE_VALUED = new Set(['gender', 'school', 'grade', 'class', 'teacher', 'birthday', 'anniversary', 'photo']);
 const CONN = 'connection:';
 const rows = new Map();   // id -> { fact, open, status, deletedFrom }
 for (const group of [...(fixtures.entities ?? []), ...(fixtures.proposed ?? [])]) {
@@ -57,7 +57,8 @@ const supersedeClose = (row) => {
 window.fetch = async (path, options) => {
   const url = String(path);
   const method = options?.method ?? 'GET';
-  const body = options?.body ? JSON.parse(options.body) : null;
+  let body = null;
+  try { body = options?.body ? JSON.parse(options.body) : null; } catch { body = { __form: true }; }
   const respond = (status, payload) => {
     calls.push({ url, method, body, status });
     return {
@@ -169,6 +170,39 @@ window.fetch = async (path, options) => {
     prev.open = true;
     return respond(200, prev.fact);
   }
+  const historyMatch = url.match(/^\/memory\/facts\/([^/]+)\/history$/);
+  if (method === 'GET' && historyMatch) {
+    // the version chain of ONE fact: walk the supersedes_id chain, oldest first
+    const start = rowById(historyMatch[1]);
+    if (!start) return respond(404, { detail: 'fact not found' });
+    const chain = [start.fact];
+    let cursor = start;
+    while (cursor.fact.supersedes_id) {
+      const prev = rowById(cursor.fact.supersedes_id);
+      if (!prev) break;
+      chain.unshift(prev.fact);
+      cursor = prev;
+    }
+    return respond(200, chain);
+  }
+  const photoMatch = url.match(/^\/memory\/entities\/([^/]+)\/photo$/);
+  if (method === 'POST' && photoMatch) {
+    // multipart upload: the stub cannot see bytes; it mirrors the FACT side
+    // of the real API (single-valued supersede, `replaced` rides back).
+    const made = { id: nextId(), subject_id: photoMatch[1], predicate: 'photo',
+      object_id: null, value: `sha-${nextId()}`, status: 'confirmed',
+      provenance: { source: 'upload' } };
+    const cur = openRows(photoMatch[1], 'photo').find((r) => r.status === 'confirmed');
+    if (cur) { supersedeClose(cur); made.supersedes_id = cur.fact.id; made.replaced = [cur.fact]; }
+    rows.set(made.id, { fact: made, open: true, status: 'confirmed', deletedFrom: null });
+    return respond(201, made);
+  }
+  if (method === 'DELETE' && photoMatch) {
+    const cur = openRows(photoMatch[1], 'photo').find((r) => r.status === 'confirmed');
+    if (!cur) return respond(404, { detail: 'no photo' });
+    cur.open = false; cur.deletedFrom = cur.status; cur.status = 'rejected';
+    return respond(204, null);
+  }
   if (method === 'DELETE') return respond(204, null);
   return respond(200, { id: url.split('/').filter(Boolean).pop(), ...body });
 };
@@ -200,7 +234,7 @@ document.addEventListener = (type, fn, opts) => {
 window.eval(__APP_JS__ + "\n" + __MEMORY_JS__ + `
 ;window.__mem = { memoryState, refreshMemory, reloadMemory, renderMemory,
   renderDetail, buildModel, confirmProposal, undoToast, memoryComposer,
-  armConfirm, postFact, patchFact, mm: () => mm,
+  armConfirm, postFact, patchFact, mm: () => mm, openMemoryDrawer,
   init: typeof init === "function" ? init : null, initMemoryTab };`);
 document.addEventListener = origAddEventListener;
 for (const listener of dclListeners) listener();

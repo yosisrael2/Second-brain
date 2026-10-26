@@ -1192,3 +1192,228 @@ def test_drafts_survive_a_poll_on_connection_review_and_promote() -> None:
     assert_check(payload, "the promote value opened")
     assert_check(payload, "the promote-poll note rendered (the poll really re-rendered)")
     assert_check(payload, "the promote draft survives the poll")
+
+
+# --- Photo avatars (A1): img vs initials, onerror fallback, upload/remove -----
+
+AVATAR_FIXTURES = {
+    "entities": [
+        {"id": "e-photo", "kind": "person", "name": "Noa", "aliases": [], "facts": [
+            {"id": "f-photo", "subject_id": "e-photo", "predicate": "photo",
+             "value": "abc123", "object_id": None, "status": "confirmed",
+             "provenance": {"sha256": "abc123", "mime": "image/png"}},
+        ]},
+        {"id": "e-plain", "kind": "person", "name": "Rona", "aliases": [], "facts": []},
+        {"id": "e-group", "kind": "channel", "name": "3rd grade parents",
+         "aliases": [], "facts": []},
+    ],
+    "proposed": [],
+}
+
+
+def test_avatar_renders_the_photo_and_falls_back_on_load_error() -> None:
+    """avatar() renders an <img> (alt = name) when the entity carries a
+    current photo fact, initials otherwise; a failed image load falls back
+    to the initials span."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      const personWith = document.querySelector(
+        `[data-entity="e-photo"] .mm-av-photo`);
+      check('the person with a photo renders an img avatar',
+        Boolean(personWith) && personWith.tagName === 'IMG',
+        personWith ? personWith.outerHTML.slice(0, 120) : 'no img found');
+      if (personWith) {
+        check('the img points at the photo endpoint with ?v=',
+          personWith.getAttribute('src') === '/memory/entities/e-photo/photo?v=abc123',
+          `src=${personWith.getAttribute('src')}`);
+        check('the img is lazy with alt = name',
+          personWith.getAttribute('loading') === 'lazy'
+          && personWith.getAttribute('alt') === 'Noa',
+          `loading=${personWith.getAttribute('loading')} alt=${personWith.getAttribute('alt')}`);
+      }
+      const personWithout = document.querySelector(
+        `[data-entity="e-plain"] .mm-av`);
+      check('the person without a photo keeps the initials avatar',
+        Boolean(personWithout) && personWithout.tagName === 'SPAN',
+        personWithout ? personWithout.outerHTML.slice(0, 120) : 'no avatar found');
+      const group = document.querySelector(`[data-entity="e-group"] .mm-av`);
+      check('a channel keeps the group icon (no img)',
+        Boolean(group) && group.tagName !== 'IMG', group ? group.tagName : 'none');
+      if (personWith) {
+        personWith.dispatchEvent(new window.Event('error'));
+        await settle(80);
+        const after = document.querySelector(`[data-entity="e-photo"] .mm-av`);
+        check('a failed image load falls back to initials',
+          Boolean(after) && after.tagName === 'SPAN'
+          && !after.classList.contains('mm-av-photo'),
+          after ? after.outerHTML.slice(0, 120) : 'no avatar found');
+      }
+    """, AVATAR_FIXTURES)
+    assert_check(payload, "the person with a photo renders an img avatar")
+    assert_check(payload, "the img points at the photo endpoint with ?v=")
+    assert_check(payload, "the img is lazy with alt = name")
+    assert_check(payload, "the person without a photo keeps the initials avatar")
+    assert_check(payload, "a channel keeps the group icon (no img)")
+    assert_check(payload, "a failed image load falls back to initials")
+
+
+def test_profile_photo_controls_upload_undo_and_remove() -> None:
+    """The profile offers Upload/Change/Remove for a person only. Upload is
+    a POST with a FormData body; when the server supersedes, the Undo is
+    one /undo-supersede call. Remove is DELETE + Undo via /restore. A
+    channel profile has no photo control."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e-photo"]').click();
+      await settle(150);
+      const input = document.querySelector('#memory-detail input[type="file"]');
+      check('the person profile has a photo upload control', Boolean(input));
+      const file = new window.File(['fake-bytes'], 'me.png', { type: 'image/png' });
+      Object.defineProperty(input, 'files', { value: [file] });
+      input.dispatchEvent(new window.Event('change', { bubbles: true }));
+      await settle(300);
+      const uploads = calls.filter((c) => c.method === 'POST' && c.url.endsWith('/photo'));
+      check('the upload POSTs the photo endpoint with a FormData body',
+        uploads.length === 1 && uploads[0].status === 201 && uploads[0].body?.__form === true,
+        JSON.stringify(uploads.map((u) => [u.status, u.body && Object.keys(u.body)])));
+      const toast = document.getElementById('memory-undo');
+      check('the superseding upload offers an Undo', toast && !toast.hidden);
+      if (toast && !toast.hidden) {
+        document.getElementById('memory-undo-btn').click();
+        await settle(300);
+        const undoCalls = calls.filter((c) => c.method === 'POST'
+          && c.url.includes('/undo-supersede'));
+        check('the upload Undo is one undo-supersede call',
+          undoCalls.length === 1, JSON.stringify(undoCalls.map((u) => u.url)));
+      }
+      const remove = [...document.querySelectorAll('#memory-detail button')]
+        .find((b) => b.dataset.photoRemove === '1');
+      check('the person profile has a remove control', Boolean(remove));
+      if (remove) {
+        remove.click();
+        await settle(300);
+        const deletes = calls.filter((c) => c.method === 'DELETE' && c.url.endsWith('/photo'));
+        check('remove DELETEs the photo endpoint', deletes.length === 1,
+          JSON.stringify(deletes.map((d) => d.url)));
+        const undoBtn = document.getElementById('memory-undo');
+        check('the remove offers an Undo', undoBtn && !undoBtn.hidden);
+        if (undoBtn && !undoBtn.hidden) {
+          document.getElementById('memory-undo-btn').click();
+          await settle(300);
+          const restores = calls.filter((c) => c.method === 'POST'
+            && c.url.includes('/restore'));
+          check('the remove Undo is one /restore call', restores.length === 1,
+            JSON.stringify(restores.map((r) => r.url)));
+        }
+      }
+    """, AVATAR_FIXTURES)
+    assert_check(payload, "the person profile has a photo upload control")
+    assert_check(payload, "the upload POSTs the photo endpoint with a FormData body")
+    assert_check(payload, "the superseding upload offers an Undo")
+    assert_check(payload, "the upload Undo is one undo-supersede call")
+    assert_check(payload, "the person profile has a remove control")
+    assert_check(payload, "remove DELETEs the photo endpoint")
+    assert_check(payload, "the remove offers an Undo")
+    assert_check(payload, "the remove Undo is one /restore call")
+
+
+def test_channel_profile_has_no_photo_control() -> None:
+    """A channel/group entity must not offer a photo upload."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e-group"]').click();
+      await settle(150);
+      check('the channel profile has no photo upload control',
+        !document.querySelector('#memory-detail input[type="file"]'));
+      check('the channel profile has no photo remove control',
+        ![...document.querySelectorAll('#memory-detail button')]
+          .some((b) => b.dataset.photoRemove === '1'));
+    """, AVATAR_FIXTURES)
+    assert_check(payload, "the channel profile has no photo upload control")
+    assert_check(payload, "the channel profile has no photo remove control")
+
+
+# --- review R2: B1 (cache-busting src) + B2 (the sha never shows as text) -----
+
+LEAK_FIXTURES = {
+    "entities": [
+        {"id": "e1", "kind": "person", "name": "Dana", "aliases": [], "facts": [
+            {"id": "f-photo", "subject_id": "e1", "predicate": "photo",
+             "value": "497790947d4666760ce38f3c00e852c71f",
+             "object_id": None, "status": "confirmed", "provenance": {"source": "upload"}},
+        ]},
+        {"id": "e2", "kind": "person", "name": "Noa", "aliases": [], "facts": [
+            {"id": "f-photo2", "subject_id": "e2", "predicate": "photo",
+             "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+             "object_id": None, "status": "confirmed", "provenance": {"source": "upload"}},
+        ]},
+    ],
+    "proposed": [{
+        "id": "e1", "kind": "person", "name": "Dana", "aliases": [], "facts": [
+            {"id": "f-prop-photo", "subject_id": "e1", "predicate": "photo",
+             "value": "aaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccdddd",
+             "object_id": None, "status": "proposed", "provenance": {}},
+        ],
+    }],
+}
+
+
+def test_avatar_src_is_cache_busted_by_the_fact_value() -> None:
+    """B1: every photo shares ONE URL, and GET sends max-age=3600 — after a
+    change (or an undo) the browser would serve the OLD bytes from its
+    cache. The src carries ?v=<the fact's sha256> so a new value is a new
+    URL; the server ignores v."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      const img1 = document.querySelector('[data-entity="e1"] img.mm-av-photo');
+      const img2 = document.querySelector('[data-entity="e2"] img.mm-av-photo');
+      const want1 = '/memory/entities/e1/photo?v=497790947d4666760ce38f3c00e852c71f';
+      check('the avatar src carries the sha as ?v=',
+        Boolean(img1) && img1.getAttribute('src') === want1,
+        img1 ? img1.getAttribute('src') : 'no img');
+      check('a different photo value yields a different src', Boolean(img2)
+        && img2.getAttribute('src') !== img1.getAttribute('src'),
+        `${img1 && img1.getAttribute('src')} vs ${img2 && img2.getAttribute('src')}`);
+    """, LEAK_FIXTURES)
+    assert_check(payload, "the avatar src carries the sha as ?v=")
+    assert_check(payload, "a different photo value yields a different src")
+
+
+def test_the_photo_sha_never_renders_as_text() -> None:
+    """B2: the profile's basic-info rows, the review inbox and the history
+    drawer must not print the sha. The history drawer shows a photo row as
+    'photo' plus its dates."""
+    payload = screen_behavior("""
+      await window.MemoryTab.refresh();
+      await settle(150);
+      document.querySelector('[data-entity="e1"]').click();
+      await settle(150);
+      const detail = document.getElementById('memory-detail');
+      const detailText = detail ? detail.textContent : '';
+      check('the basic-info rows never show the sha',
+        !detailText.includes('497790947d4666760ce38f3c00e852c71f'),
+        detailText.slice(0, 200));
+      document.getElementById('memory-review-btn').click();
+      await settle(150);
+      const review = document.getElementById('memory-review-list');
+      const reviewText = review ? review.textContent : '';
+      check('the review inbox never shows a proposed photo sha',
+        reviewText && !reviewText.includes('aaaabbbbccccdddd'),
+        reviewText.slice(0, 200));
+      // the history drawer for the CONFIRMED photo fact (opened directly —
+      // the profile's History buttons belong to valued basic fields)
+      window.__mem.openMemoryDrawer('f-photo');
+      await settle(300);
+      const drawer = document.getElementById('memory-drawer-body');
+      const drawerText = drawer ? drawer.textContent : '';
+      const hasSha = drawerText.includes('497790947d4666760ce38f3c00e852c71f');
+      check('the history drawer shows the photo row without the sha',
+        drawerText.includes('photo') && !hasSha, drawerText.slice(0, 240));
+    """, LEAK_FIXTURES)
+    assert_check(payload, "the basic-info rows never show the sha")
+    assert_check(payload, "the review inbox never shows a proposed photo sha")
+    assert_check(payload, "the history drawer shows the photo row without the sha")

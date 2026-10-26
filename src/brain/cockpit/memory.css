@@ -128,6 +128,10 @@ body[data-tab="memory"] #refresh-in { display: none; }
 .mm-av-group { border-radius: 10px; background: var(--mm-group-bg); color: var(--text); }
 .mm-av-lg.mm-av-group { border-radius: 18px; }
 .mm-av-lg.mm-av-group svg { width: 32px; height: 32px; }
+img.mm-av-photo { object-fit: cover; }
+.mm-profile-photo { display: flex; flex-direction: column; align-items: center; gap: 6px; flex: none; }
+.mm-photo-controls { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.mm-photo-controls .btn { padding: 2px 8px; font-size: 11px; }
 .tone-0 { background: var(--mm-tone-0-bg); color: var(--mm-tone-0-fg); }
 .tone-1 { background: var(--mm-tone-1-bg); color: var(--mm-tone-1-fg); }
 .tone-2 { background: var(--mm-tone-2-bg); color: var(--mm-tone-2-fg); }

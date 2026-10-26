@@ -857,6 +857,12 @@ class TelegramBot:
                 return Reply("Memory layer is not installed yet.")
             # MemoryService.overview returns a LIST of entity dicts
             entities = memory.overview(status="confirmed", q=None)
+        # 'photo' facts are never listed: the value is the avatar's sha256 and
+        # the numbered remove buttons bypass the screen's photo undo flow
+        for e in entities:
+            if e.get("kind") == "person":
+                e["facts"] = [f for f in e.get("facts", [])
+                              if f.get("predicate", "").lower() != "photo"]
         persons = [e for e in entities if e.get("kind") == "person" and e.get("facts")]
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))

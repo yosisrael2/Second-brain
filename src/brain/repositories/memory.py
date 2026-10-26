@@ -143,11 +143,18 @@ class MemoryRepository:
         return list(self._db.scalars(stmt))
 
     def search_facts(self, needle: str) -> list[MemoryFact]:
-        """Case-insensitive substring over value/predicate (lightweight; FTS later)."""
+        """Case-insensitive substring over value/predicate (lightweight; FTS later).
+
+        'photo' facts are excluded: their value is the avatar's sha256, and a
+        search for a hex fragment must not summon a person through it.
+        """
         pattern = f"%{needle}%"
         stmt = (
             select(MemoryFact)
-            .where(MemoryFact.value.ilike(pattern) | MemoryFact.predicate.ilike(pattern))
+            .where(
+                (MemoryFact.value.ilike(pattern) | MemoryFact.predicate.ilike(pattern))
+                & (MemoryFact.predicate != "photo")
+            )
             .order_by(MemoryFact.created_at.desc())
         )
         return list(self._db.scalars(stmt))
