@@ -196,26 +196,19 @@ class AskService:
             try:
                 # The kid leg runs SQL on the shared request session (memory
                 # overview + items repo). A REAL db error aborts the whole
-                # transaction — the savepoints scope the rollback to the leg
-                # (the #117 trap), the ask continues without kid additions,
-                # and later queries on the same session still work.
-                sessions = [
-                    s
-                    for s in (
-                        getattr(self._items_repo, "_db", None),
-                        getattr(getattr(self._memory, "_repo", None), "_db", None),
-                    )
-                    if s is not None and hasattr(s, "begin_nested")
-                ]
-                with ExitStack() as stack:
-                    for s in sessions:
-                        stack.enter_context(s.begin_nested())
-                    kid_items = self._kid_recall_items(
-                        question, record_ops=recording, now=now
-                    )
+                # transaction — the leg takes its own savepoints INSIDE
+                # _kid_recall_items, after the kid-mention check (the #117
+                # trap): the ask continues without kid additions, the no-kid
+                # ask pays no SAVEPOINT round trips, and later queries on the
+                # same session still work.
+                kid_items = self._kid_recall_items(
+                    question, record_ops=recording, now=now
+                )
             except Exception as exc:  # noqa: BLE001 — the leg must never kill the ask
                 logger.warning(
-                    "ask: kid leg failed; continuing without it (%s)", exc
+                    "ask: kid leg failed; continuing without it (%s)",
+                    exc,
+                    exc_info=True,
                 )
                 if recording:
                     ops.record_event(
@@ -240,13 +233,27 @@ class AskService:
                 # no kid named -> byte-identical to the pre-reservation cut
                 hits = pool[: self._top_k]
             pool_ids = [str(hit.item.id) for hit in pool]
+            # MAJOR 2: the conflict leg must see ONLY the ids that actually
+            # reach the prompt (temporal hits + the top_k cut with kid
+            # additions). Running it on the pre-cut pool pulled counterparts
+            # for below-the-cut items whose pairs were then dropped — orphans
+            # with no marker, a cap spent on relations the prompt never
+            # shows, and a note counting items that were never candidates.
+            # The temporal fetch moves up so its ids are included; the
+            # resulting context order is unchanged.
+            temporal_hits = self._temporal_hits(question, now)
+            context_pool_ids = [
+                str(hit.item.id) for hit in self._unique_by_id(temporal_hits + hits)
+            ]
             try:
                 conflict_hits, conflict_map, conflict_note = self._conflict_leg(
-                    pool_ids, recording=recording
+                    context_pool_ids, recording=recording
                 )
             except Exception as exc:  # noqa: BLE001 — the leg must never kill the ask
                 logger.warning(
-                    "ask: conflict leg failed; continuing without it (%s)", exc
+                    "ask: conflict leg failed; continuing without it (%s)",
+                    exc,
+                    exc_info=True,
                 )
                 if recording:
                     ops.record_event(
@@ -262,7 +269,7 @@ class AskService:
                 "pool_size": len(pool_ids),
                 "pool_hash": hashlib.sha1(",".join(pool_ids).encode()).hexdigest()[:12],
             }
-        context_hits = self._temporal_hits(question, now) + hits + conflict_hits
+        context_hits = temporal_hits + hits + conflict_hits
         # Text-dedupe that keeps conflicts: a dropped text-duplicate is
         # mapped to its survivor, so a counterpart collapsing into an
         # in-context item RE-POINTS the conflict marker instead of losing it
@@ -270,27 +277,38 @@ class AskService:
         context_hits, survivor_of = _dedupe_keep_conflicts(
             self._unique_by_id(context_hits)
         )
-        # Rebuild the map against the FINAL ids only, re-pointing through the
-        # text-duplicate survivors. A pair whose ends collapse into ONE item
-        # carries no quotable contradiction and is dropped.
+        # Map the leg's lists IN PLACE against the FINAL ids, re-pointing
+        # through the text-duplicate survivors. No backward re-inserts: the
+        # lists keep the leg's original order, so a prompt without any dedupe
+        # collapse is byte-identical to the pre-#135 one. A pair whose ends
+        # collapse into ONE item carries no quotable contradiction and is
+        # dropped (logged — a dedupe collapse silently eating a conflict must
+        # at least be visible in the logs).
         final_ids = {str(hit.item.id) for hit in context_hits}
         rebuilt: dict[str, list[str]] = {}
-        for a_str, others in conflict_map.items():
+        for item_id, others in conflict_map.items():
+            a = uuid.UUID(item_id)
+            sa = survivor_of.get(a, a)
+            kept: list[str] = []
             for b_str in others:
-                a = uuid.UUID(a_str)
                 b = uuid.UUID(b_str)
-                sa = survivor_of.get(a, a)
                 sb = survivor_of.get(b, b)
                 if sa == sb:
+                    logger.info(
+                        "ask: dedupe collapsed both ends of a conflict into "
+                        "item %s; dropping the pair",
+                        sa,
+                    )
                     continue
                 if str(sa) not in final_ids or str(sb) not in final_ids:
                     continue
-                forward = rebuilt.setdefault(str(sa), [])
-                if str(sb) not in forward:
-                    forward.append(str(sb))
-                backward = rebuilt.setdefault(str(sb), [])
-                if str(sa) not in backward:
-                    backward.append(str(sa))
+                if str(sb) not in kept:
+                    kept.append(str(sb))
+            if kept and str(sa) in final_ids:
+                merged = rebuilt.setdefault(str(sa), kept)
+                for entry in kept:
+                    if entry not in merged:
+                        merged.append(entry)
         conflict_map = rebuilt
         context = [
             {
@@ -375,6 +393,21 @@ class AskService:
         additions = candidates[: self._kid_reserved_slots]
         return general + additions
 
+    def _leg_sessions(self) -> list[Any]:
+        """The sessions the kid leg may run SQL on — the items repo's and the
+        memory repo's. Both usually hold the SAME shared request session;
+        dedupe by identity so it is never nested or rolled back twice."""
+        return list(
+            {
+                id(s): s
+                for s in (
+                    getattr(self._items_repo, "_db", None),
+                    getattr(getattr(self._memory, "_repo", None), "_db", None),
+                )
+                if s is not None and hasattr(s, "rollback")
+            }.values()
+        )
+
     def _kid_recall_items(
         self,
         question: str,
@@ -406,7 +439,23 @@ class AskService:
         """
         if self._memory is None or self._items_repo is None:
             return []
-        entities = self._memory.overview(status="confirmed", q=None)
+        try:
+            entities = self._memory.overview(status="confirmed", q=None)
+        except Exception:
+            # overview resolves the kid mention and runs BEFORE any savepoint
+            # (the no-kid ask takes none — review minor 4): a real db error
+            # here aborts the shared transaction, so roll the leg's sessions
+            # back before the ask's except turns the leg off. The ask path is
+            # read-only and ops writes run on their own engine, so the
+            # rollback discards nothing the ask needs and later queries on
+            # the session still work (the #117 trap). The leg's repo queries
+            # below stay savepoint-scoped: their failures never need this.
+            for s in self._leg_sessions():
+                try:
+                    s.rollback()
+                except Exception:  # noqa: BLE001 — never mask the leg error
+                    logger.debug("ask: kid-leg rollback failed", exc_info=True)
+            raise
 
         def mentions(name: str) -> bool:
             # THE shared whole-word matcher (kid-recall + triage): boundaries,
@@ -442,48 +491,63 @@ class AskService:
         # the same strings drive the structured query above.
         needles.extend(sorted(kid_channels))
         needles = [needle for needle in dict.fromkeys(needles) if needle]
+        if not needles and not kid_channels:
+            # no kid named: the leg contributes nothing and — deliberately —
+            # takes NO savepoint (the review: the no-kid ask must not pay
+            # extra SAVEPOINT round trips).
+            return []
         items: dict[uuid.UUID, MemoryItem] = {}
-        if needles:
-            for item in self._items_repo.by_text_any(
-                needles, limit=self._kid_recall_limit
-            ):
-                items[item.id] = item
         window_ids: set[uuid.UUID] = set()
         lookback_ids: set[uuid.UUID] = set()
-        if kid_channels:
-            # The SAME date resolution the temporal leg runs: with a resolved
-            # window the channel leg is bounded BY the window widened at its
-            # START by lookback days — the announcement about day D is usually
-            # SENT on D-1 (WA39 run 3; occurred_at is the SENT time), while a
-            # mid-week question must still not drown under the newest items
-            # of the same channels (WA39 run 1). Without a resolved window it
-            # falls back to newest-N, never all history.
-            ranges = parse_question_ranges(
-                question, self._tz, now or datetime.now(UTC)
-            )
-            if ranges:
-                lookback = timedelta(days=max(self._kid_recall_lookback_days, 0))
-                for start, end in ranges:
-                    for item in self._items_repo.by_channels(
-                        kid_channels, limit=self._kid_recall_limit,
-                        ranges=[(start, end)],
-                    ):
-                        items.setdefault(item.id, item)
-                        window_ids.add(item.id)
-                    if lookback:
+        # The leg's SQL is savepoint-scoped HERE (not in ask()): a real db
+        # error rolls back to the savepoint, the ask's except turns the leg
+        # off, and later queries on the same session still work (the #117
+        # trap). Both repos may hold the SAME shared request session —
+        # dedupe by identity (_leg_sessions) so it is not nested twice;
+        # different sessions each get their own savepoint.
+        with ExitStack() as stack:
+            for s in self._leg_sessions():
+                if hasattr(s, "begin_nested"):
+                    stack.enter_context(s.begin_nested())
+            if needles:
+                for item in self._items_repo.by_text_any(
+                    needles, limit=self._kid_recall_limit
+                ):
+                    items[item.id] = item
+            if kid_channels:
+                # The SAME date resolution the temporal leg runs: with a resolved
+                # window the channel leg is bounded BY the window widened at its
+                # START by lookback days — the announcement about day D is usually
+                # SENT on D-1 (WA39 run 3; occurred_at is the SENT time), while a
+                # mid-week question must still not drown under the newest items
+                # of the same channels (WA39 run 1). Without a resolved window it
+                # falls back to newest-N, never all history.
+                ranges = parse_question_ranges(
+                    question, self._tz, now or datetime.now(UTC)
+                )
+                if ranges:
+                    lookback = timedelta(days=max(self._kid_recall_lookback_days, 0))
+                    for start, end in ranges:
                         for item in self._items_repo.by_channels(
                             kid_channels, limit=self._kid_recall_limit,
-                            ranges=[(start - lookback, start)],
+                            ranges=[(start, end)],
                         ):
                             items.setdefault(item.id, item)
-                            lookback_ids.add(item.id)
-            else:
-                for item in self._items_repo.by_channels(
-                    kid_channels,
-                    limit=self._kid_recall_limit,
-                    ranges=None,
-                ):
-                    items.setdefault(item.id, item)
+                            window_ids.add(item.id)
+                        if lookback:
+                            for item in self._items_repo.by_channels(
+                                kid_channels, limit=self._kid_recall_limit,
+                                ranges=[(start - lookback, start)],
+                            ):
+                                items.setdefault(item.id, item)
+                                lookback_ids.add(item.id)
+                else:
+                    for item in self._items_repo.by_channels(
+                        kid_channels,
+                        limit=self._kid_recall_limit,
+                        ranges=None,
+                    ):
+                        items.setdefault(item.id, item)
         if not items:
             return []
         # The overall extra pool still respects the kid-recall cap, with slot
@@ -535,7 +599,12 @@ class AskService:
         prompt renders the ⚠️ line and the answer quotes both versions.
 
         Returns (counterpart hits, item_id -> [conflicting item ids],
-        truncation note). The cap stays; when relations were left out the
+        truncation note). ``pool_ids`` are the ids of the items ACTUALLY in
+        the final context (temporal hits + the top_k cut with kid
+        additions) — never the raw pre-cut search pool: a relation touching
+        an out-of-context item must not pull its counterpart (the pair
+        would be dropped later, leaving an orphan), spend the cap, or
+        inflate the note. The cap stays; when relations were left out the
         note says HOW MANY, so the answer knows the context is incomplete.
         With no repository or no relations: ([], {}, None) — the pipeline is
         byte-identical to the pre-leg one. An older repository without the
@@ -549,7 +618,10 @@ class AskService:
         try:
             uuids = [uuid.UUID(item_id) for item_id in pool_ids]
         except ValueError:
-            return [], {}
+            # a non-uuid pool id (third-party fake): the leg contributes
+            # nothing — same shape as every other early return, so the
+            # unpack in ask() cannot misreport this as a leg failure
+            return [], {}, None
         # The leg runs SQL on the ask's session: a REAL db error aborts the
         # whole transaction ("current transaction is aborted") — the catch
         # one level up would only move the crash one step later. The
@@ -586,10 +658,11 @@ class AskService:
                 ok=True,
                 detail={"pulled": len(pulled), "relations": len(pairs)},
             )
+        note = self._truncation_note(pairs, uuids)
         return (
             [SearchHit(item=item, score=None) for item in pulled.values()],
             conflict_map,
-            self._truncation_note(pairs, uuids),
+            note,
         )
 
     def _truncation_note(
@@ -598,19 +671,40 @@ class AskService:
         """One line for the prompt when the cap left live conflicts out —
         the answer must know the context is incomplete. The cap itself is
         unchanged (4 pairs); the count comes from the repo's live-relation
-        count (same predicates), so the note says the real number."""
+        count (same predicates, DISTINCT relations — a relation between two
+        in-context items joins two rows and must not count twice), so the
+        note says the real number. The count runs SQL on the shared session:
+        savepoint-scoped and caught — a broken count loses the note, never
+        the ask (the #117 trap)."""
         if len(pairs) < self._conflict_leg_limit:
             return None
         count_method = getattr(self._items_repo, "count_conflict_relations", None)
         if count_method is None:
             return None
-        total = count_method(uuids)
-        hidden = total - len(pairs)
+        session = getattr(self._items_repo, "_db", None)
+        try:
+            if session is not None and hasattr(session, "begin_nested"):
+                with session.begin_nested():
+                    total = count_method(uuids)
+            else:  # a third-party fake without a session: no savepoint to take
+                total = count_method(uuids)
+        except Exception as exc:  # noqa: BLE001 — a broken count loses the note
+            logger.warning(
+                "ask: conflict count failed; continuing without the note (%s)",
+                exc,
+                exc_info=True,
+            )
+            return None
+        # pairs are (relation, counterpart) rows: a relation with BOTH ends
+        # in context contributes two rows — count the relations actually
+        # quoted, so 'hidden' matches what the note counts.
+        shown = len({rel.id for rel, _other in pairs})
+        hidden = total - shown
         if hidden <= 0:
             return None
         note = (
             f"{hidden} more conflicting items were not shown "
-            f"(only the {len(pairs)} newest conflicts are quoted)"
+            f"(only the {shown} newest conflicts are quoted)"
         )
         logger.info("ask: conflict leg truncated: %s", note)
         return note

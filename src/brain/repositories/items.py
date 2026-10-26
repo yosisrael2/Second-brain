@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, distinct, func, or_, select
 from sqlalchemy.orm import Session
 
 from brain.db.enums import FTS_LANGUAGE, ItemStatus, ItemType
@@ -237,7 +237,10 @@ class ItemsRepository:
         the meaning-extraction lifecycle, item 19) are never recalled;
         ordinary captures, 'proposed' and 'kept' children are.
         Superseded (struck-through) items are hidden by default (item 20/D4);
-        ``include_superseded=True`` opts back in.
+        ``include_superseded=True`` opts back in. NOISE-TRIAGED conversations
+        are excluded — the ONE rule for ask-context material (the kid leg's
+        structured by_channels and the conflict leg apply the same
+        predicate; the search legs keep noise searchable by design, D2a).
         """
         if not needles:
             return []
@@ -260,6 +263,10 @@ class ItemsRepository:
         if not include_superseded:
             for cond in default_hidden_conditions():
                 stmt = stmt.where(cond)
+        # the ONE noise rule for ask-context material (kid leg + conflict leg)
+        stmt = stmt.where(
+            MemoryItem.triage_label.is_(None) | (MemoryItem.triage_label != "noise")
+        )
         return list(self._db.scalars(stmt))
 
     def conflict_counterparts(
@@ -320,12 +327,16 @@ class ItemsRepository:
         """How many live conflicts relations touch the given items — the same
         predicates as :meth:`conflict_counterparts` (dead counterparts and
         noise excluded), without the cap. The ask's conflict leg reads it to
-        say HOW MANY counterparts its cap left out."""
+        say HOW MANY counterparts its cap left out. Counts DISTINCT
+        relations: the join matches a relation once per in-context end, so
+        plain ``count(*)`` would double-count a relation whose both ends are
+        in the pool (the note would then claim hidden conflicts that were
+        already quoted)."""
         if not item_ids:
             return 0
         ids = list(item_ids)
         stmt = (
-            select(func.count())
+            select(func.count(distinct(ItemRelation.id)))
             .select_from(ItemRelation)
             .join(
                 MemoryItem,
