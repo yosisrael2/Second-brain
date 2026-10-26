@@ -105,6 +105,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     recon_eval.add_argument(
         "--tz", default=None, help="Timezone for local-day windows (default Settings.timezone)"
     )
+    recon_eval.add_argument(
+        "--judge",
+        action="store_true",
+        help="Consult the second-stage judge on the 0.60-0.80 band (real "
+        "Jev/LLM clients; OFF by default — without it the eval is "
+        "byte-identical to the pre-judge scoring)",
+    )
     extract_eval = subparsers.add_parser(
         "extract-eval",
         help="Run the LLM extractor over an emails file -> pred.jsonl (offline)",
@@ -313,7 +320,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "enrich":
         return _enrich(since=args.since, limit=args.limit, budget=args.budget)
     if args.command == "recon-eval":
-        return _recon_eval(cases=args.cases, tz_name=args.tz)
+        return _recon_eval(cases=args.cases, tz_name=args.tz, judge=args.judge)
     if args.command == "extract-eval":
         return _extract_eval(
             input_path=args.input,
@@ -434,6 +441,7 @@ def run_recon_eval(
     now: datetime | None = None,
     tz_name: str | None = None,
     embedder: Any | None = None,
+    judge: Any | None = None,
 ) -> dict[str, Any]:
     """Score reconciliation verdicts against a cases jsonl (offline).
 
@@ -508,6 +516,7 @@ def run_recon_eval(
                 now=case_now,
                 tz_name=tz_name,
                 signal=signal,
+                judge=judge,
             ).verdict.value
             expected = str(case["verdict"]).strip().lower()
             stats = per_verdict.setdefault(expected, {"tp": 0, "fp": 0, "fn": 0})
@@ -528,15 +537,27 @@ def _parse_eval_dt(value: Any) -> datetime | None:
     return datetime.fromisoformat(str(value))
 
 
-def _recon_eval(*, cases: str, tz_name: str | None) -> int:
-    """Offline recon scoring (D-recon-1): prints per-verdict P/R + matrix."""
+def _recon_eval(*, cases: str, tz_name: str | None, judge: bool = False) -> int:
+    """Offline recon scoring (D-recon-1): prints per-verdict P/R + matrix.
+
+    --judge (review fix 3): build the REAL judge (the ONE builder, the same
+    app-lifetime clients) and pass it into the scoring — only with the flag;
+    the default run never constructs a client.
+    """
     from datetime import UTC, datetime  # noqa: PLC0415
     from zoneinfo import ZoneInfo  # noqa: PLC0415
 
     from brain.config import get_settings  # noqa: PLC0415
 
     tz = ZoneInfo(tz_name or get_settings().timezone)
-    report = run_recon_eval(cases, now=datetime.now(tz=UTC), tz_name=tz.key)
+    judge_obj = None
+    if judge:
+        from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+
+        judge_obj = EnrichmentService._build_recon_judge()
+    report = run_recon_eval(
+        cases, now=datetime.now(tz=UTC), tz_name=tz.key, judge=judge_obj
+    )
     print(f"cases: {report['cases']}")
     for verdict, stats in sorted(report["per_verdict"].items()):
         tp, fp, fn = stats["tp"], stats["fp"], stats["fn"]

@@ -142,6 +142,10 @@ class ReconSignal:
 # lexical ratio is only a fast accept for near-identical strings.
 RECON_SIMILARITY_THRESHOLD = 0.80
 RECON_LEXICAL_FAST_ACCEPT = 0.95
+# Follow-up (a), approved plan: the judge band's lower edge. A pair in
+# [floor, threshold) that passes type/audience/window/exclusion and clears
+# the ambiguity margin may be judged by the second-stage judge.
+RECON_JUDGE_FLOOR = 0.60
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -252,6 +256,10 @@ class ReconResult:
     # signal alone matched a different kind); write() stores it in the
     # relation's provenance.
     cross_kind: bool = False
+    # Review B1: True when the match came through the second-stage judge's
+    # YES (the 0.60-0.80 band) — a model's opinion never auto-applies and
+    # the provenance carries judged=true so the card and ops can show it.
+    judged: bool = False
 
 
 def _sender_address(meta: dict[str, Any]) -> str:
@@ -451,6 +459,7 @@ def _compatible(
     similarity: Callable[[str, str], float],
     *,
     relax_type: bool = False,
+    floor: float = RECON_SIMILARITY_THRESHOLD,
 ) -> bool:
     """The always-on guards: same type ∧ same applies_to ∧ similar enough.
 
@@ -460,6 +469,9 @@ def _compatible(
 
     ``relax_type`` drops ONLY the type gate (PR-b cross-kind cancellation);
     the applies_to gate and the similarity threshold never relax.
+
+    With the judge active the gate drops to the judge floor: band pairs
+    reach the pool and the judge decides (they only MATCH on a yes).
     """
     if existing.type != candidate.kind and not relax_type:
         return False
@@ -467,7 +479,7 @@ def _compatible(
     existing_applies = tuple(sorted(existing.applies_to))
     if candidate_applies != existing_applies:
         return False
-    return similarity(candidate.title, existing.title) >= RECON_SIMILARITY_THRESHOLD
+    return similarity(candidate.title, existing.title) >= floor
 
 
 def classify(
@@ -479,6 +491,7 @@ def classify(
     tz_name: str,
     signal: ReconSignal | None = None,
     relax_type: bool = False,
+    judge: Callable[[ReconCandidate, ExistingItem], bool | None] | None = None,
 ) -> ReconResult:
     """One verdict for the candidate against the existing items (pure).
 
@@ -495,8 +508,10 @@ def classify(
     tz = ZoneInfo(tz_name)
     signal = signal or ReconSignal()
     relax = relax_type and signal.cancel
+    floor = RECON_JUDGE_FLOOR if judge is not None else RECON_SIMILARITY_THRESHOLD
     compatible = [
-        e for e in existing_items if _compatible(candidate, e, similarity, relax_type=relax)
+        e for e in existing_items
+        if _compatible(candidate, e, similarity, relax_type=relax, floor=floor)
     ]
     same_day = [e for e in compatible if _same_local_day(candidate, e, tz)]
     extended = (
@@ -519,25 +534,45 @@ def classify(
         # a cross-kind match (only reachable with relax_type + cancel): a
         # reminder saying an event is cancelled. Only CANCELLATION is a
         # verdict here — a change phrased cross-kind is ambiguous speech,
-        # not evidence (PR-b decision).
+        # not evidence (PR-b decision). Checked BEFORE the judge band: a
+        # cross-kind pair is never judged, main's rule stands.
         if not (relax and signal.cancel):
             return ReconResult(verdict=Verdict.NEW)
         return ReconResult(
             verdict=Verdict.CANCELLATION, matched_id=best.id, cross_kind=True
         )
+    if best_score < RECON_SIMILARITY_THRESHOLD:
+        # the judge band: everything else (type, audience, window,
+        # exclusion, ambiguity) already passed — the typed yes/no decides.
+        # None/False falls CLOSED: NEW, never a guessed match.
+        if judge is None or not judge(candidate, best):
+            return ReconResult(verdict=Verdict.NEW)
+        judged = True  # the judge said YES: every verdict below is judged
+    else:
+        judged = False
     if signal.cancel:
-        return ReconResult(verdict=Verdict.CANCELLATION, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.CANCELLATION, matched_id=best.id, judged=judged
+        )
     diffs = _field_diffs(candidate, best, tz)
     if diffs and signal.change:
-        return ReconResult(verdict=Verdict.UPDATE, matched_id=best.id, fields=diffs)
+        return ReconResult(
+            verdict=Verdict.UPDATE, matched_id=best.id, fields=diffs, judged=judged
+        )
     if diffs:
         # the extended window REQUIRES a signal, so a no-signal diff can only
         # come from a same-day match (the VETO's CONFLICT row)
-        return ReconResult(verdict=Verdict.CONFLICT, matched_id=best.id, fields=diffs)
+        return ReconResult(
+            verdict=Verdict.CONFLICT, matched_id=best.id, fields=diffs, judged=judged
+        )
     if best in same_day and _adds_info(candidate, best, tz):
-        return ReconResult(verdict=Verdict.MORE_DETAIL, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.MORE_DETAIL, matched_id=best.id, judged=judged
+        )
     if best in same_day:
-        return ReconResult(verdict=Verdict.ALREADY_KNOWN, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.ALREADY_KNOWN, matched_id=best.id, judged=judged
+        )
     # an extended-window match carries the signal but no field change we can
     # propose — that is not a verdict the spec defines; stay NEW (never invent).
     return ReconResult(verdict=Verdict.NEW)
@@ -572,6 +607,7 @@ class ReconciliationService:
         self, session: Any, repo: Any, *, tz_name: str,
         similarity: Callable[[str, str], float] | None = None,
         similarity_factory: Callable[[], Any] | None = None,
+        judge_factory: Callable[[], Any] | None = None,
     ) -> None:
         # B1 (final check): None means "not built yet" — the factory (the
         # ONE shared builder, via EnrichmentService) runs lazily on the
@@ -579,6 +615,11 @@ class ReconciliationService:
         # nor factory falls back to lexical (unit tests only).
         self._similarity = similarity
         self._similarity_factory = similarity_factory
+        self._judge_factory = judge_factory
+        self._judge: Any | None = None
+        # Review fix 2: a None build (flag off — the default) is FINAL and
+        # cached: the factory never re-runs per candidate.
+        self._judge_built = False
         self._embedder_failed = False
         self._session = session
         self._repo = repo
@@ -707,6 +748,7 @@ class ReconciliationService:
         exclude_ids: set[uuid.UUID],
         now: datetime,
         signal: ReconSignal | None = None,
+        judge: Callable[[ReconCandidate, ExistingItem], bool | None] | None = None,
     ) -> ReconResult:
         """classify() against the DB universe (the pure function, unchanged)
         plus the F3 gate (round 4): a still-PROPOSED child of ANOTHER source
@@ -727,6 +769,7 @@ class ReconciliationService:
             now=now,
             tz_name=self._tz_name,
             signal=signal or ReconSignal(),
+            judge=judge,
         )
         result = self._gate_unapproved(result, matches, candidate)
         if (
@@ -790,6 +833,16 @@ class ReconciliationService:
         """E1: switch matching to embedding cosine (production + eval use the
         same callable built by embedder_similarity)."""
         self._similarity = embedder_similarity(embedder)
+
+    def _ensure_judge(self) -> None:
+        """The judge builds ONCE per service (review fix 2): a None result —
+        build_judge returns None when RECON_JUDGE_ENABLED is false (the
+        default) — is FINAL and cached, never retried per candidate."""
+        if self._judge_built:
+            return
+        self._judge_built = True
+        if self._judge_factory is not None:
+            self._judge = self._judge_factory()
 
     def _ensure_embedder(self) -> None:
         """B1: first reconciled candidate builds the match callable through
@@ -883,12 +936,16 @@ class ReconciliationService:
 
     # -- writes -------------------------------------------------------------
 
-    def record_already_known(self, matched_id: uuid.UUID, source_id: uuid.UUID) -> None:
+    def record_already_known(
+        self, matched_id: uuid.UUID, source_id: uuid.UUID, *, judged: bool = False
+    ) -> None:
         """Ops event for an ALREADY KNOWN verdict (the quote link is done by
-        the caller — it owns the resolved quote list)."""
+        the caller — it owns the resolved quote list). ``judged`` (review B1)
+        marks a verdict that came through the second-stage judge's YES."""
         self._record(
             Verdict.ALREADY_KNOWN,
-            {"matched_id": str(matched_id), "item_id": str(source_id)},
+            {"matched_id": str(matched_id), "item_id": str(source_id),
+             **({"judged": True} if judged else {})},
         )
 
     def write(
@@ -915,20 +972,25 @@ class ReconciliationService:
         if result.verdict is Verdict.MORE_DETAIL:
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="details",
-                provenance={"how": "recon"},
+                provenance={"how": "recon", **({"judged": True} if result.judged else {})},
             )
         elif result.verdict is Verdict.CONFLICT:
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="conflicts",
-                provenance={"how": "recon", "fields": fields_json},
+                provenance={"how": "recon", "fields": fields_json,
+                            **({"judged": True} if result.judged else {})},
             )
         elif result.verdict is Verdict.UPDATE:
-            auto = self._auto_apply_allowed(source, result.matched_id)
+            # Review B1: a judged match (the 0.60-0.80 band) NEVER auto-applies
+            # — auto-apply was approved for matches above the 0.80 threshold
+            # only; a model's opinion always stays proposed.
+            auto = not result.judged and self._auto_apply_allowed(source, result.matched_id)
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="supersedes",
                 provenance={
                     "how": "recon", "state": "applied" if auto else "proposed",
                     "verdict": "update", "fields": fields_json,
+                    **({"judged": True} if result.judged else {}),
                 },
             )
             self._session.add(rel)
@@ -961,6 +1023,8 @@ class ReconciliationService:
             provenance: dict[str, Any] = {"how": "recon", "state": "proposed"}
             if result.cross_kind:
                 provenance["cross_kind"] = True
+            if result.judged:
+                provenance["judged"] = True
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="cancels",
                 provenance=provenance,

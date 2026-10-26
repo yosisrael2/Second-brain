@@ -177,6 +177,7 @@ class EnrichmentService:
         daily_cap: int = 100,
         timezone: str | None = None,
         similarity_factory: Callable[[], Any] | None = None,
+        judge_factory: Callable[[], Any] | None = None,
         on_children_changed: Callable[[list[SourceOutcome]], None] | None = None,
     ) -> None:
         """``session`` is the runner's DB session (same one behind ``repo``).
@@ -221,6 +222,7 @@ class EnrichmentService:
             # B1: tests may inject a hermetic factory; production gets the
             # ONE shared builder.
             similarity_factory=similarity_factory or self._build_recon_similarity,
+            judge_factory=judge_factory or self._build_recon_judge,
         )
 
     # --- queue ---------------------------------------------------------
@@ -856,6 +858,28 @@ class EnrichmentService:
         the reconciliation service; see ReconciliationService.answer_series_scope)."""
         return self.recon.answer_series_scope(relation_id, scope)
 
+    @staticmethod
+    def _build_recon_judge() -> Any:
+        """The judge builds through the ONE builder (build_judge) with the
+        SAME app-lifetime Jev/LLM clients triage uses (never a second
+        client). The flag is checked FIRST (review fix 2): OFF — the
+        default — constructs NO client at all; build_judge returns None and
+        that disables the stage entirely. Static so recon-eval reuses the
+        ONE builder without constructing a service."""
+        from brain.config import get_settings  # noqa: PLC0415
+
+        if not get_settings().recon_judge_enabled:
+            return None
+        from brain.api import deps  # noqa: PLC0415
+        from brain.services.extraction.judge import build_judge  # noqa: PLC0415
+
+        settings = get_settings()
+        return build_judge(
+            settings,
+            jev=deps.get_jev_client(),
+            llm=deps.get_llm_client(),
+        )
+
     def _reconcile_child(
         self,
         resolved: _ResolvedChild,
@@ -885,6 +909,7 @@ class EnrichmentService:
         )
         recon = self.recon
         recon._ensure_embedder()
+        recon._ensure_judge()
         recon_candidate = ReconCandidate(
             kind=candidate.kind,
             title=candidate.title,
@@ -899,6 +924,10 @@ class EnrichmentService:
             exclude_ids=set(existing_children.keys()) | {source.id},
             now=now,
             signal=signal,
+            # Review fix 1: the built judge is passed EXPLICITLY at the call
+            # site — no hidden default. None (flag off, the default) keeps
+            # classify() byte-identical to the pre-judge tree.
+            judge=recon._judge,
         )
 
         if result.ambiguous:
@@ -918,7 +947,7 @@ class EnrichmentService:
         if result.verdict is Verdict.ALREADY_KNOWN:
             matched = uuid.UUID(str(result.matched_id))
             self._link_existing_quote(matched, source, resolved)
-            recon.record_already_known(matched, source.id)
+            recon.record_already_known(matched, source.id, judged=result.judged)
             return ReconOutcome(verdict=Verdict.ALREADY_KNOWN, matched_id=matched)
         verdict_child = self._create_child(
             resolved,

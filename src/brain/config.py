@@ -95,6 +95,12 @@ class Settings(BaseSettings):
 
     # Local embeddings (used when embedder_provider="fastembed", the default)
     fastembed_model: str = DEFAULT_FASTEMBED_MODEL
+    # Recon second-stage judge (approved plan): only the 0.60-0.80 band,
+    # typed yes/no, Jev first then one strict LLM call, fall CLOSED.
+    recon_judge_enabled: bool = False
+    recon_judge_floor: float = 0.60
+    recon_judge_confidence: float = 0.9
+    recon_judge_max_calls: int = 20
     # Round 5 (E1): the embedder used for RECONCILIATION matching only —
     # a stronger multilingual model than the search one; search and Qdrant
     # keep fastembed_model (no vector-dim change anywhere). Loaded lazily
