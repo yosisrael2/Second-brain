@@ -256,6 +256,10 @@ class ReconResult:
     # signal alone matched a different kind); write() stores it in the
     # relation's provenance.
     cross_kind: bool = False
+    # Review B1: True when the match came through the second-stage judge's
+    # YES (the 0.60-0.80 band) — a model's opinion never auto-applies and
+    # the provenance carries judged=true so the card and ops can show it.
+    judged: bool = False
 
 
 def _sender_address(meta: dict[str, Any]) -> str:
@@ -543,19 +547,32 @@ def classify(
         # None/False falls CLOSED: NEW, never a guessed match.
         if judge is None or not judge(candidate, best):
             return ReconResult(verdict=Verdict.NEW)
+        judged = True  # the judge said YES: every verdict below is judged
+    else:
+        judged = False
     if signal.cancel:
-        return ReconResult(verdict=Verdict.CANCELLATION, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.CANCELLATION, matched_id=best.id, judged=judged
+        )
     diffs = _field_diffs(candidate, best, tz)
     if diffs and signal.change:
-        return ReconResult(verdict=Verdict.UPDATE, matched_id=best.id, fields=diffs)
+        return ReconResult(
+            verdict=Verdict.UPDATE, matched_id=best.id, fields=diffs, judged=judged
+        )
     if diffs:
         # the extended window REQUIRES a signal, so a no-signal diff can only
         # come from a same-day match (the VETO's CONFLICT row)
-        return ReconResult(verdict=Verdict.CONFLICT, matched_id=best.id, fields=diffs)
+        return ReconResult(
+            verdict=Verdict.CONFLICT, matched_id=best.id, fields=diffs, judged=judged
+        )
     if best in same_day and _adds_info(candidate, best, tz):
-        return ReconResult(verdict=Verdict.MORE_DETAIL, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.MORE_DETAIL, matched_id=best.id, judged=judged
+        )
     if best in same_day:
-        return ReconResult(verdict=Verdict.ALREADY_KNOWN, matched_id=best.id)
+        return ReconResult(
+            verdict=Verdict.ALREADY_KNOWN, matched_id=best.id, judged=judged
+        )
     # an extended-window match carries the signal but no field change we can
     # propose — that is not a verdict the spec defines; stay NEW (never invent).
     return ReconResult(verdict=Verdict.NEW)
@@ -919,12 +936,16 @@ class ReconciliationService:
 
     # -- writes -------------------------------------------------------------
 
-    def record_already_known(self, matched_id: uuid.UUID, source_id: uuid.UUID) -> None:
+    def record_already_known(
+        self, matched_id: uuid.UUID, source_id: uuid.UUID, *, judged: bool = False
+    ) -> None:
         """Ops event for an ALREADY KNOWN verdict (the quote link is done by
-        the caller — it owns the resolved quote list)."""
+        the caller — it owns the resolved quote list). ``judged`` (review B1)
+        marks a verdict that came through the second-stage judge's YES."""
         self._record(
             Verdict.ALREADY_KNOWN,
-            {"matched_id": str(matched_id), "item_id": str(source_id)},
+            {"matched_id": str(matched_id), "item_id": str(source_id),
+             **({"judged": True} if judged else {})},
         )
 
     def write(
@@ -951,20 +972,25 @@ class ReconciliationService:
         if result.verdict is Verdict.MORE_DETAIL:
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="details",
-                provenance={"how": "recon"},
+                provenance={"how": "recon", **({"judged": True} if result.judged else {})},
             )
         elif result.verdict is Verdict.CONFLICT:
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="conflicts",
-                provenance={"how": "recon", "fields": fields_json},
+                provenance={"how": "recon", "fields": fields_json,
+                            **({"judged": True} if result.judged else {})},
             )
         elif result.verdict is Verdict.UPDATE:
-            auto = self._auto_apply_allowed(source, result.matched_id)
+            # Review B1: a judged match (the 0.60-0.80 band) NEVER auto-applies
+            # — auto-apply was approved for matches above the 0.80 threshold
+            # only; a model's opinion always stays proposed.
+            auto = not result.judged and self._auto_apply_allowed(source, result.matched_id)
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="supersedes",
                 provenance={
                     "how": "recon", "state": "applied" if auto else "proposed",
                     "verdict": "update", "fields": fields_json,
+                    **({"judged": True} if result.judged else {}),
                 },
             )
             self._session.add(rel)
@@ -997,6 +1023,8 @@ class ReconciliationService:
             provenance: dict[str, Any] = {"how": "recon", "state": "proposed"}
             if result.cross_kind:
                 provenance["cross_kind"] = True
+            if result.judged:
+                provenance["judged"] = True
             rel = ItemRelation(
                 from_id=child.id, to_id=matched_id, kind="cancels",
                 provenance=provenance,

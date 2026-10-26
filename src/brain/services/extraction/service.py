@@ -947,7 +947,7 @@ class EnrichmentService:
         if result.verdict is Verdict.ALREADY_KNOWN:
             matched = uuid.UUID(str(result.matched_id))
             self._link_existing_quote(matched, source, resolved)
-            recon.record_already_known(matched, source.id)
+            recon.record_already_known(matched, source.id, judged=result.judged)
             return ReconOutcome(verdict=Verdict.ALREADY_KNOWN, matched_id=matched)
         verdict_child = self._create_child(
             resolved,

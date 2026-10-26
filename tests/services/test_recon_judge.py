@@ -346,10 +346,10 @@ def test_wiring_the_service_consults_the_judge_on_a_band_pair(db):
     assert outcome.matched_id == member.id
 
 
-def _member_for(db: Session, *, title: str) -> MemoryItem:
+def _member_for(db: Session, *, title: str, hour_utc: int = 16) -> MemoryItem:
     item = MemoryItem(
         raw_text=title, source="email", type="event",
-        occurred_at=datetime(2026, 11, 10, 16, 0, tzinfo=UTC),  # 18:00 JLM
+        occurred_at=datetime(2026, 11, 10, hour_utc, 0, tzinfo=UTC),  # 18:00 JLM at 16
         applies_to=["unknown"], status="filed",
     )
     db.add(item)
@@ -467,3 +467,82 @@ def test_off_path_verdicts_are_byte_identical():
     )
     assert result_cross.verdict.value == "cancellation"
     assert result_cross.cross_kind is True
+
+
+def test_judged_update_never_auto_applies(db):
+    """Review B1, RED FIRST: a judge 'yes' in the 0.60-0.80 band must NEVER
+    auto-apply — auto-apply was approved for matches ABOVE the 0.80
+    threshold only. The relation stays 'proposed', the existing item stays
+    visible, and the provenance carries judged=true."""
+    from tests.services.test_recon_scope_ask import _candidate_child
+    from tests.services.test_reconciliation import _make_source
+
+    from brain.db.models import ItemRelation, ItemSource
+    from brain.services.extraction.candidates import ReconHint
+
+    original = _make_source(db, text="טיול שנתי יוצא ב-16:00")
+    source = _make_source(db, text="תיקון טעות: הטיול יוצא ב-18:00")  # same sender+thread
+    existing = _member_for(db, title="טיול שנתי בפארק", hour_utc=14)  # 16:00 JLM: a 2h diff
+    db.add(ItemSource(child_id=existing.id, source_id=original.id, quote="טיול שנתי"))
+    db.commit()
+    fake = FakeJudge(default=True)
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None, daily_cap=100,
+        timezone="Asia/Jerusalem",
+        similarity_factory=lambda: (lambda a, b: 0.70),
+        judge_factory=lambda: fake,
+    )
+    resolved = service._validate(
+        _candidate_child(kind="event", title="טיול שנתי בפארק",
+                         when_raw="10.11 18:00", quote="הטיול יוצא ב-18:00",
+                         recon=ReconHint(change=True)),
+        source, NOW,
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid4(), NOW)
+    assert outcome.verdict.value == "update"
+    assert fake.calls, "the band pair must be judged"
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("state") == "proposed", (
+        "a judged update NEVER auto-applies"
+    )
+    assert (rel.provenance or {}).get("judged") is True
+    db.refresh(existing)
+    assert existing.superseded_by is None, "the existing item stays visible"
+
+
+def test_above_threshold_update_still_auto_applies(db):
+    """CONTROL (B1): the SAME setup at similarity 0.95 — above the band, no
+    judge involved — still auto-applies exactly as before the judge
+    existed."""
+    from tests.services.test_recon_scope_ask import _candidate_child
+    from tests.services.test_reconciliation import _make_source
+
+    from brain.db.models import ItemRelation, ItemSource
+    from brain.services.extraction.candidates import ReconHint
+
+    original = _make_source(db, text="טיול שנתי יוצא ב-16:00")
+    source = _make_source(db, text="תיקון טעות: הטיול יוצא ב-18:00")
+    existing = _member_for(db, title="טיול שנתי בפארק", hour_utc=14)  # 16:00 JLM: a 2h diff
+    db.add(ItemSource(child_id=existing.id, source_id=original.id, quote="טיול שנתי"))
+    db.commit()
+    fake = FakeJudge(default=True)
+    service = EnrichmentService(
+        ItemsRepository(db), db, extractor=None, memory=None, daily_cap=100,
+        timezone="Asia/Jerusalem",
+        similarity_factory=lambda: (lambda a, b: 0.95),
+        judge_factory=lambda: fake,
+    )
+    resolved = service._validate(
+        _candidate_child(kind="event", title="טיול שנתי בפארק",
+                         when_raw="10.11 18:00", quote="הטיול יוצא ב-18:00",
+                         recon=ReconHint(change=True)),
+        source, NOW,
+    )
+    outcome = service._reconcile_child(resolved, source, {}, uuid4(), NOW)
+    assert outcome.verdict.value == "update"
+    assert fake.calls == [], "an above-threshold pair never reaches the judge"
+    rel = db.query(ItemRelation).filter_by(kind="supersedes").one()
+    assert (rel.provenance or {}).get("state") == "applied"
+    assert (rel.provenance or {}).get("judged") is None
+    db.refresh(existing)
+    assert existing.superseded_by == rel.from_id
