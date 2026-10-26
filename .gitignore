@@ -28,3 +28,7 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# jsdom (screen-behavior tests install it locally with npm --prefix .)
+node_modules/
+package-lock.json

@@ -78,11 +78,13 @@ def rename_entity(
     data: schemas.EntityPatch,
     service: MemoryService = Depends(get_memory_service),
 ) -> schemas.EntityRead:
-    """Rename an entity; 404 when missing."""
+    """Rename an entity; 404 when missing, 409 when the name is taken."""
     try:
         entity = service.patch_entity(entity_id, **data.model_dump(exclude_unset=True))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"entity '{entity_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     return schemas.EntityRead.model_validate(entity)
 
 
@@ -113,6 +115,30 @@ def create_fact(
         raise HTTPException(
             status_code=404, detail=f"subject entity '{data.subject_id}' not found"
         ) from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return schemas.FactRead.model_validate(fact)
+
+
+@router.post("/facts/{fact_id}/undo-supersede", response_model=schemas.FactRead)
+def undo_supersede(
+    fact_id: uuid.UUID,
+    service: MemoryService = Depends(get_memory_service),
+) -> schemas.FactRead:
+    """Undo a supersede: close the current row, reopen the one it replaced.
+
+    One op for the screen's supersede-Undo (confirm/add of a single-valued
+    field): the replaced row was closed as HISTORY, not deleted, so /restore
+    refuses it — this op closes the new row and reopens the old one in one
+    transaction. 409 unless the new row is current, chained via
+    supersedes_id, and the replaced row is closed history (not rejected).
+    """
+    try:
+        fact = service.undo_supersede(fact_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"fact '{fact_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     return schemas.FactRead.model_validate(fact)
 
 
@@ -207,18 +233,28 @@ def add_alias(
     return schemas.EntityRead.model_validate(entity)
 
 
-@router.delete("/entities/{entity_id}/aliases/{alias}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/entities/{entity_id}/aliases/{alias:path}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_alias(
     entity_id: uuid.UUID,
     alias: str,
     service: MemoryService = Depends(get_memory_service),
 ) -> None:
-    """Remove one alias; 404 when the entity or the alias is unknown."""
+    """Remove one alias; 404 when the entity or the alias is unknown.
+
+    ``:path`` so an alias containing "/" (percent-encoded by the client)
+    still routes here instead of 404ing on the extra segment. The framework
+    decodes the path parameter exactly once — a second unquote here mangled
+    aliases containing a literal '%' ('R%41' became 'RA'), and the old
+    rstrip('/') corrupted aliases that genuinely end in a slash.
+    """
+    if not alias:
+        raise HTTPException(status_code=404, detail="empty alias")
     try:
         service.remove_alias(entity_id, alias)
     except KeyError:
         raise HTTPException(
-            status_code=404, detail=f"alias '{alias}' not found on entity '{entity_id}'"
+            status_code=404,
+            detail=f"alias {alias!r} not found on entity '{entity_id}'",
         ) from None
 
 

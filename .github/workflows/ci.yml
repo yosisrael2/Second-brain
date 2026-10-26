@@ -103,6 +103,14 @@ jobs:
           .venv/bin/pip install -e '.[dev,telegram]' shellcheck-py
       - name: Apply migrations (brain_test)
         run: .venv/bin/alembic upgrade head
+      # The memory-screen behavior tests boot the REAL cockpit files in jsdom
+      # (tests/_jsdom_screen.py). jsdom is installed --prefix . so node_modules
+      # sits under the repo root — the runner's ESM dynamic import('jsdom')
+      # resolves from the cwd and IGNORES NODE_PATH, so a NODE_PATH-based
+      # install silently skipped every behavioral test in CI. A missing jsdom
+      # is now a FAILURE when CI is set (runner + harness), never a skip.
+      - name: Install jsdom (screen-behavior tests)
+        run: npm install --silent --no-save --prefix . jsdom@24
       - name: Pytest
         # Plain `pytest` works from the repo root since pyproject sets
         # pytest pythonpath = ["."] (the suite imports tests.fakes).
