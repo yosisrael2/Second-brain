@@ -77,10 +77,10 @@ to its section or doc.
 | Capture pipeline (items, paste parsing, Jev, dedupe, recurring ICS fan-out, loud missing deps) | **Done** | #1, #7, #17, #19, #65, #77 |
 | Retrieval (embeddings, FTS fusion, temporal, recall pool, kid-aware recall incl. a kid's own channels, lookback window, kid slots that become date-relevant additions, hidden-predicate channel queries) | **Done** | #20, #21, #24, #32, #42, #89, #95, #98, #100, #104 |
 | Ask (citations, model config, conflict rule, one builder) | **Done** | #6, #27, #35 |
-| Memory layer (entities, versioned facts, channels, ask block, API, UI) + Memory Management screen (part A endpoints: aliases, archive/restore, bridge groups, family summary; part B master-detail UI, kid archive undo toast) | **Done, live** | #26, #28, #30, #106, #118, #127, #130 |
+| Memory layer (entities, versioned facts, channels, ask block, API, UI) + Memory Management screen (part A endpoints: aliases, archive/restore, bridge groups, family summary; part B master-detail UI; redesign: profile, review inbox, family map, group labels, basic info incl. birthday-as-age) | **Done, live** | #26, #28, #30, #106, #118, #127, #130, #134 |
 | WhatsApp ingestion (24/7 agent, conversations, indexing) | **Done, live** | #37, #40, #47, #50 |
 | Attachments (Telegram, email, WhatsApp media) | **Done** | #38, #44 |
-| Gmail connector (`email`) + 24/7 email agent — one live Gmail path through the runner; the agent's loop treats a backoff cycle as a normal interval and a failing cycle sleeps through its stall window; quota hygiene (bounded listing, call pacing, rate-limit retry), vanished-message 404 skips + lazy history pages, reconcile-on-reset (tombstone ledger ids the sweep no longer lists) | **Done, opt-in** (needs Google consent) | #36, #43, #59, #83, #94, #101, #109, #125, #129 |
+| Gmail connector (`email`) + 24/7 email agent — one live Gmail path through the runner; the agent's loop treats a backoff cycle as a normal interval and a failing cycle sleeps through its stall window; quota hygiene (bounded listing, call pacing, rate-limit retry), vanished-message 404 skips + lazy history pages, reconcile-on-reset (tombstone ledger ids the sweep no longer lists); SB/ labeler v1 (rules over headers only, dry-run default, undo + audit; labeler scope readonly + `gmail.modify`) | **Done, opt-in** (readonly consent done; the labeler's separate `gmail.modify` consent (`brain gmail-label --auth`) is NOT done; school label first-synced by hand) | #36, #43, #59, #83, #94, #101, #109, #125, #129, #137 |
 | Extraction data model + queue, LLM extractor (A2), proposal cards, activation seam, in-bot worker (per-pass deadline, week-1 source filter `ENRICHMENT_WORKER_SOURCES`) | **Done, inactive** (default stub; `ENRICHMENT_EXTRACTOR=llm` + `ENRICHMENT_WORKER_ENABLED` + a bot restart activate) | #33, #41, #39, #68, #84, #93, #107 |
 | WhatsApp reconciliation verdicts before proposals (new / already known / update / more detail / conflict / cancellation; auto-apply only same thread + same sender; a fact's effective date and amount are more-detail fields, amounts compared as numbers; series scope this time / from now on, cross-kind cancellation, ask conflict leg) | **Done, inactive** (runs inside the enrichment pass) | #73, #103, #102, #121 |
 | Reconciliation verdict cards on the proposal card (D-recon-2a: confirm / keep-both / keep-new / keep-existing / cancel / restore taps, one explicit tap per change) | **Done, on main, inactive** (off while extraction is off; not yet live) | #99 |
@@ -89,7 +89,7 @@ to its section or doc.
 | Enabling connectors: enable runbook, one-time `adopt` ledger pass | **Done** (runs once per connector, before its first sync) | #79, #81, #85 |
 | Connectors background agent (opt-in launchd scheduler, `BRAIN_CONNECTORS_INTERVAL_S`, per-source failure isolation, email excluded) | **Done, opt-in** (installs only when a non-email connector is enabled) | #82 |
 | Connector conformance kit (six checks against the real runner, registry-driven sweep, Gmail immutable-source change variant) | **Done** | #60 |
-| Google Calendar connector (`gcal`, read-only; bounded sync window: past 7d, rolling future 60d) | **Done, on main, inactive** (disabled by default) | #55, #114 |
+| Google Calendar connector (`gcal`, read-only; bounded sync window: past 7d, rolling future 60d; adopt runbook with window envs + dry-run reading) | **Done, on main, inactive** (disabled by default) | #55, #114, #132 |
 | Google Tasks connector (`gtasks`, read-only) | **Done, on main, inactive** (disabled by default) | #56 |
 | Google Drive connector (`gdrive`, read-only) | **Done, on main, inactive** (disabled by default) | #57 |
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
@@ -98,13 +98,16 @@ to its section or doc.
 | Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts, tests never write the repo env file, fail-fast on unknown test-DB revision with `BRAIN_TEST_DB_RESET` opt-in) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75, #92, #122, #128 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown; fastembed model cached between runs, 600s timeout on the eval module only) | **Done** | #4, #5, #25, #39, #61, #112 |
 
-**In progress** (25 Oct 2026)
+**In progress** (26 Oct 2026)
 
+- Memory-screen majors (PR #136, open): undo exemptions, supersede whitelist, move-to-basic PATCH, composer drafts, stale render
+- Ask path resilience (PR #135, open): one bad leg never kills an answer
+- Gmail SB/ labeler runbook (PR #138, open); labeler v1 (#137) merged but not activated
 - Reconciliation judge (branch local, not yet a PR)
 - WhatsApp acceptance re-run 5 (unblocked: #102 and #104 merged)
 - Stage-3 Google write-back design (PR #63, draft — needs an explicit user GO before any write-back work)
 
-The live instance runs `2ddd581` (deployed 25 Oct 2026; DB migration `7d90f6ea8407` applied). The enrichment worker is OFF (the default stub extractor), every connector is registered but disabled, and the email + connectors launchd agents are not installed. On 25 Oct the Gmail connector was run by hand once: adopt linked 18 pasted emails and a first partial sync captured 20; it is not scheduled, and the remaining label backlog waits for the next manual sync. The reconciliation verdict cards (PR #99) and the Memory Management screen went live with this deploy.
+The live instance runs `a279599` (deployed 25 Oct evening; the second deploy that day — `2ddd581` first, applying DB migration `7d90f6ea8407`; live alembic head `7d90f6ea8407`). Rollback is `git checkout --detach` of the previous sha + reinstall + restart, never `alembic downgrade`; DB backups live in `~/second-brain-backups/`. The enrichment worker is OFF (the default stub extractor), every connector is registered but disabled, and the email + connectors launchd agents are not installed. On 25 Oct the Gmail connector was run by hand: adopt linked 18 pasted emails, a first partial sync captured 20, and ~160 remain for a manual sync; it is not scheduled, and the remaining label backlog waits for the next manual sync. The reconciliation verdict cards (PR #99), the Memory Management screen and its redesign (#130, #134) are live.
 
 **Planned**
 
