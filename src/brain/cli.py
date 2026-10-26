@@ -1407,12 +1407,26 @@ def _gmail_label(args: argparse.Namespace) -> int:
         # if the user later unsets or changes the label (the escape hatch).
         if (gate := _labeler_gate(settings)) != 0:
             return gate
+        from brain.ai.gmail import GmailAuthError
         from brain.services.gmail_labeler import undo_batch
 
-        with SessionLocal() as session:
-            result = undo_batch(
-                _labeler_client(settings, modify=True), args.undo, session=session
-            )
+        try:
+            with SessionLocal() as session:
+                result = undo_batch(
+                    _labeler_client(settings, modify=True), args.undo, session=session
+                )
+        except GmailAuthError as exc:
+            # Review R2: a revoked/403 token mid-undo aborts the whole batch
+            # (undo_batch stops calling). Report what was done so far, name
+            # --auth, exit 78 — never a traceback, never exit 1-as-success.
+            partial = getattr(exc, "partial", None)
+            if partial is not None:
+                print(
+                    f"gmail-label: undone {partial.undone} label(s), already "
+                    f"absent {partial.already_absent} before the auth failure"
+                )
+            print(f"gmail-label: {exc}", file=sys.stderr)
+            return 78
         # labeler/followups #2: the three buckets are printed and a partial
         # failure is VISIBLE — exit 1 with the failed ids listed, never a
         # silent 0.

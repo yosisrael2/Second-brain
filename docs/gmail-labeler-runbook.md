@@ -240,20 +240,22 @@ EXAMPLE (format only):
   [7f3c9a2b1d4e] apply: 18c9f1b2a3d4e5f6 -> SB/Kids
 ```
 
-Undo one batch — it removes **exactly the labels that batch added** (your own
-labels on those messages, and labels added by other batches, are untouched).
-Every apply row of the batch is an undo candidate — including rows marked
 `failed` (a failed call may still have committed server-side, e.g. a timeout
 after Google accepted the write). Each candidate is checked first: a label
 that is already gone is counted as already-absent and no write is sent, and
 **one message's error never stops the batch** — the failures are listed and
 undo exits 1 so a partial result cannot look like success (exit 0 means
-everything was undone or was already absent).
+everything was undone or was already absent). A message that no longer
+exists (deleted or trashed-and-purged since the batch) is **already
+absent**, not failed — its label went with it (ops state `gone`), so a
+deleted email never fails a future undo run.
 
 Undo also **refuses, before any Gmail call**, to touch anything the labeler
 did not create: the Gmail system labels (INBOX, UNREAD, TRASH, SPAM, SENT,
 DRAFT, STARRED, IMPORTANT) and any label id without `SB/` evidence in the
-ledger:
+ledger. And if the token turns out to be revoked or un-consented mid-undo
+(401/403), undo **aborts immediately** — no more doomed calls — reports the
+counts done so far, names `--auth`, and exits 78:
 
 ```bash
 brain gmail-label --undo 7f3c9a2b1d4e
@@ -265,6 +267,9 @@ EXAMPLE output:
 gmail-label: undone 12 label(s), already absent 0 for batch 7f3c9a2b1d4e
 # if anything failed:
 gmail-label: FAILED (2): 18c9f2a7e4b6d011, 18c9f1b2a3d4e5f6   (exit 1)
+# if the token was revoked mid-run:
+gmail-label: undone 3 label(s), already absent 0 before the auth failure
+gmail-label: gmail.modify is not consented — run `brain gmail-label --auth` …   (exit 78)
 ```
 
 Everyday rhythm: dry-run → read the plan → `--apply` (each run caps at
