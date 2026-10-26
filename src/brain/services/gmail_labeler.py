@@ -14,17 +14,28 @@ classification is deterministic over headers only:
 
 Safety rails:
 - dry-run is the DEFAULT: planning performs ZERO write calls (ids + metadata
-  GETs only); ``--apply`` is explicit and capped (``max_apply``, hard default
-  20 per run).
+  GETs only); ``--apply`` is explicit and capped (``max_apply``, valid range
+  1..100, default 20 per run — argparse refuses anything outside the range;
+  the service raises ValueError below 1; there is NO unlimited).
+- own credentials: the labeler's refresh token lives in its OWN keychain item
+  (``LABELER_KEYCHAIN_SERVICE``, distinct from the sync token's item) and is
+  stored by ``--auth`` ONLY after the consented profile's email address
+  matches the configured account (``settings.gmail_account``). A missing
+  item is a refusal, never a fallback to the sync token.
 - label-only: the labeler adds SB/ labels and never removes INBOX, never
   archives/trashes/deletes. v1 creates NO Gmail filters (gmail.settings.basic
   never enters the scope set).
 - consent gate: label writes need gmail.modify. The FIRST write-capable call
   (label creation) happens before any message is modified; a 403 there aborts
   the run with a re-consent message — zero message writes.
-- audit + undo: every applied label is an ops_event (component 'gmail-label',
-  kind 'apply', detail: batch, gmail id, label path + id). ``undo_batch``
-  removes exactly the label ids its batch added — user labels are untouched.
+- write-ahead audit + undo: each label's ops_event (component 'gmail-label',
+  kind 'apply') is committed with detail state 'intent' BEFORE its Gmail
+  modify call, then updated to 'applied' or 'failed'. An intent row that
+  cannot be committed means the label is NOT applied (no unaudited writes).
+  ``undo_batch`` treats intent+applied rows as its candidates (removing a
+  label that was never applied is harmless) and removes exactly the label
+  ids its batch added — user labels are untouched. The prune EXEMPTS these
+  rows from the 7-day retention (they are the undo ledger).
 - idempotent: a message already carrying ANY SB/ label is skipped.
 
 Message selection: the same scope the email connector syncs (the configured
@@ -45,6 +56,14 @@ from brain.ops import record_event
 from brain.services.triage import is_name_token
 
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
+
+# The labeler's OWN keychain item — deliberately NOT the sync token's item
+# (brain.services.keychain.SERVICE / GMAIL_ACCOUNT). ``--auth`` stores the
+# labeler's modify-capable token HERE and never reads, writes or overwrites
+# the sync token's item; a missing item is a refusal (exit 78), never a
+# fallback to the sync token.
+LABELER_KEYCHAIN_SERVICE = "second-brain-gmail-labeler"
+LABELER_KEYCHAIN_ACCOUNT = "default"
 
 
 def token_grants_modify(
@@ -296,47 +315,189 @@ def apply_labels(
     *,
     max_apply: int,
     batch_id: str,
+    session: Any = None,
 ) -> int:
-    """Apply at most ``max_apply`` planned labelings; ops-audit each one.
+    """Apply at most ``max_apply`` planned labelings; ops-audit each one
+    WRITE-AHEAD.
 
     Returns the applied count. The label ids are ensured FIRST (a 403 aborts
-    before any message write); the cap is hard — nothing past it is sent.
+    before any message write); the cap is hard — nothing past it is sent, and
+    ``max_apply < 1`` raises ValueError (there is no unlimited; argparse
+    already pins the CLI to 1..100).
+
+    Per label: the audit row (state 'intent') is COMMITTED before the Gmail
+    modify call; after the call it is updated to 'applied' or 'failed'. An
+    intent row that cannot be committed means the label is NOT applied —
+    there are no unaudited writes. ``session`` (optional) hosts the audit
+    writes; when None a short-lived session is opened per write.
     """
-    batch = plans[:max_apply] if max_apply >= 0 else list(plans)
+    if max_apply < 1:
+        raise ValueError(
+            f"max_apply must be >= 1 (got {max_apply!r}) — the per-run cap "
+            "has no unlimited mode"
+        )
+    batch = plans[:max_apply]
     if not batch:
         return 0
     label_ids = ensure_labels(client, sorted({p.label_path for p in batch}))
     applied = 0
     for plan in batch:
+        detail = {
+            "batch": batch_id,
+            "gmail_id": plan.gmail_id,
+            "label_path": plan.label_path,
+            "label_id": label_ids[plan.label_path],
+            "source": plan.source,
+        }
+        if not _record_audit(
+            session, "apply", ok=True, detail={**detail, "state": "intent"}
+        ):
+            logger.warning(
+                "gmail-label: the intent audit row for %s (batch %s) did not "
+                "commit — the label is NOT applied (no unaudited writes)",
+                plan.gmail_id,
+                batch_id,
+            )
+            continue
         try:
             client.modify_message_labels(plan.gmail_id, add=[label_ids[plan.label_path]])
         except GmailAuthError as exc:
+            _finish_audit(session, batch_id, plan.gmail_id, state="failed", ok=False)
             raise _consent_error(exc) from exc
         except GmailError as exc:
+            _finish_audit(session, batch_id, plan.gmail_id, state="failed", ok=False)
             if getattr(exc, "status", None) == 403:
                 raise _consent_error(exc) from exc
             raise
-        record_event(
-            COMPONENT,
-            "apply",
-            ok=True,
-            detail={
-                "batch": batch_id,
-                "gmail_id": plan.gmail_id,
-                "label_path": plan.label_path,
-                "label_id": label_ids[plan.label_path],
-                "source": plan.source,
-            },
-        )
+        _finish_audit(session, batch_id, plan.gmail_id, state="applied", ok=True)
         applied += 1
     record_event(COMPONENT, "batch", ok=True, detail={"batch": batch_id, "applied": applied})
     return applied
 
 
+def _record_audit(session: Any, kind: str, *, ok: bool, detail: dict[str, Any]) -> bool:
+    """INSERT one labeler audit row into ops_events and COMMIT.
+
+    True only when the row COMMITTED. Unlike :func:`brain.ops.record_event`
+    (log-and-swallow — instrumentation must never break the pipeline), the
+    labeler's write-ahead audit MUST know whether its row landed: a failed
+    write means the label is not applied. Same table, same component; just
+    an honest return.
+    """
+    own = session is None
+    audit_session = None
+    try:
+        from sqlalchemy import text  # noqa: PLC0415
+
+        audit_session = _audit_session(session)
+        audit_session.execute(
+            text(
+                "INSERT INTO ops_events (component, kind, ok, detail) "
+                "VALUES (:component, :kind, :ok, CAST(:detail AS jsonb))"
+            ),
+            {
+                "component": COMPONENT,
+                "kind": kind[:64],
+                "ok": ok,
+                "detail": json.dumps(_audit_detail(detail)),
+            },
+        )
+        audit_session.commit()
+        return True
+    except Exception:
+        logger.warning("gmail-label: the audit INSERT failed", exc_info=True)
+        if audit_session is not None:
+            _rollback_quietly(audit_session)
+        return False
+    finally:
+        if own and audit_session is not None:
+            audit_session.close()
+
+
+def _finish_audit(
+    session: Any, batch_id: str, gmail_id: str, *, state: str, ok: bool
+) -> None:
+    """Advance ONE apply row's detail state: 'intent' -> 'applied'/'failed'.
+
+    Best-effort but loud: a failed state update leaves the row at 'intent',
+    which stays an undo candidate (removing a label that was maybe never
+    applied is harmless) — it must never strand a half-audited write.
+    """
+    own = session is None
+    audit_session = None
+    try:
+        from sqlalchemy import text  # noqa: PLC0415
+
+        audit_session = _audit_session(session)
+        result = audit_session.execute(
+            text(
+                "UPDATE ops_events SET ok = :ok, "
+                "detail = jsonb_set(detail, '{state}', to_jsonb(CAST(:state AS text))) "
+                "WHERE component = :component AND kind = 'apply' "
+                "AND detail->>'batch' = :batch AND detail->>'gmail_id' = :gmail_id "
+                "AND detail->>'state' = 'intent'"
+            ),
+            {
+                "ok": ok,
+                "state": state,
+                "component": COMPONENT,
+                "batch": batch_id,
+                "gmail_id": gmail_id,
+            },
+        )
+        audit_session.commit()
+        if not (result.rowcount or 0):
+            logger.warning(
+                "gmail-label: no open intent row for %s/%s to mark %s",
+                batch_id,
+                gmail_id,
+                state,
+            )
+    except Exception:
+        logger.warning(
+            "gmail-label: the audit state update to %s failed", state, exc_info=True
+        )
+        if audit_session is not None:
+            _rollback_quietly(audit_session)
+    finally:
+        if own and audit_session is not None:
+            audit_session.close()
+
+
+def _audit_session(session: Any) -> Any:
+    """The given audit session, or a fresh one from the app's factory."""
+    from brain.db.session import SessionLocal  # noqa: PLC0415
+
+    return session or SessionLocal()
+
+
+def _rollback_quietly(session: Any) -> None:
+    try:
+        session.rollback()
+    except Exception:  # noqa: BLE001 (the failure is already logged)
+        pass
+
+
+def _audit_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    """Bounded, JSON-safe scalars only (the labeler's own detail is short
+    strings; the defense mirrors brain.ops._safe_detail for the row shape
+    this module writes directly)."""
+    safe: dict[str, Any] = {}
+    for key, value in list(detail.items())[:16]:
+        safe[str(key)[:64]] = value if isinstance(value, (str, int, float, bool)) \
+            or value is None else str(value)[:120]
+    return safe
+
+
 def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
     """Remove exactly the label ids ONE batch added (its own ops events).
 
-    A pre-existing user label on the same message is untouched: only the
+    The undo candidates are the batch's rows with detail state 'intent' or
+    'applied' — an 'intent' row's label may never have reached Gmail (the
+    run died between the audit commit and the modify), and removing a label
+    that was never applied is a harmless no-op that must not error. Rows
+    marked 'failed' are skipped (their modify did not complete). A
+    pre-existing user label on the same message is untouched: only the
     batch's own label ids are removed, and only from the messages the batch
     touched.
     """
@@ -359,7 +520,10 @@ def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
 
 
 def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
-    """The 'apply' events of ONE batch (the undo ledger), oldest first."""
+    """The undo ledger of ONE batch: its 'apply' rows in state 'intent' or
+    'applied', oldest first ('failed' rows are not candidates — their
+    modify did not complete; an intent row that never got its modify is
+    still safe to remove, harmlessly)."""
     from sqlalchemy import text  # noqa: PLC0415
 
     from brain.db.session import SessionLocal  # noqa: PLC0415
@@ -369,7 +533,8 @@ def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
         rows = own.execute(
             text(
                 "SELECT detail FROM ops_events WHERE component = :component "
-                "AND kind = 'apply' AND detail->>'batch' = :batch ORDER BY ts"
+                "AND kind = 'apply' AND detail->>'batch' = :batch "
+                "AND detail->>'state' IN ('intent', 'applied') ORDER BY ts"
             ),
             {"component": COMPONENT, "batch": batch_id},
         ).all()

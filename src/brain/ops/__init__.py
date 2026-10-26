@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 RETENTION_DAYS = 7
 _PRUNE_INTERVAL_S = 3600  # hourly retention sweep from the write path
 
+# Components EXEMPT from the retention prune. The Gmail labeler's rows ARE
+# its undo ledger (`brain gmail-label --undo` reads its 'apply' rows back —
+# including batches older than the 7-day window), so pruning them would
+# silently break `--undo`. Written ahead of the Gmail modify call
+# (brain.services.gmail_labeler, COMPONENT = 'gmail-label').
+PRUNE_EXEMPT_COMPONENTS = frozenset({"gmail-label"})
+
 _engine: Engine | None = None
 _last_prune = 0.0
 
@@ -146,12 +153,24 @@ def _record_span(handle: Span) -> None:
 
 
 def prune_events(max_age_days: int = RETENTION_DAYS) -> int:
-    """Delete ops_events older than the retention window; returns the count."""
+    """Delete ops_events older than the retention window; returns the count.
+
+    The Gmail labeler's audit rows (PRUNE_EXEMPT_COMPONENTS) are EXEMPT:
+    they are the write-ahead undo ledger of `gmail-label --apply` — pruning
+    them would make `--undo` silently no-op on older batches. Every other
+    component ages out on the normal 7-day window.
+    """
+    from sqlalchemy import bindparam
+
     try:
         with _get_engine().begin() as conn:
             result = conn.execute(
-                text("DELETE FROM ops_events WHERE ts < now() - make_interval(days => :d)"),
-                {"d": max_age_days},
+                text(
+                    "DELETE FROM ops_events "
+                    "WHERE ts < now() - make_interval(days => :d) "
+                    "AND component NOT IN :exempt"
+                ).bindparams(bindparam("exempt", expanding=True)),
+                {"d": max_age_days, "exempt": sorted(PRUNE_EXEMPT_COMPONENTS)},
             )
             return int(result.rowcount or 0)
     except Exception:  # noqa: BLE001
