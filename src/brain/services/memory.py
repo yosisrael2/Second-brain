@@ -91,10 +91,16 @@ SINGLE_VALUED_KID_PREDICATES: frozenset[str] = frozenset(
 # supersede exactly this set; restore_fact refuses a second current value
 # for exactly this set. phone/email/work/relation and every other
 # predicate stay additive (notes, memories, links).
+# 'photo' (PR: photo avatars): the avatar bytes live in the file store, the
+# fact carries the sha256 — one current avatar per person, a new upload
+# supersedes (undo via the same undo-supersede op as the other fields).
 SINGLE_VALUED_PREDICATES: frozenset[str] = SINGLE_VALUED_KID_PREDICATES | {
     "birthday",
     "anniversary",
+    "photo",
 }
+
+PHOTO_PREDICATE = "photo"
 
 
 class MemoryService:
@@ -788,6 +794,24 @@ class MemoryService:
         created = self._repo.add_fact(new)
         self._repo.commit()
         return _fact_dict(created)
+
+    def get_entity(self, entity_id: uuid.UUID) -> dict[str, Any] | None:
+        """One entity by id, None when unknown (the photo routes' existence
+        and kind checks; the screen gets everything via :meth:`overview`)."""
+        entity = self._repo.get_entity(entity_id)
+        if entity is None:
+            return None
+        return _entity_dict(entity, self._repo.aliases_for(entity.id))
+
+    def current_photo_fact(self, entity_id: uuid.UUID) -> dict[str, Any] | None:
+        """The entity's current confirmed 'photo' fact (avatars), or None.
+
+        The photo BYTES live in the AttachmentFileStore; the fact carries
+        value=sha256 plus provenance {sha256, mime, size, source} — the
+        route layer maps that onto the upload/serve/remove endpoints.
+        """
+        fact = self._current_confirmed_fact(entity_id, PHOTO_PREDICATE)
+        return _fact_dict(fact) if fact is not None else None
 
     def delete_fact(self, fact_id: uuid.UUID) -> dict[str, Any]:
         """Soft-delete: status 'rejected', valid_to=now; history is kept.

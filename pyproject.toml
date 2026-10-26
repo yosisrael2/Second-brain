@@ -22,6 +22,8 @@ dependencies = [
     "fastembed>=0.6,<2",
     # PDF text-layer extraction for attachments (item 44; BSD-3-Clause).
     "pypdf>=5,<7",
+    # Multipart form parsing for the memory photo upload (FastAPI UploadFile).
+    "python-multipart>=0.0.20,<0.1",
     # Hebrew-calendar date conversion for extraction (delta item 2a).
     "pyluach>=2.0,<3",
     # RRULE expansion for pasted recurring calendar events (P1; BSD-3,
