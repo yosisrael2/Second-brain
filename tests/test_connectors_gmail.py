@@ -136,14 +136,22 @@ class _FakeMessages:
             return _FakeRequest(result=self._state.list_pages[0])
         return _FakeRequest(result=self._state.list_result)
 
-    def get(self, userId, id, format="full"):  # noqa: N803, A002
-        self._state.calls.append(("messages.get", {"id": id, "format": format}))
+    def get(self, userId, id, format="full", **kwargs):  # noqa: N803, A002
+        self._state.calls.append(("messages.get", {"id": id, "format": format, **kwargs}))
         err = self._state.get_errors.get(id)
         if err is not None:
             return _FakeRequest(error=err)
         msg = self._state.messages.get(id)
         if msg is None:
             return _FakeRequest(error=_FakeHttpError(404, b"Requested entity was not found"))
+        # The real API honors metadataHeaders: only those headers come back.
+        wanted = kwargs.get("metadataHeaders")
+        if wanted is not None:
+            msg = dict(msg)
+            msg["payload"] = dict(msg["payload"])
+            msg["payload"]["headers"] = [
+                h for h in msg["payload"]["headers"] if h.get("name") in wanted
+            ]
         return _FakeRequest(result=msg)
 
     def modify(self, userId, id, body):  # noqa: N803, A002
@@ -222,7 +230,10 @@ class _FakeUsers:
 
     def getProfile(self, userId):  # noqa: N803
         self._state.calls.append(("getProfile", {"userId": userId}))
-        return _FakeRequest(result={"historyId": self._state.profile_history_id})
+        result = {"historyId": self._state.profile_history_id}
+        if self._state.profile_email is not None:
+            result["emailAddress"] = self._state.profile_email
+        return _FakeRequest(result=result)
 
 
 class _FakeLabels:
@@ -239,9 +250,17 @@ class _FakeLabels:
 
     def create(self, **kwargs):
         self._state.calls.append(("labels.create", kwargs))
-        if self._state.create_error is not None:
-            return _FakeRequest(error=self._state.create_error)
         name = (kwargs.get("body") or {}).get("name")
+        if self._state.create_error is not None:
+            # A 409 means a CONCURRENT creator won the race: the label exists
+            # by the time the error surfaces (re-listing finds it).
+            if getattr(self._state.create_error, "resp", None) is not None \
+                    and self._state.create_error.resp.status == 409:
+                self._state.list_labels_result["labels"].append(
+                    {"id": self._state.next_label_id, "name": name, "type": "user"}
+                )
+                self._state.next_label_id += 1
+            return _FakeRequest(error=self._state.create_error)
         lid = self._state.next_label_id
         self._state.next_label_id += 1
         self._state.list_labels_result["labels"].append({"id": lid, "name": name, "type": "user"})
@@ -286,6 +305,8 @@ class _ServiceState:
         self.create_error: Exception | None = None
         self.modify_error: Exception | None = None
         self.next_label_id = 1000
+        # users.getProfile emailAddress (None = the fake returns historyId only)
+        self.profile_email: str | None = None
 
 
 def _connector(

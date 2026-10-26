@@ -56,6 +56,13 @@ def scopes_for(enabled: Sequence[str]) -> list[str]:
     return scopes
 
 
+# The ONLY acceptable token endpoint prefix: the refresh token is POSTed to
+# token_uri by the granted-scope check (and the google libs), so a client
+# secret file pointing anywhere else must be refused — it would exfiltrate
+# the refresh token (review follow-up).
+GOOGLE_TOKEN_URI_PREFIX = "https://oauth2.googleapis.com/"
+
+
 def oauth_client_config(settings: Any = None) -> dict[str, str]:
     """The OAuth client (client_id/client_secret/token_uri) from the
     configured secret file — the labeler's granted-scope check reuses the
@@ -86,6 +93,12 @@ def oauth_client_config(settings: Any = None) -> dict[str, str]:
         raise ConnectorAuthError(
             f"client secret file at {path!r} is not an OAuth client JSON "
             "(client_id/client_secret/token_uri missing)"
+        )
+    if not str(token_uri).startswith(GOOGLE_TOKEN_URI_PREFIX):
+        raise ConnectorAuthError(
+            f"client secret file at {path!r} has token_uri {token_uri!r} — not "
+            f"the Google OAuth endpoint ({GOOGLE_TOKEN_URI_PREFIX}…); refusing: "
+            "the refresh token is POSTed to token_uri and must never leave Google"
         )
     return {"client_id": client_id, "client_secret": client_secret, "token_uri": token_uri}
 

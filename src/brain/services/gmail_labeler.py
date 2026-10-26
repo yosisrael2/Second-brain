@@ -22,9 +22,10 @@ Safety rails:
 - consent gate: label writes need gmail.modify. The FIRST write-capable call
   (label creation) happens before any message is modified; a 403 there aborts
   the run with a re-consent message — zero message writes.
-- audit + undo: every applied label is an ops_event (component 'gmail-label',
-  kind 'apply', detail: batch, gmail id, label path + id). ``undo_batch``
-  removes exactly the label ids its batch added — user labels are untouched.
+- audit + undo: every applied label is a row in a DURABLE append-only JSONL
+  ledger (0600, under the app data dir — NOT ops_events, which is pruned
+  after 7 days and would silently kill undo). ``undo_batch`` removes exactly
+  the label ids its batch added — user labels are untouched.
 - idempotent: a message already carrying ANY SB/ label is skipped.
 
 Message selection: the same scope the email connector syncs (the configured
@@ -35,13 +36,17 @@ costs ~5 quota units, paced by the client.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from brain.ai.gmail import GMAIL_LABEL_SCOPES, GmailAuthError, GmailError
-from brain.ops import record_event
+from brain.ai.gmail import GmailAuthError, GmailError
 from brain.services.triage import is_name_token
 
 MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
@@ -102,6 +107,32 @@ LABEL_ORDER = ("Kids", "School", "Logistics", "Bills", "Noise")
 
 COMPONENT = "gmail-label"
 
+# Hard per-run ceiling on applied labels (review MAJOR 1): --max-apply used
+# to accept -1 as 'unlimited'. The CLI rejects < 1; even a huge value can
+# never write more than this many labels in one run.
+MAX_APPLY_CEILING = 50
+
+# The durable undo ledger (review MAJOR 3): a 0600 append-only JSONL file
+# under the app data dir. ops_events is pruned after RETENTION_DAYS=7, which
+# turned 'undo' into a silent 'undone 0' — the ledger must outlive retention.
+AUDIT_FILENAME = "gmail-label-audit.jsonl"
+
+
+class AuditLedgerError(RuntimeError):
+    """A write to the durable audit ledger failed. The ledger is the undo
+    source of truth, so the run fails BEFORE the label is applied — an
+    applied label is never left un-undoable (review MAJOR 4)."""
+
+
+@dataclass(frozen=True)
+class UndoResult:
+    """What one undo pass did (the CLI reports all of it)."""
+
+    total: int  # apply events believed applied (outcome ok) for the batch
+    undone: int
+    already_undone: int
+    failed: int
+
 
 @dataclass(frozen=True)
 class RuleSet:
@@ -116,7 +147,9 @@ def load_rules(path: str | None) -> RuleSet:
 
     An empty/missing path means NO domain/list rules — everything that is not
     a kid subject lands SB/Unsorted. Unknown labels in the file are ignored
-    (the taxonomy is the code's, not the file's).
+    (the taxonomy is the code's, not the file's). EMPTY patterns are dropped:
+    an empty domain or List-Id substring would otherwise match EVERY message
+    ( ''.in(x) is always True; ''.endswith('') is True ) — review follow-up.
     """
     if not path:
         return RuleSet()
@@ -127,8 +160,12 @@ def load_rules(path: str | None) -> RuleSet:
     for label, spec in (raw or {}).items():
         if not isinstance(spec, dict):
             continue
-        domains[str(label)] = tuple(str(d).lower() for d in (spec.get("domains") or []))
-        list_ids[str(label)] = tuple(str(d).lower() for d in (spec.get("list_ids") or []))
+        domains[str(label)] = tuple(
+            str(d).lower().strip() for d in (spec.get("domains") or []) if str(d).strip()
+        )
+        list_ids[str(label)] = tuple(
+            str(d).lower().strip() for d in (spec.get("list_ids") or []) if str(d).strip()
+        )
     return RuleSet(domains=domains, list_ids=list_ids)
 
 
@@ -178,24 +215,12 @@ class LabelPlan:
     source: str  # "kid:<name>" | "domain" | "list-id" | "unsorted"
 
 
-def build_labeler_client(
-    refresh_token: str,
-    *,
-    settings: Any,
-    service_factory: Any = None,
-) -> Any:
-    """RestGmailClient over GMAIL_LABEL_SCOPES (readonly + gmail.modify),
-    paced by the connector's quota-hygiene interval. The SYNC path never uses
-    this (its credentials stay readonly-only)."""
-    from brain.ai.gmail import RestGmailClient
-    from brain.connectors.google.base import default_service_factory
-
-    factory = service_factory or default_service_factory
-    service = factory(refresh_token, list(GMAIL_LABEL_SCOPES), "gmail", "v1")
-    return RestGmailClient(
-        service=service,
-        min_interval_s=getattr(settings, "gmail_min_call_interval_s", None),
-    )
+def plan_hash(plans: list[LabelPlan]) -> str:
+    """A stable content hash of ONE plan (review follow-up): the dry-run
+    prints it; ``--apply --confirm-plan <hash>`` writes exactly that preview
+    or refuses with an explanation when the plan has since changed."""
+    payload = "\n".join(f"{p.gmail_id}\t{p.label_path}\t{p.source}" for p in plans)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def plan_labels(
@@ -271,7 +296,8 @@ def ensure_labels(client: Any, paths: list[str]) -> dict[str, str]:
     """Map each SB/ path to a label id, CREATING the missing ones.
 
     This is the run's FIRST write-capable call: a 403 here (gmail.modify not
-    consented) aborts before ANY message is modified.
+    consented) aborts before ANY message is modified. A 409 on create means a
+    CONCURRENT creator won the race — re-list and use the existing label.
     """
     try:
         by_name = {label.name: label for label in client.list_labels()}
@@ -279,7 +305,15 @@ def ensure_labels(client: Any, paths: list[str]) -> dict[str, str]:
         for path in paths:
             label = by_name.get(path)
             if label is None:
-                label = client.create_label(path)
+                try:
+                    label = client.create_label(path)
+                except GmailError as exc:
+                    if getattr(exc, "status", None) != 409:
+                        raise
+                    by_name = {label.name: label for label in client.list_labels()}
+                    label = by_name.get(path)
+                    if label is None:  # not a create race after all
+                        raise
             out[path] = label.id
     except GmailAuthError as exc:
         raise _consent_error(exc) from exc
@@ -290,37 +324,96 @@ def ensure_labels(client: Any, paths: list[str]) -> dict[str, str]:
     return out
 
 
+# --- the durable audit ledger (review MAJORs 3+4) -----------------------------
+
+
+def audit_path_for(settings: Any) -> Path:
+    """Where the JSONL audit ledger lives: GMAIL_LABELER_AUDIT_PATH when set,
+    else ``<files_dir>/gmail-label-audit.jsonl`` (the app data dir, OUTSIDE
+    the repo and the DB)."""
+    configured = str(getattr(settings, "gmail_labeler_audit_path", "") or "")
+    if configured:
+        return Path(configured).expanduser()
+    files_dir = getattr(settings, "files_dir", None) or (Path.home() / ".second-brain-files")
+    return Path(files_dir) / AUDIT_FILENAME
+
+
+def append_audit_row(path: Path, row: dict[str, Any]) -> None:
+    """Append ONE row to the JSONL ledger, flushed + fsync'd, file 0600.
+
+    Raises (AuditLedgerError wrapping the OSError) on ANY failure — the
+    caller fails the run BEFORE touching Gmail (MAJOR 4: no un-undoable
+    labels)."""
+    row = {"ts": datetime.now(UTC).isoformat(), **row}
+    line = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise AuditLedgerError(
+            f"the audit ledger is unwritable at {path}: {exc} — refusing to "
+            "apply labels that could not be recorded (undo depends on it)"
+        ) from exc
+
+
+def read_audit_rows(path: Path) -> list[dict[str, Any]]:
+    """Every ledger row, oldest first (file order = append order). A corrupt
+    trailing line (a crash mid-write) is skipped with a warning, never fatal
+    for reads — undo still works off the intact prefix."""
+    if not Path(path).exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                logger.warning("audit ledger %s: skipping corrupt line %d", path, lineno)
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
 def apply_labels(
     client: Any,
     plans: list[LabelPlan],
     *,
     max_apply: int,
     batch_id: str,
+    audit_path: Path,
 ) -> int:
-    """Apply at most ``max_apply`` planned labelings; ops-audit each one.
+    """Apply at most ``max_apply`` planned labelings; audit each one.
 
-    Returns the applied count. The label ids are ensured FIRST (a 403 aborts
-    before any message write); the cap is hard — nothing past it is sent.
+    Per message (review MAJOR 4): the 'apply' audit row is written FIRST —
+    a failed ledger write fails the run with NOTHING modified (no label can
+    end up un-undoable) — then the modify, then the 'outcome' row.
+    Returns the applied count. The cap is hard: max_apply < 1 is a
+    programming error (ValueError), and everything past MIN(max_apply,
+    MAX_APPLY_CEILING) is never sent (MAJOR 1).
     """
-    batch = plans[:max_apply] if max_apply >= 0 else list(plans)
+    if max_apply < 1:
+        raise ValueError(f"max_apply must be >= 1 (got {max_apply}) — the cap cannot be lifted")
+    batch = plans[: min(max_apply, MAX_APPLY_CEILING)]
     if not batch:
         return 0
     label_ids = ensure_labels(client, sorted({p.label_path for p in batch}))
     applied = 0
     for plan in batch:
-        try:
-            client.modify_message_labels(plan.gmail_id, add=[label_ids[plan.label_path]])
-        except GmailAuthError as exc:
-            raise _consent_error(exc) from exc
-        except GmailError as exc:
-            if getattr(exc, "status", None) == 403:
-                raise _consent_error(exc) from exc
-            raise
-        record_event(
-            COMPONENT,
-            "apply",
-            ok=True,
-            detail={
+        event = uuid.uuid4().hex[:16]
+        # MAJOR 4: the ledger row FIRST (fsync'd), BEFORE the label write.
+        append_audit_row(
+            audit_path,
+            {
+                "kind": "apply",
+                "event": event,
                 "batch": batch_id,
                 "gmail_id": plan.gmail_id,
                 "label_path": plan.label_path,
@@ -328,52 +421,85 @@ def apply_labels(
                 "source": plan.source,
             },
         )
+        try:
+            client.modify_message_labels(plan.gmail_id, add=[label_ids[plan.label_path]])
+        except GmailAuthError as exc:
+            raise _consent_error(exc) from exc
+        except GmailError as exc:
+            if getattr(exc, "status", None) == 403:
+                raise _consent_error(exc) from exc
+            append_audit_row(
+                audit_path,
+                {"kind": "outcome", "event": event, "batch": batch_id,
+                 "gmail_id": plan.gmail_id, "ok": False,
+                 "error": f"{type(exc).__name__}: {exc}"[:200]},
+            )
+            raise
+        append_audit_row(
+            audit_path,
+            {"kind": "outcome", "event": event, "batch": batch_id,
+             "gmail_id": plan.gmail_id, "ok": True},
+        )
         applied += 1
-    record_event(COMPONENT, "batch", ok=True, detail={"batch": batch_id, "applied": applied})
+    append_audit_row(audit_path, {"kind": "batch", "batch": batch_id, "ok": True,
+                                  "applied": applied})
     return applied
 
 
-def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
-    """Remove exactly the label ids ONE batch added (its own ops events).
+def undo_batch(client: Any, batch_id: str, *, audit_path: Path) -> UndoResult:
+    """Remove exactly the label ids ONE batch added, from the durable JSONL
+    ledger (survives ops_events' 7-day prune — review MAJOR 3).
 
-    A pre-existing user label on the same message is untouched: only the
-    batch's own label ids are removed, and only from the messages the batch
-    touched.
+    Continues past per-item errors (a deleted message, a missing label):
+    each failure is recorded in the ledger and counted, never fatal for the
+    rest of the batch. A batch (or item) already undone is skipped —
+    re-running an undo never churns (review follow-up). A pre-existing user
+    label on the same message is untouched: only the batch's own label ids
+    are removed, and only from the messages the batch touched.
     """
-    events = _batch_events(batch_id, session)
-    undone = 0
-    for detail in events:
-        gmail_id = detail.get("gmail_id")
-        label_id = detail.get("label_id")
-        if not gmail_id or not label_id:
+    rows = read_audit_rows(audit_path)
+    applied: dict[str, dict[str, Any]] = {}  # event -> apply row, file order
+    for row in rows:
+        if row.get("batch") != batch_id:
             continue
-        client.modify_message_labels(gmail_id, remove=[label_id])
-        record_event(
-            COMPONENT,
-            "undo",
-            ok=True,
-            detail={"batch": batch_id, "gmail_id": gmail_id, "label_id": label_id},
-        )
+        event = str(row.get("event") or "")
+        if row.get("kind") == "apply":
+            applied[event] = {**row, "event": event}
+        elif row.get("kind") == "outcome" and event in applied:
+            applied[event]["_outcome_ok"] = row.get("ok") is True
+    undone_before = {
+        row.get("event")
+        for row in rows
+        if row.get("kind") == "undo" and row.get("batch") == batch_id and row.get("ok") is True
+    }
+    targets = [row for row in applied.values() if row.get("_outcome_ok") is not False]
+    undone = already = failed = 0
+    for row in targets:
+        event = row.get("event") or ""
+        if event in undone_before:
+            already += 1
+            continue
+        gmail_id, label_id = row.get("gmail_id"), row.get("label_id")
+        if not gmail_id or not label_id:
+            failed += 1
+            append_audit_row(audit_path, {"kind": "undo", "event": event,
+                                          "batch": batch_id, "ok": False,
+                                          "error": "ledger row missing gmail_id/label_id"})
+            continue
+        try:
+            client.modify_message_labels(gmail_id, remove=[label_id])
+        except GmailAuthError as exc:
+            raise _consent_error(exc) from exc
+        except GmailError as exc:
+            if getattr(exc, "status", None) == 403:
+                raise _consent_error(exc) from exc
+            append_audit_row(audit_path, {"kind": "undo", "event": event,
+                                          "batch": batch_id, "gmail_id": gmail_id,
+                                          "label_id": label_id, "ok": False,
+                                          "error": f"{type(exc).__name__}: {exc}"[:200]})
+            failed += 1
+            continue
+        append_audit_row(audit_path, {"kind": "undo", "event": event, "batch": batch_id,
+                                      "gmail_id": gmail_id, "label_id": label_id, "ok": True})
         undone += 1
-    return undone
-
-
-def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:
-    """The 'apply' events of ONE batch (the undo ledger), oldest first."""
-    from sqlalchemy import text  # noqa: PLC0415
-
-    from brain.db.session import SessionLocal  # noqa: PLC0415
-
-    own = session or SessionLocal()
-    try:
-        rows = own.execute(
-            text(
-                "SELECT detail FROM ops_events WHERE component = :component "
-                "AND kind = 'apply' AND detail->>'batch' = :batch ORDER BY ts"
-            ),
-            {"component": COMPONENT, "batch": batch_id},
-        ).all()
-        return [dict(row.detail) for row in rows]
-    finally:
-        if session is None:
-            own.close()
+    return UndoResult(total=len(targets), undone=undone, already_undone=already, failed=failed)

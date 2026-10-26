@@ -232,6 +232,15 @@ class Settings(BaseSettings):
     # "list_ids": [...]}, ...}). Empty default = no domain/list rules (no
     # personal domains committed); kid names come from confirmed memory.
     gmail_labeler_rules_path: str = ""
+    # The labeler's account pin (review MAJOR 2): --auth verifies via
+    # getProfile that the consented mailbox IS this account BEFORE storing
+    # the refresh token (which REPLACES the shared keychain token the sync
+    # uses), and --apply refuses on mismatch. Unset refuses --auth/--apply.
+    gmail_labeler_account_email: str = ""
+    # The labeler's durable audit ledger (append-only JSONL, 0600). Empty =
+    # <files_dir>/gmail-label-audit.jsonl. NOT ops_events: that table is
+    # pruned after 7 days, which would silently kill undo.
+    gmail_labeler_audit_path: str = ""
 
     # Google Drive source (connectors ticket, C3). BRAIN_GDRIVE_FOLDERS is a
     # comma-separated list of immutable Drive folder ids; EMPTY (the default)

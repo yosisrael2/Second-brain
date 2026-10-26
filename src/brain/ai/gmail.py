@@ -43,6 +43,13 @@ GMAIL_LABEL_SCOPES = (
     "https://www.googleapis.com/auth/gmail.modify",
 )
 
+# System label ids the labeler must NEVER add or remove (review follow-up:
+# guard modify_message_labels — label-only means user labels only; removing
+# UNREAD would mark mail read, removing INBOX would archive it).
+SYSTEM_LABEL_IDS = frozenset(
+    {"INBOX", "UNREAD", "TRASH", "SPAM", "SENT", "DRAFT", "STARRED"}
+)
+
 
 class GmailError(RuntimeError):
     """A Gmail call failed transiently (network, 5xx) — retry with backoff.
@@ -395,11 +402,16 @@ class RestGmailClient:
 
     def get_message_metadata(self, message_id: str) -> GmailMessage:
         """One message's HEADERS + labelIds (format=metadata, no body) — the
-        labeler classifies on sender/subject only, so it never pulls bodies."""
+        labeler classifies on sender/subject only, so it never pulls bodies.
+        metadataHeaders pins the read to From/Subject/List-Id exactly (review
+        follow-up): no other headers are fetched."""
         service = self._get_service()
         raw = self._execute(
             service.users().messages().get(
-                userId=self._user_id, id=message_id, format="metadata"
+                userId=self._user_id,
+                id=message_id,
+                format="metadata",
+                metadataHeaders=["From", "Subject", "List-Id"],
             )
         )
         return _message_from_payload(raw)
@@ -429,8 +441,15 @@ class RestGmailClient:
         self, message_id: str, *, add: Sequence[str] = (), remove: Sequence[str] = ()
     ) -> None:
         """Add/remove label ids on ONE message (users.messages.modify —
-        WRITE: gmail.modify). Label-only by contract: the labeler never
-        removes INBOX and never archives/trashes."""
+        WRITE: gmail.modify). Label-only by contract, enforced HERE (review
+        follow-up): system label ids are refused before the call — the
+        labeler never removes INBOX/UNREAD, never archives/trashes."""
+        system = [lid for lid in (*add, *remove) if lid in SYSTEM_LABEL_IDS]
+        if system:
+            raise GmailError(
+                "refusing to modify system label id(s): "
+                f"{', '.join(sorted(set(system)))} — the labeler writes SB/ user labels only"
+            )
         service = self._get_service()
         self._execute(
             service.users().messages().modify(
@@ -471,6 +490,18 @@ class RestGmailClient:
             page_token = page.get("nextPageToken")
             if not page_token:
                 return
+
+    def profile_email(self) -> str:
+        """The mailbox owner's email address (users.getProfile) — the labeler's
+        account guard reads it before storing a labeler token or applying
+        labels, so the shared keychain token can never silently point at the
+        wrong mailbox (review MAJOR 2)."""
+        service = self._get_service()
+        raw = self._execute(service.users().getProfile(userId=self._user_id))
+        email = raw.get("emailAddress") if isinstance(raw, dict) else None
+        if not email:
+            raise GmailError("getProfile returned no emailAddress")
+        return str(email)
 
     def profile_history_id(self) -> str | None:
         """The mailbox's CURRENT historyId (a fresh sync cursor)."""

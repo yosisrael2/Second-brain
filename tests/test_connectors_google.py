@@ -86,7 +86,7 @@ def test_default_service_factory_builds_the_subclass_api(monkeypatch, tmp_path):
             {"installed": {
                 "client_id": "cid",
                 "client_secret": "sec",
-                "token_uri": "https://token-uri",
+                "token_uri": "https://oauth2.googleapis.com/token",
             }}
         )
     )
