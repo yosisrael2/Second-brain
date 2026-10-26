@@ -170,6 +170,26 @@ window.fetch = async (path, options) => {
     prev.open = true;
     return respond(200, prev.fact);
   }
+  const groupsMatch = url.match(/^\/memory\/entities\/([^/]+)\/groups$/);
+  if (method === 'GET' && groupsMatch) {
+    const payload = (fixtures.groupsByEntity ?? {})[groupsMatch[1]] ?? { groups: [] };
+    return respond(200, payload);
+  }
+  const keepMatch = url.match(/^\/memory\/entities\/([^/]+)\/groups\/keep$/);
+  if (method === 'POST' && keepMatch) {
+    // honest mirror: the kept conversation's row flips to kept_fact_id, a
+    // second keep of the same item 409s, the fact rides back
+    const payload = (fixtures.groupsByEntity ?? {})[keepMatch[1]];
+    const conv = payload ? (payload.groups ?? []).flatMap((g) => g.conversations)
+      .find((c) => c.item_id === body?.item_id) : null;
+    if (!conv) return respond(409, { detail: 'this conversation is not in this person\'s groups' });
+    if (conv.kept_fact_id) return respond(409, { detail: 'this conversation is already kept' });
+    const made = { id: nextId(), subject_id: keepMatch[1], predicate: 'note',
+      object_id: null, value: body?.snippet ?? 'kept snippet', status: 'confirmed',
+      provenance: { how: 'group-keep', item_id: conv.item_id } };
+    conv.kept_fact_id = made.id;
+    return respond(201, made);
+  }
   const historyMatch = url.match(/^\/memory\/facts\/([^/]+)\/history$/);
   if (method === 'GET' && historyMatch) {
     // the version chain of ONE fact: walk the supersedes_id chain, oldest first

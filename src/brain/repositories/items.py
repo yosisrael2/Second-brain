@@ -369,6 +369,7 @@ class ItemsRepository:
         *,
         limit: int,
         ranges: Sequence[tuple[datetime, datetime]] | None = None,
+        relevant_only: bool = False,
     ) -> Sequence[MemoryItem]:
         """WhatsApp conversation items whose meta.channel is one of ``channels``.
 
@@ -381,9 +382,21 @@ class ItemsRepository:
         exactly as from listings; dropped children too; superseded AND
         confirmed-cancelled items go through the ONE shared predicate
         (default_hidden_conditions) like every other SQL leg.
+
+        ``relevant_only`` (the memory groups projection, PR B1): strictly
+        triage_label == 'relevant' — noise AND UNTRIAGED are excluded. The
+        default keeps the /recent semantics (NULL = not triaged yet, always
+        listed), so every existing caller is unchanged.
         """
         if not channels:
             return []
+        if relevant_only:
+            triage_condition = MemoryItem.triage_label == "relevant"
+        else:
+            triage_condition = or_(
+                MemoryItem.triage_label.is_(None),
+                MemoryItem.triage_label != "noise",
+            )
         stmt = select(MemoryItem).where(
             MemoryItem.source == SOURCE_WHATSAPP,
             MemoryItem.meta["channel"].as_string().in_(list(channels)),
@@ -392,10 +405,7 @@ class ItemsRepository:
                 MemoryItem.child_state != "dropped",
             ),
             *default_hidden_conditions(),
-            or_(
-                MemoryItem.triage_label.is_(None),
-                MemoryItem.triage_label != "noise",
-            ),
+            triage_condition,
         )
         if ranges:
             stmt = stmt.where(

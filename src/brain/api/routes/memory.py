@@ -38,8 +38,9 @@ from fastapi import (
 )
 
 from brain import schemas
-from brain.api.deps import get_memory_service
+from brain.api.deps import get_items_repository, get_memory_service
 from brain.config import get_settings
+from brain.repositories.items import ItemsRepository
 from brain.services.attachments import AttachmentFileStore
 from brain.services.memory import MemoryError, MemoryService
 
@@ -269,6 +270,46 @@ def delete_photo(
         raise HTTPException(status_code=404, detail="this person has no photo")
     service.delete_fact(uuid.UUID(str(fact["id"])))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/entities/{entity_id}/groups", response_model=schemas.GroupsRead)
+def entity_groups(
+    entity_id: uuid.UUID,
+    service: MemoryService = Depends(get_memory_service),
+    items: ItemsRepository = Depends(get_items_repository),
+) -> schemas.GroupsRead:
+    """A kid's WhatsApp groups with each group's newest relevant
+    conversations (the memory groups projection). A non-kid person gets
+    {groups: []}; a non-person is 409; unknown entity 404."""
+    try:
+        payload = service.entity_groups(entity_id, items_repo=items)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"entity '{entity_id}' not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return schemas.GroupsRead.model_validate(payload)
+
+
+@router.post("/entities/{entity_id}/groups/keep", status_code=status.HTTP_201_CREATED,
+             response_model=schemas.FactRead)
+def keep_group_item(
+    entity_id: uuid.UUID,
+    data: schemas.GroupKeepCreate,
+    service: MemoryService = Depends(get_memory_service),
+    items: ItemsRepository = Depends(get_items_repository),
+) -> schemas.FactRead:
+    """Keep one of the profile's group conversations as a confirmed note on
+    THIS person (B3): value = the first 600 chars, whitespace-collapsed;
+    provenance {how: 'group-keep', item_id, channel, chat_jid}. 409 on a
+    double keep or a conversation outside this person's groups' relevant
+    set; undo = the existing soft DELETE + /restore."""
+    try:
+        fact = service.keep_group_item(entity_id, data.item_id, items_repo=items)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="entity or item not found") from None
+    except MemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    return schemas.FactRead.model_validate(fact)
 
 
 @router.post("/facts/{fact_id}/undo-supersede", response_model=schemas.FactRead)

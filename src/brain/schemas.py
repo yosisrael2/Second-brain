@@ -194,6 +194,35 @@ class EntityRead(BaseModel):
     archived: bool = False
 
 
+class GroupConversationRead(BaseModel):
+    """One projected WhatsApp conversation in a person's groups section."""
+
+    item_id: str
+    occurred_at: datetime | None = None
+    preview: str
+    kept_fact_id: str | None = None
+
+
+class GroupRead(BaseModel):
+    """One of the person's groups with its newest relevant conversations."""
+
+    channel: str
+    applies_to: str
+    conversations: list[GroupConversationRead] = Field(default_factory=list)
+
+
+class GroupsRead(BaseModel):
+    """GET /memory/entities/{id}/groups — a kid's groups projection."""
+
+    groups: list[GroupRead] = Field(default_factory=list)
+
+
+class GroupKeepCreate(BaseModel):
+    """Payload for POST /memory/entities/{id}/groups/keep."""
+
+    item_id: uuid.UUID
+
+
 class AliasCreate(BaseModel):
     """Payload for POST /memory/entities/{id}/aliases."""
 

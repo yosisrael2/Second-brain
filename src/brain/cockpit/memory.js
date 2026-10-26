@@ -947,6 +947,7 @@ function renderDetail() {
   left.append(basicInfoCard(entity), connectionsCard(entity));
   columns.append(left, memoriesCard(entity));
   nodes.push(columns);
+  if (isKid(entity)) nodes.push(groupsSection(entity));
   body.replaceChildren(...nodes);
 }
 
@@ -2348,3 +2349,107 @@ document.addEventListener("DOMContentLoaded", initMemoryTab);
 
 // The single symbol the shared shell knows about.
 window.MemoryTab = { refresh: refreshMemory };
+
+// ---------- WhatsApp groups on a kid's profile (B1 + B3) ----------
+
+// A read-only projection (GET /memory/entities/{id}/groups): the kid's own
+// groups (applies_to names the kid, or 'family'), each with its newest 5
+// RELEVANT conversations. "Keep as memory" writes a confirmed note on THIS
+// profile (B3, POST .../groups/keep); its Undo rides the existing undo
+// stack (soft DELETE; /restore brings it back from history).
+function groupsSection(entity) {
+  const card = el("section", { class: "mm-card", "aria-labelledby": "mm-groups-h" });
+  const head = el("div", { class: "mm-card-head" });
+  head.append(el("h3", { id: "mm-groups-h", text: "WhatsApp groups" }));
+  card.append(head);
+  const body = el("div", { class: "mm-groups-body" });
+  body.append(el("div", { class: "empty", text: "loading…" }));
+  card.append(body);
+  loadGroups(entity, body);
+  return card;
+}
+
+async function loadGroups(entity, body) {
+  let payload;
+  try {
+    payload = await api(`/memory/entities/${entity.id}/groups`);
+  } catch (error) {
+    if (memoryState.selected !== entity.id) return; // another profile took over
+    body.replaceChildren(el("div", { class: "empty", text: `groups failed: ${error.message}` }));
+    return;
+  }
+  if (memoryState.selected !== entity.id) return;
+  const groups = payload.groups || [];
+  if (!groups.length) {
+    body.replaceChildren(
+      el("div", { class: "empty", text: `No WhatsApp groups linked to ${entity.name}` }),
+      el("p", {
+        class: "mm-card-hint",
+        text: "A group appears here once it is registered for this kid and its conversations are triaged as relevant.",
+      }),
+    );
+    return;
+  }
+  const nodes = [];
+  for (const group of groups) {
+    nodes.push(el("h4", { class: "mm-group-name", text: group.channel, dir: "auto" }));
+    for (const conv of group.conversations) nodes.push(groupRow(entity, conv));
+  }
+  body.replaceChildren(...nodes);
+}
+
+function groupRow(entity, conv) {
+  const row = el("div", { class: "mm-group-row" });
+  if (conv.occurred_at) {
+    const when = new Date(conv.occurred_at);
+    row.append(el("span", {
+      class: "mm-group-date",
+      text: when.toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }),
+    }));
+  }
+  row.append(el("span", { class: "mm-group-preview", text: conv.preview, dir: "auto" }));
+  const open = el("button", {
+    type: "button", class: "btn btn-sm btn-ghost", text: "Open",
+    "aria-label": "open the conversation in the inspector",
+  });
+  open.addEventListener("click", () => {
+    closeMemoryDrawer();
+    switchTab("debug");
+    openInspector(conv.item_id);
+  });
+  row.append(open);
+  if (conv.kept_fact_id) {
+    row.append(el("button", {
+      type: "button", class: "btn btn-sm", text: "Kept ✓", disabled: true,
+      title: "already kept as a memory on this profile",
+    }));
+  } else {
+    const keep = el("button", { type: "button", class: "btn btn-sm btn-pri", text: "Keep as memory" });
+    keep.addEventListener("click", () => keepGroupItem(entity, conv));
+    row.append(keep);
+  }
+  return row;
+}
+
+async function keepGroupItem(entity, conv) {
+  try {
+    const made = await api(`/memory/entities/${entity.id}/groups/keep`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ item_id: conv.item_id }),
+    });
+    // Undo = the existing soft DELETE (history keeps the note; /restore
+    // reopens it — the toast rides the shared undo stack).
+    undoToast("kept as a memory — Undo removes it", async () => {
+      try {
+        await api(`/memory/facts/${made.id}`, { method: "DELETE" });
+        toast("removed");
+      } catch (error) { toast(`remove failed: ${error.message}`); }
+      reloadMemory();
+    });
+    toast("kept as a memory");
+  } catch (error) {
+    toast(`keep failed: ${error.message}`);
+  }
+  reloadMemory();
+}
