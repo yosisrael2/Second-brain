@@ -1401,7 +1401,10 @@ def _gmail_label(args: argparse.Namespace) -> int:
         return _labeler_auth(settings)
     if args.undo:
         # Writes: behind the SAME consent gate as --apply (exit 78, zero
-        # calls) and a modify-scoped client.
+        # calls) and a modify-scoped client. NOT guarded by GMAIL_LABEL_ID:
+        # undo reads the audit ledger and removes the batch's own label ids
+        # — it never scans the label scope, and it must keep working even
+        # if the user later unsets or changes the label (the escape hatch).
         if (gate := _labeler_gate(settings)) != 0:
             return gate
         from brain.services.gmail_labeler import undo_batch
@@ -1415,6 +1418,21 @@ def _gmail_label(args: argparse.Namespace) -> int:
     if args.audit:
         _labeler_audit(args.audit)
         return 0
+    # The scope guard: the SCANNING paths (dry-run and --apply) walk the ONE
+    # label the email connector syncs. With it unset or blank the planning
+    # path would send a blank label id to Gmail — an obscure API error or a
+    # WHOLE-MAILBOX scan. Refuse BEFORE the token read: exit 78, the env var
+    # named, zero Gmail calls. (--undo/--audit are deliberately NOT guarded:
+    # they read the ledger / remove a batch's own labels, never scan.)
+    if not (settings.gmail_label_id or "").strip():
+        print(
+            "gmail-label: GMAIL_LABEL_ID is not set — the labeler only scans "
+            "inside the label the email connector syncs (its immutable Gmail "
+            "label id, e.g. GMAIL_LABEL_ID=Label_1234567890). Set it in .env "
+            "and re-run. Nothing was read or written.",
+            file=sys.stderr,
+        )
+        return 78
 
     from brain.services.gmail_labeler import load_rules
 
