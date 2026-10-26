@@ -136,20 +136,38 @@ class _FakeMessages:
             return _FakeRequest(result=self._state.list_pages[0])
         return _FakeRequest(result=self._state.list_result)
 
-    def get(self, userId, id, format="full"):  # noqa: N803, A002
-        self._state.calls.append(("messages.get", {"id": id, "format": format}))
+    def get(self, userId, id, format="full", metadataHeaders=None):  # noqa: N803, A002
+        self._state.calls.append(
+            ("messages.get", {"id": id, "format": format, "metadataHeaders": metadataHeaders})
+        )
         err = self._state.get_errors.get(id)
         if err is not None:
             return _FakeRequest(error=err)
         msg = self._state.messages.get(id)
         if msg is None:
             return _FakeRequest(error=_FakeHttpError(404, b"Requested entity was not found"))
+        if metadataHeaders is not None:
+            # The real API filters headers server-side (format=metadata +
+            # metadataHeaders returns ONLY the named headers) — mimic it so
+            # the labeler's minimal-metadata contract is actually exercised.
+            # Google takes header NAMES (strings).
+            wanted = {h if isinstance(h, str) else h["name"] for h in metadataHeaders}
+            msg = {
+                **msg,
+                "payload": {
+                    **msg["payload"],
+                    "headers": [h for h in msg["payload"]["headers"] if h["name"] in wanted],
+                },
+            }
         return _FakeRequest(result=msg)
 
     def modify(self, userId, id, body):  # noqa: N803, A002
         self._state.calls.append(
             ("messages.modify", {"id": id, "body": dict(body)})
         )
+        err = self._state.modify_errors.get(id)
+        if err is not None:
+            return _FakeRequest(error=err)
         if self._state.modify_error is not None:
             return _FakeRequest(error=self._state.modify_error)
         msg = self._state.messages.get(id)
@@ -269,6 +287,9 @@ class _ServiceState:
         self.messages: dict[str, dict] = {}
         self.get_errors: dict[str, Exception] = {}
         self.list_result: dict = {"messages": []}
+        # Per-id modify failures (labeler/followups: undo must keep going
+        # past a per-message error); falls back to modify_error.
+        self.modify_errors: dict[str, Exception] = {}
         # Per-call page sequence for the reset-sweep tests: popped per
         # messages.list call; when exhausted the LAST page repeats (so a
         # trailing nextPageToken is an endless page train).

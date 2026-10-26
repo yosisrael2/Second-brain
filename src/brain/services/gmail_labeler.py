@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -119,6 +120,13 @@ logger = logging.getLogger(__name__)
 
 SB_PREFIX = "SB/"
 UNSORTED = "SB/Unsorted"
+
+# Gmail's system labels (the reserved ids). The labeler NEVER adds, removes
+# or 'undoes' any of them — a modify naming one is refused before any HTTP
+# call (labeler/followups #1).
+SYSTEM_LABEL_IDS: frozenset[str] = frozenset({
+    "INBOX", "UNREAD", "TRASH", "SPAM", "SENT", "DRAFT", "STARRED", "IMPORTANT",
+})
 # The per-run apply cap ceiling (M1/R2): ONE constant shared by the argparse
 # type (cli._max_apply_value) and the service's own check, so the CLI range
 # and the defense in depth can never drift apart.
@@ -297,11 +305,13 @@ def _label_names(msg: Any, existing: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _consent_error(exc: Exception) -> GmailAuthError:
     """A 403 from a write call = gmail.modify not consented (rate-limit 403s
-    are retried inside the client and never surface here)."""
-    raise GmailAuthError(
+    are retried inside the client and never surface here). RETURNS the error
+    — callers raise it (``raise _consent_error(exc) from exc``), so undo can
+    attach its partial counts before re-raising."""
+    return GmailAuthError(
         "gmail.modify is not consented — run `brain gmail-label --auth` to "
         "re-consent (the labeler writes labels only)",
-    ) from exc
+    )
 
 
 def ensure_labels(client: Any, paths: list[str]) -> dict[str, str]:
@@ -358,6 +368,11 @@ def apply_labels(
     if not batch:
         return 0
     label_ids = ensure_labels(client, sorted({p.label_path for p in batch}))
+    # labeler/followups #1: every id about to be modified must be provably a
+    # labeler-created SB/ label — refused BEFORE any message write.
+    _assert_labeler_label_ids(
+        [(label_ids[path], path) for path in label_ids]
+    )
     applied = 0
     for plan in batch:
         detail = {
@@ -391,6 +406,44 @@ def apply_labels(
         applied += 1
     record_event(COMPONENT, "batch", ok=True, detail={"batch": batch_id, "applied": applied})
     return applied
+
+
+def _assert_labeler_label_ids(pairs: Iterable[tuple[Any, Any]]) -> None:
+    """Refuse any label id that is NOT one the labeler itself created as an
+    SB/ label (labeler/followups #1) — pure, so the refusal happens BEFORE
+    any HTTP call.
+
+    ``pairs`` are ``(label_id, label_path)`` as the caller already knows
+    them: for apply the resolved ``{path: id}`` mapping from
+    :func:`ensure_labels` (every path is an SB/ path by construction), for
+    undo the batch's own audit rows (``label_id``, ``label_path``). A pair is
+    refused when
+
+    - the id IS a Gmail system label (``SYSTEM_LABEL_IDS``), or
+    - neither the id's path/name evidence nor the audit's label_path marks
+      it ``SB/`` — i.e. it cannot be proven to be a labeler-created label
+      (an unknown id with no SB/ path is refused too: undo only ever
+      removes what the labeler can PROVE is its own).
+
+    Raises ``ValueError`` naming every refused id; the caller must not have
+    sent anything to Gmail before this check.
+    """
+    bad: list[str] = []
+    for label_id, label_path in pairs:
+        if label_id is None:
+            continue
+        if str(label_id) in SYSTEM_LABEL_IDS:
+            bad.append(f"{label_id} (a Gmail system label)")
+            continue
+        path_evidence = str(label_path or "")
+        if not path_evidence.startswith(SB_PREFIX):
+            bad.append(f"{label_id} (path {path_evidence!r} — not created by "
+                       "the labeler as an SB/ label)")
+    if bad:
+        raise ValueError(
+            "gmail-label: refusing to modify label(s) the labeler did not "
+            "create: " + "; ".join(bad)
+        )
 
 
 def _record_audit(session: Any, kind: str, *, ok: bool, detail: dict[str, Any]) -> bool:
@@ -507,7 +560,18 @@ def _audit_detail(detail: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
+@dataclass(frozen=True)
+class UndoResult:
+    """The three undo buckets (labeler/followups #2): labels removed, labels
+    already absent (nothing to write), and the gmail ids that FAILED — a
+    partial failure must be visible, never swallowed."""
+
+    undone: int
+    already_absent: int
+    failed: list[str]
+
+
+def undo_batch(client: Any, batch_id: str, session: Any = None) -> UndoResult:
     """Remove exactly the label ids ONE batch added (its own ops events).
 
     The undo candidates are EVERY 'apply' row of the batch, whatever its
@@ -515,19 +579,127 @@ def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
     prove the label never landed — a 5xx, a timeout or a connection reset
     can fire AFTER Google committed the write, and then the row says
     'failed' while the label is on the message. The state is audit truth
-    only; undo does not trust it. Removing a label that was never applied is
-    a harmless no-op that must not error. A pre-existing user label on the
+    only; undo does not trust it. A pre-existing user label on the
     same message is untouched: only the batch's own label ids are removed,
     and only from the messages the batch touched.
+
+    The batch's label ids are checked by :func:`_assert_labeler_label_ids`
+    BEFORE any call (labeler/followups #1): a system label or an id without
+    SB/ evidence aborts the whole undo with a ValueError and zero Gmail
+    calls.
+
+    One message's failure does NOT stop the batch (labeler/followups #2):
+    each row is checked (metadata GET — the label is genuinely absent) and
+    removed independently; errors are collected in ``failed`` and the loop
+    continues. A 404 (message deleted or purged since the batch) means the
+    label is gone with the message: counted ``already_absent`` with ops
+    state ``'gone'``, never ``failed`` — a deleted message must not fail
+    every future undo run (review R1). An AUTH failure (GmailAuthError, or
+    401/403) is different: it dooms every remaining call, so the undo
+    ABORTS immediately with the same consent error apply uses —
+    :func:`_consent_error` — carrying the counts done so far on
+    ``exc.partial`` (review R2). Returns the three buckets; the caller
+    decides the exit code (0 = everything undone or already absent, 1 = at
+    least one failure, 78 = the auth abort).
     """
     events = _batch_events(batch_id, session)
+    _assert_labeler_label_ids(
+        [(detail.get("label_id"), detail.get("label_path")) for detail in events]
+    )
     undone = 0
+    already_absent = 0
+    failed: list[str] = []
+
+    def _abort(exc: Exception) -> GmailAuthError:
+        """Auth failure: stop NOW (no more doomed calls), record it, and
+        let the counts done so far ride the consent error."""
+        consent = _consent_error(exc)
+        consent.partial = UndoResult(
+            undone=undone, already_absent=already_absent, failed=list(failed)
+        )
+        record_event(
+            COMPONENT,
+            "undo",
+            ok=False,
+            detail={"batch": batch_id, "state": "auth-abort", "undone": undone,
+                    "already_absent": already_absent, "failed": len(failed)},
+        )
+        return consent
+
     for detail in events:
         gmail_id = detail.get("gmail_id")
         label_id = detail.get("label_id")
         if not gmail_id or not label_id:
             continue
-        client.modify_message_labels(gmail_id, remove=[label_id])
+        try:
+            present = label_id in (client.get_message_metadata(gmail_id).label_ids or [])
+        except GmailAuthError as exc:
+            # NOTE: GmailAuthError subclasses GmailError — this clause MUST
+            # stay ahead of the GmailError one or it would be swallowed.
+            raise _abort(exc) from exc
+        except GmailError as exc:
+            status = getattr(exc, "status", None)
+            if status in (401, 403):
+                raise _abort(exc) from exc
+            if status == 404:
+                # The message is gone (deleted/purged): no message, no label.
+                already_absent += 1
+                record_event(
+                    COMPONENT,
+                    "undo",
+                    ok=True,
+                    detail={"batch": batch_id, "gmail_id": gmail_id,
+                            "label_id": label_id, "state": "gone"},
+                )
+                continue
+            failed.append(str(gmail_id))
+            record_event(
+                COMPONENT,
+                "undo",
+                ok=False,
+                detail={"batch": batch_id, "gmail_id": gmail_id,
+                        "label_id": label_id, "state": "read-failed"},
+            )
+            continue
+        if not present:
+            # Nothing to remove: count it, send no write.
+            already_absent += 1
+            record_event(
+                COMPONENT,
+                "undo",
+                ok=True,
+                detail={"batch": batch_id, "gmail_id": gmail_id,
+                        "label_id": label_id, "state": "absent"},
+            )
+            continue
+        try:
+            client.modify_message_labels(gmail_id, remove=[label_id])
+        except GmailAuthError as exc:
+            raise _abort(exc) from exc
+        except GmailError as exc:
+            status = getattr(exc, "status", None)
+            if status in (401, 403):
+                raise _abort(exc) from exc
+            if status == 404:
+                # Gone between the read and the write — same 'gone' bucket.
+                already_absent += 1
+                record_event(
+                    COMPONENT,
+                    "undo",
+                    ok=True,
+                    detail={"batch": batch_id, "gmail_id": gmail_id,
+                            "label_id": label_id, "state": "gone"},
+                )
+                continue
+            failed.append(str(gmail_id))
+            record_event(
+                COMPONENT,
+                "undo",
+                ok=False,
+                detail={"batch": batch_id, "gmail_id": gmail_id,
+                        "label_id": label_id, "state": "failed"},
+            )
+            continue
         record_event(
             COMPONENT,
             "undo",
@@ -535,7 +707,7 @@ def undo_batch(client: Any, batch_id: str, session: Any = None) -> int:
             detail={"batch": batch_id, "gmail_id": gmail_id, "label_id": label_id},
         )
         undone += 1
-    return undone
+    return UndoResult(undone=undone, already_absent=already_absent, failed=failed)
 
 
 def _batch_events(batch_id: str, session: Any) -> list[dict[str, Any]]:

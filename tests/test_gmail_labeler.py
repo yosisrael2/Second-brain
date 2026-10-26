@@ -205,8 +205,8 @@ class TestPlanAndApply:
         client = _client(state)
         plans = plan_labels(client, rules=load_rules(rules), kid_names=[], label_id=LABEL, query="")
         apply_labels(client, plans, max_apply=20, batch_id="B1")
-        undone = undo_batch(client, "B1")
-        assert undone == 2
+        result = undo_batch(client, "B1")
+        assert result.undone == 2
         # The batch's SB label is gone; the USER's label is untouched.
         assert "USER_KEEP" in state.messages["m1"]["labelIds"]
         assert "USER_KEEP" in state.messages["m2"]["labelIds"]
@@ -625,3 +625,322 @@ class TestReviewRound2:
         assert "Traceback" not in err
         assert "gmail-label --auth" in err
         assert state.calls == []
+
+
+class TestFollowups:
+    """labeler/followups: four safety ideas ported from the closed PR #143
+    onto the MERGED design (#142 + #144) — re-implemented on the current
+    code, not copied."""
+
+    @staticmethod
+    def _label_batch(state: _ServiceState, tmp_path: Any, *, batch_id: str = "B1",
+                     ids: tuple[str, ...] = ("m1", "m2")) -> tuple[Any, list]:
+        """Plan + apply one SB batch over the given ids; returns (client, plans)."""
+        rules = _rules_file(tmp_path, {"School": {"domains": ["school.example"], "list_ids": []}})
+        from brain.services.gmail_labeler import apply_labels, load_rules, plan_labels
+
+        for mid in ids:
+            state.messages[mid] = _msg_with_headers(
+                mid, sender="office@school.example", subject=mid
+            )
+        state.list_result = {"messages": [{"id": mid} for mid in ids]}
+        client = _client(state)
+        plans = plan_labels(
+            client, rules=load_rules(rules), kid_names=[], label_id=LABEL, query=""
+        )
+        apply_labels(client, plans, max_apply=20, batch_id=batch_id)
+        return client, plans
+
+    @staticmethod
+    def _poison(batch_id: str, gmail_id: str, label_id: Any, label_path: str) -> None:
+        """Insert one hand-crafted 'apply' ledger row (simulating a ledger a
+        bug or an intruder might have written) into the ops audit."""
+        import json as _json
+
+        from sqlalchemy import text as _text
+
+        from brain.db.session import SessionLocal
+
+        detail = _json.dumps(
+            {"batch": batch_id, "gmail_id": gmail_id,
+             "label_id": label_id, "label_path": label_path}
+        )
+        with SessionLocal() as session:
+            session.execute(
+                _text(
+                    "INSERT INTO ops_events (component, kind, ok, detail) "
+                    "VALUES ('gmail-label', 'apply', true, CAST(:d AS jsonb))"
+                ),
+                {"d": detail},
+            )
+            session.commit()
+
+    # -- followup 1: SYSTEM-LABEL REFUSAL ----------------------------------
+
+    def test_undo_refuses_a_system_label_before_any_call(self, tmp_path, database):
+        """A ledger row pointing at INBOX must make undo raise BEFORE any
+        HTTP call — a Gmail system label is never touched, not even to
+        'undo' it."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU1")
+        self._poison("BAD", "m1", "INBOX", "INBOX")
+        modifies = [c for c in state.calls if c[0] == "messages.modify"]
+        from brain.services.gmail_labeler import undo_batch
+
+        with pytest.raises(ValueError) as excinfo:
+            undo_batch(client, "BAD")
+        assert [c for c in state.calls if c[0] == "messages.modify"] == modifies, (
+            "the refusal must happen before ANY modify call"
+        )
+        assert "INBOX" in str(excinfo.value)
+
+    def test_undo_refuses_ids_not_created_by_the_labeler(self, tmp_path, database):
+        """A ledger row whose label id resolves to a live NON-SB/ label is
+        refused the same way — undo only ever removes the labeler's own
+        SB/ labels."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.list_labels_result = {
+            "labels": [{"id": "Label_user_keep", "name": "Keep", "type": "user"}]
+        }
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU2")
+        self._poison("BAD", "m1", "Label_user_keep", "Keep")
+        modifies = [c for c in state.calls if c[0] == "messages.modify"]
+        from brain.services.gmail_labeler import undo_batch
+
+        with pytest.raises(ValueError) as excinfo:
+            undo_batch(client, "BAD")
+        assert [c for c in state.calls if c[0] == "messages.modify"] == modifies, (
+            "the refusal must happen before ANY modify call"
+        )
+        assert "Keep" in str(excinfo.value)
+
+    # -- followup 2: UNDO KEEPS GOING --------------------------------------
+
+    def test_undo_continues_past_a_failed_message_and_buckets(self, tmp_path, database):
+        """One message's 500 must not stop the batch: the rest is undone and
+        the failure is returned as a bucket, not raised."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU3", ids=("m1", "m2", "m3"))
+        sb_id = [lid for lid in state.messages["m1"]["labelIds"] if lid != LABEL][0]
+        state.modify_errors["m2"] = _FakeHttpError(500, b"backend error")
+        from brain.services.gmail_labeler import undo_batch
+
+        result = undo_batch(client, "FU3")
+        assert result.undone == 2
+        assert result.failed == ["m2"]
+        assert result.already_absent == 0
+        # m3 was still processed AFTER m2 failed.
+        assert sb_id not in state.messages["m1"]["labelIds"]
+        assert sb_id not in state.messages["m3"]["labelIds"]
+        assert sb_id in state.messages["m2"]["labelIds"]
+
+    def test_undo_counts_already_absent_without_writing(self, tmp_path, database):
+        """A label that is already gone (removed by hand, say) is counted as
+        already-absent — no write is sent for it."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU4", ids=("m1", "m2"))
+        sb_id = [lid for lid in state.messages["m1"]["labelIds"] if lid != LABEL][0]
+        state.messages["m2"]["labelIds"].remove(sb_id)
+        from brain.services.gmail_labeler import undo_batch
+
+        before = len(state.calls)
+        result = undo_batch(client, "FU4")
+        assert result.undone == 1
+        assert result.already_absent == 1
+        assert result.failed == []
+        assert [
+            c for c in state.calls[before:]
+            if c[0] == "messages.modify" and c[1]["id"] == "m2"
+        ] == [], "an absent label must not trigger a write during undo"
+
+    def test_undo_cli_exit_0_when_all_succeeded_or_absent(self, tmp_path, monkeypatch,
+                                                          capsys, database):
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU5", ids=("m1", "m2"))
+        sb_id = [lid for lid in state.messages["m1"]["labelIds"] if lid != LABEL][0]
+        state.messages["m2"]["labelIds"].remove(sb_id)
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=str(tmp_path / "rules.json")),
+        )
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings, modify=False: client)
+        monkeypatch.setattr(cli, "_labeler_gate", lambda settings: 0)
+        code = cli.main(["gmail-label", "--undo", "FU5"])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "undone 1" in out
+        assert "already absent 1" in out
+
+    def test_undo_cli_exit_1_and_lists_failures_when_any_failed(self, tmp_path, monkeypatch,
+                                                                capsys, database):
+        """A partial failure must be VISIBLE: exit 1 with the failed gmail
+        ids listed — never a silent 0."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="FU6", ids=("m1", "m2", "m3"))
+        state.modify_errors["m2"] = _FakeHttpError(500, b"backend error")
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=str(tmp_path / "rules.json")),
+        )
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings, modify=False: client)
+        monkeypatch.setattr(cli, "_labeler_gate", lambda settings: 0)
+        code = cli.main(["gmail-label", "--undo", "FU6"])
+        assert code == 1
+        captured = capsys.readouterr()
+        assert "m2" in captured.err, "the failed gmail id must be listed"
+
+    # -- followup 3: BATCH ID FIRST -----------------------------------------
+
+    def test_apply_prints_the_undo_handle_before_the_first_modify(
+        self, tmp_path, monkeypatch, capsys, database
+    ):
+        """A crash mid-apply must still leave the user an undo handle: the
+        batch id (and its undo command) is printed BEFORE the first modify
+        call — here simulated by apply_labels blowing up."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        state.messages["m1"] = _msg_with_headers(
+            "m1", sender="office@school.example", subject="trip"
+        )
+        state.list_result = {"messages": [{"id": "m1"}]}
+        rules = _rules_file(tmp_path, {"School": {"domains": ["school.example"], "list_ids": []}})
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=str(rules)),
+        )
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings, modify=False: _client(state))
+        monkeypatch.setattr(cli, "_labeler_gate", lambda settings: 0)
+        import brain.services.gmail_labeler as labeler_mod
+
+        def _boom(*a: Any, **k: Any) -> int:
+            raise RuntimeError("crash mid-run")
+
+        monkeypatch.setattr(labeler_mod, "apply_labels", _boom)
+        with pytest.raises(RuntimeError):
+            cli.main(["gmail-label", "--apply"])
+        out = capsys.readouterr().out
+        assert "brain gmail-label --undo" in out, (
+            "the undo handle must be printed BEFORE the first modify call"
+        )
+        assert "applied" not in out
+
+    # -- followup 4: MINIMAL METADATA ---------------------------------------
+
+    def test_planning_metadata_gets_fetch_only_the_needed_headers(self, tmp_path):
+        """Planning reads format=metadata with metadataHeaders limited to
+        From/Subject/List-Id — the exact headers classify() consumes."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        raw = _msg_with_headers("m1", sender="office@school.example", subject="trip")
+        raw["payload"]["headers"].append({"name": "To", "value": "someone@example"})
+        raw["payload"]["headers"].append(
+            {"name": "List-Unsubscribe", "value": "<mailto:leave@lists.example>"}
+        )
+        state.messages["m1"] = raw
+        state.list_result = {"messages": [{"id": "m1"}]}
+        rules = _rules_file(tmp_path, {"School": {"domains": ["school.example"], "list_ids": []}})
+        from brain.services.gmail_labeler import load_rules, plan_labels
+
+        client = _client(state)
+        plans = plan_labels(
+            client, rules=load_rules(rules), kid_names=[], label_id=LABEL, query=""
+        )
+        gets = [c for c in state.calls if c[0] == "messages.get"]
+        assert gets, "planning must read each message's metadata"
+        for _kind, kwargs in gets:
+            assert kwargs["format"] == "metadata"
+            assert kwargs["metadataHeaders"] == ["From", "Subject", "List-Id"], (
+                "planning metadata GETs must request ONLY From/Subject/List-Id"
+            )
+        # the planning itself still works on the narrowed headers
+        assert [p.label_path for p in plans] == ["SB/School"]
+
+
+class TestFollowupsReviewR1R2:
+    """Review fixes on #145: deleted messages must not fail undo forever
+    (R1: 404 = already absent, state 'gone'), and an auth failure must
+    abort with the consent error + exit 78 (R2), reporting what was done
+    so far."""
+
+    _label_batch = staticmethod(TestFollowups._label_batch)  # reuse the helper, not the tests
+
+    def test_a_deleted_message_counts_as_already_absent_exit_0(self, tmp_path, monkeypatch,
+                                                               capsys, database):
+        """R1: the user deleted (or purged) a labeled message — its metadata
+        read 404s. The message carries no label anymore: already-absent,
+        ops state 'gone', NOT failed; undo still exits 0."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="RV1", ids=("m1", "m2"))
+        del state.messages["m2"]  # deleted server-side after the batch
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=str(tmp_path / "rules.json")),
+        )
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings, modify=False: client)
+        monkeypatch.setattr(cli, "_labeler_gate", lambda settings: 0)
+        code = cli.main(["gmail-label", "--undo", "RV1"])
+        assert code == 0, "a deleted message must not fail undo forever"
+        out = capsys.readouterr().out
+        assert "already absent 1" in out
+        assert "FAILED" not in out and "FAILED" not in capsys.readouterr().err
+
+    def test_a_404_on_the_modify_counts_as_already_absent(self, tmp_path, database):
+        """R1: the message vanishes between the read and the write — the
+        modify's 404 is 'gone', not a failure."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="RV2", ids=("m1", "m2"))
+        state.modify_errors["m2"] = _FakeHttpError(404, b"Requested entity was not found")
+        from brain.services.gmail_labeler import undo_batch
+
+        result = undo_batch(client, "RV2")
+        assert result.undone == 1
+        assert result.already_absent == 1
+        assert result.failed == []
+        from sqlalchemy import text as _text
+
+        from brain.db.session import SessionLocal
+
+        with SessionLocal() as session:
+            states = [
+                row[0]
+                for row in session.execute(
+                    _text("SELECT detail->>'state' FROM ops_events "
+                          "WHERE component='gmail-label' AND kind='undo' "
+                          "AND detail->>'batch'='RV2' AND detail->>'gmail_id'='m2'")
+                ).all()
+            ]
+        assert "gone" in states, "the modify 404 must be recorded as state 'gone'"
+
+    def test_auth_failure_mid_batch_aborts_with_counts_and_78(self, tmp_path, monkeypatch,
+                                                              capsys, database):
+        """R2: a revoked/403 token mid-undo must NOT keep making doomed
+        calls: abort immediately with the consent error, the 3rd message is
+        never called, and the counts done so far are reported; exit 78."""
+        state = _ServiceState()
+        state.profile_history_id = "9002"
+        client, _plans = self._label_batch(state, tmp_path, batch_id="RV3", ids=("m1", "m2", "m3"))
+        state.modify_errors["m2"] = _FakeHttpError(403, b"insufficientPermissions")
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=str(tmp_path / "rules.json")),
+        )
+        monkeypatch.setattr(cli, "_labeler_client", lambda settings, modify=False: client)
+        monkeypatch.setattr(cli, "_labeler_gate", lambda settings: 0)
+        before_undo = len(state.calls)
+        code = cli.main(["gmail-label", "--undo", "RV3"])
+        assert code == 78
+        captured = capsys.readouterr()
+        assert "gmail-label --auth" in captured.err, "the consent error must name --auth"
+        assert "undone 1" in captured.out, "the counts done so far must be reported"
+        assert [
+            c[1]["id"] for c in state.calls[before_undo:]
+            if c[0] == "messages.modify"
+        ] == ["m1", "m2"], "the abort must happen at m2 — m3 is never called"
