@@ -1410,10 +1410,20 @@ def _gmail_label(args: argparse.Namespace) -> int:
         from brain.services.gmail_labeler import undo_batch
 
         with SessionLocal() as session:
-            undone = undo_batch(
+            result = undo_batch(
                 _labeler_client(settings, modify=True), args.undo, session=session
             )
-        print(f"gmail-label: undone {undone} label(s) for batch {args.undo}")
+        # labeler/followups #2: the three buckets are printed and a partial
+        # failure is VISIBLE — exit 1 with the failed ids listed, never a
+        # silent 0.
+        print(
+            f"gmail-label: undone {result.undone} label(s), already absent "
+            f"{result.already_absent} for batch {args.undo}"
+        )
+        if result.failed:
+            print(f"gmail-label: FAILED ({len(result.failed)}): "
+                  f"{', '.join(result.failed)}", file=sys.stderr)
+            return 1
         return 0
     if args.audit:
         _labeler_audit(args.audit)
@@ -1471,6 +1481,10 @@ def _gmail_label(args: argparse.Namespace) -> int:
     from brain.services.gmail_labeler import apply_labels
 
     batch_id = _uuid.uuid4().hex[:12]
+    # labeler/followups #3: the undo handle exists BEFORE the first modify
+    # call — a crash mid-run still leaves the user a way back.
+    print(f"gmail-label: batch {batch_id} — undo with: "
+          f"brain gmail-label --undo {batch_id}")
     applied = apply_labels(
         _labeler_client(settings, modify=True), plans,
         max_apply=args.max_apply, batch_id=batch_id,

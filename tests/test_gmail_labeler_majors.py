@@ -680,12 +680,22 @@ class TestM4WriteAheadAudit:
         assert _audit_states("m01", batch="mf1") == ["failed"], (
             "the modify that failed must leave state=failed"
         )
+        before_undo = len(state.calls)
         undone = undo_batch(client, "mf1")
-        assert undone == 2, "undo treats EVERY apply row of the batch as a candidate"
-        removed = [c[1]["id"] for c in state.calls
+        # R1/followup-2 buckets: m00's label landed (undone); m01's modify
+        # raised BEFORE the write, so its label never landed (already-absent,
+        # no pointless remove). The run aborted at m01 (apply semantics
+        # unchanged), so m02 has no ledger row and is not a candidate.
+        assert undone.undone == 1, "the applied row is undone"
+        assert undone.already_absent == 1, (
+            "the failed row whose label never landed is an already-absent "
+            "candidate — counted, not an error"
+        )
+        assert undone.failed == [], "undo must keep going; nothing failed here"
+        removed = [c[1]["id"] for c in state.calls[before_undo:]
                    if c[0] == "messages.modify" and c[1]["body"].get("removeLabelIds")]
-        assert removed == ["m00", "m01"], (
-            "undo must remove the applied AND the failed row's label "
+        assert removed == ["m00"], (
+            "undo removes exactly the rows whose label is present "
             f"(removed {removed!r})"
         )
 
@@ -707,7 +717,7 @@ class TestM4WriteAheadAudit:
         )
         label_id = _audit_label_id("m00", batch="fl1")
         undone = undo_batch(client, "fl1")
-        assert undone == 1, "a failed row whose label LANDED must be undoable"
+        assert undone.undone == 1, "a failed row whose label LANDED must be undoable"
         assert not _fake_label_landed(state, "m00", label_id), (
             "the label Google committed must be gone after --undo"
         )
@@ -735,9 +745,9 @@ class TestM4WriteAheadAudit:
                                   "source": "rules", "state": "failed"})},
             )
         undone = undo_batch(_client(state), "fr1")
-        assert undone == 1, (
+        assert undone.already_absent == 1 and undone.failed == [], (
             "a failed row is an undo candidate even when the label never "
-            "landed (the remove is then a harmless no-op)"
+            "landed — it is counted as already-absent and no write is sent"
         )
 
     def test_undo_treats_every_apply_row_as_a_candidate(self, database):
@@ -769,7 +779,8 @@ class TestM4WriteAheadAudit:
                                       "source": "rules", "state": row_state})},
                 )
         undone = undo_batch(_client(state), "ix1")
-        assert undone == 3, (
+        assert undone.already_absent == 3 and undone.failed == [] and undone.undone == 0, (
             "undo candidates are EVERY apply row of the batch (intent, "
-            "applied, failed); removing a never-applied label must not error"
+            "applied, failed) — none may error; none of these labels landed, "
+            "so all three are already-absent"
         )

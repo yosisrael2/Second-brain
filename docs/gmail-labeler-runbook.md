@@ -9,7 +9,9 @@ deletes anything, and it creates **no Gmail filters**.
 Safety rails you are relying on:
 
 - **Dry-run is the default.** Without `--apply` the command performs zero
-  write calls (list + metadata GETs only) and prints what it *would* do.
+  write calls (list + metadata GETs only — each GET fetches just the three
+  headers the classifier reads: From, Subject, List-Id) and prints what it
+  *would* do.
 - `--apply` is explicit and **capped per run** (`--max-apply`: default 20,
   valid range 1..100 — anything outside the range, including `-1`, is
   refused before any Gmail call; the service enforces the same range).
@@ -214,12 +216,15 @@ EXAMPLE output:
 gmail-label: 12 message(s) to label (kids: 2, scan cap 100)
   18c9f2a7e4b6d011 -> SB/School (rules)
   ...
+gmail-label: batch 7f3c9a2b1d4e — undo with: brain gmail-label --undo 7f3c9a2b1d4e
 gmail-label: applied 12 label(s), batch 7f3c9a2b1d4e
               (undo: brain gmail-label --undo 7f3c9a2b1d4e)
 ```
 
-Note the **batch id** in the output — that is your undo handle. Every run
-gets its own batch, so a mistake is bounded to one run's worth of labels.
+Note the **batch id** in the output — that is your undo handle, and it is
+printed BEFORE the first label write, so even a crash mid-run leaves you the
+undo command. Every run gets its own batch, so a mistake is bounded to one
+run's worth of labels.
 
 Look at what a run did (one batch, or every batch):
 
@@ -239,14 +244,28 @@ Undo one batch — it removes **exactly the labels that batch added** (your own
 labels on those messages, and labels added by other batches, are untouched).
 Every apply row of the batch is an undo candidate — including rows marked
 `failed` (a failed call may still have committed server-side, e.g. a timeout
-after Google accepted the write), and removing a label that was never applied
-is a harmless no-op:
+after Google accepted the write). Each candidate is checked first: a label
+that is already gone is counted as already-absent and no write is sent, and
+**one message's error never stops the batch** — the failures are listed and
+undo exits 1 so a partial result cannot look like success (exit 0 means
+everything was undone or was already absent).
+
+Undo also **refuses, before any Gmail call**, to touch anything the labeler
+did not create: the Gmail system labels (INBOX, UNREAD, TRASH, SPAM, SENT,
+DRAFT, STARRED, IMPORTANT) and any label id without `SB/` evidence in the
+ledger:
 
 ```bash
 brain gmail-label --undo 7f3c9a2b1d4e
 ```
 
-EXAMPLE output: `gmail-label: undone 12 label(s) for batch 7f3c9a2b1d4e`
+EXAMPLE output:
+
+```
+gmail-label: undone 12 label(s), already absent 0 for batch 7f3c9a2b1d4e
+# if anything failed:
+gmail-label: FAILED (2): 18c9f2a7e4b6d011, 18c9f1b2a3d4e5f6   (exit 1)
+```
 
 Everyday rhythm: dry-run → read the plan → `--apply` (each run caps at
 `--max-apply`, default 20, range 1..100) → `--audit` → keep the batch ids

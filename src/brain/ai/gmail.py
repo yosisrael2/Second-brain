@@ -393,13 +393,22 @@ class RestGmailClient:
         )
         return _message_from_payload(raw)
 
+    # labeler/followups #4: the planner reads sender/subject/List-Id ONLY
+    # (classify()'s exact inputs) — request just those headers, never the
+    # full metadata set.
+    PLANNING_METADATA_HEADERS = ("From", "Subject", "List-Id")
+
     def get_message_metadata(self, message_id: str) -> GmailMessage:
         """One message's HEADERS + labelIds (format=metadata, no body) — the
-        labeler classifies on sender/subject only, so it never pulls bodies."""
+        labeler classifies on sender/subject only, so it never pulls bodies,
+        and it fetches only the headers it classifies on."""
         service = self._get_service()
         raw = self._execute(
             service.users().messages().get(
-                userId=self._user_id, id=message_id, format="metadata"
+                userId=self._user_id,
+                id=message_id,
+                format="metadata",
+                metadataHeaders=list(self.PLANNING_METADATA_HEADERS),
             )
         )
         return _message_from_payload(raw)
