@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from brain import ops
 from brain.ai.ask import LLMClient, answer
 from brain.db.models import MemoryItem
@@ -441,14 +443,18 @@ class AskService:
             return []
         try:
             entities = self._memory.overview(status="confirmed", q=None)
-        except Exception:
+        except SQLAlchemyError:
             # overview resolves the kid mention and runs BEFORE any savepoint
-            # (the no-kid ask takes none — review minor 4): a real db error
+            # (the no-kid ask takes none — review minor 4): a real DB error
             # here aborts the shared transaction, so roll the leg's sessions
-            # back before the ask's except turns the leg off. The ask path is
-            # read-only and ops writes run on their own engine, so the
-            # rollback discards nothing the ask needs and later queries on
-            # the session still work (the #117 trap). The leg's repo queries
+            # back before the ask's except turns the leg off. A DB error has
+            # already aborted the transaction, so the rollback loses nothing
+            # that was not already lost, and later queries on the session
+            # still work (the #117 trap). Deliberately NARROW: a non-db
+            # failure (a plain bug) leaves the transaction healthy — rolling
+            # it back would discard uncommitted work from earlier in the
+            # request — so any other exception propagates untouched and the
+            # ask's except just turns the leg off. The leg's repo queries
             # below stay savepoint-scoped: their failures never need this.
             for s in self._leg_sessions():
                 try:
@@ -703,7 +709,10 @@ class AskService:
         if hidden <= 0:
             return None
         note = (
-            f"{hidden} more conflicting items were not shown "
+            # relations, not items: the count is DISTINCT relations (a
+            # relation between two in-context items is one conflict, not two
+            # items) — the wording must not claim items it does not count.
+            f"{hidden} more conflicts were not shown "
             f"(only the {shown} newest conflicts are quoted)"
         )
         logger.info("ask: conflict leg truncated: %s", note)
