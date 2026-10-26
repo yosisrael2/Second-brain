@@ -200,6 +200,7 @@ def build_prompt(
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
     memory_block: str = "",
+    truncation_note: str | None = None,
 ) -> str:
     """Render the answer prompt: question, dated sources, citation rules.
 
@@ -208,6 +209,8 @@ def build_prompt(
     the user's real clock — and the per-source When is already local.
     ``memory_block`` (confirmed memory; '' when empty) is prepended so the
     LLM knows the durable facts (who the kids are, standing routines).
+    ``truncation_note`` (conflict-leg cap hit; None otherwise) appends one
+    line so the model knows conflicting items were left out.
     """
     instant = now or datetime.now(UTC)
     zone = tz or ZoneInfo("UTC")
@@ -240,6 +243,8 @@ def build_prompt(
                 + " ".join(f"[{cid}]" for cid in conflict_with)
             )
     lines += ["", CITATION_RULES, "", CONFLICT_RULES]
+    if truncation_note:
+        lines += ["", f"NOTE: {truncation_note}."]
     return "\n".join(lines)
 
 
@@ -251,16 +256,27 @@ def answer(
     now: datetime | None = None,
     tz: ZoneInfo | None = None,
     memory_block: str = "",
+    truncation_note: str | None = None,
 ) -> dict[str, Any]:
     """Answer ``question`` from ``context_items``, citing item ids.
 
     Returns ``{answer, cited_ids, model}`` where ``cited_ids`` lists every context
     item id referenced in the answer text and ``model`` is the model that
     answered (None when the backend does not expose one). LLM failures raise
-    :class:`LLMError`; callers own the fallback policy.
+    :class:`LLMError`; callers own the fallback policy. ``truncation_note``
+    (a conflict leg that hit its cap) renders one line telling the model the
+    context is incomplete — absent otherwise, so prompts without truncation
+    stay byte-identical.
     """
     completion = llm.complete(
-        build_prompt(question, context_items, now=now, tz=tz, memory_block=memory_block)
+        build_prompt(
+            question,
+            context_items,
+            now=now,
+            tz=tz,
+            memory_block=memory_block,
+            truncation_note=truncation_note,
+        )
     )
     return {
         "answer": completion.text,
