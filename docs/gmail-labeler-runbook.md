@@ -40,7 +40,8 @@ Safety rails you are relying on:
 2. Your app is up to date — it includes the labeler review fixes
    (PR #142 @ `4c9f5cd`, 2026-10-26).
 3. `GMAIL_LABEL_ID` is set in `.env` (the label the pipeline syncs — the
-   labeler only scans inside it).
+   labeler only scans inside it; the gmail-label commands REFUSE with exit
+   78 — before any Gmail call — when it is unset or blank).
 4. `GMAIL_ACCOUNT` is set in `.env` — **your Gmail address**, the account the
    connector syncs. `--auth` refuses to run without it (step 2); dry-run and
    `--apply` do not need it.

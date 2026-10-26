@@ -1399,6 +1399,20 @@ def _gmail_label(args: argparse.Namespace) -> int:
 
     if args.auth:
         return _labeler_auth(settings)
+    # The scope guard: every gmail-label subcommand except --auth scans (or
+    # writes into) the ONE label the email connector syncs. With it unset or
+    # blank the planning path would send a blank label id to Gmail — an
+    # obscure API error or a WHOLE-MAILBOX scan. Refuse BEFORE the token
+    # read: exit 78, the env var named, zero Gmail calls.
+    if not (settings.gmail_label_id or "").strip():
+        print(
+            "gmail-label: GMAIL_LABEL_ID is not set — the labeler only scans "
+            "inside the label the email connector syncs (its immutable Gmail "
+            "label id, e.g. GMAIL_LABEL_ID=Label_1234567890). Set it in .env "
+            "and re-run. Nothing was read or written.",
+            file=sys.stderr,
+        )
+        return 78
     if args.undo:
         # Writes: behind the SAME consent gate as --apply (exit 78, zero
         # calls) and a modify-scoped client.

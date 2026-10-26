@@ -536,6 +536,12 @@ class TestReviewRound2:
         from brain import cli
 
         state = self._seed_state()
+        # The label guard fires BEFORE the gate; give it a label so this
+        # test keeps exercising the consent gate it exists for.
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=""),
+        )
         monkeypatch.setattr(
             cli, "_labeler_token", lambda: "1//readonly-token"
         )
@@ -592,6 +598,12 @@ class TestReviewRound2:
         from brain import cli
 
         state = self._seed_state()
+        # The label guard fires BEFORE the gate; give it a label so this
+        # test keeps exercising the consent gate it exists for.
+        monkeypatch.setattr(
+            "brain.config.get_settings",
+            lambda: _FakeSettings(rules_path=""),
+        )
         monkeypatch.setattr(
             cli, "_labeler_token", lambda: "1//revoked"
         )

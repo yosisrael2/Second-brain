@@ -237,7 +237,17 @@ def plan_labels(
     """Walk the sync scope (ids + metadata GETs ONLY — zero writes) and plan
     one label per message that carries none yet. Bounded by ``max_scan``
     metadata GETs; messages already carrying ANY SB/ label are skipped
-    (idempotence — no re-label churn)."""
+    (idempotence — no re-label churn).
+
+    Raises ValueError for a falsy/blank ``label_id`` (defense in depth): the
+    scope IS the connector's label — a blank one would scan the whole
+    mailbox, and the labeler must never reach outside the pipeline's scope.
+    """
+    if not label_id or not str(label_id).strip():
+        raise ValueError(
+            "label_id must be set (the immutable Gmail label id the email "
+            "connector syncs) — a blank label would scan the whole mailbox"
+        )
     plans: list[LabelPlan] = []
     existing_names = {label.name: label for label in client.list_labels()}
     page_token: str | None = None
