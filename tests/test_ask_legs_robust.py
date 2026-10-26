@@ -245,7 +245,7 @@ def test_conflict_counterparts_exclude_noise(clean_items, memory_db) -> None:
 
 def test_conflict_cap_truncation_note_says_how_many(clean_items, memory_db) -> None:
     """RED: 6 live conflict relations, cap 4 -> 4 counterparts pulled and the
-    prompt carries one line saying 2 more conflicting items were not shown."""
+    prompt carries one line saying 2 more conflicts were not shown."""
     memory, repo, session = _world()
     a = repo.add(MemoryItem(raw_text="מקור: הפגישה בשעה 10:00"))
     others = [
@@ -265,7 +265,7 @@ def test_conflict_cap_truncation_note_says_how_many(clean_items, memory_db) -> N
     ids = [str(h.item.id) for h in result.sources]
     assert str(a.id) in ids
     assert len(ids) == 5, "4 counterparts + the source (cap unchanged)"
-    assert "2 more conflicting items were not shown" in llm.prompts[-1], (
+    assert "2 more conflicts were not shown" in llm.prompts[-1], (
         "the prompt must carry the full truncation line, not a bare count"
     )
 
@@ -320,10 +320,11 @@ def test_conflict_count_broken_sql_no_note_and_session_alive(
         "counterparts and each counterpart lists the source"
     )
     assert "NOTE:" not in prompt, "a broken count loses the note, never the ask"
-    still = repo.by_text_any(["פגישה"], limit=5)
+    still = repo.by_text_any(["פגישה"], limit=10)
     assert str(a.id) in {str(i.id) for i in still}, (
         "a later query on the same session must work after a broken count "
-        "(membership, not position: equal created_at ties order to random ids)"
+        "(limit 10: all 7 matches fit — with limit 5 the created_at ties "
+        "resolve by random ids and the seed could legitimately miss the cut)"
     )
 
 
@@ -573,6 +574,52 @@ def test_second_session_kid_leg_still_savepointed(
     result = service.ask("מה איתמר צריך?", now=NOW)
     ids = [str(h.item.id) for h in result.sources]
     assert str(wa.id) in ids, "the kid leg still recalls across two sessions"
-    assert calls["s1"] >= 1 and calls["s2"] >= 1, (
-        f"both sessions must be savepointed by the kid leg, got {calls}"
+    assert calls["s1"] >= 1 and calls["s2"] >= 2, (
+        f"both sessions must be savepointed by the kid leg — s2 needs TWO "
+        f"(the kid leg's own + the conflict leg's; >=1 was vacuous), got {calls}"
+    )
+
+
+def test_overview_non_db_error_leaves_session_alone(
+    clean_items, memory_db
+) -> None:
+    """RED: the overview-failure path rolled the shared request session back
+    for ANY exception. A NON-db failure (a plain bug raising RuntimeError, no
+    SQL involved) leaves the transaction healthy — the blanket rollback then
+    DISCARDED uncommitted work from earlier in the request for nothing. The
+    recovery must fire for SQLAlchemyError only; a non-db leg failure just
+    turns the leg off and leaves the session (and its uncommitted work)
+    untouched."""
+    from types import SimpleNamespace
+
+    memory, repo, session = _world()
+    _seed_itamar(memory)
+    hit = repo.add(MemoryItem(raw_text="מכתב הנהלה על תשלומים"))  # uncommitted
+
+    class NonDbBrokenMemory:
+        """overview() that raises a plain Python error — no SQL involved."""
+
+        def __init__(self, s: Session) -> None:
+            self._repo = SimpleNamespace(_db=s)
+
+        def overview(self, **kw):
+            raise RuntimeError("a bug, not a db error")
+
+        def channel_names_for_kid(self, kid: str) -> list[str]:
+            return []
+
+    service = AskService(
+        RecordingSearch([SearchHit(item=hit, score=0.9)]),
+        FakeLLMClient(reply=lambda p: "ok"),  # type: ignore[arg-type]
+        memory=NonDbBrokenMemory(session),  # type: ignore[arg-type]
+        items_repo=repo,
+    )
+    result = service.ask("מה איתמר צריך?", now=NOW)
+    assert [str(h.item.id) for h in result.sources] == [str(hit.id)], (
+        "a non-db kid-leg failure must not kill the ask"
+    )
+    still = repo.by_text_any(["תשלומים"], limit=5)
+    assert str(hit.id) in {str(i.id) for i in still}, (
+        "a non-db kid-leg failure must NOT roll the session back: "
+        "uncommitted work from earlier in the request survives"
     )
