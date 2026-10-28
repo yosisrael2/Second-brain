@@ -1695,3 +1695,99 @@ class TestResetSweep:
         result = connector.fetch(None, limit=10)
         assert result.reset is False
         assert result.full_listing_ids is None
+
+
+class TestAgentLogVisibility:
+    """email-agent/info-log review items 1+3: with the agent's root logger
+    at INFO (the new email.log state), a resync must not write per-message
+    lines — message ids map 1:1 to content, and 140 emails must not become
+    140 lines. The per-message lines exist at DEBUG instead."""
+
+    def test_resync_writes_no_per_message_info_lines(self, gmail_harness, caplog):
+        import logging
+
+        h = gmail_harness
+        h._state_service.list_result = {
+            "messages": [{"id": "gaa1", "threadId": "t1"},
+                          {"id": "gaa2", "threadId": "t1"},
+                          {"id": "gaa3", "threadId": "t1"}]
+        }
+        for mid, rfc, body_text in (
+            ("gaa1", "<r1@mail.gmail>", "week plan one"),
+            ("gaa2", "<r2@mail.gmail.com>", "week plan two"),
+        ):
+            msg = _msg_fixture(mid, rfc)
+            msg["payload"]["parts"][0]["body"]["data"] = _b64(f"plan: {body_text}")
+            h._state_service.messages[mid] = msg
+        # gaa3 is listed but never defined: its GET 404s -> the vanished path.
+        first = h.runner.run()
+        assert first.created == 2
+        h._state_service.history_error = _FakeHttpError(404)
+        with caplog.at_level(logging.INFO, logger="brain.connectors"):
+            summary = h.runner.run()
+        assert summary.reset is True
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and r.name.startswith("brain.")
+        ]
+        assert info_records, (
+            "the capture must be live — the resync's history-expired line is "
+            "expected at INFO (cursor + error text, no content)"
+        )
+        forbidden = ("gaa1", "gaa2", "gaa3", "<r1@", "<r2@", "gmail.com", "@x")
+        for record in info_records:
+            msg = record.getMessage()
+            for secret in forbidden:
+                assert secret not in msg, (
+                    f"an INFO line on the poll path carries a message id or "
+                    f"content marker ({secret!r}): {msg}"
+                )
+        assert len(info_records) <= 2, (
+            "a resync must not write one INFO line per message into email.log; "
+            f"wrote {len(info_records)}"
+        )
+
+    def test_vanished_and_label_removed_lines_are_debug_not_info(
+        self, gmail_harness, caplog
+    ):
+        """The demoted per-message lines still EXIST — at DEBUG, and never
+        at INFO (they carry gmail ids)."""
+        import logging
+
+        h = gmail_harness
+        _queue_message(h._state_service, "gaa1")
+        first = h.runner.run()
+        assert first.created == 1
+        # The SB label is removed from gaa1 and the HISTORY path delivers it
+        # again (messagesAdded): the GET sees no SB label -> tombstone via
+        # the label check. (labelsRemoved would tombstone without a GET;
+        # the query path skips known ids entirely — no GET, no label check.)
+        h._state_service.messages["gaa1"]["labelIds"] = []
+        h._state_service.history_pages = {
+            "first": {
+                "history": [
+                    {"id": "h1", "messagesAdded": [{"message": {"id": "gaa1"}}]}
+                ],
+                "historyId": "9100",
+            }
+        }
+        with caplog.at_level(logging.DEBUG, logger="brain.connectors.google.gmail"):
+            second = h.runner.run()
+        assert second.deleted >= 1
+        debug_msgs = [
+            r.getMessage()
+            for r in caplog.records
+            for r in caplog.records
+            if r.levelno == logging.DEBUG and r.name.startswith("brain.")
+        ]
+        info_msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.name.startswith("brain.")
+        ]
+        assert any("no longer carries the label" in m for m in debug_msgs), (
+            "the per-message line must still exist at DEBUG"
+        )
+        assert not any("no longer carries the label" in m for m in info_msgs), (
+            "per-message lines must not appear at INFO (they carry message ids)"
+        )

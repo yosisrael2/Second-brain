@@ -418,7 +418,9 @@ class GmailConnector(GoogleConnector):
                 except ConnectorError as exc:
                     if getattr(exc, "status", None) == 404:
                         # Listed then hard-deleted before the GET: gone is gone.
-                        logger.info("connectors: email message %s vanished (404)", stub.id)
+                        # DEBUG: per-message id — must not scale with a resync
+                        # in email.log (email-agent/info-log review item 3).
+                        logger.debug("connectors: email message %s vanished (404)", stub.id)
                         continue
                     raise
                 if self._backstop_catches(record):
@@ -566,7 +568,8 @@ class GmailConnector(GoogleConnector):
                 # ADDED then hard-deleted between the history read and the
                 # GET: gone is gone (the query path's semantics). This is a
                 # vanished MESSAGE, not cursor expiry — never a full resync.
-                logger.info("connectors: email message %s vanished (404)", mid)
+                # DEBUG: per-message id (volume + PII, review items 1+3).
+                logger.debug("connectors: email message %s vanished (404)", mid)
                 continue
             if self._backstop_catches(record):
                 continue  # re-delivery under a new id: ledgered, no new item
@@ -597,7 +600,10 @@ class GmailConnector(GoogleConnector):
             )
             return False
         if caught:
-            logger.info(
+            # DEBUG: per-message ids — a 140-email resync must not write
+            # 140+ lines with ids into email.log (review item 3); the ids
+            # also map 1:1 to content (review item 1).
+            logger.debug(
                 "connectors: email %s re-delivered under a new id with the same "
                 "Message-ID %s — ledgered against the existing item",
                 record.external_id,
@@ -624,7 +630,7 @@ class GmailConnector(GoogleConnector):
         # ANY id — only messages still carrying the polled label may be
         # reported; a removed one is a deletion of the source.
         if not deleted and self._label_id() not in msg.label_ids:
-            logger.info("connectors: email %s no longer carries the label", message_id)
+            logger.debug("connectors: email %s no longer carries the label", message_id)
             return _tombstone(message_id)
         return record_from_message(msg, deleted=deleted)
 

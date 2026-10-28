@@ -28,7 +28,14 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 # Third-party loggers that may embed URLs (query strings, tokens in
 # request lines) at INFO/DEBUG — never let the new verbosity surface them.
-_PINNED_TO_WARNING = ("httpx", "httpcore", "googleapiclient", "google", "urllib3")
+# sqlalchemy: SA sets its own loggers to effective WARNING when NOTSET
+# (proven on this venv); the pin documents intent and guards a future SA
+# change. asyncio/anthropic/claude_sdk are not on the gmail-poll import
+# path today; pinned so a future import can never turn them chatty.
+_PINNED_TO_WARNING = (
+    "httpx", "httpcore", "googleapiclient", "google", "urllib3",
+    "sqlalchemy", "asyncio", "anthropic", "claude_sdk",
+)
 
 
 def configure_agent_logging(stream: object | None = None) -> None:
