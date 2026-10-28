@@ -1882,13 +1882,11 @@ def _build_pass_service(settings: Any, session: Any) -> Any:
     """
     from brain.api import deps  # noqa: PLC0415
     from brain.repositories.items import ItemsRepository  # noqa: PLC0415
-    from brain.repositories.memory import (  # noqa: PLC0415
-        MemoryRepository,
-        MemoryService,
-    )
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
     from brain.services.extraction.service import (  # noqa: PLC0415
         EnrichmentService,
     )
+    from brain.services.memory import MemoryService  # noqa: PLC0415
 
     return EnrichmentService(
         ItemsRepository(session),
