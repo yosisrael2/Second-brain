@@ -18,6 +18,7 @@ from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreErro
 from brain.config import Settings, get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
+from brain.logsetup import configure_agent_logging
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
 from brain.services.eval_extraction import (
@@ -347,6 +348,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "gmail-auth":
         return _gmail_auth(args)
     if args.command == "gmail-poll":
+        # email-agent/info-log: the loop's per-cycle INFO line must reach
+        # the launchd email.log (stdout). launchd starts the agent with no
+        # logging config (root at WARNING, no handler) — without this the
+        # INFO records are dropped and operators see only warnings.
+        configure_agent_logging()
         return _gmail_poll(args)
     if args.command == "gmail-label":
         return _gmail_label(args)
@@ -1196,28 +1202,79 @@ def _gmail_auth(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_poll_enrichment(
+    repo: Any, session: Any, settings: Any
+) -> Any:
+    """The poll cycle's EnrichmentService, or None when the A2 gate is closed.
+
+    Gate (no enqueue at all unless the worker will actually drain the jobs):
+    ENRICHMENT_WORKER_ENABLED must be true AND email must be in the worker's
+    scope. An EMPTY scope means the worker drains EVERY source (the
+    documented semantics of ENRICHMENT_WORKER_SOURCES) — email is in scope
+    then too; an explicit non-empty scope without 'email' keeps the queue
+    empty — otherwise the moment week 2 widens the scope, the accumulated
+    queue IS a backfill. None = exactly the pre-A2 wiring (both hooks no-op).
+
+    Built the SAME way the worker builds its pass service
+    (telegram_bot._build_pass_service): the DEFAULT extractor (the A2
+    activation seam — settings-driven, the ONE shared LLM client via
+    deps.get_llm_client; this service only ever enqueues, it never
+    extracts), memory compaction, the shared indexer, the daily cap, the
+    timezone. Never a second wiring.
+    """
+    if not settings.enrichment_worker_enabled:
+        return None
+    scoped = settings.worker_source_list
+    if scoped and "email" not in scoped:
+        return None
+    from brain.api import deps  # noqa: PLC0415 (deferred: shared client singletons)
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.extraction.service import EnrichmentService  # noqa: PLC0415
+    from brain.services.memory import MemoryService  # noqa: PLC0415
+
+    return EnrichmentService(
+        repo,
+        session,
+        memory=MemoryService(MemoryRepository(session)),
+        indexer=deps.get_item_indexer(),
+        daily_cap=settings.enrichment_daily_cap,
+        timezone=settings.timezone,
+    )
+
+
 def _gmail_poll_cycle(indexer: Any, attachments: Any) -> Any:
-    """One ConnectorRunner cycle for the email connector (the ONE live path)."""
+    """One ConnectorRunner cycle for the email connector (the ONE live path).
+
+    A2 (email path): when the enrichment worker is enabled with email in
+    scope, both the IngestService and the ConnectorRunner get the cycle's
+    EnrichmentService so a NEWLY ingested email capture lands a durable
+    daily-budget job (enqueue is idempotent per item — the double hook
+    cannot duplicate). When the gate is off, wiring stays None: the current
+    live behaviour, byte for byte."""
     from brain.api import deps  # noqa: PLC0415 (deferred: shared client singletons)
     from brain.connectors.google.gmail import GmailConnector  # noqa: F401 (registers)
     from brain.connectors.runner import ConnectorRunner
     from brain.connectors.state import ConnectorRecordRepo, ConnectorStateRepo
 
     with SessionLocal() as session:
+        repo = ItemsRepository(session)
+        enrichment = _build_poll_enrichment(repo, session, get_settings())
         ingest = IngestService(
             ItemsRepository(session),
             deps.get_classifier(),
             deps.get_item_indexer(),
+            enrichment=enrichment,
         )
         connector = _build_connector("email", session=session)
         runner = ConnectorRunner(
             connector,
             ingest=ingest,
-            repo=ItemsRepository(session),
+            repo=repo,
             state=ConnectorStateRepo(session),
             records=ConnectorRecordRepo(session),
             indexer=indexer,
             attachments=attachments,
+            enrichment=enrichment,
         )
         try:
             summary = runner.run(limit=200)
