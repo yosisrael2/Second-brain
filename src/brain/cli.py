@@ -18,6 +18,7 @@ from brain.ai.vectorstore import QdrantVectorStore, VectorStore, VectorStoreErro
 from brain.config import Settings, get_settings, unwrap_secret
 from brain.db.session import SessionLocal
 from brain.factories import build_embedder
+from brain.logsetup import configure_agent_logging
 from brain.repositories.items import ItemsRepository
 from brain.services.dedupe import content_fingerprint
 from brain.services.eval_extraction import (
@@ -347,6 +348,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "gmail-auth":
         return _gmail_auth(args)
     if args.command == "gmail-poll":
+        # email-agent/info-log: the loop's per-cycle INFO line must reach
+        # the launchd email.log (stdout). launchd starts the agent with no
+        # logging config (root at WARNING, no handler) — without this the
+        # INFO records are dropped and operators see only warnings.
+        configure_agent_logging()
         return _gmail_poll(args)
     if args.command == "gmail-label":
         return _gmail_label(args)
