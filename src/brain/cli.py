@@ -1788,6 +1788,35 @@ def _labeler_audit(batch: str) -> None:
               f"{detail.get('label_path', detail.get('label_id'))}")
 
 
+def _nango_seams(settings: Any, name: str) -> tuple[str, Any]:
+    """(token, service_factory) for connector ``name`` under
+    BRAIN_GOOGLE_AUTH=nango. The "token" is the Nango connection id — it only
+    feeds GoogleConnector's "configured?" guard; the factory asks Nango for
+    access tokens. Missing config exits 78 like a missing keychain token."""
+    from brain.config import unwrap_secret
+    from brain.connectors.google.nango import (
+        NangoConnection,
+        NangoTokenClient,
+        nango_service_factory,
+    )
+
+    secret = unwrap_secret(settings.nango_secret_key)
+    connection_id = getattr(settings, f"nango_{name}_connection_id", "")
+    if not secret or not connection_id:
+        print(
+            f"connectors: BRAIN_GOOGLE_AUTH=nango needs NANGO_SECRET_KEY and "
+            f"NANGO_{name.upper()}_CONNECTION_ID",
+            file=sys.stderr,
+        )
+        raise SystemExit(78)
+    connection = NangoConnection(
+        provider_config_key=getattr(settings, f"nango_{name}_provider_config_key"),
+        connection_id=connection_id,
+    )
+    client = NangoTokenClient(secret_key=secret, host=settings.nango_host)
+    return connection_id, nango_service_factory(client, connection)
+
+
 def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:
     """Instantiate the registry's connector with production seams: the shared
     keychain token (same item as gmail-auth — one OAuth client, one token)
@@ -1800,23 +1829,32 @@ def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -
     ``dry_run=True`` (review B1) wires READ-ONLY seams only: no legacy seed
     runs and the Message-ID backstop only REPORTS its decision — --dry-run
     writes nothing (no ledger, no cursor, no state, no items).
+
+    BRAIN_GOOGLE_AUTH=nango swaps the keychain token for the connector's
+    Nango connection (see brain.connectors.google.nango).
     """
+    from brain.config import get_settings
     from brain.connectors import get
     from brain.connectors.google.base import default_service_factory
     from brain.services.keychain import GMAIL_ACCOUNT, Keychain
 
     cls: Any = get(name)
-    token = Keychain().read(GMAIL_ACCOUNT)
-    if not token:
-        print(
-            "connectors: no Google refresh token in the keychain — run "
-            "`brain connectors auth google` first",
-            file=sys.stderr,
-        )
-        raise SystemExit(78)
+    settings = get_settings()
+    if settings.google_auth == "nango":
+        token, service_factory = _nango_seams(settings, cls.name)
+    else:
+        token = Keychain().read(GMAIL_ACCOUNT)
+        if not token:
+            print(
+                "connectors: no Google refresh token in the keychain — run "
+                "`brain connectors auth google` first",
+                file=sys.stderr,
+            )
+            raise SystemExit(78)
+        service_factory = default_service_factory
     kwargs: dict[str, Any] = {
         "token_loader": lambda: token,
-        "service_factory": default_service_factory,
+        "service_factory": service_factory,
     }
     if session is not None and name in ("email", "gmail"):
         if dry_run:
