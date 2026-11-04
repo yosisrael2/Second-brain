@@ -485,8 +485,9 @@ connector needs `NANGO_<NAME>_CONNECTION_ID` (e.g. `NANGO_GCAL_CONNECTION_ID`),
 and `NANGO_SECRET_KEY` must be set. `NANGO_<NAME>_PROVIDER_CONFIG_KEY` defaults
 to `google-mail` / `google-calendar` / `google-drive` / `google-tasks`, and
 `NANGO_HOST` defaults to `https://api.nango.dev`. Cursors, the runner, the
-ledger and adopt are unchanged. Only the connector sync path uses this
-setting: `gmail-poll` and the labeler still use the keychain. Nango's free
+ledger and adopt are unchanged. Only the `brain connectors` commands
+(sync, adopt) use this setting: `gmail-poll` (the live email agent) and the
+labeler always use the keychain, even with `BRAIN_GOOGLE_AUTH=nango`. Nango's free
 plan pauses *functions* (syncs and actions) every two weeks. This path uses
 only connections and tokens, which the pause presumably doesn't cover. That's
 not yet verified against Nango's docs.
