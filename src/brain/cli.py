@@ -1319,7 +1319,9 @@ def _gmail_poll_cycle(indexer: Any, attachments: Any) -> Any:
             deps.get_item_indexer(),
             enrichment=enrichment,
         )
-        connector = _build_connector("email", session=session)
+        # gmail-poll stays on the keychain whatever BRAIN_GOOGLE_AUTH says:
+        # the live email agent must not change auth on a config edit.
+        connector = _build_connector("email", session=session, keychain_only=True)
         runner = ConnectorRunner(
             connector,
             ingest=ingest,
@@ -1842,6 +1844,14 @@ def _labeler_audit(batch: str) -> None:
               f"{detail.get('label_path', detail.get('label_id'))}")
 
 
+def _google_reconsent_hint() -> str:
+    """How to fix a Google auth error for the `brain connectors` commands,
+    by token source: reconnect in Nango, or re-run the keychain consent."""
+    if get_settings().google_auth == "nango":
+        return "reconnect the account in Nango (check NANGO_SECRET_KEY and the connection id)"
+    return "run `brain connectors auth google` first"
+
+
 def _nango_seams(settings: Any, name: str) -> tuple[str, Any]:
     """(token, service_factory) for connector ``name`` under
     BRAIN_GOOGLE_AUTH=nango. The "token" is the Nango connection id — it only
@@ -1871,7 +1881,9 @@ def _nango_seams(settings: Any, name: str) -> tuple[str, Any]:
     return connection_id, nango_service_factory(client, connection)
 
 
-def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -> Any:
+def _build_connector(
+    name: str, session: Any = None, *, dry_run: bool = False, keychain_only: bool = False
+) -> Any:
     """Instantiate the registry's connector with production seams: the shared
     keychain token (same item as gmail-auth — one OAuth client, one token)
     and the default google service factory. Registry aliases resolve.
@@ -1885,7 +1897,9 @@ def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -
     writes nothing (no ledger, no cursor, no state, no items).
 
     BRAIN_GOOGLE_AUTH=nango swaps the keychain token for the connector's
-    Nango connection (see brain.connectors.google.nango).
+    Nango connection (see brain.connectors.google.nango) — for the
+    `brain connectors` commands only. ``keychain_only=True`` (gmail-poll, the
+    live email agent) ignores the setting and always uses the keychain.
     """
     from brain.config import get_settings
     from brain.connectors import get
@@ -1894,7 +1908,7 @@ def _build_connector(name: str, session: Any = None, *, dry_run: bool = False) -
 
     cls: Any = get(name)
     settings = get_settings()
-    if settings.google_auth == "nango":
+    if settings.google_auth == "nango" and not keychain_only:
         token, service_factory = _nango_seams(settings, cls.name)
     else:
         token = Keychain().read(GMAIL_ACCOUNT)
@@ -2065,8 +2079,7 @@ def _dry_run_failure(name: str, exc: Exception) -> tuple[int, str]:
     if isinstance(exc, ConnectorAuthError):
         return (
             78,
-            f"connectors: {name}: auth (needs re-consent): {exc} — run "
-            f"`brain connectors auth google` first",
+            f"connectors: {name}: auth (needs re-consent): {exc} — {_google_reconsent_hint()}",
         )
     if isinstance(exc, ConnectorRetryableError):
         return (1, f"connectors: {name}: retryable: {exc}")
@@ -2155,7 +2168,7 @@ def _connectors_adopt(args: argparse.Namespace) -> int:
             report = adopt_connector(connector, session, dry_run=args.dry_run, limit=args.limit)
     except ConnectorAuthError as exc:
         print(
-            f"connectors adopt: re-consent needed — run `brain connectors auth google` ({exc})",
+            f"connectors adopt: re-consent needed — {_google_reconsent_hint()} ({exc})",
             file=sys.stderr,
         )
         return 78

@@ -211,3 +211,84 @@ def test_build_connector_in_nango_mode_skips_the_keychain(monkeypatch):
 
     assert connector._token_loader() == "conn-1"
     assert connector._service_factory.__qualname__.startswith("nango_service_factory")
+
+
+# --- gmail-poll stays on the keychain (review of #153) ------------------------
+
+
+def _keychain_with(token: str) -> type:
+    class _Keychain:
+        reads: list[str] = []
+
+        def read(self, account: str) -> str:
+            _Keychain.reads.append(account)
+            return token
+
+    return _Keychain
+
+
+def test_keychain_only_ignores_nango_mode(monkeypatch):
+    """gmail-poll's seam: even with BRAIN_GOOGLE_AUTH=nango (and no Nango email
+    connection configured) the email connector uses the keychain token."""
+    from brain import cli
+    from brain.connectors import ensure_registered
+    from brain.connectors.google.base import default_service_factory
+
+    ensure_registered()
+    keychain = _keychain_with("1//keychain-refresh-token")
+    monkeypatch.setattr("brain.services.keychain.Keychain", keychain)
+    monkeypatch.setattr("brain.config.get_settings", lambda: _settings())
+
+    connector = cli._build_connector("email", keychain_only=True)
+
+    assert keychain.reads, "keychain_only must read the keychain"
+    assert connector._token_loader() == "1//keychain-refresh-token"
+    assert connector._service_factory is default_service_factory
+
+
+def test_gmail_poll_cycle_builds_its_connector_keychain_only(monkeypatch):
+    """The live email agent (gmail-poll) must not switch auth when
+    BRAIN_GOOGLE_AUTH=nango lands in .env for the connector commands."""
+    import contextlib
+
+    from brain import cli
+
+    class _Stop(Exception):
+        pass
+
+    seen: dict[str, Any] = {}
+
+    def spy(name: str, session: Any = None, **kwargs: Any) -> Any:
+        seen.update(name=name, **kwargs)
+        raise _Stop
+
+    monkeypatch.setattr(cli, "SessionLocal", lambda: contextlib.nullcontext(object()))
+    monkeypatch.setattr(cli, "get_settings", lambda: _settings())
+    monkeypatch.setattr(cli, "_build_poll_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr("brain.api.deps.get_classifier", lambda: object())
+    monkeypatch.setattr("brain.api.deps.get_item_indexer", lambda: object())
+    monkeypatch.setattr(cli, "_build_connector", spy)
+
+    with pytest.raises(_Stop):
+        cli._gmail_poll_cycle(object(), object())
+
+    assert seen["name"] == "email"
+    assert seen.get("keychain_only") is True
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected", "absent"),
+    [
+        ("nango", "reconnect the account in Nango", "brain connectors auth google"),
+        ("keychain", "brain connectors auth google", "Nango"),
+    ],
+)
+def test_reconsent_hint_follows_the_token_source(monkeypatch, mode, expected, absent):
+    from brain import cli
+
+    monkeypatch.setattr(cli, "get_settings", lambda: _settings(google_auth=mode))
+
+    hint = cli._google_reconsent_hint()
+
+    assert expected in hint
+    assert absent not in hint
