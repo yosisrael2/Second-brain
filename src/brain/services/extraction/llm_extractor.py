@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Versioned prompt (recorded in extraction_meta for every child it produces;
 # iterating the prompt bumps this version, so eval runs are comparable).
-EXTRACTION_PROMPT_VERSION = "v7"
+EXTRACTION_PROMPT_VERSION = "v8"
 
 # Injection defense: the source text is DATA (docs/ai-layer.md rationale).
 _PROMPT_TEMPLATE = """You extract structured children from one message.
@@ -107,7 +107,10 @@ Rules (labeling rules from the design spec, plain words):
   14:15" -> when_raw "יום רביעי 3.12 בשעה 14:15". If the message states a
   clock time, when_raw MUST carry it. NEVER compute, convert or invent a
   date — the pipeline resolves deterministically against the sent time
-  given below. A stated clock time makes a timed child; a date with no
+  given below. When the message places the day in NEXT week through a
+  heading or an earlier sentence ("ומה מחכה לנו שבוע הבא? ... ביום שישי"),
+  prefix that phrase: when_raw "שבוע הבא ביום שישי" — a bare "ביום שישי"
+  would land in the wrong week. A stated clock time makes a timed child; a date with no
   time is an all-day child; a deadline gets due = true. If the message
   has no date for a child, use when_raw = "".
 - quote: copy a VERBATIM span of the email text (never paraphrase). Every

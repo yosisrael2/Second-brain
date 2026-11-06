@@ -185,6 +185,36 @@ class TestCardRendering:
         assert "<b>" not in line
         assert html.escape("Gift <b>for</b> Dana & me") in line
 
+    def test_timed_child_shows_its_local_clock(self, world):
+        """Live bug (30 Oct 2026): 'דיאלוג בנים - איסוף ב-13:35' was stored at
+        13:35 local but the card said only 'Mon 02.11' — the time was lost."""
+        repo, _session, _memory = world
+        child = repo.add(
+            MemoryItem(
+                raw_text="Boys dialogue, pickup",
+                source="email",
+                type="event",
+                occurred_at=datetime(2026, 11, 2, 11, 35, tzinfo=UTC),  # 13:35 IST
+                child_state="proposed",
+            )
+        )
+        assert "Mon 02.11 13:35" in child_line(child, TZ)
+
+    def test_all_day_child_shows_the_date_only(self, world):
+        repo, _session, _memory = world
+        child = repo.add(
+            MemoryItem(
+                raw_text="Kite day",
+                source="email",
+                type="event",
+                occurred_at=datetime(2026, 11, 1, 22, 0, tzinfo=UTC),  # local midnight 02.11
+                child_state="proposed",
+            )
+        )
+        line = child_line(child, TZ)
+        assert "Mon 02.11" in line
+        assert "00:00" not in line
+
 
 class TestSupersedeHook:
     """D4 (item 20): a superseded child renders struck-through; the relation

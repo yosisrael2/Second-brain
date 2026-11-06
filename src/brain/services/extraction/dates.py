@@ -153,8 +153,7 @@ def resolve_when(
     if relative is None:
         weekday = temporal._find_weekday(text.lower())
         if weekday is not None:
-            offset = (weekday - local_date.weekday()) % 7
-            relative = local_date + timedelta(days=offset)
+            relative = _weekday_day(weekday, local_date, next_week=_says_next_week(text))
             kind = "weekday"
             return _with_conflict(
                 ResolvedWhen(day=relative, when_raw=text, kind=kind, named_weekday=weekday),
@@ -163,6 +162,33 @@ def resolve_when(
     if relative is not None:
         return ResolvedWhen(day=relative, when_raw=text, kind=kind)
     return None
+
+
+# "next week" in the date phrase itself (the extractor copies it into
+# when_raw when the message places the day in next week).
+_NEXT_WEEK = re.compile(r"(?:^|[\s,])[בה]?שבוע\s+הבא|\bnext\s+week\b", re.IGNORECASE)
+
+
+def _says_next_week(text: str) -> bool:
+    return _NEXT_WEEK.search(text) is not None
+
+
+def _weekday_day(weekday: int, local_date: date, *, next_week: bool) -> date:
+    """The day a weekday name points at, relative to the SENT day.
+
+    - "next week" -> that weekday in the FOLLOWING week; weeks start on
+      Sunday (Israeli school week), so from Sun 01.11 "שבוע הבא ביום
+      שלישי" is Tue 10.11, never Tue 03.11.
+    - a bare weekday -> the next such day AFTER the sent day. A message
+      naming its own sent weekday ("ביום שישי" sent on a Friday) means next
+      week's: the same day is written "היום"/"today", resolved earlier.
+    """
+    if next_week:
+        days_since_sunday = (local_date.weekday() + 1) % 7
+        next_sunday = local_date - timedelta(days=days_since_sunday) + timedelta(days=7)
+        return next_sunday + timedelta(days=(weekday + 1) % 7)
+    offset = (weekday - local_date.weekday()) % 7 or 7
+    return local_date + timedelta(days=offset)
 
 
 def _with_conflict(resolved: ResolvedWhen, named_weekday: int | None) -> ResolvedWhen:

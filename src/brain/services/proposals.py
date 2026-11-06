@@ -98,7 +98,11 @@ def _local(child: MemoryItem, tz: ZoneInfo) -> datetime | None:
 
 
 def _date_part(moment: datetime) -> str:
-    return moment.strftime("%a %d.%m")
+    """'Mon 02.11' for an all-day child (local midnight), 'Mon 02.11 13:35'
+    for a timed one — the card must not drop a stated pickup time."""
+    if (moment.hour, moment.minute) == (0, 0):
+        return moment.strftime("%a %d.%m")
+    return moment.strftime("%a %d.%m %H:%M")
 
 
 def child_line(child: MemoryItem, tz_name: str, *, state: str | None = None,
