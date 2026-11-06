@@ -99,3 +99,45 @@ def test_clock_extraction():
     assert xdates.extract_clock("איסוף הילדות 13:35") == time(13, 35)
     assert xdates.extract_clock("ב-9:40 בבוקר") == time(9, 40)
     assert xdates.extract_clock("יום חמישי 22.10") is None
+
+
+# --- weekday resolution against the sent day (live bug, 30 Oct 2026) ---------
+# Rinat's Friday 30.10 newsletter: "שבוע הבא ... וביום שישי נשמע הרצאה" —
+# the extractor copied when_raw "ביום שישי" and the resolver put the lecture
+# on the SENT day (Fri 30.10) instead of Fri 06.11.
+
+FRI_30_OCT = datetime(2026, 10, 30, 13, 43, tzinfo=TZ)
+
+
+def test_bare_weekday_naming_the_sent_day_means_next_week():
+    resolved = xdates.resolve_when("ביום שישי", FRI_30_OCT, TZ)
+    assert resolved is not None
+    assert resolved.day == date(2026, 11, 6)
+    assert not resolved.date_conflict
+
+
+def test_bare_weekday_after_the_sent_day_stays_this_week():
+    for raw, expected in (("ביום שני", date(2026, 11, 2)), ("בשלישי הקרוב", date(2026, 11, 3))):
+        resolved = xdates.resolve_when(raw, FRI_30_OCT, TZ)
+        assert resolved is not None
+        assert resolved.day == expected, raw
+
+
+def test_today_still_means_the_sent_day():
+    resolved = xdates.resolve_when("היום", FRI_30_OCT, TZ)
+    assert resolved is not None
+    assert resolved.day == date(2026, 10, 30)
+
+
+def test_next_week_weekday_lands_in_the_following_sunday_week():
+    """Sent Sun 01.11: 'שבוע הבא ביום שלישי' is Tue 10.11, not Tue 03.11
+    (Israeli weeks start on Sunday)."""
+    sun_1_nov = datetime(2026, 11, 1, 9, 0, tzinfo=TZ)
+    for raw in ("שבוע הבא ביום שלישי", "בשבוע הבא, יום שלישי", "next week on Tuesday"):
+        resolved = xdates.resolve_when(raw, sun_1_nov, TZ)
+        assert resolved is not None
+        assert resolved.day == date(2026, 11, 10), raw
+    # and from the Friday newsletter: next week's Friday is 06.11
+    resolved = xdates.resolve_when("שבוע הבא ביום שישי", FRI_30_OCT, TZ)
+    assert resolved is not None
+    assert resolved.day == date(2026, 11, 6)
