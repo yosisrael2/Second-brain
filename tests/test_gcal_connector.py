@@ -166,6 +166,19 @@ def test_connector_builds_with_calendar_v3() -> None:
     assert seen == [("calendar", "v3")]
 
 
+# The fixtures are real dated events (Thu 29.10, Wed 04.11, Wed 11.11 2026).
+# The adapter's window is relative to "now" (past 7 days, future 60), so a
+# wall-clock "now" ages the fixtures out of it: these tests started failing
+# on 5 Nov 2026 when 29.10 left the past window. Every test runs on a frozen
+# clock instead; tests that move time patch ``_now`` again on top.
+_FROZEN_NOW = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gcal_calendar, "_now", lambda: _FROZEN_NOW)
+
+
 def _timed() -> dict[str, Any]:
     return _fixture("event_timed_hebrew.json")
 
@@ -438,7 +451,7 @@ def test_fetch_full_sync_requests_instances_bounded_by_time_min(
     assert call["showDeleted"] is True
     assert "syncToken" not in call
     time_min = datetime.fromisoformat(call["timeMin"])
-    assert abs((datetime.now(UTC) - time_min).days - 60) <= 1  # now - BRAIN_GCAL_PAST_DAYS
+    assert abs((_FROZEN_NOW - time_min).days - 60) <= 1  # now - BRAIN_GCAL_PAST_DAYS
     # The fresh cutoff is frozen into the cursor for all later syncs.
     decoded = json.loads(result.next_cursor or "{}")
     assert decoded["calendars"] == {
@@ -742,7 +755,7 @@ def test_fetch_fresh_cutoff_honors_brain_gcal_past_days(
     result = conn.fetch(None, limit=50)
 
     time_min = datetime.fromisoformat(fake.calls[0]["timeMin"])
-    assert abs((datetime.now(UTC) - time_min).days - 14) <= 1
+    assert abs((_FROZEN_NOW - time_min).days - 14) <= 1
     assert (
         datetime.fromisoformat(json.loads(result.next_cursor or "{}")["cutoff"]) == time_min
     )
@@ -1120,7 +1133,7 @@ def _jlm_edge(days_from_today: int) -> datetime:
     ``timeMax`` is exclusive, so events STARTING through today+N are included.
     """
     zone = ZoneInfo("Asia/Jerusalem")
-    now_local = datetime.now(UTC).astimezone(zone)
+    now_local = gcal_calendar._now().astimezone(zone)
     day = now_local.date() + timedelta(days=days_from_today)
     return datetime.combine(day, datetime.min.time(), tzinfo=zone).astimezone(UTC)
 
@@ -1206,7 +1219,7 @@ def test_fresh_cursor_default_past_days_is_7(monkeypatch: pytest.MonkeyPatch) ->
     result = conn.fetch(None, limit=50)
 
     time_min = datetime.fromisoformat(fake.calls[0]["timeMin"])
-    assert abs((datetime.now(UTC) - time_min).days - 7) <= 1
+    assert abs((_FROZEN_NOW - time_min).days - 7) <= 1
     json.loads(result.next_cursor or "{}")  # cursor still valid JSON
 
 
@@ -1221,7 +1234,7 @@ def test_incremental_beyond_window_instances_dropped_and_counted(
     monkeypatch.setenv("BRAIN_GCAL_FUTURE_DAYS", "60")
     monkeypatch.setenv("TIMEZONE", "Asia/Jerusalem")
     get_settings.cache_clear()
-    soon = (datetime.now(UTC) + timedelta(days=3)).isoformat()
+    soon = (_FROZEN_NOW + timedelta(days=3)).isoformat()
     far = "2040-01-30T16:45:00Z"
     skeletal = {"id": "cancelled-no-start", "status": "cancelled"}  # no start: kept
     fake = _FakeCalendarService()
@@ -1302,7 +1315,7 @@ class _ShiftingNow:
 
     @classmethod
     def now(cls, tz=None):
-        base = datetime.now(UTC) + timedelta(days=cls.offset_days)
+        base = _FROZEN_NOW + timedelta(days=cls.offset_days)
         return base.astimezone(tz) if tz is not None else base
 
 
