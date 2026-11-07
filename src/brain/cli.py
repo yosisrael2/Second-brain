@@ -306,8 +306,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Path to the Desktop-client secret JSON "
         "(default: GMAIL_CREDENTIALS_PATH; keep it OUTSIDE the repo)",
     )
+    secret_store = subparsers.add_parser(
+        "secret-store",
+        help="Store one secret read from STDIN in the secret store (keychain on "
+        "macOS, the 0600 secrets file elsewhere); for moving tokens to a server",
+    )
+    secret_store.add_argument("service", help="e.g. second-brain-gmail")
+    secret_store.add_argument("account", nargs="?", default=GMAIL_ACCOUNT)
     args = parser.parse_args(argv)
 
+    if args.command == "secret-store":
+        return _secret_store(service=args.service, account=args.account)
     if args.command == "reindex":
         return _reindex(batch_size=args.batch_size)
     if args.command == "telegram":
@@ -1160,6 +1169,27 @@ def _build_oauth_flow(
     return InstalledAppFlow.from_client_secrets_file(
         client_secret_path, scopes=scopes if scopes is not None else [GMAIL_SCOPE]
     )
+
+
+def _secret_store(service: str, account: str) -> int:
+    """Read one secret from STDIN and store it; the value is never echoed.
+
+    Lets a token move between hosts through a pipe, e.g.
+    ``security find-generic-password -s S -a A -w | ssh host brain secret-store S A``.
+    """
+    from brain.services.keychain import KeychainError
+
+    secret = sys.stdin.read().strip()
+    if not secret:
+        print("secret-store: nothing on STDIN; pipe the secret in", file=sys.stderr)
+        return 78
+    try:
+        Keychain(service=service).store(account, secret)
+    except KeychainError as exc:
+        print(f"secret-store: {exc}", file=sys.stderr)
+        return 1
+    print(f"secret-store: stored {service}/{account} ({len(secret)} chars)")
+    return 0
 
 
 def _gmail_auth(args: argparse.Namespace) -> int:
