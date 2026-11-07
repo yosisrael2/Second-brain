@@ -1,0 +1,21 @@
+# Second Brain — API server (uvicorn on :27800). Linux replacement for com.secondbrain.api (launchd).
+# Install: see deploy/README.md. Paths assume the checkout at /opt/second-brain.
+#
+# Restart=on-failure keeps the launchd KeepAlive contract of scripts/run-server.sh:
+# it exits 0 for permanent problems (disabled, config error) and non-zero for
+# transient ones, so only the transient ones restart.
+[Unit]
+Description=Second Brain API server (uvicorn on :27800)
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/second-brain
+ExecStart=/opt/second-brain/scripts/run-server.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
