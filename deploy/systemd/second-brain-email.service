@@ -12,6 +12,10 @@ Wants=network-online.target docker.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/second-brain
+# Claude Code login for the claude_sdk LLM (CLAUDE_CODE_OAUTH_TOKEN from
+# `claude setup-token`). The app reads .env itself, but the SDK subprocess
+# only sees real environment variables. "-" = optional file.
+EnvironmentFile=-/root/.config/second-brain/claude.env
 ExecStart=/opt/second-brain/scripts/run-email.sh
 Restart=on-failure
 RestartSec=10
