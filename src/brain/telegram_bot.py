@@ -2381,8 +2381,13 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
         await _send(tg, chat_id, core.unsupported("Voice and video"))
         return
     if message.text:
+        command, _, argument = message.text.strip().partition(" ")
         if core.is_question(message.text):
             reply = await _ask_with_typing(tg, chat_id, core, message.text.strip())
+        elif command == "/ask" and argument.strip():
+            # Same worker-thread path as a "?" question: the LLM client uses
+            # asyncio.run, which raises inside this running event loop.
+            reply = await _ask_with_typing(tg, chat_id, core, argument.strip())
         else:
             reply = core.route(message.text, user.id, forward=_forward_info(message))
         await _send(tg, chat_id, reply)
