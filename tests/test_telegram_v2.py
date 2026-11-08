@@ -344,6 +344,55 @@ class _CannedAsk:
         return self._result
 
 
+class _LoopSensitiveAsk(_CannedAsk):
+    """Fails like ClaudeSdkLLMClient when called inside a running event loop."""
+
+    def __init__(self, result: AskResult) -> None:
+        super().__init__(result)
+        self.questions: list[str] = []
+
+    def ask(self, question: str) -> AskResult:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.questions.append(question)
+            return self._result
+        raise RuntimeError("asyncio.run() cannot be called from a running event loop")
+
+
+class TestAskCommandOffTheLoop:
+    """7 Nov 2026: `/ask x` ran the blocking LLM call inside the poll loop."""
+
+    def test_ask_command_runs_in_a_worker_thread(self):
+        ask = _LoopSensitiveAsk(AskResult(answer="42", cited_ids=[], model="m"))
+        core, _ = make_core(ask=ask)
+        tg = _AdapterTG()
+
+        _handle(_text_update("/ask what is on this week"), core, tg)
+
+        assert ask.questions == ["what is on this week"]
+        assert any("42" in (s["text"] or "") for s in tg.sent)
+
+    def test_question_mark_text_still_runs_in_a_worker_thread(self):
+        ask = _LoopSensitiveAsk(AskResult(answer="42", cited_ids=[], model="m"))
+        core, _ = make_core(ask=ask)
+        tg = _AdapterTG()
+
+        _handle(_text_update("what is on this week?"), core, tg)
+
+        assert ask.questions == ["what is on this week?"]
+
+    def test_bare_ask_command_still_shows_usage(self):
+        ask = _LoopSensitiveAsk(AskResult(answer="42", cited_ids=[], model="m"))
+        core, _ = make_core(ask=ask)
+        tg = _AdapterTG()
+
+        _handle(_text_update("/ask"), core, tg)
+
+        assert ask.questions == []
+        assert any("Usage: /ask" in (s["text"] or "") for s in tg.sent)
+
+
 # --- 5. /recent + registered commands -----------------------------------------
 
 
