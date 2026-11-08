@@ -1,0 +1,13 @@
+# Second Brain — one auto-deploy check (scripts/auto-deploy.sh).
+# Started by second-brain-deploy.timer; safe to run by hand:
+#   systemctl start second-brain-deploy && journalctl -u second-brain-deploy -n 30
+[Unit]
+Description=Second Brain auto-deploy (pull origin/main, migrate, restart, health check)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/second-brain
+ExecStart=/opt/second-brain/scripts/auto-deploy.sh
+TimeoutStartSec=15min
