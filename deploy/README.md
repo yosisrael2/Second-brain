@@ -50,6 +50,22 @@ security find-generic-password -s second-brain-gmail -a default -w \
   | ssh <host> '/opt/second-brain/.venv/bin/brain secret-store second-brain-gmail default'
 ```
 
+### LLM login (claude_sdk)
+
+The default LLM provider runs through a Claude Code login, which a headless
+server does not have. On a machine with a browser run `claude setup-token`,
+then on the server store the printed token without echoing it:
+
+```bash
+install -m 600 /dev/null /root/.config/second-brain/claude.env
+read -rs -p "token: " T && echo "CLAUDE_CODE_OAUTH_TOKEN=$T" > /root/.config/second-brain/claude.env && unset T
+```
+
+The units load that file with `EnvironmentFile=`. It must be a real
+environment variable: the app reads the env file itself, but the Claude Code
+subprocess only inherits the process environment. Alternatively set
+`LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`.
+
 ## 4. Services
 
 ```bash
