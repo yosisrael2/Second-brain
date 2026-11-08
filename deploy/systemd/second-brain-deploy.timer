@@ -1,8 +1,14 @@
 # Checks GitHub for a new main every 2 minutes; deploys only when it moved.
+#
+# OnUnitInactiveSec counts from the deploy service's LAST run, so on its own
+# it never elapses before the first run; OnBootSec only covers a boot after
+# the timer was enabled. OnActiveSec fires once a minute after the timer
+# itself starts (enable --now, or a restart), which starts the cycle.
 [Unit]
 Description=Second Brain auto-deploy check
 
 [Timer]
+OnActiveSec=1min
 OnBootSec=3min
 OnUnitInactiveSec=2min
 Persistent=false
