@@ -154,6 +154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
         help="<kid name> | me | family (values handed over at seed time)",
     )
+    set_language = memory_sub.add_parser(
+        "set-language", help="The bot's language (a fact on 'me'): he | en"
+    )
+    set_language.add_argument("language", choices=["he", "en"])
     eval_extraction = subparsers.add_parser(
         "eval-extraction",
         help="Score predicted extraction children against gold labels",
@@ -350,6 +354,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.memory_command == "seed-channel":
             return _memory_seed_channel(name=args.name, kind=args.kind, applies_to=args.applies_to)
+        if args.memory_command == "set-language":
+            return _memory_set_language(args.language)
         parser.error(f"unknown memory command {args.memory_command!r}")
         return 2
     if args.command == "eval-extraction":
@@ -684,6 +690,24 @@ def _memory_seed_channel(*, name: str, kind: str, applies_to: str) -> int:
         return 0
     except ValueError as exc:
         print(f"seed-channel: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        session.close()
+
+
+def _memory_set_language(language: str) -> int:
+    """Store the bot language on 'me' (the bot reads it per message)."""
+    from brain.db.session import SessionLocal  # noqa: PLC0415  (deferred: CLI startup)
+    from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+    from brain.services.memory import MemoryError, MemoryService  # noqa: PLC0415
+
+    session = SessionLocal()
+    try:
+        code = MemoryService(MemoryRepository(session)).set_user_language(language)
+        print(f"bot language set to {code}")
+        return 0
+    except MemoryError as exc:
+        print(f"set-language: {exc}", file=sys.stderr)
         return 1
     finally:
         session.close()

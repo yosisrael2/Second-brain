@@ -302,7 +302,7 @@ class TestQuestionRouting:
         core, _ = make_core(ask=_CannedAsk(AskResult(answer="42", cited_ids=[], model="gpt-x")))
         reply = core.route("What did I decide yesterday?", 111)
         assert "42" in reply.text
-        assert "gpt-x" in reply.text
+        assert "gpt-x" not in reply.text  # no model footer for the reader
 
     def test_typing_chat_action_while_waiting(self, monkeypatch):
         core, _ = make_core(ask=_CannedAsk(AskResult(answer="42", cited_ids=[], model="m")))
@@ -427,6 +427,7 @@ class TestRecentAndCommands:
             "profile",
             "remember",
             "status",
+            "language",
             "help",
         ]
 
@@ -690,29 +691,13 @@ class TestGoldenFormat:
 
         reply = core.route("When is the TLS cert due?", 111)
 
-        assert (
-            reply.text
-            == (
-                "🧠 <b>Answer</b>\n"
-                "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
-                "\n"
-                "📚 <b>Sources</b>\n"
-                "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
-                "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
-                "\n"
-                "<i>claude-sonnet-5-5 · "
-            )
-            or True
-        )  # seconds vary: assert prefix exactly, footer tail loosely
-        assert reply.text.startswith(
+        assert reply.text == (
             "🧠 <b>Answer</b>\n"
             "Renew it &lt;b&gt;before&lt;/b&gt; Friday &amp; audit keys. See ¹ and ².\n"
             "\n"
             "📚 <b>Sources</b>\n"
-            "1. 📧 Renew the TLS certificate before Friday · 22 Oct\n"
-            "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · 21 Oct\n"
-            "\n"
-            "<i>claude-sonnet-5-5 · "
+            "1. 📧 Renew the TLS certificate before Friday · received 22 Oct\n"
+            "2. 💬 WhatsApp pool party on Saturday, bring towels and snacks for… · received 21 Oct"
         )
         labels = [label for row in reply.keyboard for label, _ in row]
         assert labels == ["📎 1", "📎 2"]  # one row, matches source numbers
@@ -723,8 +708,7 @@ class TestGoldenFormat:
         )
         reply = core.route("What?", 111)
 
-        assert reply.text.startswith("🧠 <b>Answer</b>\nI do not know.\n\n<i>m · ")
-        assert reply.text.endswith("</i>")
+        assert reply.text == "🧠 <b>Answer</b>\nI do not know."
         assert "📚" not in reply.text  # no sources block
         assert reply.keyboard == []  # no buttons
 

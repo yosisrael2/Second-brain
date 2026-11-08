@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from brain import i18n
 from brain.db.models import MemoryItem
 from brain.services.extraction.dates import combine_local, extract_clock, resolve_when
 
@@ -97,52 +98,88 @@ def _local(child: MemoryItem, tz: ZoneInfo) -> datetime | None:
     return moment.astimezone(tz)
 
 
-def _date_part(moment: datetime) -> str:
+def _date_part(moment: datetime, lang: str = i18n.DEFAULT) -> str:
     """'Mon 02.11' for an all-day child (local midnight), 'Mon 02.11 13:35'
-    for a timed one — the card must not drop a stated pickup time."""
-    if (moment.hour, moment.minute) == (0, 0):
-        return moment.strftime("%a %d.%m")
-    return moment.strftime("%a %d.%m %H:%M")
+    for a timed one — the card must not drop a stated pickup time. Hebrew:
+    'יום ב׳ 02.11'."""
+    return i18n.short_date(moment, lang)
 
 
-def child_line(child: MemoryItem, tz_name: str, *, state: str | None = None,
-               matched_title: str | None = None) -> str:
+# Types whose card line must say "no date" when none was resolved: for
+# them a missing date is information. A reminder is often a standing rule
+# ("bring a reading book every day") and a fact has no date at all.
+_DATED_TYPES = frozenset({"event", "task"})
+
+
+def _who(applies_to: list[str] | None, lang: str, names: dict[str, str]) -> str | None:
+    """The 'for whom' part: display names (e.g. Hebrew aliases), or None."""
+    values = [v for v in (applies_to or []) if v]
+    if not values:
+        return None
+    if values == ["unknown"]:
+        return i18n.t(lang, "who_unknown")
+    if values == ["nobody"]:
+        return i18n.t(lang, "who_nobody")
+    special = {"me": i18n.t(lang, "who_me"), "family": i18n.t(lang, "who_family")}
+    shown = [special.get(v) or names.get(v) or v for v in values if v not in ("unknown", "nobody")]
+    return _esc(", ".join(shown)) if shown else None
+
+
+def child_line(
+    child: MemoryItem,
+    tz_name: str,
+    *,
+    state: str | None = None,
+    matched_title: str | None = None,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
+    number: int | None = None,
+) -> str:
     """One card line for one child (HTML-escaped).
 
     ``state``/``matched_title`` come from the child's recon relation (the
     card builders look it up): an applied UPDATE renders "↩︎ applied:
-    …" and a cancellation names its target."""
+    …" and a cancellation names its target. ``number`` prefixes the line
+    so it matches its numbered buttons; ``names`` maps stored applies_to
+    names to display names (the Hebrew alias when the bot speaks Hebrew)."""
     tz = ZoneInfo(tz_name)
-    emoji = CHILD_EMOJI.get(child.type.value if child.type else "", "•")
+    kind = child.type.value if child.type else ""
+    emoji = CHILD_EMOJI.get(kind, "•")
     warning = "⚠️ " if child.date_conflict else ""
-    parts = [f"{warning}{emoji} {_esc(child.raw_text)}"]
+    prefix = f"{number}. " if number is not None else ""
+    parts = [f"{prefix}{warning}{emoji} {_esc(child.raw_text)}"]
     moment = _local(child, tz)
     if moment is not None:
-        parts.append(_date_part(moment))
-    applies = ", ".join(child.applies_to or [])
-    if applies and applies != "unknown":
-        parts.append(_esc(applies))
-    elif applies == "unknown":
-        parts.append("❓ who is this for?")
-    marker = superseded_marker(child)
+        parts.append(_date_part(moment, lang))
+    elif kind in _DATED_TYPES:
+        parts.append(i18n.t(lang, "no_date"))
+    who = _who(child.applies_to, lang, names or {})
+    if who:
+        parts.append(who)
+    marker = superseded_marker(child, lang)
     if marker:
         parts.append(marker)
-    recon = verdict_marker(child, state=state, matched_title=matched_title)
+    recon = verdict_marker(child, state=state, matched_title=matched_title, lang=lang)
     if recon:
         parts.append(_esc(recon))
     return " · ".join(parts)
 
 
-def superseded_marker(child: MemoryItem) -> str:
+def superseded_marker(child: MemoryItem, lang: str = i18n.DEFAULT) -> str:
     """D4 rendering hook: non-empty when the child was superseded (PR B)."""
     meta = child.extraction_meta or {}
     if meta.get("superseded_by"):
-        return "↩︎ superseded"
+        return i18n.t(lang, "superseded")
     return ""
 
 
-def verdict_marker(child: MemoryItem, *, state: str | None = None,
-                   matched_title: str | None = None) -> str:
+def verdict_marker(
+    child: MemoryItem,
+    *,
+    state: str | None = None,
+    matched_title: str | None = None,
+    lang: str = i18n.DEFAULT,
+) -> str:
     """PR D-recon (item 37) rendering hook: one short line per non-NEW
     verdict stored on the child. ``state`` is the recon relation's
     provenance.state (an applied UPDATE says "applied", not "proposes");
@@ -155,18 +192,18 @@ def verdict_marker(child: MemoryItem, *, state: str | None = None,
     if verdict == "update":
         changes = "; ".join(f"{k}: {v[0]} → {v[1]}" for k, v in fields.items())
         if state == "applied":
-            return f"↩︎ applied: {changes}"
-        return f"↩︎ proposes: {changes}"
+            return i18n.t(lang, "v_update_applied", changes=changes)
+        return i18n.t(lang, "v_update", changes=changes)
     if verdict == "conflict":
-        return "⚠️ conflicts — both versions shown"
+        return i18n.t(lang, "v_conflict")
     if verdict == "cancellation":
         if state == "applied":
-            return "🗑 cancelled"
+            return i18n.t(lang, "v_cancelled")
         if matched_title:
-            return f"🗑 cancels: {matched_title}"
-        return "🗑 proposes cancelling"
+            return i18n.t(lang, "v_cancels", title=matched_title)
+        return i18n.t(lang, "v_proposes_cancel")
     if verdict == "more_detail":
-        return "➕ adds detail"
+        return i18n.t(lang, "v_more_detail")
     return ""
 
 
@@ -176,6 +213,8 @@ def render_source_card(
     tz_name: str,
     *,
     recon: dict[int, tuple[str, object, str | None]] | None = None,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
 ) -> str:
     """The whole card text for one source's proposed children (HTML-escaped).
 
@@ -187,16 +226,27 @@ def render_source_card(
     for index, child in enumerate(children):
         entry = recon.get(index)
         if entry is None:
-            lines.append(child_line(child, tz_name))
+            lines.append(child_line(child, tz_name, lang=lang, names=names, number=index + 1))
             continue
         verdict, rel, matched_title = entry
         state = (rel.provenance or {}).get("state")
-        lines.append(child_line(
-            child, tz_name, state=state,
-            matched_title=matched_title if verdict == "cancellation" else None,
-        ))
-    header = f"🧠 found {len(children)} items in {_esc(source_short_title(source))}"
-    return "\n".join([header, *lines])
+        lines.append(
+            child_line(
+                child,
+                tz_name,
+                state=state,
+                matched_title=matched_title if verdict == "cancellation" else None,
+                lang=lang,
+                names=names,
+                number=index + 1,
+            )
+        )
+    title = _esc(source_short_title(source))
+    if len(children) == 1:
+        header = i18n.t(lang, "card_header_one", title=title)
+    else:
+        header = i18n.t(lang, "card_header", n=len(children), title=title)
+    return "\n".join([header, i18n.t(lang, "card_legend"), *lines])
 
 
 def proposal_keyboard(
@@ -204,6 +254,7 @@ def proposal_keyboard(
     children: list[MemoryItem],
     *,
     recon: dict[int, tuple[str, object, str | None]] | None = None,
+    lang: str = i18n.DEFAULT,
 ) -> list[list[tuple[str, str]]]:
     """Per-child ✅/✏️/🗑 rows + one 'Keep all' row (callback data < 64 bytes).
 
@@ -226,39 +277,44 @@ def proposal_keyboard(
     recon = recon or {}
     rows: list[list[tuple[str, str]]] = []
     for index, _child in enumerate(children):
+        n = index + 1  # the line number on the card
         entry = recon.get(index)
         if entry is not None:
             verdict, rel, _matched_title = entry
             state = (rel.provenance or {}).get("state")
             if verdict == "update" and state == "applied":
-                rows.append([("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{rel.id}")])
+                rows.append([(i18n.t(lang, "btn_undo", n=n), f"{CB_REL_UNDO}:{token}:{rel.id}")])
                 continue
             if verdict == "update":
                 rows.append([
-                    ("✅ Confirm update", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
-                    ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{rel.id}"),
+                    (i18n.t(lang, "btn_confirm_update", n=n), f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    (i18n.t(lang, "btn_keep_both", n=n), f"{CB_REL_KEEP_BOTH}:{token}:{rel.id}"),
                 ])
                 continue
             if verdict == "conflict":
+                discard = f"{CB_RECON_DISCARD}:{token}:{rel.id}"
+                confirm = f"{CB_REL_CONFIRM}:{token}:{rel.id}"
                 rows.append([
-                    ("✅ keep existing", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
-                    ("✅ keep new", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
+                    (i18n.t(lang, "btn_keep_existing", n=n), discard),
+                    (i18n.t(lang, "btn_keep_new", n=n), confirm),
                 ])
                 continue
             if verdict == "cancellation":
+                confirm = f"{CB_REL_CONFIRM}:{token}:{rel.id}"
+                discard = f"{CB_RECON_DISCARD}:{token}:{rel.id}"
                 rows.append([
-                    ("✅ Confirm cancellation", f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
-                    ("✖ Not cancelled", f"{CB_RECON_DISCARD}:{token}:{rel.id}"),
+                    (i18n.t(lang, "btn_confirm_cancel", n=n), confirm),
+                    (i18n.t(lang, "btn_not_cancelled", n=n), discard),
                 ])
                 continue
         rows.append(
             [
-                ("✅ Keep", f"{CB_PROPOSED_KEEP}:{token}:{index}"),
-                ("✏️ Fix", f"{CB_PROPOSED_FIX}:{token}:{index}"),
-                ("🗑 Drop", f"{CB_PROPOSED_DROP}:{token}:{index}"),
+                (i18n.t(lang, "btn_keep", n=n), f"{CB_PROPOSED_KEEP}:{token}:{index}"),
+                (i18n.t(lang, "btn_fix", n=n), f"{CB_PROPOSED_FIX}:{token}:{index}"),
+                (i18n.t(lang, "btn_drop", n=n), f"{CB_PROPOSED_DROP}:{token}:{index}"),
             ]
         )
-    rows.append([("✅ Keep all", f"{CB_PROPOSED_KEEP_ALL}:{token}")])
+    rows.append([(i18n.t(lang, "btn_keep_all"), f"{CB_PROPOSED_KEEP_ALL}:{token}")])
     return rows
 
 
@@ -407,9 +463,15 @@ def mark_pinged(children: list[MemoryItem], now: datetime) -> None:
         child.extraction_meta = meta
 
 
-def ping_line(child: MemoryItem, tz_name: str) -> str:
+def ping_line(
+    child: MemoryItem,
+    tz_name: str,
+    *,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
+) -> str:
     """The 48h ping text (item 19/D7: it doubles as the confirmation moment)."""
-    return f"⏰ due soon: {child_line(child, tz_name)}"
+    return i18n.t(lang, "due_soon", line=child_line(child, tz_name, lang=lang, names=names))
 
 
 def proposed_children_of(session: Session, source_id) -> list[MemoryItem]:

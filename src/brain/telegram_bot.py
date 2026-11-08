@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from brain import i18n
 from brain.config import Settings, unwrap_secret
 from brain.schemas import ItemUpdate
 from brain.services.ask import AskResult
@@ -155,6 +156,7 @@ BOT_COMMANDS = (
     ("profile", "Your kids and remembered facts"),
     ("remember", "Remember a fact: /remember <text>"),
     ("status", "Component health"),
+    ("language", "Bot language: /language he | en"),
     ("help", "How to use the bot"),
 )
 
@@ -404,6 +406,21 @@ def _stars(importance: Any) -> str:
     return "⭐" * max(0, min(n, 5))
 
 
+def _locale_of(session: Any) -> tuple[str, dict[str, str]]:
+    """(language, display names) from the memory layer; English on any error
+    so a memory problem never blocks a card."""
+    try:
+        from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
+        from brain.services.memory import MemoryService  # noqa: PLC0415
+
+        memory = MemoryService(MemoryRepository(session))
+        lang = memory.user_language()
+        return lang, memory.display_names(lang)
+    except Exception:  # noqa: BLE001
+        logger.warning("telegram: could not read the language from memory", exc_info=True)
+        return i18n.DEFAULT, {}
+
+
 class TelegramBot:
     """Update-processing core: allowlist, commands, capture; PTB-agnostic.
 
@@ -472,6 +489,8 @@ class TelegramBot:
             return self.search(argument)
         if command == "/ask":
             return self.ask(argument)
+        if command == "/language":
+            return self.set_language(argument)
         if command == "/review":
             return self.review()
         if command == "/recent":
@@ -724,6 +743,7 @@ class TelegramBot:
         from brain.ai.ask import LLMError  # noqa: PLC0415
 
         started = time.monotonic()
+        lang = self._language()
         try:
             with self._services_factory() as services:
                 result = services.ask.ask(question)
@@ -734,23 +754,56 @@ class TelegramBot:
                 ok=False,
                 detail={"error": f"{type(exc).__name__}: {exc!s}"[:200]},
             )
-            return Reply("⚠️ LLM unavailable; try again later.")
+            return Reply(i18n.t(lang, "llm_unavailable"))
         elapsed = time.monotonic() - started
         record_event(
             "telegram",
             EVENT_ASK,
             ok=True,
-            detail={"item_ids": list(result.cited_ids), "chars": len(result.answer)},
+            detail={
+                "item_ids": list(result.cited_ids),
+                "chars": len(result.answer),
+                "model": result.model,
+                "elapsed_s": round(elapsed, 1),
+            },
         )
-        return self._ask_card(result, elapsed)
+        return self._ask_card(result, elapsed, lang=lang)
 
-    def _ask_card(self, result: AskResult, elapsed_s: float) -> Reply:
-        """Format an answer: 🧠 header, refs instead of raw uuids, 📚 sources."""
+    def set_language(self, argument: str) -> Reply:
+        """/language he|en: store the bot language in the memory layer."""
+        current = self._language()
+        code = argument.strip().lower()
+        if code not in i18n.SUPPORTED:
+            return Reply(i18n.t(current, "language_usage", current=current))
+        try:
+            with self._services_factory() as services:
+                if services.memory is None:
+                    return Reply(i18n.t(current, "language_usage", current=current))
+                services.memory.set_user_language(code)
+        except MemoryError as exc:
+            return Reply(f"⚠️ {_esc(str(exc))}")
+        return Reply(i18n.t(code, "language_set"))
+
+    def _language(self) -> str:
+        """The user's bot language from the memory layer (English on any error)."""
+        try:
+            with self._services_factory() as services:
+                memory = getattr(services, "memory", None)
+                return memory.user_language() if memory is not None else i18n.DEFAULT
+        except Exception:  # noqa: BLE001
+            logger.warning("telegram: could not read the language from memory", exc_info=True)
+            return i18n.DEFAULT
+
+    def _ask_card(self, result: AskResult, elapsed_s: float, *, lang: str = i18n.DEFAULT) -> Reply:
+        """Format an answer: 🧠 header, refs instead of raw uuids, 📚 sources.
+
+        No model/latency footer: it meant nothing to the reader (the model
+        and elapsed time stay in the ops log)."""
         order = {item_id: n for n, item_id in enumerate(result.cited_ids, start=1)}
         body = _esc(result.answer)
         for item_id, n in order.items():
             body = body.replace(f"[{item_id}]", _ref(n))
-        lines = ["🧠 <b>Answer</b>", body]
+        lines = [i18n.t(lang, "ask_answer"), body]
         if order:  # nothing cited -> plain answer, no sources block
             by_id = {str(hit.item.id): hit for hit in result.sources}
             source_lines: list[str] = []
@@ -759,21 +812,22 @@ class TelegramBot:
                 if hit is None:
                     continue
                 emoji = KIND_EMOJI.get(hit.item.source, "📝")
-                when = self._short_date(hit.item)
-                suffix = f" · {when}" if when else ""
+                when = self._short_date(hit.item, lang)
+                suffix = f" · {i18n.t(lang, 'ask_received', date=when)}" if when else ""
                 source_lines.append(f"{n}. {emoji} {_one_line(hit.item.raw_text, 60)}{suffix}")
             if source_lines:
-                lines += ["", "📚 <b>Sources</b>", *source_lines]
-        if result.model:
-            lines += ["", f"<i>{_esc(result.model)} · {elapsed_s:.1f}s</i>"]
+                lines += ["", i18n.t(lang, "ask_sources"), *source_lines]
         return Reply(text="\n".join(lines), keyboard=self._open_buttons(result.cited_ids))
 
-    def _short_date(self, item: Any) -> str | None:
-        """Day + short month in the bot's timezone (source-line suffix)."""
+    def _short_date(self, item: Any, lang: str = i18n.DEFAULT) -> str | None:
+        """Day + month in the bot's timezone (source-line suffix): '7 Nov',
+        or '7.11' in Hebrew (no English month name inside a Hebrew line)."""
         instant = item.occurred_at or item.created_at
         if instant is None:
             return None
         local = instant.astimezone(self._timezone)
+        if lang == "he":
+            return f"{local.day}.{local.month}"
         return f"{local.day} {local.strftime('%b')}"
 
     def _open_buttons(self, cited_ids: list[str]) -> list[list[tuple[str, str]]]:
@@ -1046,17 +1100,20 @@ class TelegramBot:
             if not children:
                 return None
             recon, blocks = self._recon_payload(session, children)
+            lang, names = _locale_of(session)
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
             parts = [part for part in (
                 notice,
-                render_source_card(source, children, self._timezone.key, recon=recon),
+                render_source_card(
+                    source, children, self._timezone.key, recon=recon, lang=lang, names=names
+                ),
                 *blocks,
             ) if part]
             return Reply(
                 text="\n".join(parts),
-                keyboard=proposal_keyboard(token, children, recon=recon),
+                keyboard=proposal_keyboard(token, children, recon=recon, lang=lang),
             )
         finally:
             session.close()
@@ -1148,17 +1205,20 @@ class TelegramBot:
             if source is None or not children:
                 return Reply(f"{notice}\n ✓ all done here.", edit=True)
             recon, blocks = self._recon_payload(session, children)
+            lang, names = _locale_of(session)
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
             parts = [part for part in (
                 notice,
-                render_source_card(source, children, self._timezone.key, recon=recon),
+                render_source_card(
+                    source, children, self._timezone.key, recon=recon, lang=lang, names=names
+                ),
                 *blocks,
             ) if part]
             return Reply(
                 text="\n".join(parts),
-                keyboard=proposal_keyboard(token, children, recon=recon),
+                keyboard=proposal_keyboard(token, children, recon=recon, lang=lang),
                 edit=True,
             )
         finally:
@@ -1432,13 +1492,14 @@ class TelegramBot:
             mark_pinged(children, moment)
             session.commit()
             pings: list[tuple[int, Reply]] = []
+            lang, names = _locale_of(session)
             for child in children:
                 token = self.registry.put(Pending(ids=(child.id,), kind="proposal"))
                 reply = Reply(
-                    text=ping_line(child, self._timezone.key),
+                    text=ping_line(child, self._timezone.key, lang=lang, names=names),
                     keyboard=[
-                        [("✅ Keep", f"{CB_PROPOSED_KEEP}:{token}:0")],
-                        [("🗑 Drop", f"{CB_PROPOSED_DROP}:{token}:0")],
+                        [(i18n.t(lang, "btn_keep", n="").strip(), f"{CB_PROPOSED_KEEP}:{token}:0")],
+                        [(i18n.t(lang, "btn_drop", n="").strip(), f"{CB_PROPOSED_DROP}:{token}:0")],
                     ],
                 )
                 for chat_id in sorted(self._allowed_ids):
