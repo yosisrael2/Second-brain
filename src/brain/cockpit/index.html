@@ -35,6 +35,7 @@
       <a class="tab nav-item" data-tab="debug" href="#debug">Debug</a>
       <a class="tab nav-item" data-tab="memory" href="#memory">Memory</a>
       <a class="tab nav-item" data-tab="prompts" href="#prompts">Prompts</a>
+      <a class="tab nav-item" data-tab="scheduled" href="#scheduled">Scheduled</a>
     </nav>
     <div class="build-card" title="deployed git sha + overall status">
       <span id="build-dot" class="dot ok" aria-hidden="true"></span>
@@ -168,6 +169,16 @@
           <div id="prompts-list" class="debug-card pr-list"><div class="empty">loading…</div></div>
           <div id="prompts-editor" class="debug-card pr-editor"><div class="empty">loading…</div></div>
         </div>
+      </section>
+
+      <!-- SCHEDULED (schedules.js): recurring prompts the bot runs + sends to Telegram -->
+      <section id="tab-scheduled" class="tab-panel">
+        <div class="sc-top">
+          <p class="hint">Recurring questions to your memory — the bot runs each one on its schedule and sends the answer to Telegram.</p>
+          <button id="sched-new" type="button" class="btn btn-sm btn-primary">+ New task</button>
+        </div>
+        <div id="sched-editor" class="debug-card sc-editor" hidden></div>
+        <div id="sched-list" class="sc-list"><div class="empty">loading…</div></div>
       </section>
 
       <!-- MEMORY -->
@@ -314,5 +325,6 @@
 <script src="/cockpit/app.js"></script>
 <script src="/cockpit/memory.js"></script>
 <script src="/cockpit/prompts.js"></script>
+<script src="/cockpit/schedules.js"></script>
 </body>
 </html>

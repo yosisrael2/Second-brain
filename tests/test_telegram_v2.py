@@ -426,6 +426,7 @@ class TestRecentAndCommands:
             "recent",
             "profile",
             "remember",
+            "schedules",
             "status",
             "language",
             "help",

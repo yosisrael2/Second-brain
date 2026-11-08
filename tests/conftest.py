@@ -120,6 +120,7 @@ _RESET_TABLES = (
     "connector_records",
     "ops_events",
     "prompt_versions",  # a leftover prompt override would change every rendered prompt
+    "scheduled_tasks",  # CASCADE: scheduled_task_runs; a leftover due task would run in a bot test
 )
 
 

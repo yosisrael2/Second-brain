@@ -470,6 +470,12 @@ def get_cockpit_prompts_js() -> FileResponse:
     return FileResponse(_COCKPIT_DIR / "prompts.js", media_type="application/javascript")
 
 
+@router.get("/cockpit/schedules.js")
+def get_cockpit_schedules_js() -> FileResponse:
+    """The Scheduled tab: recurring prompts run by the bot."""
+    return FileResponse(_COCKPIT_DIR / "schedules.js", media_type="application/javascript")
+
+
 @router.get("/cockpit/memory.css")
 def get_cockpit_memory_css() -> FileResponse:
     return FileResponse(_COCKPIT_DIR / "memory.css", media_type="text/css")

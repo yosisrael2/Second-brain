@@ -373,3 +373,81 @@ class PromptList(BaseModel):
     """GET /prompts."""
 
     prompts: list[PromptSummary]
+
+
+# --- scheduled tasks (/schedules) ----------------------------------------------
+# brain.services.scheduled_tasks / schedule_spec own the real validation
+# (cron syntax, timezone, empty text) and answer 422 with a readable detail;
+# these caps only bound the request body.
+
+
+class ScheduledTaskIn(BaseModel):
+    """Payload for POST /schedules and PUT /schedules/{id}."""
+
+    name: str = Field(max_length=500)
+    prompt: str = Field(max_length=20_000)
+    schedule: str = Field(max_length=500)
+    timezone: str = Field(default="Asia/Jerusalem", max_length=64)
+    enabled: bool | None = None
+
+
+class ScheduledTaskOut(BaseModel):
+    """One task; schedule_text is the schedule in words (English)."""
+
+    id: uuid.UUID
+    name: str
+    prompt: str
+    schedule: str
+    schedule_text: str
+    timezone: str
+    enabled: bool
+    next_run_at: datetime | None = None
+    last_run_at: datetime | None = None
+    last_status: str | None = None
+    run_requested: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ScheduledTaskList(BaseModel):
+    """GET /schedules."""
+
+    tasks: list[ScheduledTaskOut]
+
+
+class ScheduledTaskRunOut(BaseModel):
+    """One run (or a recorded skip) of a task."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    task_id: uuid.UUID
+    trigger: str
+    scheduled_for: datetime | None = None
+    started_at: datetime
+    finished_at: datetime | None = None
+    status: str
+    output: str | None = None
+    error: str | None = None
+    cited_ids: list[str]
+
+
+class ScheduledTaskRunList(BaseModel):
+    """GET /schedules/{id}/runs (newest first)."""
+
+    runs: list[ScheduledTaskRunOut]
+
+
+class SchedulePreviewIn(BaseModel):
+    """POST /schedules/preview: validate a schedule without saving."""
+
+    schedule: str = Field(max_length=500)
+    timezone: str = Field(default="Asia/Jerusalem", max_length=64)
+
+
+class SchedulePreviewOut(BaseModel):
+    """The normalized cron, the schedule in words, and the next fires."""
+
+    schedule: str
+    schedule_text: str
+    next_runs: list[datetime]

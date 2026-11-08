@@ -126,6 +126,9 @@ async function refreshAll() {
   if (state.tab === "prompts" && window.PromptsTab) {
     jobs.push(window.PromptsTab.refresh().catch(() => {}));
   }
+  if (state.tab === "scheduled" && window.SchedulesTab) {
+    jobs.push(window.SchedulesTab.refresh().catch(() => {}));
+  }
   if (state.tab === "stats") {
     jobs.push(api("/ops/stats").then((stats) => {
       state.stats = stats;
