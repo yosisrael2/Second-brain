@@ -19,6 +19,7 @@ from brain import ops
 from brain.ai.ask import LLMClient
 from brain.config import get_settings
 from brain.db.models import MemoryItem
+from brain.services import prompts as prompt_registry
 from brain.services.extraction.base import MemoryContext
 from brain.services.extraction.candidates import CHILD_KINDS, ChildCandidate, ReconHint
 
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 EXTRACTION_PROMPT_VERSION = "v8"
 
 # Injection defense: the source text is DATA (docs/ai-layer.md rationale).
+# The code DEFAULT of the user-editable prompt registry key 'extraction'
+# (brain.services.prompts); an override records "v8+u<N>" as its version.
 _PROMPT_TEMPLATE = """You extract structured children from one message.
 
 Return STRICT JSON only — no markdown, no commentary. Schema:
@@ -179,10 +182,22 @@ def _loads_strict(reply: str) -> Any:
         raise ExtractionError(f"reply is not valid JSON: {exc}") from exc
 
 
-class LLMExtractor:
-    """Extractor strategy: one LLM call per source, strict-JSON output."""
+_MODEL_LABEL = "claude-sonnet-5-5"
+PROMPT_KEY = "extraction"
 
-    name = f"claude-sonnet-5-5/extraction-prompt-{EXTRACTION_PROMPT_VERSION}"
+
+class LLMExtractor:
+    """Extractor strategy: one LLM call per source, strict-JSON output.
+
+    ``name`` / ``prompt_version`` (recorded in extraction_meta) are the
+    class defaults until :meth:`extract` runs; each call then sets them on
+    the instance to the version of the prompt it ACTUALLY rendered — "v8"
+    on the code default, "v8+u3" for user override version 3, plus "+m<N>"
+    when the user memory file (version N) rode along — so every child stays
+    traceable to the exact prompt.
+    """
+
+    name = f"{_MODEL_LABEL}/extraction-prompt-{EXTRACTION_PROMPT_VERSION}"
     prompt_version = EXTRACTION_PROMPT_VERSION  # recorded in extraction_meta
 
     def __init__(self, llm: LLMClient, *, retries: int = 1) -> None:
@@ -194,13 +209,21 @@ class LLMExtractor:
 
         tz = ZoneInfo(get_settings().timezone)
         sent = (source.occurred_at or source.created_at).astimezone(tz)
-        prompt = _PROMPT_TEMPLATE.format(
+        # ONE snapshot of both texts: the prompt and its recorded version
+        # can never disagree (the registry cache may refresh between calls).
+        template = prompt_registry.resolve(PROMPT_KEY)
+        memory = prompt_registry.resolve(prompt_registry.MEMORY_FILE_KEY)
+        prompt = prompt_registry.with_memory_file(template.text.format(
             sent_local=sent.strftime("%a %d %b %Y %H:%M"),
             today_local=sent.strftime("%a %d %b %Y"),
             tz_name=tz.key,
             memory_context=memory_context or "(no confirmed memory yet)",
             email_text=source.raw_text,
+        ), memory.text)
+        self.prompt_version = prompt_registry.version_tag(
+            EXTRACTION_PROMPT_VERSION, template, memory
         )
+        self.name = f"{_MODEL_LABEL}/extraction-prompt-{self.prompt_version}"
         reply = self._llm.complete(prompt).text
         try:
             candidates = self._parse(reply, source)

@@ -123,6 +123,9 @@ async function refreshAll() {
   if (state.tab === "memory" && window.MemoryTab) {
     jobs.push(window.MemoryTab.refresh().catch(() => {}));
   }
+  if (state.tab === "prompts" && window.PromptsTab) {
+    jobs.push(window.PromptsTab.refresh().catch(() => {}));
+  }
   if (state.tab === "stats") {
     jobs.push(api("/ops/stats").then((stats) => {
       state.stats = stats;

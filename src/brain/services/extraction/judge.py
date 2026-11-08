@@ -19,6 +19,7 @@ import re
 from typing import Any
 
 from brain import ops
+from brain.services import prompts as prompt_registry
 from brain.services.extraction.reconciliation import (
     RECON_JUDGE_FLOOR,
     RECON_SIMILARITY_THRESHOLD,
@@ -45,6 +46,8 @@ _JUDGE_OPTIONS = {
 
 _MAX_STATE_CHARS = 4000
 
+# The code DEFAULT of the user-editable prompt registry key 'recon_judge'
+# (brain.services.prompts).
 _LLM_PROMPT_TEMPLATE = """You decide whether two mentions are the SAME real-world thing
 for a family's memory system. Answer STRICT JSON only:
 {{"same": true|false, "confidence": 0.0-1.0}}
@@ -183,13 +186,17 @@ class ReconJudge:
         if self._llm is None:
             return None
         try:
-            completion = self._llm.complete(_LLM_PROMPT_TEMPLATE.format(
-                candidate=json.dumps(_state(candidate, existing)["candidate"],
-                                     ensure_ascii=False),
-                existing=json.dumps(_state(candidate, existing)["existing"],
-                                    ensure_ascii=False),
-                version=self._version,
-            )[:_MAX_STATE_CHARS])
+            # the memory-file block (empty = none) goes on AFTER the cap so
+            # it never truncates the pair the judge decides on
+            completion = self._llm.complete(prompt_registry.with_memory_file(
+                prompt_registry.prompt_text("recon_judge").format(
+                    candidate=json.dumps(_state(candidate, existing)["candidate"],
+                                         ensure_ascii=False),
+                    existing=json.dumps(_state(candidate, existing)["existing"],
+                                        ensure_ascii=False),
+                    version=self._version,
+                )[:_MAX_STATE_CHARS]
+            ))
             parsed = json.loads(completion.text)
             same = parsed["same"]
             confidence = float(parsed["confidence"])

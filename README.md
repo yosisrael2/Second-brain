@@ -60,7 +60,7 @@ to its section or doc.
 - **Conformance kit**: every connector registered on `main` must pass the six kit checks against the real runner — termination (small-limit syncs drain a scrambled dataset), key-paged termination with a tie group bigger than a page, idempotency (a re-sync changes nothing), change (one upstream change → exactly one ingested change, the item takes the adapter-rendered text), delete (hides via the PR-B mechanism, never hard-deletes), reset (a resync subset deletes nothing); Gmail declares its messages immutable so its change check runs the domain-true variant (a new record ingests once; the same id re-delivered is skipped, never a second item) — the sweep reads the registry live and fails naming any registered adapter without a donation file — `tests/conformance/`, `src/brain/connectors/conformance.py` (PR #60)
 
 **Cockpit**
-- One local dashboard: flow diagram, health, events, stats, debug traces, memory; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; a Connectors card (per-source status: enabled, last ok, cursor, `deduped` counter, last error); the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54, #80)
+- One local dashboard: flow diagram, health, events, stats, debug traces, memory, editable prompts + memory file; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; a Connectors card (per-source status: enabled, last ok, cursor, `deduped` counter, last error); the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54, #80)
 
 **Ops**
 - 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent and an opt-in `com.secondbrain.connectors` scheduler), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
@@ -352,6 +352,20 @@ Tabs:
   a "Proposed" inbox (✅ confirm / ❌ reject), and a per-fact history drawer
   showing every version with its provenance (source item + quote; item ids
   open in the Debug inspector).
+- **Prompts** — see and edit the LLM system prompts (ask citation + conflict
+  rules, extraction, entity judge, WhatsApp triage, attachment reader) and
+  the **memory file** (standing instructions/context, max 8000 chars, added
+  in a delimited block ahead of every one of those prompts; empty = nothing
+  added). Each save appends a version (`prompt_versions`, history kept);
+  reset to default and restore-from-history append too. Templates must keep
+  exactly their placeholders (a broken edit is rejected with a 422 naming
+  them); lookups fall back to the code default on any DB error and are
+  cached 30s per process. An overridden extraction prompt records
+  `v8+u<N>` (plus `+m<N>` when the memory file is set) as its prompt
+  version; triage records `triage-v3+u<N>[+m<N>]`. API: `GET /prompts`,
+  `GET|PUT /prompts/{key}`, `POST /prompts/{key}/reset`,
+  `POST /prompts/{key}/restore/{version}`, `GET|PUT /prompts/memory-file`
+  — `src/brain/services/prompts.py`.
 
 Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 

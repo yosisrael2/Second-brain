@@ -22,10 +22,12 @@ from typing import Any, Protocol
 
 from brain import ops
 from brain.ai.jev import JevError
+from brain.services import prompts as prompt_registry
 
 logger = logging.getLogger(__name__)
 
 TRIAGE_VERSION = "triage-v3"
+TRIAGE_PROMPT_KEY = "whatsapp_triage"
 # Below this Jev confidence the LLM gets the final say (item 36: LLM only
 # when Jev is unsure — a band keeps the cheap path dominant).
 JEV_CONFIDENT_BAND = 0.9
@@ -55,7 +57,9 @@ _TRIAGE_CRITERIA: dict[str, str] = {
         "group admin"
     ),
 }
-# The strict, versioned LLM prompt: ONE call, JSON-only answer.
+# The strict, versioned LLM prompt: ONE call, JSON-only answer. The code
+# DEFAULT of the user-editable prompt registry key 'whatsapp_triage'
+# (brain.services.prompts); an override records "triage-v3+u<N>".
 _PROMPT_TEMPLATE = """You triage a WhatsApp conversation for a family's memory system.
 Our children's names are known to the system; messages about other families'
 children (pick-up arrangements, 'tell X her grandma is coming', 'Y is waiting
@@ -293,11 +297,16 @@ def triage_conversation(
             version=TRIAGE_VERSION,
         ))
 
-    # Low-confidence Jev (or Jev down): exactly ONE strict LLM call.
+    # Low-confidence Jev (or Jev down): exactly ONE strict LLM call. One
+    # snapshot of the (user-editable) prompt + memory file: the version
+    # recorded on the item names exactly the prompt that was sent.
+    template = prompt_registry.resolve(TRIAGE_PROMPT_KEY)
+    memory = prompt_registry.resolve(prompt_registry.MEMORY_FILE_KEY)
+    llm_version = prompt_registry.version_tag(TRIAGE_VERSION, template, memory)
     try:
-        completion = llm.complete(_PROMPT_TEMPLATE.format(
-            text=text[-_MAX_PROMPT_CHARS:], version=TRIAGE_VERSION,
-        ))
+        completion = llm.complete(prompt_registry.with_memory_file(template.text.format(
+            text=text[-_MAX_PROMPT_CHARS:], version=llm_version,
+        ), memory.text))
         parsed = json.loads(completion.text)
         label = str(parsed["label"])
         confidence = float(parsed["confidence"])
@@ -310,7 +319,7 @@ def triage_conversation(
         )
         return None
     return _record(TriageResult(
-        label=label, confidence=confidence, method="llm", version=TRIAGE_VERSION,
+        label=label, confidence=confidence, method="llm", version=llm_version,
     ))
 
 

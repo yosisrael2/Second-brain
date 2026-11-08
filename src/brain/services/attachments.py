@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from brain.db.models import Attachment, MemoryItem
+from brain.services import prompts as prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ TEXT_LAYER_MIN_CHARS = 16
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 SUPPORTED_MIMES = IMAGE_MIMES | {"application/pdf"}
 
+# The code DEFAULT of the user-editable prompt registry key
+# 'attachments.read_instruction' (brain.services.prompts).
 _READ_INSTRUCTION = (
     "Use the Read tool to read the given file. Output (1) the VERBATIM text "
     "you see in the file, in its original language and normal reading order, "
@@ -193,7 +196,9 @@ class ClaudeFileReader:
                 strict_mcp_config=True,
                 permission_mode="default",
                 can_use_tool=make_read_gate(path),
-                system_prompt=_READ_INSTRUCTION,
+                system_prompt=prompt_registry.with_memory_file(
+                    prompt_registry.prompt_text("attachments.read_instruction")
+                ),
                 max_turns=3,
                 model=self._model,
                 cwd=str(tmp),

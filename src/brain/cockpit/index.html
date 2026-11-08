@@ -34,8 +34,7 @@
       <a class="tab nav-item" data-tab="stats" href="#stats">Stats</a>
       <a class="tab nav-item" data-tab="debug" href="#debug">Debug</a>
       <a class="tab nav-item" data-tab="memory" href="#memory">Memory</a>
-      <!-- Sixth slot kept free: the sidebar flex column absorbs more items
-           with no layout change. -->
+      <a class="tab nav-item" data-tab="prompts" href="#prompts">Prompts</a>
     </nav>
     <div class="build-card" title="deployed git sha + overall status">
       <span id="build-dot" class="dot ok" aria-hidden="true"></span>
@@ -160,6 +159,14 @@
             <button id="inspector-btn" class="btn btn-sm">Open item</button>
             <div id="inspector-out" class="inspector"></div>
           </div>
+        </div>
+      </section>
+
+      <!-- PROMPTS (prompts.js): the LLM system prompts + the memory file -->
+      <section id="tab-prompts" class="tab-panel">
+        <div class="prompts-grid">
+          <div id="prompts-list" class="debug-card pr-list"><div class="empty">loading…</div></div>
+          <div id="prompts-editor" class="debug-card pr-editor"><div class="empty">loading…</div></div>
         </div>
       </section>
 
@@ -306,5 +313,6 @@
 
 <script src="/cockpit/app.js"></script>
 <script src="/cockpit/memory.js"></script>
+<script src="/cockpit/prompts.js"></script>
 </body>
 </html>
