@@ -81,3 +81,50 @@ over updates, and two Gmail pollers process the same mail twice.
 
 The WhatsApp agent is not covered here. It reads a local WhatsApp bridge
 (`WHATSAPP_BRIDGE_URL`, `WHATSAPP_BRIDGE_DB`) that has to run on the same host.
+
+## 5. Auto-deploy on merge
+
+`second-brain-deploy.timer` runs `scripts/auto-deploy.sh` every 2 minutes.
+When `origin/main` moved it backs up Postgres to `/var/backups/second-brain`
+(14 days kept), fast-forwards the checkout, reinstalls, runs `alembic upgrade
+head`, refreshes changed units, restarts the services and waits for
+`/ops/health` (api ok). Every outcome is sent to the Telegram allowlist.
+
+- Health check fails and no migration changed: the code rolls back to the
+  previous sha.
+- Health check fails after a schema change: no rollback (never `alembic
+  downgrade`); you get an alert with the backup path.
+- A failed sha is not retried on every tick; a newer commit, or
+  `rm /opt/second-brain/.dev/deploy-failed-sha`, tries again.
+- A checkout with local commits is left alone and reported.
+
+```bash
+cp deploy/systemd/second-brain-deploy.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now second-brain-deploy.timer
+systemctl list-timers second-brain-deploy.timer
+journalctl -u second-brain-deploy -n 30        # last run
+systemctl start second-brain-deploy            # deploy now
+```
+
+## 6. Remote access (Tailscale)
+
+The API keeps listening on 127.0.0.1 only. Tailscale publishes it to your own
+devices, nothing opens to the internet. An unprivileged Proxmox LXC needs the
+TUN device first; on the Proxmox host:
+
+```bash
+cat >> /etc/pve/lxc/102.conf <<'CONF'
+lxc.cgroup2.devices.allow: c 10:200 rwm
+lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
+CONF
+pct reboot 102
+```
+
+Then inside the container:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up                       # open the printed login link
+tailscale serve --bg 27800         # https://brain.<tailnet>.ts.net -> 127.0.0.1:27800
+tailscale serve status
+```
