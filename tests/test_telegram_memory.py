@@ -179,3 +179,53 @@ def test_remove_buttons_survive_registry_ttl_gracefully(memory_db) -> None:
     reply = core.handle_callback(callback)
 
     assert "expired" in reply.text
+
+
+# --- bot language (a memory-layer fact on 'me') ---------------------------------
+
+
+def test_language_defaults_to_english_and_is_set_by_command(memory_db) -> None:
+    core = _core()
+    with core._services_factory() as services:  # noqa: SLF001 - reading
+        assert services.memory.user_language() == "en"
+
+    reply = core.route("/language he", 111)
+
+    assert reply.text == "🌐 השפה הוגדרה לעברית."
+    with core._services_factory() as services:  # noqa: SLF001 - reading
+        assert services.memory.user_language() == "he"
+
+
+def test_language_change_supersedes_one_current_fact(memory_db) -> None:
+    core = _core()
+    core.route("/language he", 111)
+    core.route("/language en", 111)
+    core.route("/language en", 111)  # unchanged: no extra history row
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT value, valid_to IS NULL FROM memory_facts "
+                "WHERE predicate = 'language' ORDER BY valid_from"
+            )
+        ).all()
+    assert [tuple(r) for r in rows] == [("he", False), ("en", True)]
+
+
+def test_language_command_rejects_unknown_codes(memory_db) -> None:
+    core = _core()
+    reply = core.route("/language fr", 111)
+    assert reply.text.startswith("Usage: /language he|en")
+    with core._services_factory() as services:  # noqa: SLF001 - reading
+        assert services.memory.user_language() == "en"
+
+
+def test_display_names_use_the_hebrew_alias(memory_db) -> None:
+    core = _core()
+    with core._services_factory() as services:  # noqa: SLF001 - seeding
+        _seed_family(services.memory)
+        rona = services.memory._repo.find_entity(kind="person", name="Rona")  # noqa: SLF001
+        services.memory.add_alias(rona.id, "Roni")
+        services.memory.add_alias(rona.id, "רונה")
+        assert services.memory.display_names("he") == {"Rona": "רונה"}
+        assert services.memory.display_names("en") == {}

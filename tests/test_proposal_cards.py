@@ -109,6 +109,75 @@ class TestSourceTitle:
         assert source_short_title(source).startswith("שלום")
 
 
+class TestHebrewCard:
+    """7 Nov review: the card was unreadable (unlabeled button rows, 'nobody',
+    silent missing dates, English inside Hebrew lines)."""
+
+    def _children(self, repo):
+        rows = [
+            MemoryItem(
+                raw_text="מבחן לאיתור מחוננים",
+                source="email",
+                type="event",
+                occurred_at=datetime(2026, 11, 29, 22, 0, tzinfo=UTC),  # 30.11 local
+                child_state="proposed",
+                applies_to=["Itamar"],
+            ),
+            MemoryItem(
+                raw_text="מפגש סיכום דיאלוג בנים",
+                source="email",
+                type="event",
+                child_state="proposed",
+                applies_to=["Itamar"],
+            ),
+            MemoryItem(
+                raw_text="תחרות מטוסי הנייר של שכבה ו'",
+                source="email",
+                type="fact",
+                child_state="proposed",
+                applies_to=["nobody"],
+            ),
+        ]
+        return [repo.add(row) for row in rows]
+
+    def test_hebrew_card_is_numbered_and_explicit(self, world):
+        repo, _session, _memory = world
+        source = _capture(repo, "עדכונים מכיתה ב' ברקת")
+        children = self._children(repo)
+
+        card = render_source_card(source, children, TZ, lang="he", names={"Itamar": "איתמר"})
+
+        assert card.split("\n") == [
+            "🧠 מצאתי 3 פריטים בהודעה: עדכונים מכיתה ב' ברקת",
+            "📅 אירוע · ✔️ משימה · 🔔 תזכורת · ℹ️ לידיעה",
+            "1. 📅 מבחן לאיתור מחוננים · יום ב׳ 30.11 · איתמר",
+            "2. 📅 מפגש סיכום דיאלוג בנים · ללא תאריך · איתמר",
+            "3. ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו",
+        ]
+
+    def test_buttons_carry_the_line_number(self, world):
+        repo, _session, _memory = world
+        children = self._children(repo)
+
+        rows = proposal_keyboard("tok", children, lang="he")
+
+        assert [[label for label, _ in row] for row in rows] == [
+            ["1 ✅ שמור", "1 ✏️ תקן", "1 🗑 מחק"],
+            ["2 ✅ שמור", "2 ✏️ תקן", "2 🗑 מחק"],
+            ["3 ✅ שמור", "3 ✏️ תקן", "3 🗑 מחק"],
+            ["✅ שמור הכל"],
+        ]
+
+    def test_english_card_gets_the_same_fixes(self, world):
+        repo, _session, _memory = world
+        source = _capture(repo, "Class update")
+        lines = render_source_card(source, self._children(repo), TZ).split("\n")
+
+        assert lines[2] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Itamar"
+        assert lines[3].endswith("· no date · Itamar")
+        assert lines[4].endswith("· not for us")
+
+
 class TestCardRendering:
     def test_header_counts_children_and_names_the_source(self, world):
         repo, session, memory = world
@@ -118,7 +187,7 @@ class TestCardRendering:
         service.run_once(NOW)
         children = session.query(MemoryItem).filter(MemoryItem.child_state == "proposed").all()
         card = render_source_card(source, children, TZ)
-        assert card.startswith(f"🧠 found {len(children)} items in")
+        assert card.startswith(f"🧠 Found {len(children)} items in:")
         for child in children:
             assert child_line(child, TZ) in card
 
@@ -552,7 +621,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         queued = bot.drain_outbound()
-        assert [(c, r.text[:12]) for c, r in queued] == [(7, "🧠 found 2 it")]
+        assert [(c, r.text[:12]) for c, r in queued] == [(7, "🧠 Found 2 it")]
         assert bot.drain_outbound() == []  # drained
 
     def test_keep_callback_round_trip(self, world):

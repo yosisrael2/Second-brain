@@ -95,10 +95,14 @@ SINGLE_VALUED_KID_PREDICATES: frozenset[str] = frozenset(
 # 'photo' (PR: photo avatars): the avatar bytes live in the file store, the
 # fact carries the sha256 — one current avatar per person, a new upload
 # supersedes (undo via the same undo-supersede op as the other fields).
+# The bot's language: a fact on the 'me' entity (see MemoryService.user_language).
+LANGUAGE_PREDICATE = "language"
+
 SINGLE_VALUED_PREDICATES: frozenset[str] = SINGLE_VALUED_KID_PREDICATES | {
     "birthday",
     "anniversary",
     "photo",
+    LANGUAGE_PREDICATE,
 }
 
 PHOTO_PREDICATE = "photo"
@@ -282,6 +286,47 @@ class MemoryService:
         )
         self._repo.commit()
         return _fact_dict(fact)
+
+    # -- user preferences (fact on 'me') --------------------------------------------
+
+    def user_language(self) -> str:
+        """The bot's language: the confirmed current ``language`` fact on 'me'
+        (``i18n.DEFAULT`` until the user sets one)."""
+        from brain import i18n  # noqa: PLC0415
+
+        me = self._repo.find_entity(kind="person", name="me")
+        if me is None:
+            return i18n.DEFAULT
+        fact = self._current_confirmed_fact(me.id, LANGUAGE_PREDICATE)
+        return i18n.normalize(fact.value if fact is not None else None)
+
+    def set_user_language(self, lang: str) -> str:
+        """Store the bot language on 'me' (single-valued: a change supersedes)."""
+        from brain import i18n  # noqa: PLC0415
+
+        code = (lang or "").strip().lower()
+        if code not in i18n.SUPPORTED:
+            raise MemoryError(f"unsupported language {lang!r} (use: {', '.join(i18n.SUPPORTED)})")
+        me = self._ensure_entity(kind="person", name="me")
+        self.add_fact(me.id, LANGUAGE_PREDICATE, value=code, provenance={"source": "user"})
+        _ops("language_set", language=code)
+        return code
+
+    def display_names(self, lang: str) -> dict[str, str]:
+        """Entity name -> the name to show in ``lang``.
+
+        For Hebrew: the first alias written in Hebrew letters (``Itamar`` ->
+        ``איתמר``). Names without such an alias (and every name in English)
+        show as stored."""
+        if lang != "he":
+            return {}
+        names: dict[str, str] = {}
+        for entity in self._repo.list_entities(kinds=["person"]):
+            for alias in self._repo.aliases_for(entity.id):
+                if any("֐" <= ch <= "׿" for ch in alias):
+                    names[entity.name] = alias
+                    break
+        return names
 
     # -- prompt block ------------------------------------------------------------
 

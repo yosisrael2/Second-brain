@@ -409,7 +409,7 @@ def test_worker_enabled_runs_pass_and_delivers_card(monkeypatch):
         jobs = session.execute(text("SELECT state FROM enrichment_jobs")).scalars().all()
         assert jobs and all(state == "done" for state in jobs)
         assert len(tg2.sent) == 1
-        assert "🧠 found" in tg2.sent[0]["text"]
+        assert "🧠 Found" in tg2.sent[0]["text"]
 
     asyncio.run(go())
     _wipe(session)
@@ -447,7 +447,7 @@ def test_shutdown_delivers_a_finished_unharvested_pass(monkeypatch):
         tg = _Tg()
         await _shutdown_enrichment(tg, core)
         assert len(tg.sent) == 1  # the card went out during shutdown
-        assert "🧠 found" in tg.sent[0]["text"]
+        assert "🧠 Found" in tg.sent[0]["text"]
         assert core._enrich_task is None  # noqa: SLF001  reference cleared
 
     asyncio.run(go())
@@ -685,7 +685,7 @@ def test_finished_stalled_pass_still_delivers_its_cards(monkeypatch):
             # the pass ran past its deadline, but its changed source STILL
             # gets exactly one proposal card
             assert len(tg2.sent) == 1
-            assert "🧠 found" in tg2.sent[0]["text"]
+            assert "🧠 Found" in tg2.sent[0]["text"]
         finally:
             fake.release.set()
 

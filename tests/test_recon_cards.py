@@ -175,8 +175,8 @@ class TestUpdateCards:
         assert reply is not None
         assert "↩︎ proposes:" in reply.text
         assert "when: Friday 10:00 → Saturday 10:00" in reply.text
-        assert "✅ Confirm update" in _labels(reply)
-        assert "✖ Keep both" in _labels(reply)
+        assert "1 ✅ Confirm update" in _labels(reply)
+        assert "1 ✖ Keep both" in _labels(reply)
         # the recon verdict owns the row: no Keep/Fix/Drop for it
         assert "✏️ Fix" not in _labels(reply)
         confirm = _find(reply, CB_REL_CONFIRM)
@@ -195,8 +195,8 @@ class TestUpdateCards:
         reply = bot._proposal_reply_for(source)
 
         labels = _labels(reply)
-        assert "✅ Confirm update" in labels
-        assert "✏️ Fix" in labels  # the plain child keeps its row
+        assert "1 ✅ Confirm update" in labels
+        assert "2 ✏️ Fix" in labels  # the plain child keeps its row
 
     def test_confirm_update_applies_and_strikes_the_old_item(self, world):
         repo, session = world
@@ -250,7 +250,7 @@ class TestUpdateCards:
 
         assert "↩︎ applied:" in reply.text
         labels = _labels(reply)
-        assert "↩︎ Undo" in labels
+        assert "1 ↩︎ Undo" in labels
         assert "✅ Confirm update" not in labels
         assert "✖ Keep both" not in labels
 
@@ -425,8 +425,8 @@ class TestConflictCards:
         assert "birthday dinner at Nana's" in reply.text  # the existing version
         assert "birthday dinner at Daniel's" in reply.text  # the new version
         labels = _labels(reply)
-        assert "✅ keep existing" in labels
-        assert "✅ keep new" in labels
+        assert "1 ✅ Keep existing" in labels
+        assert "1 ✅ Keep new" in labels
         assert "✏️ Fix" not in labels
         keep_existing = _find(reply, CB_RECON_DISCARD)
         keep_new = _find(reply, CB_REL_CONFIRM)

@@ -393,7 +393,7 @@ class TestCore:
 
         reply = core.route("/ask what?", 111)
 
-        assert reply.text.startswith("⚠️ LLM unavailable")
+        assert reply.text.startswith("⚠️ The AI is unavailable")
         assert events.events[-1][0] == "ask" and events.events[-1][1] is False
 
     def test_review_lists_inbox(self, monkeypatch):
