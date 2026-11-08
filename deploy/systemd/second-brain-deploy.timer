@@ -1,10 +1,11 @@
 # Checks GitHub for a new main every 2 minutes; deploys only when it moved.
+# A wall-clock schedule needs no service history or boot-time ordering.
 [Unit]
 Description=Second Brain auto-deploy check
 
 [Timer]
-OnBootSec=3min
-OnUnitInactiveSec=2min
+OnCalendar=*:0/2
+AccuracySec=10s
 Persistent=false
 
 [Install]
