@@ -119,6 +119,7 @@ _RESET_TABLES = (
     "connector_state",
     "connector_records",
     "ops_events",
+    "prompt_versions",  # a leftover prompt override would change every rendered prompt
 )
 
 

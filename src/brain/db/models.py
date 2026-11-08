@@ -160,7 +160,8 @@ class MemoryItem(Base):
     # override first (v3), Jev's typed choice next, the LLM only below the
     # confidence band; triage_version pins the prompt version.
     triage_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    triage_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 32: room for a user-prompt / memory-file suffix ("triage-v3+u12+m4").
+    triage_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # PR B (item 20/D4): when this item is superseded by a newer version
     # (relation kind 'supersedes'/'corrects', applied), it stays in the DB
     # with strike-through semantics: hidden by default from /recent, /review
@@ -608,3 +609,34 @@ class ConnectorRecord(Base):
         Integer, nullable=False, default=0, server_default=text("0")
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+PROMPT_VERSION_SOURCES = ("edit", "reset", "restore")
+
+
+class PromptVersion(Base):
+    """One saved version of a user-editable prompt text (append-only).
+
+    Rows are never updated or deleted: the CURRENT text of a key is its
+    highest ``version`` row, and the full history stays queryable. A row
+    with ``text`` NULL is a reset — the key is back on the code default
+    (brain.services.prompts) from that version on. ``source`` records how
+    the row was made: 'edit' (a new text), 'reset' (back to default) or
+    'restore' (an older version's text copied forward).
+    """
+
+    __tablename__ = "prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("key", "version", name="uq_prompt_versions_key_version"),
+        CheckConstraint(_in_domain("source", PROMPT_VERSION_SOURCES), name="source"),
+        CheckConstraint("version >= 1", name="version_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

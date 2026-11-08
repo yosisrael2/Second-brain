@@ -464,6 +464,12 @@ def get_cockpit_memory_js() -> FileResponse:
     return FileResponse(_COCKPIT_DIR / "memory.js", media_type="application/javascript")
 
 
+@router.get("/cockpit/prompts.js")
+def get_cockpit_prompts_js() -> FileResponse:
+    """The Prompts tab: the LLM system prompts + the user memory file."""
+    return FileResponse(_COCKPIT_DIR / "prompts.js", media_type="application/javascript")
+
+
 @router.get("/cockpit/memory.css")
 def get_cockpit_memory_css() -> FileResponse:
     return FileResponse(_COCKPIT_DIR / "memory.css", media_type="text/css")

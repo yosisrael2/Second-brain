@@ -320,3 +320,56 @@ class RelationRead(BaseModel):
     kind: str
     provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+
+
+# --- editable prompts + memory file (/prompts) -----------------------------------
+# The service (brain.services.prompts) owns the per-key limits and the
+# placeholder contract; this cap only bounds the request body.
+PROMPT_TEXT_MAX_LENGTH = 50_000
+
+
+class PromptTextUpdate(BaseModel):
+    """Payload for PUT /prompts/{key} and PUT /prompts/memory-file."""
+
+    text: str = Field(max_length=PROMPT_TEXT_MAX_LENGTH)
+
+
+class PromptSummary(BaseModel):
+    """One registry key in the list view."""
+
+    key: str
+    title: str
+    description: str
+    kind: Literal["prompt", "memory_file"]
+    is_overridden: bool
+    # The current user version (None = on the code default).
+    version: int | None = None
+    # The newest history row (a reset row counts), None = never edited.
+    latest_version: int | None = None
+    updated_at: datetime | None = None
+
+
+class PromptHistoryEntry(BaseModel):
+    """One append-only version row; is_default = a reset (text = the default)."""
+
+    version: int
+    source: str
+    is_default: bool
+    text: str
+    created_at: datetime
+
+
+class PromptDetail(PromptSummary):
+    """One key: current + default text, the placeholder contract, history."""
+
+    text: str
+    default_text: str
+    placeholders: list[str]
+    max_chars: int
+    history: list[PromptHistoryEntry]
+
+
+class PromptList(BaseModel):
+    """GET /prompts."""
+
+    prompts: list[PromptSummary]

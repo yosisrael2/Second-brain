@@ -19,6 +19,7 @@ from brain.config import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_MAX_TOKENS,
 )
+from brain.services import prompts as prompt_registry
 
 from ._http import post_json
 
@@ -211,6 +212,12 @@ def build_prompt(
     LLM knows the durable facts (who the kids are, standing routines).
     ``truncation_note`` (conflict-leg cap hit; None otherwise) appends one
     line so the model knows conflicting items were left out.
+
+    The citation/conflict rules are user-editable (prompt registry keys
+    ``ask.citation_rules`` / ``ask.conflict_rules``; the constants above are
+    the defaults) and the user memory file, when non-empty, rides in a
+    delimited block ahead of the prompt — with neither, the output is
+    byte-identical to the hard-coded format.
     """
     instant = now or datetime.now(UTC)
     zone = tz or ZoneInfo("UTC")
@@ -242,10 +249,15 @@ def build_prompt(
                 "  ⚠️ conflicts with: "
                 + " ".join(f"[{cid}]" for cid in conflict_with)
             )
-    lines += ["", CITATION_RULES, "", CONFLICT_RULES]
+    lines += [
+        "",
+        prompt_registry.prompt_text("ask.citation_rules"),
+        "",
+        prompt_registry.prompt_text("ask.conflict_rules"),
+    ]
     if truncation_note:
         lines += ["", f"NOTE: {truncation_note}."]
-    return "\n".join(lines)
+    return prompt_registry.with_memory_file("\n".join(lines))
 
 
 def answer(
