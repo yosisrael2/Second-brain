@@ -88,7 +88,8 @@ The WhatsApp agent is not covered here. It reads a local WhatsApp bridge
 When `origin/main` moved it backs up Postgres to `/var/backups/second-brain`
 (14 days kept), fast-forwards the checkout, reinstalls, runs `alembic upgrade
 head`, refreshes changed units, restarts the services and waits for
-`/ops/health` (api ok) plus `systemctl is-active` for every service. Every
+`/ops/health` (api ok) plus `systemctl is-active` for each service that was
+running before (two passing probes in a row). Every
 outcome is sent to the Telegram allowlist. Backups are root-only (0600).
 
 - Any step fails (new script does not parse, unit install, pip, alembic,

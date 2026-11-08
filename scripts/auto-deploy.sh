@@ -71,17 +71,35 @@ install_and_restart() {
   systemctl restart $SERVICES
 }
 
+# Units that were running before the deploy. Only these must be running
+# after it: the bot and the poller deliberately exit 0 and stay inactive when
+# disabled (no token, config error), which must not fail every deploy.
+# `systemctl is-active a b` succeeds if ANY unit is active, so check each.
+WAS_ACTIVE=""  # filled just before the merge
+
+services_up() {
+  local unit
+  for unit in $WAS_ACTIVE; do
+    systemctl is-active --quiet "$unit" || return 1
+  done
+}
+
+api_ok() {
+  curl -s -m 10 "$HEALTH_URL" 2>/dev/null | python3 -c \
+    'import json,sys; sys.exit(json.load(sys.stdin)["components"]["api"]["status"] != "ok")' \
+    2>/dev/null
+}
+
+# Two consecutive passing probes: a service that dies a few seconds after
+# start must not slip through on the first probe.
 healthy() {
-  local i body
+  local i passes=0
   for ((i = 1; i <= HEALTH_TRIES; i++)); do
-    body="$(curl -s -m 10 "$HEALTH_URL" 2>/dev/null || true)"
-    if printf '%s' "$body" | python3 -c \
-      'import json,sys; sys.exit(json.load(sys.stdin)["components"]["api"]["status"] != "ok")' \
-      2>/dev/null; then
-      # The API answering is not enough: a crash-looping bot or poller must
-      # fail the deploy too.
-      # shellcheck disable=SC2086  # SERVICES is a word list on purpose
-      systemctl is-active --quiet $SERVICES && return 0
+    if api_ok && services_up; then
+      passes=$((passes + 1))
+      [ "$passes" -ge 2 ] && return 0
+    else
+      passes=0
     fi
     sleep "$HEALTH_SLEEP"
   done
@@ -108,10 +126,12 @@ fi
 subject="$(git log -1 --format=%s "$new")"
 log "deploying ${old:0:7} -> ${new:0:7}: $subject"
 
-umask 077  # the dump holds every mail and message: root-only
-mkdir -p "$BACKUP_DIR"
+mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
 dump="$BACKUP_DIR/pre-${new:0:7}-$(date +%Y%m%d-%H%M).dump"
-if ! docker compose exec -T db pg_dump -U brain -Fc brain >"$dump" || [ ! -s "$dump" ]; then
+# umask scoped to the dump (it holds every mail and message: root-only);
+# the checkout and the installed units keep their normal modes.
+if ! (umask 077 && docker compose exec -T db pg_dump -U brain -Fc brain >"$dump") \
+  || [ ! -s "$dump" ]; then
   rm -f "$dump"
   mark_failed
   notify "❌ Deploy of ${new:0:7} stopped: the database backup failed. Nothing changed. Retry: rm $FAILED_FILE"
@@ -130,6 +150,10 @@ install_units() {
 # by Postgres' transactional DDL).
 schema_rev() { "$VENV_BIN/alembic" current 2>/dev/null | tail -n 1; }
 rev_before="$(schema_rev)"
+WAS_ACTIVE=""
+for unit in $SERVICES; do
+  systemctl is-active --quiet "$unit" && WAS_ACTIVE="$WAS_ACTIVE $unit"
+done
 
 git merge -q --ff-only "$new" || {
   mark_failed

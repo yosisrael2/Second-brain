@@ -71,10 +71,18 @@ class World:
             self.bin / "docker",
             f'echo "docker $*" >>{log}\n[ "${{DOCKER_FAIL:-}}" = 1 ] && exit 1\necho DUMPDATA\n',
         )
+        # systemctl: SERVICE_DOWN=<unit> dies after any restart (a crash
+        # loop); SERVICE_DISABLED=<unit> is inactive all along (a bot with
+        # no token exits 0 by design).
+        restarted = tmp / "restarted"
         _stub(
             self.bin / "systemctl",
             f'echo "systemctl $*" >>{log}\n'
-            f'[ "$1" = is-active ] && [ "${{SERVICES_DOWN:-}}" = 1 ] && exit 3\nexit 0\n',
+            f'[ "$1" = restart ] && touch {restarted}\n'
+            f'if [ "$1" = is-active ]; then unit="${{@: -1}}"\n'
+            f'  [ "$unit" = "${{SERVICE_DISABLED:-}}" ] && exit 3\n'
+            f'  [ "$unit" = "${{SERVICE_DOWN:-}}" ] && [ -e {restarted} ] && exit 3\n'
+            f"fi\nexit 0\n",
         )
         _stub(
             self.bin / "curl",
@@ -163,18 +171,21 @@ def test_new_commit_backs_up_migrates_restarts_and_reports(world: World) -> None
 
     assert result.returncode == 0, result.stderr
     assert world.head() == new
-    calls = world.calls().splitlines()
+    calls = [c for c in world.calls().splitlines() if not c.startswith("systemctl is-active")]
     order = [c.split()[0] + " " + c.split()[1] for c in calls]
     assert order == [
         "docker compose",
         "pip install",
         "alembic upgrade",
         "systemctl restart",
-        "systemctl is-active",
         "notify -s",
     ]
     assert "second-brain-api second-brain-telegram second-brain-email" in calls[3]
-    assert "✅ Deployed" in calls[5] and "feat: thing" in calls[5]
+    assert "✅ Deployed" in calls[4] and "feat: thing" in calls[4]
+    # each unit is checked on its own (is-active with several units passes
+    # when ANY of them is up)
+    checks = [c for c in world.calls().splitlines() if c.startswith("systemctl is-active")]
+    assert checks and all(len(c.split()) == 4 for c in checks)
     assert "123:abc" not in world.calls()  # the token never reaches argv
     dumps = list((world.tmp / "backups").glob(f"pre-{new[:7]}-*.dump"))
     assert len(dumps) == 1 and dumps[0].read_text() == "DUMPDATA\n"
@@ -259,10 +270,20 @@ def test_failed_first_migration_rolls_back(world: World) -> None:
 def test_a_crash_looping_service_fails_the_deploy(world: World) -> None:
     world.commit("feat: breaks the bot")
 
-    world.run(SERVICES_DOWN="1")
+    world.run(SERVICE_DOWN="second-brain-telegram")
 
     assert world.head() == world.first
     assert "failed at the health check" in world.calls()
+
+
+def test_a_unit_that_was_already_stopped_does_not_fail_the_deploy(world: World) -> None:
+    """A disabled bot (no token: exit 0, inactive) is not a failed deploy."""
+    new = world.commit("feat: thing")
+
+    world.run(SERVICE_DISABLED="second-brain-email")
+
+    assert world.head() == new
+    assert "✅ Deployed" in world.calls()
 
 
 def test_unparseable_deploy_script_is_refused(world: World) -> None:
@@ -299,7 +320,7 @@ def test_rollback_restores_the_old_units(world: World) -> None:
     """Review of #161: a code rollback must not leave the new units in force."""
     world.commit("deploy: unit", {"deploy/systemd/second-brain-api.service": "[Unit]\n#x\n"})
 
-    world.run(SERVICES_DOWN="1")
+    world.run(SERVICE_DOWN="second-brain-telegram")
 
     assert world.head() == world.first
     assert (world.tmp / "units/second-brain-api.service").read_text() == "[Unit]\n"
