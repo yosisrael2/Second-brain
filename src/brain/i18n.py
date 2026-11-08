@@ -72,6 +72,43 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "⚠️ The AI is unavailable right now; try again later.",
         "he": "⚠️ אין כרגע חיבור למודל. נסו שוב בעוד כמה דקות.",
     },
+    # scheduled tasks: the schedule in words (brain.services.schedule_spec)
+    "sched_daily": {"en": "Every day at {time}", "he": "כל יום ב-{time}"},
+    "sched_hourly": {"en": "Every hour at :{minute}", "he": "כל שעה ב-:{minute}"},
+    "sched_weekdays": {"en": "Weekdays (Mon–Fri) at {time}", "he": "בימים שני–שישי ב-{time}"},
+    "sched_sun_thu": {"en": "Sun–Thu at {time}", "he": "בימים ראשון–חמישי ב-{time}"},
+    "sched_weekly_one": {"en": "Every {days} at {time}", "he": "כל יום {days} ב-{time}"},
+    "sched_weekly": {"en": "Every {days} at {time}", "he": "בימים {days} ב-{time}"},
+    "sched_monthly": {
+        "en": "Monthly on day {day} at {time}",
+        "he": "כל חודש ב-{day} לחודש ב-{time}",
+    },
+    "sched_cron": {"en": "Cron: {expr}", "he": "Cron: {expr}"},
+    # scheduled tasks: the run result message + /schedules
+    "sched_result_header": {"en": "⏰ <b>{name}</b>", "he": "⏰ <b>{name}</b>"},
+    "sched_failed": {
+        "en": "⚠️ The scheduled task failed: {error}",
+        "he": "⚠️ המשימה המתוזמנת נכשלה: {error}",
+    },
+    "sched_timed_out": {
+        "en": "⚠️ The scheduled task took longer than {seconds}s and was stopped.",
+        "he": "⚠️ המשימה המתוזמנת נמשכה יותר מ-{seconds} שניות והופסקה.",
+    },
+    "sched_list_header": {"en": "⏰ <b>Scheduled tasks</b>", "he": "⏰ <b>משימות מתוזמנות</b>"},
+    "sched_list_empty": {
+        "en": "⏰ No scheduled tasks yet — create one in the cockpit (Scheduled tab).",
+        "he": "⏰ אין עדיין משימות מתוזמנות. אפשר ליצור משימה בקוקפיט (לשונית Scheduled).",
+    },
+    "sched_active": {"en": "Active", "he": "פעילה"},
+    "sched_paused": {"en": "Paused", "he": "מושהית"},
+    "sched_next": {"en": "next: {when}", "he": "הבאה: {when}"},
+    "sched_queued": {"en": "▶️ Queued: {name}", "he": "▶️ נכנסה לתור: {name}"},
+    "sched_now_paused": {"en": "⏸ Paused: {name}", "he": "⏸ הושהתה: {name}"},
+    "sched_now_resumed": {"en": "▶ Resumed: {name}", "he": "▶ חודשה: {name}"},
+    "sched_gone": {"en": "That task no longer exists.", "he": "המשימה כבר לא קיימת."},
+    "btn_sched_run": {"en": "{n} ▶️ Run now", "he": "{n} ▶️ הרץ עכשיו"},
+    "btn_sched_pause": {"en": "{n} ⏸ Pause", "he": "{n} ⏸ השהה"},
+    "btn_sched_resume": {"en": "{n} ▶ Resume", "he": "{n} ▶ חדש"},
     # /language
     "language_set": {
         "en": "🌐 Language set to English.",

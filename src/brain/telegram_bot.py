@@ -97,6 +97,15 @@ from brain.services.relations_view import (
     replaced_by_notice,
     strike,
 )
+from brain.services.schedule_spec import describe as describe_schedule
+from brain.services.scheduled_tasks import (
+    Claim,
+    RunOutcome,
+    ScheduledTaskNotFound,
+    StoreFactory,
+    default_store,
+    execute_claim,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +156,9 @@ CB_OPEN = "o"  # o:<token>:<index>     -> show a cited item card
 CB_WA_JOIN = "w1"  # w1:<token>        -> save WhatsApp thread as one item
 CB_WA_SPLIT = "wm"  # wm:<token>      -> save one item per message
 CB_MEM_DEL = "m"  # m:<token>:<index> -> remove one memory fact (soft delete)
+CB_SCHED_RUN = "sr"  # sr:<token>:<index>  -> queue a scheduled task's run-now
+CB_SCHED_TOGGLE = "st"  # st:<token>:<index> -> pause / resume a scheduled task
+SCHEDULES_LIST_MAX = 20  # /schedules shows (and buttons) at most this many tasks
 
 BOT_COMMANDS = (
     ("ask", "Ask your memory a question"),
@@ -155,6 +167,7 @@ BOT_COMMANDS = (
     ("recent", "Show the last 10 items"),
     ("profile", "Your kids and remembered facts"),
     ("remember", "Remember a fact: /remember <text>"),
+    ("schedules", "Scheduled tasks: run now, pause, resume"),
     ("status", "Component health"),
     ("language", "Bot language: /language he | en"),
     ("help", "How to use the bot"),
@@ -170,6 +183,7 @@ EVENT_DOCUMENT = "document"
 EVENT_REJECTED_USER = "rejected_user"
 EVENT_MEMORY = "memory"
 EVENT_ERROR = "error"
+EVENT_SCHEDULE = "schedule"
 
 # Exit codes (launchd contract; see module docstring).
 EXIT_DISABLED = 0
@@ -437,6 +451,7 @@ class TelegramBot:
         allowed_ids: frozenset[int],
         timezone: ZoneInfo,
         registry: PendingRegistry | None = None,
+        schedule_store: StoreFactory | None = None,
     ) -> None:
         self._services_factory = services_factory
         self._allowed_ids = allowed_ids
@@ -452,6 +467,13 @@ class TelegramBot:
         # shutdown path can await/cancel it)
         self._enrich_last_run = 0.0
         self._enrich_task: Any = None
+        # Scheduled tasks: the store (fresh session per call), the tasks
+        # whose worker thread is still running (never claimed again until it
+        # ends, even after a timeout), and the in-flight asyncio tasks (kept
+        # referenced so they are not garbage-collected).
+        self._schedule_store: StoreFactory = schedule_store or default_store
+        self._sched_inflight: set[uuid_mod.UUID] = set()
+        self._sched_tasks: set[Any] = set()
 
     def is_allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self._allowed_ids
@@ -499,6 +521,8 @@ class TelegramBot:
             return self.profile()
         if command == "/remember":
             return self.remember(argument)
+        if command == "/schedules":
+            return self.schedules()
         return self.capture(stripped, forward=forward)
 
     # -- capture ----------------------------------------------------------------
@@ -1033,7 +1057,8 @@ class TelegramBot:
             "👋 Second Brain bot ready.\n"
             "Paste an email / WhatsApp thread / calendar event — I'll capture it.\n"
             "Any question ending in '?' goes to /ask.\n"
-            "Commands: /search, /ask, /review, /recent, /profile, /remember, /status, /help"
+            "Commands: /search, /ask, /review, /recent, /profile, /remember, /schedules, "
+            "/status, /help"
         )
 
     def help_text(self) -> Reply:
@@ -1047,6 +1072,7 @@ class TelegramBot:
             "/recent — last 10 items\n"
             "/profile — your kids and remembered facts (with remove buttons)\n"
             "/remember <fact> — remember something about your world\n"
+            "/schedules — scheduled tasks (run now / pause / resume)\n"
             "/status — component health (cockpit)\n"
             "/start — this greeting"
         )
@@ -1508,6 +1534,115 @@ class TelegramBot:
         finally:
             session.close()
 
+    # -- scheduled tasks ----------------------------------------------------------
+
+    def schedules(self, notice: str | None = None, *, edit: bool = False) -> Reply:
+        """/schedules: every task with its state + next run, and per task a
+        ▶️ run-now and a ⏸ pause / ▶ resume button (ids parked in the
+        registry: callback data stays ~15 bytes)."""
+        lang = self._language()
+        with self._schedule_store() as store:
+            rows = [
+                (task.id, task.name, task.schedule, task.timezone, task.enabled, task.next_run_at)
+                for task in store.all()[:SCHEDULES_LIST_MAX]
+            ]
+        head = [notice] if notice else []
+        if not rows:
+            return Reply("\n".join([*head, i18n.t(lang, "sched_list_empty")]), edit=edit)
+        token = self.registry.put(Pending(ids=tuple(row[0] for row in rows), kind="schedules"))
+        lines = [*head, i18n.t(lang, "sched_list_header")]
+        keyboard: list[list[tuple[str, str]]] = []
+        for n, (_, name, schedule, tz_name, enabled, next_run_at) in enumerate(rows, start=1):
+            icon = "▶" if enabled else "⏸"
+            words = describe_schedule(schedule, lang)
+            lines.append(f"{n}. {icon} <b>{_one_line(name, 60)}</b> — {_esc(words)}")
+            state = i18n.t(lang, "sched_active" if enabled else "sched_paused")
+            if enabled and next_run_at is not None:
+                local = next_run_at.astimezone(ZoneInfo(tz_name))
+                when = f"{i18n.weekday(local, lang)} {local.strftime('%d.%m %H:%M')}"
+                state += " · " + i18n.t(lang, "sched_next", when=when)
+            lines.append(f"    {state}")
+            toggle = "btn_sched_pause" if enabled else "btn_sched_resume"
+            keyboard.append(
+                [
+                    (i18n.t(lang, "btn_sched_run", n=n), f"{CB_SCHED_RUN}:{token}:{n - 1}"),
+                    (i18n.t(lang, toggle, n=n), f"{CB_SCHED_TOGGLE}:{token}:{n - 1}"),
+                ]
+            )
+        return Reply("\n".join(lines), keyboard=keyboard, edit=edit)
+
+    def _schedule_action(self, prefix: str, pending: Pending, index: int) -> Reply:
+        """▶️ queues a run-now (the flush right after this update claims it);
+        ⏸ / ▶ pauses or resumes. Re-renders the list in place."""
+        lang = self._language()
+        if pending.kind != "schedules" or not 0 <= index < len(pending.ids):
+            return Reply("Unknown action — the button is stale or invalid.")
+        task_id = pending.ids[index]
+        try:
+            with self._schedule_store() as store:
+                if prefix == CB_SCHED_RUN:
+                    task = store.request_run(task_id)
+                    notice = i18n.t(lang, "sched_queued", name=_one_line(task.name, 60))
+                else:
+                    current = store.get(task_id)
+                    task = store.set_enabled(task_id, not current.enabled)
+                    key = "sched_now_resumed" if task.enabled else "sched_now_paused"
+                    notice = i18n.t(lang, key, name=_one_line(task.name, 60))
+        except ScheduledTaskNotFound:
+            notice = i18n.t(lang, "sched_gone")
+        return self.schedules(notice, edit=True)
+
+    def claim_scheduled(self, *, max_late_s: float, stale_after_s: float) -> list[Claim]:
+        """Claim every due task (compare-and-set; see scheduled_tasks).
+        Tasks whose previous worker is still running are left for later."""
+        with self._schedule_store() as store:
+            return store.claim_due(
+                max_late_s=max_late_s,
+                exclude=tuple(self._sched_inflight),
+                stale_after_s=stale_after_s,
+            )
+
+    def run_scheduled(self, claim: Claim) -> tuple[RunOutcome, str]:
+        """Execute one claimed task through the /ask pipeline -> (outcome,
+        lang). BLOCKING (the LLM client uses asyncio.run): worker thread only."""
+        lang = self._language()
+
+        def ask(prompt: str) -> Any:
+            with self._services_factory() as services:
+                return services.ask.ask(prompt)
+
+        return execute_claim(self._schedule_store, claim, ask), lang
+
+    def finish_scheduled_timeout(self, claim: Claim, timeout_s: float) -> tuple[bool, str]:
+        """Record a timed-out run as an error (unless the worker beat us)."""
+        with self._schedule_store() as store:
+            recorded = store.finish_run(
+                claim.run_id, status="error", error=f"timed out after {timeout_s:.0f}s"
+            )
+        return recorded, self._language()
+
+    def scheduled_reply(self, claim: Claim, outcome: RunOutcome, lang: str) -> Reply:
+        """The message for a finished run: ⏰ <name> + the ask answer card, or
+        the failure line. Loop thread only (the card parks its 📎 buttons in
+        the registry)."""
+        header = i18n.t(lang, "sched_result_header", name=_one_line(claim.name, 100))
+        if outcome.status == "ok" and outcome.result is not None:
+            card = self._ask_card(outcome.result, 0.0, lang=lang)
+            return Reply(f"{header}\n{card.text}", keyboard=card.keyboard)
+        if outcome.llm_unavailable:
+            return Reply(f"{header}\n{i18n.t(lang, 'llm_unavailable')}")
+        error = _one_line(outcome.error or "error", 200)
+        return Reply(f"{header}\n{i18n.t(lang, 'sched_failed', error=error)}")
+
+    def scheduled_timeout_reply(self, claim: Claim, timeout_s: float, lang: str) -> Reply:
+        header = i18n.t(lang, "sched_result_header", name=_one_line(claim.name, 100))
+        body = i18n.t(lang, "sched_timed_out", seconds=f"{timeout_s:.0f}")
+        return Reply(f"{header}\n{body}")
+
+    def scheduled_recipients(self) -> list[int]:
+        """Every allowed user gets the result (same as the proposal cards)."""
+        return sorted(self._allowed_ids)
+
     # -- callbacks -----------------------------------------------------------------
 
     def handle_callback(self, data: str, user_id: int | None = None) -> Reply:
@@ -1531,6 +1666,8 @@ class TelegramBot:
                 CB_REL_CONFIRM,
                 CB_REL_KEEP_BOTH,
                 CB_RECON_DISCARD,
+                CB_SCHED_RUN,
+                CB_SCHED_TOGGLE,
             ):
                 token, _, arg = rest.partition(":")
             elif prefix in (
@@ -1552,6 +1689,8 @@ class TelegramBot:
                 CB_PROPOSED_KEEP,
                 CB_PROPOSED_FIX,
                 CB_PROPOSED_DROP,
+                CB_SCHED_RUN,
+                CB_SCHED_TOGGLE,
             ):
                 index = int(arg)
         except ValueError:
@@ -1588,6 +1727,8 @@ class TelegramBot:
             return self._relation_transition(prefix, pending, arg)
         if prefix == CB_REL_RESTORE:
             return self._relation_restore(pending)
+        if prefix in (CB_SCHED_RUN, CB_SCHED_TOGGLE):
+            return self._schedule_action(prefix, pending, index)
         if prefix == CB_UNDO:
             return self._delete_items(pending, undo=True)
         return self._delete_items(pending, undo=False)  # CB_DELETE
@@ -2164,6 +2305,11 @@ async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
     import time as _time  # noqa: PLC0415
 
     try:
+        await _schedules_tick(tg, core)
+    except Exception:  # noqa: BLE001 — isolated: a schedule failure never blocks the rest
+        record_event("telegram", EVENT_ERROR, ok=False, detail={"error": "schedules tick failed"})
+        logger.exception("telegram: schedules tick failed")
+    try:
         await _enrichment_tick(tg, core)  # starts/harvests the pass FIRST...
         for chat_id, reply in core.drain_outbound():  # ...so its cards go out
             await _send(tg, chat_id, reply)  # in THIS flush
@@ -2175,6 +2321,90 @@ async def _flush_bot_jobs(tg: Any, core: TelegramBot) -> None:
     except Exception:  # noqa: BLE001 — background jobs must never kill polling
         record_event("telegram", EVENT_ERROR, ok=False, detail={"error": "proposal flush failed"})
         logger.exception("telegram: proposal flush failed")
+
+
+async def _schedules_tick(tg: Any, core: TelegramBot) -> None:
+    """Claim due scheduled tasks and start each as its own background task.
+
+    Called from every poll cycle (<= telegram_poll_timeout_s apart, so a
+    task fires within about a minute of its time, and a ▶️ run-now pressed
+    in this cycle is claimed by the flush right after it). The claim is a
+    quick DB call, still done in a worker thread; the poll loop never waits
+    for a run.
+    """
+    if not hasattr(core, "claim_scheduled"):  # stub cores in older tests
+        return
+    from brain.config import get_settings  # noqa: PLC0415
+
+    settings = get_settings()
+    timeout_s = float(settings.scheduled_task_timeout_s)
+    claims = await asyncio.to_thread(
+        core.claim_scheduled,
+        max_late_s=float(settings.scheduled_task_max_late_s),
+        stale_after_s=timeout_s + 120.0,
+    )
+    for claim in claims:
+        core._sched_inflight.add(claim.task_id)  # noqa: SLF001 (same module)
+        task = asyncio.create_task(_run_scheduled(tg, core, claim, timeout_s))
+        core._sched_tasks.add(task)  # noqa: SLF001 (same module)
+        task.add_done_callback(core._sched_tasks.discard)  # noqa: SLF001 (same module)
+
+
+async def _run_scheduled(tg: Any, core: TelegramBot, claim: Claim, timeout_s: float) -> None:
+    """One scheduled run: the ask in a worker thread (NEVER on the loop),
+    bounded by ``timeout_s``, then the ⏰ card to every allowed chat.
+
+    Never raises (a background task): a failure is logged + an ops event and
+    touches nothing else. A timed-out thread cannot be killed: the run is
+    recorded as an error now, its late result is dropped (the run row's
+    first-writer-wins update), and the task stays in-flight — not claimed
+    again — until that thread actually ends.
+    """
+    started = time.monotonic()
+    worker = asyncio.ensure_future(asyncio.to_thread(core.run_scheduled, claim))
+
+    def _released(future: Any) -> None:
+        core._sched_inflight.discard(claim.task_id)  # noqa: SLF001 (same module)
+        if not future.cancelled():
+            future.exception()  # retrieved: no 'exception was never retrieved'
+
+    worker.add_done_callback(_released)
+    try:
+        done, _ = await asyncio.wait({worker}, timeout=timeout_s)
+        if done:
+            outcome, lang = worker.result()
+            reply = core.scheduled_reply(claim, outcome, lang)
+            deliver, ok = outcome.recorded, outcome.status == "ok"
+        else:
+            deliver, lang = await asyncio.to_thread(core.finish_scheduled_timeout, claim, timeout_s)
+            reply = core.scheduled_timeout_reply(claim, timeout_s, lang)
+            ok = False
+        record_event(
+            "telegram",
+            EVENT_SCHEDULE,
+            ok=ok,
+            detail={
+                "task_id": str(claim.task_id),
+                "trigger": claim.trigger,
+                "timed_out": not done,
+                "elapsed_s": round(time.monotonic() - started, 1),
+            },
+        )
+        if not deliver:
+            return
+        for chat_id in core.scheduled_recipients():
+            try:
+                await _send(tg, chat_id, reply)
+            except Exception:  # noqa: BLE001 — one chat failing never blocks the others
+                logger.exception("telegram: scheduled task message failed")
+    except Exception as exc:  # noqa: BLE001 — a background run must never escape
+        record_event(
+            "telegram",
+            EVENT_SCHEDULE,
+            ok=False,
+            detail={"task_id": str(claim.task_id), "error": type(exc).__name__},
+        )
+        logger.exception("telegram: scheduled task %s failed", claim.task_id)
 
 
 def _inline_keyboard(rows: list[list[tuple[str, str]]] | None) -> Any:

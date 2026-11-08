@@ -62,6 +62,9 @@ to its section or doc.
 **Cockpit**
 - One local dashboard: flow diagram, health, events, stats, debug traces, memory, editable prompts + memory file; KPI row; light + dark; laptop + phone; health cards for WhatsApp ("WhatsApp sources": per-channel conversations today/total and media read/not-read), attachments and extraction; a Connectors card (per-source status: enabled, last ok, cursor, `deduped` counter, last error); the item inspector shows item relations (directional, with proposed supersede suffixes) and a superseded banner with struck-through text — [Cockpit](#cockpit-ops-dashboard) (PRs #29, #46, #50, #54, #80)
 
+**Scheduled tasks**
+- Recurring prompts (name + free-text prompt + schedule + Active/Paused) managed in the cockpit **Scheduled** tab, the `/schedules` API and the bot's `/schedules` command; each run is the `/ask` pipeline over the memory (memory-layer facts + memory file) and the answer goes to every allowed Telegram user as a ⏰ card in their language; runs happen in the bot's poll loop (no new service), each claimed atomically, off the event loop, under a timeout — [Scheduled tasks](#scheduled-tasks)
+
 **Ops**
 - 24/7 launchd services (`scripts/service.sh`: API, bot, WhatsApp poller, plus an opt-in `com.secondbrain.email` Gmail agent and an opt-in `com.secondbrain.connectors` scheduler), single bot instance lock, install retries launchd's bootstrap race — [Background services](#background-services-launchd-247) (email agent: PR #43)
 - Live-store guard at construction: the database engine and the vector store refuse the live store unless `BRAIN_ALLOW_LIVE=1` (set only by the service scripts); commands that never touch the database need no flag; migrations refuse the live database the same way (alembic guard); each test session fails loudly if the live collection gains test-originated vectors — [Live-store startup guard](#live-store-startup-guard) (PRs #31, #45, #70, #74)
@@ -366,6 +369,37 @@ Tabs:
   `GET|PUT /prompts/{key}`, `POST /prompts/{key}/reset`,
   `POST /prompts/{key}/restore/{version}`, `GET|PUT /prompts/memory-file`
   — `src/brain/services/prompts.py`.
+- **Scheduled** — recurring prompts: cards with the schedule in words,
+  Active/Paused, next and last run; New / Edit (presets daily / weekly on
+  days / custom cron, timezone, live "next run" preview), Pause / Resume,
+  Run now, Delete, and the run history with outputs. See
+  [Scheduled tasks](#scheduled-tasks).
+
+### Scheduled tasks
+
+A task = name + prompt + a standard 5-field cron string (`minute hour
+day-of-month month day-of-week`, names and `@daily`-style macros accepted)
+evaluated as wall-clock time in the task's IANA timezone (default
+`Asia/Jerusalem`). DST: a time skipped by spring-forward fires once right
+after the gap; a time repeated by fall-back fires on its first occurrence
+only. Schedules firing more often than every 15 minutes, never firing, or
+in an unknown timezone are rejected with a 422.
+
+The Telegram bot runs due tasks from its poll loop (`_schedules_tick`,
+called from `_flush_bot_jobs`), so a task fires within about a minute of
+its time while the bot runs. A run is claimed by a compare-and-set update
+of `next_run_at` (never twice); it executes the `/ask` pipeline in a worker
+thread with the prompt as the question, records output + cited ids in
+`scheduled_task_runs`, and sends `⏰ <name>` + the answer card to every
+allowed user. After downtime the missed slots collapse into one run for the
+latest slot; when that slot is more than `SCHEDULED_TASK_MAX_LATE_S` (12h)
+old it is recorded as `skipped` instead. A run longer than
+`SCHEDULED_TASK_TIMEOUT_S` (300s) is recorded as an error (its late result is
+dropped). Run now (API, cockpit, bot ▶️) queues the run for the next tick.
+
+API (`src/brain/api/routes/schedules.py`): `GET|POST /schedules`,
+`POST /schedules/preview`, `GET|PUT|DELETE /schedules/{id}`,
+`POST /schedules/{id}/pause|resume|run`, `GET /schedules/{id}/runs`.
 
 Underlying ops endpoints (router: `src/brain/api/routes/ops.py`):
 
@@ -585,7 +619,7 @@ for MVP top-k use.
 `brain telegram` runs a long-polling Telegram bot (no webhook; optional extra:
 `pip install -e '.[telegram]'`). Plain messages are captured through the same
 paste parser as `POST /capture`; `/search`, `/ask`, `/review`, `/recent`,
-`/profile` and `/remember` use the same services as the API in-process; `/status`
+`/profile`, `/remember` and `/schedules` use the same services as the API in-process; `/status`
 shows live per-component health via the `brain.ops` shim — zero bot changes. Access is
 allowlist-only: with `TELEGRAM_BOT_TOKEN` set, `TELEGRAM_ALLOWED_USER_IDS`
 (comma-separated ids) is required — anyone else gets no reply (their id is
@@ -612,7 +646,8 @@ Interaction details:
 - `/review` walks the inbox one card at a time (File / Type / Delete / Next);
   `/recent` lists the last 10 items; `/profile` shows the kids + remembered
   facts with a ✖ remove button per fact; `/remember <text>` stores a
-  confirmed free-text fact; bot commands are registered via
+  confirmed free-text fact; `/schedules` lists the scheduled tasks (state +
+  next run) with ▶️ Run now and ⏸ Pause / ▶ Resume per task; bot commands are registered via
   `set_my_commands` at startup.
 - documents: `.ics` files are captured as calendar items; other files,
   photos and voice get a "not supported yet" reply.

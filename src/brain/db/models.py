@@ -640,3 +640,79 @@ class PromptVersion(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+SCHEDULED_TASK_STATUSES = ("running", "ok", "error", "skipped")
+SCHEDULED_RUN_TRIGGERS = ("schedule", "manual")
+
+
+class ScheduledTask(Base):
+    """A user-defined recurring prompt (cockpit Scheduled tab, /schedules).
+
+    ``schedule`` is a 5-field cron string evaluated in ``timezone``
+    (brain.services.schedule_spec). ``next_run_at`` is the next due instant
+    (NULL while paused); the runner claims a run by moving it forward with a
+    compare-and-set UPDATE, so one slot can never run twice.
+    ``run_requested_at`` is the run-now queue (set by the API/bot, cleared
+    by the claim).
+    """
+
+    __tablename__ = "scheduled_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            f"last_status IS NULL OR {_in_domain('last_status', SCHEDULED_TASK_STATUSES)}",
+            name="last_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    schedule: Mapped[str] = mapped_column(String(120), nullable=False)
+    timezone: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="Asia/Jerusalem"
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    run_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ScheduledTaskRun(Base):
+    """One run (or recorded skip) of a scheduled task; deleted with the task."""
+
+    __tablename__ = "scheduled_task_runs"
+    __table_args__ = (
+        CheckConstraint(_in_domain("status", SCHEDULED_TASK_STATUSES), name="status"),
+        CheckConstraint(_in_domain("trigger", SCHEDULED_RUN_TRIGGERS), name="trigger"),
+        Index("ix_scheduled_task_runs_task_started", "task_id", "started_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("scheduled_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
+    # The slot this run served (NULL for a manual run).
+    scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cited_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )

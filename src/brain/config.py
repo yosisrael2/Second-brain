@@ -165,6 +165,14 @@ class Settings(BaseSettings):
     # taken from the model — an unknown value fails at startup.
     enrichment_worker_sources: str = ""
 
+    # Scheduled tasks (cockpit Scheduled tab / /schedules), run by the bot's
+    # poll loop: one run may take this long before it is recorded as an
+    # error (the worker thread cannot be killed; its late result is dropped);
+    # a slot missed by more than scheduled_task_max_late_s (bot down) is
+    # recorded as skipped instead of running late.
+    scheduled_task_timeout_s: int = 300
+    scheduled_task_max_late_s: int = 12 * 3600
+
     # Anthropic LLM (used when llm_provider="anthropic")
     anthropic_api_key: SecretStr | None = None
     anthropic_base_url: str = DEFAULT_ANTHROPIC_URL
