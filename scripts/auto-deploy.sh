@@ -78,7 +78,10 @@ healthy() {
     if printf '%s' "$body" | python3 -c \
       'import json,sys; sys.exit(json.load(sys.stdin)["components"]["api"]["status"] != "ok")' \
       2>/dev/null; then
-      return 0
+      # The API answering is not enough: a crash-looping bot or poller must
+      # fail the deploy too.
+      # shellcheck disable=SC2086  # SERVICES is a word list on purpose
+      systemctl is-active --quiet $SERVICES && return 0
     fi
     sleep "$HEALTH_SLEEP"
   done
@@ -105,6 +108,7 @@ fi
 subject="$(git log -1 --format=%s "$new")"
 log "deploying ${old:0:7} -> ${new:0:7}: $subject"
 
+umask 077  # the dump holds every mail and message: root-only
 mkdir -p "$BACKUP_DIR"
 dump="$BACKUP_DIR/pre-${new:0:7}-$(date +%Y%m%d-%H%M).dump"
 if ! docker compose exec -T db pg_dump -U brain -Fc brain >"$dump" || [ ! -s "$dump" ]; then
@@ -115,37 +119,57 @@ if ! docker compose exec -T db pg_dump -U brain -Fc brain >"$dump" || [ ! -s "$d
 fi
 find "$BACKUP_DIR" -name 'pre-*.dump' -mtime +14 -delete 2>/dev/null || true
 
-migrations="$(git diff --name-only "$old" "$new" -- src/brain/db/migrations/versions)"
 units="$(git diff --name-only "$old" "$new" -- deploy/systemd)"
+install_units() {
+  cp deploy/systemd/second-brain-*.service deploy/systemd/second-brain-*.timer "$UNIT_DIR"/ 2>/dev/null
+  systemctl daemon-reload
+}
+# The schema decides whether a rollback is safe: compare the DATABASE's
+# revision before and after, not whether migration files changed (a failed
+# pip install never reaches alembic; a failed first migration is rolled back
+# by Postgres' transactional DDL).
+schema_rev() { "$VENV_BIN/alembic" current 2>/dev/null | tail -n 1; }
+rev_before="$(schema_rev)"
 
 git merge -q --ff-only "$new" || {
   mark_failed
   notify "❌ Deploy of ${new:0:7} failed: git could not fast-forward. Nothing changed."
   exit 0
 }
-if [ -n "$units" ]; then
-  cp deploy/systemd/second-brain-*.service deploy/systemd/second-brain-*.timer "$UNIT_DIR"/ 2>/dev/null
-  systemctl daemon-reload
-fi
 
-if "$VENV_BIN/pip" install -q -e '.[gmail,telegram]' && "$VENV_BIN/alembic" upgrade head \
-  && { # shellcheck disable=SC2086
-       systemctl restart $SERVICES; } && healthy; then
+step=""
+deploy_new() {
+  # A broken deploy script would be run by every later tick and could never
+  # pull its own fix: refuse it here.
+  step="the new auto-deploy.sh does not parse"; bash -n scripts/auto-deploy.sh || return 1
+  if [ -n "$units" ]; then step="installing systemd units"; install_units || return 1; fi
+  step="pip install"; "$VENV_BIN/pip" install -q -e '.[gmail,telegram]' || return 1
+  step="alembic upgrade head"; "$VENV_BIN/alembic" upgrade head || return 1
+  step="restarting services"
+  # shellcheck disable=SC2086  # SERVICES is a word list on purpose
+  systemctl restart $SERVICES || return 1
+  step="the health check"; healthy
+}
+
+if deploy_new; then
   rm -f "$FAILED_FILE"
   notify "✅ Deployed ${new:0:7}: $subject"
   exit 0
 fi
+mark_failed
 
-if [ -n "$migrations" ]; then
-  notify "❌ Deploy of ${new:0:7} is unhealthy and it changed the database schema, so I did NOT roll back. Backup: $dump. Check: journalctl -u second-brain-api"
+if [ "$(schema_rev)" != "$rev_before" ]; then
+  notify "❌ Deploy of ${new:0:7} failed at $step after the database schema moved, so I did NOT roll back (never alembic downgrade). Backup: $dump. Check: journalctl -u second-brain-api"
   exit 0
 fi
-mark_failed
-log "rolling back to ${old:0:7}"
+log "rolling back to ${old:0:7} (failed at: $step)"
 git reset -q --hard "$old"
+if [ -n "$units" ]; then
+  install_units
+fi
 if install_and_restart && healthy; then
-  notify "↩️ Deploy of ${new:0:7} failed the health check; rolled back to ${old:0:7}. ($subject)"
+  notify "↩️ Deploy of ${new:0:7} failed at $step; rolled back to ${old:0:7}. ($subject)"
 else
-  notify "❌ Deploy of ${new:0:7} failed AND the rollback to ${old:0:7} is unhealthy. Check the server: journalctl -u second-brain-api"
+  notify "❌ Deploy of ${new:0:7} failed at $step AND the rollback to ${old:0:7} is unhealthy. Check: journalctl -u second-brain-api"
 fi
 exit 0

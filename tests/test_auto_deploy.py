@@ -71,14 +71,36 @@ class World:
             self.bin / "docker",
             f'echo "docker $*" >>{log}\n[ "${{DOCKER_FAIL:-}}" = 1 ] && exit 1\necho DUMPDATA\n',
         )
-        _stub(self.bin / "systemctl", f'echo "systemctl $*" >>{log}\n')
+        _stub(
+            self.bin / "systemctl",
+            f'echo "systemctl $*" >>{log}\n'
+            f'[ "$1" = is-active ] && [ "${{SERVICES_DOWN:-}}" = 1 ] && exit 3\nexit 0\n',
+        )
         _stub(
             self.bin / "curl",
             f'if [[ " $* " == *" -K - "* ]]; then cat >/dev/null; '
             f'echo "notify $*" >>{log}; exit 0; fi\ncat {self.health}\n',
         )
-        _stub(self.venv / "pip", f'echo "pip $*" >>{log}\n')
-        _stub(self.venv / "alembic", f'echo "alembic $*" >>{log}\n')
+        # pip fails only on its FIRST call when PIP_FAIL_ONCE=1 (the new
+        # code), so the rollback's reinstall succeeds.
+        flag = tmp / "pip-failed"
+        _stub(
+            self.venv / "pip",
+            f'echo "pip $*" >>{log}\n'
+            f'if [ "${{PIP_FAIL_ONCE:-}}" = 1 ] && [ ! -e {flag} ]; then\n'
+            f"  touch {flag}; exit 1\nfi\n",
+        )
+        # alembic: `current` prints the DB revision; `upgrade` advances it
+        # when ALEMBIC_ADVANCE=1 and fails when ALEMBIC_FAIL=1.
+        self.rev = tmp / "db-rev"
+        self.rev.write_text("rev_old\n")
+        _stub(
+            self.venv / "alembic",
+            f'if [ "$1" = current ]; then cat {self.rev}; exit 0; fi\n'
+            f'echo "alembic $*" >>{log}\n'
+            f'[ "${{ALEMBIC_ADVANCE:-}}" = 1 ] && echo rev_new >{self.rev}\n'
+            f'[ "${{ALEMBIC_FAIL:-}}" = 1 ] && exit 1\nexit 0\n',
+        )
 
     def commit(self, message: str, files: dict[str, str] | None = None) -> str:
         for rel, text in (files or {"app.txt": message + "\n"}).items():
@@ -143,15 +165,16 @@ def test_new_commit_backs_up_migrates_restarts_and_reports(world: World) -> None
     assert world.head() == new
     calls = world.calls().splitlines()
     order = [c.split()[0] + " " + c.split()[1] for c in calls]
-    assert order[:5] == [
+    assert order == [
         "docker compose",
         "pip install",
         "alembic upgrade",
         "systemctl restart",
+        "systemctl is-active",
         "notify -s",
     ]
     assert "second-brain-api second-brain-telegram second-brain-email" in calls[3]
-    assert "✅ Deployed" in calls[4] and "feat: thing" in calls[4]
+    assert "✅ Deployed" in calls[5] and "feat: thing" in calls[5]
     assert "123:abc" not in world.calls()  # the token never reaches argv
     dumps = list((world.tmp / "backups").glob(f"pre-{new[:7]}-*.dump"))
     assert len(dumps) == 1 and dumps[0].read_text() == "DUMPDATA\n"
@@ -186,7 +209,9 @@ def test_rollback_reports_success_when_old_code_is_healthy(world: World) -> None
         world.bin / "curl",
         dedent(
             f"""\
-            if [[ " $* " == *" -K - "* ]]; then cat >/dev/null; echo "notify $*" >>{world.log}; exit 0; fi
+            if [[ " $* " == *" -K - "* ]]; then
+              cat >/dev/null; echo "notify $*" >>{world.log}; exit 0
+            fi
             n=$(( $(cat {counter}) + 1 )); echo $n >{counter}
             if [ $n -ge 3 ]; then echo '{HEALTHY}'; else echo '{UNHEALTHY}'; fi
             """
@@ -199,15 +224,56 @@ def test_rollback_reports_success_when_old_code_is_healthy(world: World) -> None
     assert "↩️ Deploy of" in world.calls()
 
 
-def test_schema_change_is_never_rolled_back(world: World) -> None:
+def test_schema_that_moved_is_never_rolled_back(world: World) -> None:
     new = world.commit("feat: new table", {"src/brain/db/migrations/versions/b.py": "# b\n"})
     world.health.write_text(UNHEALTHY)
 
+    world.run(ALEMBIC_ADVANCE="1")
+
+    assert world.head() == new  # code stays: the database schema already moved
+    assert "did NOT roll back" in world.calls()
+    assert not any(c.startswith("alembic downgrade") for c in world.calls().splitlines())
+
+
+def test_migration_files_alone_do_not_block_rollback(world: World) -> None:
+    """Review of #161: pip failed before alembic ran, so the DB never moved
+    and the code must roll back even though migration files changed."""
+    world.commit("feat: new table", {"src/brain/db/migrations/versions/b.py": "# b\n"})
+
+    world.run(PIP_FAIL_ONCE="1")
+
+    assert world.head() == world.first
+    assert "failed at pip install; rolled back" in world.calls()
+    assert "alembic upgrade" not in world.calls()
+
+
+def test_failed_first_migration_rolls_back(world: World) -> None:
+    world.commit("feat: bad migration", {"src/brain/db/migrations/versions/b.py": "# b\n"})
+
+    world.run(ALEMBIC_FAIL="1")  # Postgres DDL is transactional: revision unchanged
+
+    assert world.head() == world.first
+    assert "failed at alembic upgrade head; rolled back" in world.calls()
+
+
+def test_a_crash_looping_service_fails_the_deploy(world: World) -> None:
+    world.commit("feat: breaks the bot")
+
+    world.run(SERVICES_DOWN="1")
+
+    assert world.head() == world.first
+    assert "failed at the health check" in world.calls()
+
+
+def test_unparseable_deploy_script_is_refused(world: World) -> None:
+    world.commit("deploy: oops", {"scripts/auto-deploy.sh": "if then fi\n"})
+
     world.run()
 
-    assert world.head() == new  # code stays: the schema already moved
-    assert "did NOT roll back" in world.calls()
-    assert "downgrade" not in world.calls()
+    assert world.head() == world.first
+    assert "does not parse; rolled back" in world.calls()
+    assert world.calls().count("pip install") == 1  # only the rollback's reinstall
+    assert "alembic upgrade" not in world.calls()
 
 
 def test_failed_backup_changes_nothing(world: World) -> None:
@@ -227,6 +293,24 @@ def test_changed_units_are_installed_and_reloaded(world: World) -> None:
 
     assert (world.tmp / "units/second-brain-api.service").read_text() == "[Unit]\n#x\n"
     assert "systemctl daemon-reload" in world.calls()
+
+
+def test_rollback_restores_the_old_units(world: World) -> None:
+    """Review of #161: a code rollback must not leave the new units in force."""
+    world.commit("deploy: unit", {"deploy/systemd/second-brain-api.service": "[Unit]\n#x\n"})
+
+    world.run(SERVICES_DOWN="1")
+
+    assert world.head() == world.first
+    assert (world.tmp / "units/second-brain-api.service").read_text() == "[Unit]\n"
+    assert world.calls().count("systemctl daemon-reload") == 2
+
+
+def test_backup_is_private(world: World) -> None:
+    world.commit("feat: thing")
+    world.run()
+    dump = next((world.tmp / "backups").glob("pre-*.dump"))
+    assert dump.stat().st_mode & 0o077 == 0
 
 
 def test_diverged_checkout_is_left_alone(world: World) -> None:
