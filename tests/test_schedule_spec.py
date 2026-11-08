@@ -150,6 +150,8 @@ def test_names_ranges_steps_and_sunday_seven():
         ("0 7 * * 8", "out of range"),
         ("0 7 * * fri-mon", "backwards"),
         ("x 7 * * *", "invalid minute"),
+        ("0 ² * * *", "invalid hour"),  # "²".isdigit() is True; must be a 422, not a 500
+        ("0 7 */² * *", "invalid step"),
         ("0 7 */0 * *", "invalid step"),
         ("* * * * *", "too often"),
         ("*/5 * * * *", "too often"),

@@ -231,6 +231,22 @@ def test_slot_missed_by_more_than_the_window_is_recorded_as_skipped(sched_db):
     assert run.scheduled_for == _at("2026-11-13 07:00") and run.finished_at is not None
 
 
+def test_run_now_survives_a_skipped_slot(sched_db):
+    """Review of #163: bot down 38h, the user pressed Run now meanwhile; the
+    too-late slot is skipped but the manual request must still run."""
+    task_id = _make(_at("2026-11-08 12:00"))
+    with _store() as store:
+        store.request_run(task_id, now=_at("2026-11-14 20:00"))
+    now = _at("2026-11-14 21:00")
+    with _store() as store:
+        claims = store.claim_due(now, max_late_s=12 * 3600)
+        task = store.get(task_id)
+    assert [c.trigger for c in claims] == ["manual"]
+    assert task.run_requested_at is None
+    assert task.next_run_at == _at("2026-11-20 07:00")
+    assert sorted(r.status for r in _runs(task_id)) == ["running", "skipped"]
+
+
 def test_short_downtime_runs_the_missed_slot_once(sched_db):
     task_id = _make(_at("2026-11-08 12:00"), schedule="0 * * * *")
     with engine.begin() as conn:

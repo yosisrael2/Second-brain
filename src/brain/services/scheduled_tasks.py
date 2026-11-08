@@ -301,9 +301,11 @@ class ScheduledTaskStore:
                 )
                 .values(
                     next_run_at=new_next,
-                    run_requested_at=None,
                     last_run_at=now,
                     last_status=status,
+                    # a run-now request is consumed by a real run only: a
+                    # skipped (too-late) slot leaves it for the manual path
+                    **({} if skipped else {"run_requested_at": None}),
                 )
                 .returning(ScheduledTask.id)
                 .execution_options(synchronize_session=False)
@@ -328,9 +330,9 @@ class ScheduledTaskStore:
             )
             self._session.add(run)
             self._commit()
-            if skipped:
-                return None
-            return Claim(run.id, task.id, task.name, task.prompt, "schedule", slot)
+            if not skipped:
+                return Claim(run.id, task.id, task.name, task.prompt, "schedule", slot)
+            # skipped slot: fall through, a pending run-now still runs
         if task.run_requested_at is None:
             return None
         matched = self._session.execute(

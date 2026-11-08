@@ -95,7 +95,7 @@ def _value(token: str, field: str, low: int, high: int, names: dict[str, int]) -
     lowered = token.lower()
     if lowered in names:
         return names[lowered]
-    if not token.isdigit():
+    if not (token.isascii() and token.isdigit()):  # "²".isdigit() is True
         raise ScheduleError(f"invalid {field} value '{token}'")
     value = int(token)
     if not low <= value <= high:
@@ -114,7 +114,7 @@ def _parse_field(text: str, index: int) -> tuple[set[int], bool]:
         base, slash, step_text = part.partition("/")
         step = 1
         if slash:
-            if not step_text.isdigit() or int(step_text) < 1:
+            if not (step_text.isascii() and step_text.isdigit()) or int(step_text) < 1:
                 raise ScheduleError(f"invalid step '{step_text}' in the {field} field")
             step = int(step_text)
         if base == "*":
