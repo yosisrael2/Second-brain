@@ -70,7 +70,13 @@ _PING_WINDOW = timedelta(hours=48)
 
 
 class FixError(ValueError):
-    """A fix the user typed failed validation (bad title or unresolvable date)."""
+    """A fix the user typed failed validation (bad title or unresolvable date).
+
+    ``code`` names the i18n message (``fixerr_<code>``) the bot shows."""
+
+    def __init__(self, message: str, code: str = "bad_date") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _esc(value: str) -> str:
@@ -147,7 +153,7 @@ def child_line(
     emoji = CHILD_EMOJI.get(kind, "•")
     warning = "⚠️ " if child.date_conflict else ""
     prefix = f"{number}. " if number is not None else ""
-    parts = [f"{prefix}{warning}{emoji} {_esc(child.raw_text)}"]
+    parts = [f"{prefix}{warning}{emoji} {i18n.iso(_esc(child.raw_text), lang)}"]
     moment = _local(child, tz)
     if moment is not None:
         parts.append(_date_part(moment, lang))
@@ -190,7 +196,10 @@ def verdict_marker(
         return ""
     fields = meta.get("recon_fields") or {}
     if verdict == "update":
-        changes = "; ".join(f"{k}: {v[0]} → {v[1]}" for k, v in fields.items())
+        changes = "; ".join(
+            i18n.t(lang, "v_change", field=i18n.label(lang, f"vf_{k}", k), old=v[0], new=v[1])
+            for k, v in fields.items()
+        )
         if state == "applied":
             return i18n.t(lang, "v_update_applied", changes=changes)
         return i18n.t(lang, "v_update", changes=changes)
@@ -200,7 +209,7 @@ def verdict_marker(
         if state == "applied":
             return i18n.t(lang, "v_cancelled")
         if matched_title:
-            return i18n.t(lang, "v_cancels", title=matched_title)
+            return i18n.t(lang, "v_cancels", title=i18n.iso(matched_title, lang))
         return i18n.t(lang, "v_proposes_cancel")
     if verdict == "more_detail":
         return i18n.t(lang, "v_more_detail")
@@ -371,21 +380,24 @@ def apply_fix(
     fails the Fix (the same policy as capture).
     """
     if not title or not title.strip():
-        raise FixError("the title cannot be empty")
+        raise FixError("the title cannot be empty", "empty_title")
     title = title.strip()
     if len(title) > 200:
-        raise FixError("the title is too long (max 200 characters)")
+        raise FixError("the title is too long (max 200 characters)", "long_title")
     tz = ZoneInfo(tz_name)
     moment = None
     conflict = False
     note = None
     if when_raw.strip():
         if source is None:
-            raise FixError("no source to resolve the date against")
+            raise FixError("no source to resolve the date against", "no_source")
         sent_local = _source_sent_local(source, tz)
         resolved = resolve_when(when_raw.strip(), sent_local, tz)
         if resolved is None:
-            raise FixError("could not read that date — try dd.mm (e.g. 29.10) or 'יום חמישי 29.10'")
+            raise FixError(
+                "could not read that date — try dd.mm (e.g. 29.10) or 'יום חמישי 29.10'",
+                "bad_date",
+            )
         clock = extract_clock(when_raw)
         moment = combine_local(resolved.day, clock, tz)
         conflict = resolved.date_conflict

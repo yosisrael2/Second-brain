@@ -50,12 +50,14 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import uuid as uuid_mod
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -142,6 +144,8 @@ TYPE_EMOJI = {
     "event": "📅",
     "reference": "🔗",
     "idea": "💡",
+    "reminder": "🔔",  # the proposal card's legend uses the same two
+    "fact": "ℹ️",
 }
 
 # Compact callback-data prefixes (kept < 64 bytes; ids live in the registry).
@@ -172,6 +176,18 @@ BOT_COMMANDS = (
     ("language", "Bot language: /language he | en"),
     ("help", "How to use the bot"),
 )
+
+
+
+def bot_commands(lang: str | None = i18n.DEFAULT) -> list[tuple[str, str]]:
+    """Telegram's command menu with descriptions in ``lang``."""
+    return [(name, i18n.t(lang, f"cmd_{name}")) for name, _ in BOT_COMMANDS]
+
+
+def _kind_name(kind: str, lang: str) -> str:
+    """'Note' / 'פתק' for an item source or type (raw value when unknown)."""
+    return i18n.label(lang, f"kind_{kind}", KIND_NAME.get(kind, kind))
+
 
 # Kinds accepted by ops.record_event (cockpit contract).
 EVENT_CAPTURE = "capture"
@@ -222,6 +238,30 @@ def record_event(
         return
     except Exception:  # noqa: BLE001
         logger.debug("telegram: ops.record_event raised", exc_info=True)
+
+
+def _ops_status_entries() -> list[tuple[str, str, str]] | None:
+    """(status, component, summary) per component from the cockpit health
+    service — the language-neutral form of :func:`_ops_status_lines` (the
+    bot renders it in the user's language). None when unavailable."""
+    try:
+        health_mod = importlib.import_module("brain.ops.health")
+        run = getattr(health_mod, "run_health_checks", None)
+        if run is None:
+            return None
+        health = run()
+        entries = [
+            (
+                str(entry.get("status") or "not probed"),
+                str(name),
+                str(entry.get("summary") or ""),
+            )
+            for name, entry in health.get("components", {}).items()
+        ]
+    except Exception:  # noqa: BLE001  (a broken cockpit must not crash /status)
+        logger.debug("telegram: cockpit status failed", exc_info=True)
+        return None
+    return entries or None
 
 
 def _ops_status_lines() -> list[str] | None:
@@ -420,19 +460,41 @@ def _stars(importance: Any) -> str:
     return "⭐" * max(0, min(n, 5))
 
 
-def _locale_of(session: Any) -> tuple[str, dict[str, str]]:
+def _locale_of(session: Any, lang: str | None = None) -> tuple[str, dict[str, str]]:
     """(language, display names) from the memory layer; English on any error
-    so a memory problem never blocks a card."""
+    so a memory problem never blocks a card. A ``lang`` already read for
+    this update is reused (one language read per update)."""
     try:
         from brain.repositories.memory import MemoryRepository  # noqa: PLC0415
         from brain.services.memory import MemoryService  # noqa: PLC0415
 
         memory = MemoryService(MemoryRepository(session))
-        lang = memory.user_language()
+        if lang is None:
+            lang = memory.user_language()
         return lang, memory.display_names(lang)
     except Exception:  # noqa: BLE001
         logger.warning("telegram: could not read the language from memory", exc_info=True)
         return i18n.DEFAULT, {}
+
+
+def _speaks(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run ``method`` inside the bot's per-update language scope: the user's
+    language is read from memory ONCE (on first use) and every string the
+    update renders reuses it. Re-entrant; per thread (the ask and scheduled
+    runs live in worker threads)."""
+
+    @wraps(method)
+    def wrapper(self: TelegramBot, *args: Any, **kwargs: Any) -> Any:
+        local = self._lang_local
+        if getattr(local, "active", False):
+            return method(self, *args, **kwargs)
+        local.active, local.value = True, None
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            local.active, local.value = False, None
+
+    return wrapper
 
 
 class TelegramBot:
@@ -474,6 +536,8 @@ class TelegramBot:
         self._schedule_store: StoreFactory = schedule_store or default_store
         self._sched_inflight: set[uuid_mod.UUID] = set()
         self._sched_tasks: set[Any] = set()
+        # per-update language cache (see _speaks / _language)
+        self._lang_local = threading.local()
 
     def is_allowed(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self._allowed_ids
@@ -490,6 +554,7 @@ class TelegramBot:
         stripped = text.strip()
         return bool(stripped) and not stripped.startswith("/") and stripped.endswith("?")
 
+    @_speaks
     def route(self, text: str, user_id: int, *, forward: dict[str, Any] | None = None) -> Reply:
         """Dispatch one allowed text message; returns the reply."""
         stripped = text.strip()
@@ -533,23 +598,25 @@ class TelegramBot:
         if parsed.kind == "whatsapp" and self._message_count(parsed) > 1:
             token = self.registry.put(Pending(text=text))
             count = self._message_count(parsed)
+            lang = self._language()
             return Reply(
-                text=(
-                    f"💬 WhatsApp thread with {count} messages — save as one item or separately?"
-                ),
+                text=i18n.t(lang, "wa_thread", n=count),
                 keyboard=[
-                    [("Save as 1 item", f"{CB_WA_JOIN}:{token}")],
-                    [("Save separately", f"{CB_WA_SPLIT}:{token}")],
+                    [(i18n.t(lang, "btn_wa_join"), f"{CB_WA_JOIN}:{token}")],
+                    [(i18n.t(lang, "btn_wa_split"), f"{CB_WA_SPLIT}:{token}")],
                 ],
             )
         return self._save_parsed(parsed, forward=forward)
 
+    @_speaks
     def capture_document(self, file_name: str, text: str) -> Reply:
         """Capture an .ics document's contents as a calendar item."""
         parsed = parse_paste(text or "", kind_hint="calendar", tz=self._timezone)
         reply = self._save_parsed(parsed)
         record_event("telegram", EVENT_DOCUMENT, ok=True, detail={"chars": len(text or "")})
-        return Reply(text=f"📎 {reply.text}\nfile: {_esc(file_name)}", keyboard=reply.keyboard)
+        name = i18n.iso(_esc(file_name), self._language())
+        line = i18n.t(self._language(), "doc_file", name=name)
+        return Reply(text=f"📎 {reply.text}\n{line}", keyboard=reply.keyboard)
 
     def capture_attachment_parent(self, text: str) -> Any:
         """Capture the caption as an attachment's parent item (item 45).
@@ -569,13 +636,15 @@ class TelegramBot:
                 return "unsupported"
             return services.attachments.process(attachment_id)
 
+    @_speaks
     def attachment_summary(self, attachment_id: Any, status: str) -> Reply:
         """Short follow-up for a finished (or failed) attachment read."""
+        lang = self._language()
         with self._services_factory() as services:
             att = services.attachments.get(attachment_id) if services.attachments else None
         if att is None:
-            return Reply(text="📎 attachment saved")
-        name = _esc(att.filename)
+            return Reply(text=i18n.t(lang, "att_saved"))
+        name = i18n.iso(_esc(att.filename), lang)
         if status == "done":
             with self._services_factory() as services:
                 own = services.attachments.own_item(attachment_id)
@@ -586,11 +655,11 @@ class TelegramBot:
             preview = head[0][:160] if head else ""
             return Reply(text=f"📎 {name}\n{preview}" if preview else f"📎 {name}")
         if status == "unsupported":
-            return Reply(text=f"📎 {name} — saved (searchable by filename only)")
+            return Reply(text=i18n.t(lang, "att_unreadable", name=name))
         if status == "too_large":
-            return Reply(text=f"📎 {name} — too large to read (over 20 MB), not stored")
+            return Reply(text=i18n.t(lang, "att_too_large", name=name))
         # failed or queued
-        return Reply(text=f"📎 {name} — ⚠️ reading failed; recorded in ops")
+        return Reply(text=i18n.t(lang, "att_failed", name=name))
 
     def _save_parsed(self, parsed: Any, *, forward: dict[str, Any] | None = None) -> Reply:
         extra_meta: dict[str, Any] = {"channel": "telegram"}
@@ -632,16 +701,17 @@ class TelegramBot:
         token = self.registry.put(Pending(ids=tuple(item.id for item in items)))
         filed = bool(items) and all(item.status == "filed" for item in items)
         deduped = bool(items) and all(getattr(item, "deduplicated", False) for item in items)
+        lang = self._language()
         row: list[tuple[str, str]] = []
         if not filed:
-            row.append(("✅ File", f"{CB_FILE}:{token}"))
-        row.append(("🏷 Type", f"{CB_TYPE}:{token}"))
+            row.append((i18n.t(lang, "btn_file"), f"{CB_FILE}:{token}"))
+        row.append((i18n.t(lang, "btn_type"), f"{CB_TYPE}:{token}"))
         if deduped:
-            row.append(("🗑 Delete original", f"{CB_DELETE}:{token}"))
+            row.append((i18n.t(lang, "btn_delete_original"), f"{CB_DELETE}:{token}"))
             return [row]
         row += [
-            ("🗑 Delete", f"{CB_DELETE}:{token}"),
-            ("↩️ Undo", f"{CB_UNDO}:{token}"),
+            (i18n.t(lang, "btn_delete"), f"{CB_DELETE}:{token}"),
+            (i18n.t(lang, "btn_undo_capture"), f"{CB_UNDO}:{token}"),
         ]
         return [row]
 
@@ -661,12 +731,13 @@ class TelegramBot:
         by the ingest guard) says 'Already saved' instead — the card below is
         the EXISTING item.
         """
+        lang = self._language()
         if items and all(getattr(item, "deduplicated", False) for item in items):
-            header = f"ℹ️ <b>Already saved</b> · {self._kind_label(items)}"
+            header = i18n.t(lang, "already_saved", kind=self._kind_label(items))
         else:
-            header = f"✅ <b>Saved</b> · {self._kind_label(items)}"
+            header = i18n.t(lang, "saved", kind=self._kind_label(items))
         if len(items) > 1:
-            header += f" · {len(items)} items"
+            header += i18n.t(lang, "n_items", n=len(items))
         return f"{notice}\n{header}" if notice else header
 
     def _capture_card(self, parsed: Any, items: list[Any]) -> str:
@@ -674,18 +745,22 @@ class TelegramBot:
 
     def _kind_label(self, items: list[Any]) -> str:
         """Source kind for email/whatsapp/calendar; classified type otherwise."""
+        lang = self._language()
         item = items[0] if items else None
         source = str(getattr(item, "source", "note") or "note")
         if source in ("email", "whatsapp", "calendar"):
-            return f"{KIND_EMOJI.get(source, '📝')} {KIND_NAME.get(source, 'Note')}"
+            return f"{KIND_EMOJI.get(source, '📝')} {_kind_name(source, lang)}"
         item_type = str(getattr(item, "type", "") or "note")
-        return f"{TYPE_EMOJI.get(item_type, '📝')} {KIND_NAME.get(item_type, 'Note')}"
+        if item_type not in KIND_NAME and item_type not in TYPE_EMOJI:
+            item_type = "note"
+        return f"{TYPE_EMOJI.get(item_type, '📝')} {_kind_name(item_type, lang)}"
 
     def _item_card(self, item: Any, indent: str = "") -> str:
         """Compact HTML card: text preview, existing fields, rating, status.
 
         PR B (D4): a superseded item's text renders struck-through.
         """
+        lang = self._language()
         text_line = _one_line(item.raw_text, 200)
         if getattr(item, "superseded_by", None) is not None:
             text_line = strike(_flat_line(item.raw_text, 200))
@@ -695,35 +770,40 @@ class TelegramBot:
         who = meta.get("from") or meta.get("sender")
         if not who and meta.get("senders"):
             who = ", ".join(meta["senders"])
+
+        def field(key: str, value: str) -> str:
+            return i18n.t(lang, key, value=i18n.iso(value, lang))
+
         if who:
-            fields.append(f"From: {_one_line(who, 60)}")
+            fields.append(field("field_from", _one_line(who, 60)))
         if meta.get("subject"):
-            fields.append(f"Subject: {_one_line(meta['subject'], 60)}")
-        when = self._when_of(item)
+            fields.append(field("field_subject", _one_line(meta["subject"], 60)))
+        when = self._when_of(item, lang)
         if when:
-            fields.append(f"When: {_esc(when)}")
+            fields.append(field("field_when", _esc(when)))
         if meta.get("location"):
-            fields.append(f"Where: {_one_line(meta['location'], 60)}")
-        lines += [f"{indent}{field}" for field in fields[:3]]
-        rating = " · ".join(
-            part
-            for part in (
-                _stars(item.importance),
-                ACTIONABILITY_LABEL.get(str(item.actionability or ""), "—"),
-            )
-            if part
-        )
+            fields.append(field("field_where", _one_line(meta["location"], 60)))
+        lines += [f"{indent}{line}" for line in fields[:3]]
+        actionability = str(item.actionability or "")
+        if actionability in ACTIONABILITY_LABEL:
+            act = i18n.t(lang, f"act_{actionability}")
+        else:  # English keeps its "—"; Hebrew leaves an unknown out
+            act = "—" if lang == i18n.DEFAULT else ""
+        rating = " · ".join(part for part in (_stars(item.importance), act) if part)
         if rating:
             lines.append(f"{indent}{rating}")
         if item.status == "needs_review":
             percent = int(round((item.confidence or 0) * 100))
-            lines.append(f"{indent}🔎 Needs review ({percent}%)")
+            lines.append(f"{indent}{i18n.t(lang, 'needs_review', percent=percent)}")
         return "\n".join(lines)
 
-    def _when_of(self, item: Any) -> str | None:
-        """When-line in the USER'S zone (occurred_at is aware UTC)."""
+    def _when_of(self, item: Any, lang: str = i18n.DEFAULT) -> str | None:
+        """When-line in the USER'S zone (occurred_at is aware UTC): 'Sat 7 Nov
+        19:35' / 'שבת 07.11 19:35' (Hebrew weekday, no English month)."""
         if item.occurred_at is not None:
             local = item.occurred_at.astimezone(self._timezone)
+            if lang != i18n.DEFAULT:
+                return i18n.short_date(local, lang)
             return f"{local:%a} {local.day} {local:%b} {local:%H:%M}"
         meta = item.meta or {}
         for key in ("start", "date"):
@@ -733,22 +813,33 @@ class TelegramBot:
 
     # -- commands ------------------------------------------------------------------
 
+    def _list_line(self, position: int, item: Any, lang: str) -> str:
+        """'3. 💬 <text…> · 6 Nov' — one row of /search and /recent."""
+        emoji = KIND_EMOJI.get(item.source, "📝")
+        when = self._short_date(item, lang)
+        suffix = f" · {when}" if when else ""
+        text = i18n.iso(_one_line(item.raw_text, 60), lang)
+        return f"{position}. {emoji} {text}{suffix}"
+
+    @_speaks
     def search(self, query: str) -> Reply:
+        lang = self._language()
         if not query:
             record_event("telegram", EVENT_SEARCH, ok=False, detail={"error": "empty query"})
-            return Reply("Usage: /search <words>")
+            return Reply(i18n.t(lang, "search_usage"))
         with self._services_factory() as services:
             hits = services.search.search(query, limit=5)
+        shown = i18n.iso(_esc(query), lang)
         if not hits:
             detail = {"item_ids": [], "chars": len(query)}
             record_event("telegram", EVENT_SEARCH, ok=True, detail=detail)
-            return Reply(f"🔍 No results for '{_esc(query)}'.")
-        lines = [f"🔍 {len(hits)} result(s) for '{_esc(query)}':"]
+            return Reply(i18n.t(lang, "search_none", query=shown))
+        lines = [i18n.tn(lang, "search_header", len(hits), query=shown)]
         for position, hit in enumerate(hits, start=1):
-            emoji = KIND_EMOJI.get(hit.item.source, "📝")
-            when = self._short_date(hit.item)
-            suffix = f" · {when}" if when else ""
-            lines.append(f"{position}. {emoji} {_one_line(hit.item.raw_text, 60)}{suffix}")
+            lines.append(self._list_line(position, hit.item, lang))
+        hint = i18n.t(lang, "open_hint")
+        if hint:
+            lines.append(hint)
         record_event(
             "telegram",
             EVENT_SEARCH,
@@ -760,14 +851,15 @@ class TelegramBot:
             keyboard=self._open_buttons([str(hit.item.id) for hit in hits]),
         )
 
+    @_speaks
     def ask(self, question: str) -> Reply:
+        lang = self._language()
         if not question:
             record_event("telegram", EVENT_ASK, ok=False, detail={"error": "empty question"})
-            return Reply("Usage: /ask <question>")
+            return Reply(i18n.t(lang, "ask_usage"))
         from brain.ai.ask import LLMError  # noqa: PLC0415
 
         started = time.monotonic()
-        lang = self._language()
         try:
             with self._services_factory() as services:
                 result = services.ask.ask(question)
@@ -797,19 +889,46 @@ class TelegramBot:
         """/language he|en: store the bot language in the memory layer."""
         current = self._language()
         code = argument.strip().lower()
+        usage = i18n.t(
+            current,
+            "language_usage",
+            current=current,
+            current_name=i18n.t(current, f"lang_name_{current}"),
+        )
         if code not in i18n.SUPPORTED:
-            return Reply(i18n.t(current, "language_usage", current=current))
+            return Reply(usage)
         try:
             with self._services_factory() as services:
                 if services.memory is None:
-                    return Reply(i18n.t(current, "language_usage", current=current))
+                    return Reply(usage)
                 services.memory.set_user_language(code)
         except MemoryError as exc:
-            return Reply(f"⚠️ {_esc(str(exc))}")
+            return Reply(i18n.t(current, "language_failed", error=_esc(str(exc))))
+        self._lang_local.value = code  # the rest of this update speaks the new language
         return Reply(i18n.t(code, "language_set"))
 
+    def _session_locale(self, session: Any) -> tuple[str, dict[str, str]]:
+        """(language, display names) for a card rendered on ``session``:
+        the update's language when already read, else read here (and kept
+        for the rest of the update)."""
+        local = self._lang_local
+        known = local.value if getattr(local, "active", False) else None
+        lang, names = _locale_of(session, known)
+        if getattr(local, "active", False):
+            local.value = lang
+        return lang, names
+
     def _language(self) -> str:
-        """The user's bot language from the memory layer (English on any error)."""
+        """The user's bot language: read from the memory layer once per update
+        (inside a :func:`_speaks` scope) — English on any error."""
+        local = self._lang_local
+        if getattr(local, "active", False):
+            if local.value is None:
+                local.value = self._read_language()
+            return local.value
+        return self._read_language()
+
+    def _read_language(self) -> str:
         try:
             with self._services_factory() as services:
                 memory = getattr(services, "memory", None)
@@ -838,24 +957,28 @@ class TelegramBot:
                 emoji = KIND_EMOJI.get(hit.item.source, "📝")
                 when = self._short_date(hit.item, lang)
                 suffix = f" · {i18n.t(lang, 'ask_received', date=when)}" if when else ""
-                source_lines.append(f"{n}. {emoji} {_one_line(hit.item.raw_text, 60)}{suffix}")
+                text = i18n.iso(_one_line(hit.item.raw_text, 60), lang)
+                source_lines.append(f"{n}. {emoji} {text}{suffix}")
             if source_lines:
                 lines += ["", i18n.t(lang, "ask_sources"), *source_lines]
         return Reply(text="\n".join(lines), keyboard=self._open_buttons(result.cited_ids))
 
     def _short_date(self, item: Any, lang: str = i18n.DEFAULT) -> str | None:
         """Day + month in the bot's timezone (source-line suffix): '7 Nov',
-        or '7.11' in Hebrew (no English month name inside a Hebrew line)."""
+        or 'שבת 07.11' in Hebrew (weekday, no English month name; the
+        cards' date shape)."""
         instant = item.occurred_at or item.created_at
         if instant is None:
             return None
         local = instant.astimezone(self._timezone)
         if lang == "he":
-            return f"{local.day}.{local.month}"
+            return f"{i18n.weekday(local, lang)} {local:%d.%m}"
         return f"{local.day} {local.strftime('%b')}"
 
-    def _open_buttons(self, cited_ids: list[str]) -> list[list[tuple[str, str]]]:
-        """One row of 📎 buttons (max 5), numbered like the source list."""
+    def _open_buttons(
+        self, cited_ids: list[str], limit: int = 5
+    ) -> list[list[tuple[str, str]]]:
+        """📎 buttons (max ``limit``, rows of 5), numbered like the list."""
         valid: list[uuid_mod.UUID] = []
         for raw in cited_ids or []:
             try:
@@ -864,12 +987,15 @@ class TelegramBot:
                 continue
         if not valid:
             return []
-        valid = valid[:5]
+        valid = valid[:limit]
         token = self.registry.put(Pending(ids=tuple(valid)))
-        return [[(f"📎 {n}", f"{CB_OPEN}:{token}:{n - 1}") for n in range(1, len(valid) + 1)]]
+        buttons = [(f"📎 {n}", f"{CB_OPEN}:{token}:{n - 1}") for n in range(1, len(valid) + 1)]
+        return [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
 
+    @_speaks
     def review(self, offset: int = 0) -> Reply:
         """Walk the inbox one card at a time (File / Type / Delete / Next)."""
+        lang = self._language()
         with self._services_factory() as services:
             items = list(
                 services.items.list(
@@ -878,45 +1004,50 @@ class TelegramBot:
             )
         if not items:
             record_event("telegram", EVENT_REVIEW, ok=True, detail={"item_ids": [], "chars": 0})
-            return Reply("📥 Inbox is empty.")
+            return Reply(i18n.t(lang, "inbox_empty"))
         if not 0 <= offset < len(items):
-            return Reply("📥 End of inbox.")
+            return Reply(i18n.t(lang, "inbox_end"))
         item = items[offset]
         token = self.registry.put(Pending(ids=(item.id,)))
         row = [
-            ("✅ File", f"{CB_FILE}:{token}"),
-            ("🏷 Type", f"{CB_TYPE}:{token}"),
-            ("🗑 Delete", f"{CB_DELETE}:{token}"),
+            (i18n.t(lang, "btn_file"), f"{CB_FILE}:{token}"),
+            (i18n.t(lang, "btn_type"), f"{CB_TYPE}:{token}"),
+            (i18n.t(lang, "btn_delete"), f"{CB_DELETE}:{token}"),
         ]
         rows = [row]
         if offset + 1 < len(items):
-            rows.append([("Next ▶️", f"{CB_NEXT}:{offset + 1}")])
+            rows.append([(i18n.t(lang, "btn_next"), f"{CB_NEXT}:{offset + 1}")])
         record_event(
             "telegram", EVENT_REVIEW, ok=True, detail={"item_ids": [str(item.id)], "chars": 0}
         )
         return Reply(
-            text=f"📥 Inbox ({offset + 1}/{len(items)})\n{self._item_card(item)}",
+            text=(
+                i18n.t(lang, "inbox_position", i=offset + 1, n=len(items))
+                + f"\n{self._item_card(item)}"
+            ),
             keyboard=rows,
             edit=offset > 0,
         )
 
     def recent(self) -> Reply:
         """List the last 10 items as compact rows with an Open button each."""
+        lang = self._language()
         with self._services_factory() as services:
             items = list(
                 services.items.list(item_type=None, project=None, status=None, limit=10, offset=0)
             )
         if not items:
-            return Reply("No items yet — paste something!")
-        lines = [f"🕘 Last {len(items)} item(s):"]
+            return Reply(i18n.t(lang, "recent_empty"))
+        lines = [i18n.tn(lang, "recent_header", len(items))]
         for position, item in enumerate(items, start=1):
-            emoji = KIND_EMOJI.get(item.source, "📝")
-            when = self._short_date(item)
-            suffix = f" · {when}" if when else ""
-            lines.append(f"{position}. {emoji} {_one_line(item.raw_text, 60)}{suffix}")
+            lines.append(self._list_line(position, item, lang))
+        hint = i18n.t(lang, "open_hint")
+        if hint:
+            lines.append(hint)
         return Reply(
             text="\n".join(lines),
-            keyboard=self._open_buttons([str(item.id) for item in items]),
+            # every listed row gets its 📎 (rows of 5): the hint says "tap its number"
+            keyboard=self._open_buttons([str(item.id) for item in items], limit=len(items)),
         )
 
     # -- memory (profile + remember) -------------------------------------------
@@ -929,64 +1060,88 @@ class TelegramBot:
         Lines are numbered to match the ✖ buttons (soft delete; history kept).
         Fact ids ride in the pending registry so callback data stays < 64B.
         """
+        lang = self._language()
         with self._services_factory() as services:
             memory = getattr(services, "memory", None)
             if memory is None:
-                return Reply("Memory layer is not installed yet.")
+                return Reply(i18n.t(lang, "memory_missing"))
             # MemoryService.overview returns a LIST of entity dicts
             entities = memory.overview(status="confirmed", q=None)
-        # 'photo' facts are never listed: the value is the avatar's sha256 and
-        # the numbered remove buttons bypass the screen's photo undo flow
+            names = memory.display_names(lang)
+        # Never listed: 'photo' facts (the value is the avatar's sha256 and the
+        # numbered remove buttons bypass the screen's photo undo flow) and the
+        # bot 'language' setting (changed with /language, not a remembered fact)
+        hidden = {"photo", "language"}
         for e in entities:
             if e.get("kind") == "person":
                 e["facts"] = [f for f in e.get("facts", [])
-                              if f.get("predicate", "").lower() != "photo"]
+                              if f.get("predicate", "").lower() not in hidden]
         persons = [e for e in entities if e.get("kind") == "person" and e.get("facts")]
+        by_id = {str(e.get("id")): e.get("name", "?") for e in entities}
+
+        def shown(name: str) -> str:
+            return names.get(name, name)
+
+        def value_of(fact: dict[str, Any]) -> str:
+            """The fact's value in words: a connection names the other person;
+            a known value (boy/girl…) is translated; data shows as stored."""
+            value = fact.get("value")
+            if value is None and fact.get("object_id"):
+                value = shown(by_id.get(str(fact["object_id"]), "?"))
+            if value is None:
+                return ""
+            text = str(value)
+            return i18n.label(lang, f"val_{text.lower()}", text)
+
+        def fact_line(n: int, fact: dict[str, Any], bullet: str = "") -> str:
+            predicate = str(fact.get("predicate", "note"))
+            word = i18n.label(lang, f"pred_{predicate.lower()}", predicate)
+            word = word.removeprefix("connection:")
+            value = i18n.iso(_one_line(value_of(fact), 80), lang)
+            return f"{n}. {bullet}{_esc(word)}: {value}"
+
         # kids (persons carrying a kid-fact) first, then the rest by name
         persons.sort(key=lambda e: (0 if self._is_kid(e) else 1, e.get("name", "")))
-        lines = ["👤 <b>Profile</b>"]
+        lines = [i18n.t(lang, "profile_title")]
         fact_ids: list[str] = []
         for entity in persons:
             facts = entity.get("facts", [])
             if entity.get("name") == "me":
                 lines.append("")
-                lines.append("🧠 <b>Remembered</b>")
+                lines.append(i18n.t(lang, "profile_remembered"))
                 for fact in facts:
                     fact_ids.append(str(fact["id"]))
-                    predicate = _esc(fact.get("predicate", "note"))
-                    lines.append(
-                        f"{len(fact_ids)}. • {predicate}: {_one_line(fact.get('value'), 80)}"
-                    )
+                    lines.append(fact_line(len(fact_ids), fact, "• "))
                 continue
             lines.append("")
-            lines.append(f"🧒 <b>{_esc(entity.get('name', '?'))}</b>")
+            icon = "🧒" if self._is_kid(entity) else "👤"
+            name = shown(entity.get("name", "?"))
+            lines.append(f"{icon} <b>{i18n.iso(_esc(name), lang)}</b>")
             by_predicate = {f["predicate"]: f for f in facts}
             summary = " · ".join(
-                str(by_predicate[p]["value"])
+                value_of(by_predicate[p])
                 for p in self._KID_FACT_ORDER
                 if p in by_predicate and by_predicate[p].get("value")
             )
             if summary:
-                lines.append(_esc(summary))
-            for predicate, fact in by_predicate.items():
+                lines.append(i18n.iso(_esc(summary), lang))
+            for fact in by_predicate.values():
                 fact_ids.append(str(fact["id"]))
-                lines.append(
-                    f"{len(fact_ids)}. {_esc(predicate)}: {_one_line(fact.get('value'), 80)}"
-                )
+                lines.append(fact_line(len(fact_ids), fact))
         if not fact_ids:
-            return Reply(
-                "👤 Profile is empty.\n"
-                "Kids are set up once via the seed CLI:\n"
-                "  brain memory seed-kid --name Rona --gender girl --school <school> "
-                "--grade 5 --class <class> --teacher <teacher>\n"
-                "/remember <text> stores a free-text note (not kid facts)."
-            )
+            return Reply(i18n.t(lang, "profile_empty"))
+        hint = i18n.t(lang, "profile_hint")
+        if hint:
+            lines += ["", hint]
         return Reply(text="\n".join(lines), keyboard=self._memory_remove_buttons(fact_ids))
 
     @staticmethod
     def _is_kid(entity: dict) -> bool:
-        """A person carrying at least one kid-fact (grade/class/gender/teacher)."""
-        kid_predicates = {"gender", "grade", "class", "teacher"}
+        """A person carrying at least one SCHOOL fact (grade/class/teacher).
+
+        Gender alone does not make a kid: the parents carry it too (they
+        were listed with the 🧒 icon before)."""
+        kid_predicates = {"grade", "class", "teacher"}
         return any(f.get("predicate") in kid_predicates for f in entity.get("facts", []))
 
     def _memory_remove_buttons(self, fact_ids: list[str]) -> list[list[tuple[str, str]]]:
@@ -997,19 +1152,18 @@ class TelegramBot:
 
     def _remove_profile_fact(self, pending: Pending, index: int) -> Reply:
         """Soft-delete one profile fact, then re-render the card in place."""
+        lang = self._language()
         if not 0 <= index < len(pending.ids):
-            return Reply("Unknown action — the button is stale or invalid.")
+            return Reply(i18n.t(lang, "btn_unknown"))
         with self._services_factory() as services:
             memory = getattr(services, "memory", None)
             if memory is None:
-                return Reply("Memory layer is not installed yet.")
+                return Reply(i18n.t(lang, "memory_missing"))
             try:
                 memory.delete_fact(pending.ids[index])
-            except KeyError:
-                return Reply("⌛ That fact was already removed.")
-            except MemoryError:
-                return Reply("⌛ That fact was already removed.")
-        return self.profile_reply(notice="🗑 Removed (history kept).")
+            except (KeyError, MemoryError):
+                return Reply(i18n.t(lang, "fact_gone"))
+        return self.profile_reply(notice=i18n.t(lang, "fact_removed"))
 
     def profile_reply(self, notice: str | None = None) -> Reply:
         """Re-render the profile card (edit-in-place after a removal)."""
@@ -1019,12 +1173,13 @@ class TelegramBot:
 
     def remember(self, text: str) -> Reply:
         """Store a free-text fact on the 'me' entity (confirmed)."""
+        lang = self._language()
         if not text:
-            return Reply("Usage: /remember <fact> — e.g. /remember Itamar plays basketball")
+            return Reply(i18n.t(lang, "remember_usage"))
         with self._services_factory() as services:
             memory = getattr(services, "memory", None)
             if memory is None:
-                return Reply("Memory layer is not installed yet.")
+                return Reply(i18n.t(lang, "memory_missing"))
             fact = memory.remember(text)
         record_event(
             "telegram",
@@ -1032,56 +1187,76 @@ class TelegramBot:
             ok=True,
             detail={"fact_id": str((fact or {}).get("id", "")), "chars": len(text)},
         )
-        return Reply(f"🧠 <b>Remembered</b>\n{_one_line(text, 300)}")
+        return Reply(i18n.t(lang, "remembered", text=_one_line(text, 300)))
 
+    def _status_hebrew(self, lang: str) -> Reply | None:
+        """/status in the user's (non-English) language: header + one line per
+        component in words; the technical summary only where something is
+        wrong (direction-isolated). None -> the English rendering."""
+        entries = _ops_status_entries()
+        if entries is None:
+            return None
+        icon = {"ok": "🟢", "degraded": "🟡", "down": "🔴"}
+        statuses = {status for status, _, _ in entries}
+        if "down" in statuses:
+            header = i18n.t(lang, "status_down")
+        elif statuses - {"ok", "disabled", "not probed"}:
+            header = i18n.t(lang, "status_degraded")
+        else:
+            header = i18n.t(lang, "status_healthy")
+        lines = [header]
+        for status, name, summary in entries:
+            word = i18n.label(lang, f"health_{status}", status)
+            component = _esc(i18n.label(lang, f"comp_{name}", name))
+            line = f"{icon.get(status, '⚪')} {component}: {word}"
+            if status in ("degraded", "down") and summary:
+                line += f" ({i18n.iso(_esc(summary), lang)})"
+            lines.append(line)
+        return Reply("\n".join(lines))
+
+    @_speaks
     def status(self) -> Reply:
         """Component health from the cockpit (no event: /status is not data ops)."""
+        lang = self._language()
+        if lang != i18n.DEFAULT:
+            localized = self._status_hebrew(lang)
+            if localized is not None:
+                return localized
         lines = _ops_status_lines()
         if lines is None:
-            return Reply("cockpit not installed yet")
+            return Reply(i18n.t(lang, "status_missing"))
         emoji_lines = [line for line in lines if line.startswith(("🟢", "🟡", "🔴", "⚪"))]
         if emoji_lines and len(emoji_lines) == len(lines):
             if any(line.startswith("🔴") for line in lines):
-                header = "🔴 brain: down"
+                header = i18n.t(lang, "status_down")
             elif any(not line.startswith(("🟢", "⚪")) for line in lines):
-                header = "🟠 brain: degraded"
+                header = i18n.t(lang, "status_degraded")
             else:
-                header = "🟢 brain: healthy"
+                header = i18n.t(lang, "status_healthy")
         else:  # legacy plain-string component_status: only ok/not-ok known
             all_ok = all(line.startswith("🟢") or ":" not in line for line in lines)
-            header = "🟢 brain: healthy" if all_ok else "🟠 brain: degraded"
+            header = i18n.t(lang, "status_healthy" if all_ok else "status_degraded")
         return Reply(header + "\n" + "\n".join(lines))
 
     def start(self) -> Reply:
-        return Reply(
-            "👋 Second Brain bot ready.\n"
-            "Paste an email / WhatsApp thread / calendar event — I'll capture it.\n"
-            "Any question ending in '?' goes to /ask.\n"
-            "Commands: /search, /ask, /review, /recent, /profile, /remember, /schedules, "
-            "/status, /help"
-        )
+        return Reply(i18n.t(self._language(), "start"))
 
     def help_text(self) -> Reply:
-        return Reply(
-            "Commands:\n"
-            "— paste any text: captured (email/WhatsApp/calendar detected)\n"
-            "— any question ending in '?': answered from the memory\n"
-            "/search <words> — semantic search\n"
-            "/ask <question> — ask the memory\n"
-            "/review — walk the inbox one card at a time\n"
-            "/recent — last 10 items\n"
-            "/profile — your kids and remembered facts (with remove buttons)\n"
-            "/remember <fact> — remember something about your world\n"
-            "/schedules — scheduled tasks (run now / pause / resume)\n"
-            "/status — component health (cockpit)\n"
-            "/start — this greeting"
-        )
+        return Reply(i18n.t(self._language(), "help"))
 
+    _UNSUPPORTED = {
+        "Voice and video": "unsupported_voice",
+        "Files other than .ics": "unsupported_files",
+    }
+
+    @_speaks
     def unsupported(self, what: str) -> Reply:
-        return Reply(f"😕 {_esc(what)} are not supported yet — paste the text instead.")
+        key = self._UNSUPPORTED.get(what, "unsupported_other")
+        return Reply(i18n.t(self._language(), key, what=_esc(what)))
 
     # -- proposal cards (PR C: delta items 19/20/D2/D4/D7) -----------------------
 
+    @_speaks
     def proposals_changed(self, outcomes: list) -> None:
         """The EnrichmentService completion hook: queue one card per changed
         source for every allowed chat (flushed by the poll loop)."""
@@ -1098,14 +1273,16 @@ class TelegramBot:
         self._outbound = []
         return queued
 
-    def _recon_payload(self, session, children):
+    def _recon_payload(  # type: ignore[no-untyped-def]  # (untyped before: session/rows)
+        self, session, children, lang: str = i18n.DEFAULT
+    ):
         """(recon, blocks) for a proposal card: the verdict rows and the
         CONFLICT both-versions blocks (D-recon-2a). The verdict rows carry
         the relation ID in the callback data — nothing positional to
         misalign."""
         recon = self._recon_rows(session, children)
         blocks = [
-            conflict_notice(session, rel)
+            conflict_notice(session, rel, lang)  # type: ignore[arg-type]  # rel: ItemRelation
             for verdict, rel, _title in recon.values()
             if verdict == "conflict"
         ]
@@ -1125,8 +1302,8 @@ class TelegramBot:
             children = proposed_children_of(session, source.id)
             if not children:
                 return None
-            recon, blocks = self._recon_payload(session, children)
-            lang, names = _locale_of(session)
+            lang, names = self._session_locale(session)
+            recon, blocks = self._recon_payload(session, children, lang)
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
@@ -1175,14 +1352,15 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
             if child is None or child.child_state != "proposed":
-                return Reply("⌛ That button expired — the card moved on.", edit=True)
-            title = child.raw_text[:40]
+                return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            title = _esc(child.raw_text[:40])
             apply_keep(_repo_of(session), child)
-        return self._proposal_card_reply(pending, notice=f"✅ Kept: {title}")
+        notice = i18n.t(self._language(), "kept_title", title=title)
+        return self._proposal_card_reply(pending, notice=notice)
 
     def _proposal_drop(self, pending: Pending, index: int) -> Reply:
         from brain.db.models import MemoryItem  # noqa: PLC0415
@@ -1190,14 +1368,15 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
             if child is None or child.child_state != "proposed":
-                return Reply("⌛ That button expired — the card moved on.", edit=True)
-            title = child.raw_text[:40]
+                return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            title = _esc(child.raw_text[:40])
             apply_drop(_repo_of(session), child)
-        return self._proposal_card_reply(pending, notice=f"🗑 Dropped (never returns): {title}")
+        notice = i18n.t(self._language(), "dropped_title", title=title)
+        return self._proposal_card_reply(pending, notice=notice)
 
     def _proposal_keep_all(self, pending: Pending) -> Reply:
         from brain.db.models import MemoryItem  # noqa: PLC0415
@@ -1213,7 +1392,8 @@ class TelegramBot:
                     changed += 1
             if changed:
                 repo.commit()
-        return self._proposal_card_reply(pending, notice=f"✅ Kept {changed} item(s).")
+        notice = i18n.tn(self._language(), "kept_n", changed)
+        return self._proposal_card_reply(pending, notice=notice)
 
     def _proposal_card_reply(self, pending: Pending, *, notice: str) -> Reply:
         """Re-render the source card after an action (edit-in-place)."""
@@ -1229,9 +1409,11 @@ class TelegramBot:
                 if row is not None and row.child_state == "proposed"
             ]
             if source is None or not children:
-                return Reply(f"{notice}\n ✓ all done here.", edit=True)
-            recon, blocks = self._recon_payload(session, children)
-            lang, names = _locale_of(session)
+                lang = self._language()
+                done = i18n.t(lang, "all_done")
+                return Reply(f"{notice}\n{done}", edit=True)
+            lang, names = self._session_locale(session)
+            recon, blocks = self._recon_payload(session, children, lang)
             token = self.registry.put(
                 Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
             )
@@ -1252,6 +1434,15 @@ class TelegramBot:
 
     # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
 
+    def _relation_error(self, exc: Exception) -> str:
+        """A relation service refusal, for the user: English keeps the service
+        text; other languages say "already handled" (the raw text names
+        internal ids and states)."""
+        lang = self._language()
+        if lang == i18n.DEFAULT:
+            return f"⌛ {_esc(str(exc))}"
+        return i18n.t(lang, "already_handled")
+
     def _relation_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
         """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b);
         a proposal card's verdict rows route to the D-recon-2a handler."""
@@ -1262,23 +1453,23 @@ class TelegramBot:
         try:
             index = int(arg)
         except ValueError:
-            return Reply("Unknown action — the button is stale or invalid.")
+            return Reply(i18n.t(self._language(), "btn_unknown"))
         rel_ids = list(pending.ids[1:])
         if not 0 <= index < len(rel_ids):
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         service = RelationsService()
         try:
             if prefix == CB_REL_UNDO:
                 service.undo_supersede(rel_ids[index])
-                notice = "↩️ Undone — the earlier item is current again."
+                notice = i18n.t(self._language(), "rel_undone")
             elif prefix == CB_REL_CONFIRM:
                 service.confirm_supersede(rel_ids[index])
-                notice = "✅ Confirmed — the old version is struck through (undo anytime)."
+                notice = i18n.t(self._language(), "rel_confirmed")
             else:  # CB_REL_KEEP_BOTH
                 service.discard_proposal(rel_ids[index])
-                notice = "✖ Keeping both — proposal discarded."
+                notice = i18n.t(self._language(), "rel_kept_both")
         except RelationsError as exc:
-            return Reply(f"⌛ {_esc(str(exc))}", edit=True)
+            return Reply(self._relation_error(exc), edit=True)
         return self._card_reply(pending, notice=notice)
 
     def _recon_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
@@ -1299,8 +1490,8 @@ class TelegramBot:
         try:
             rel_id = uuid_mod.UUID(str(arg))
         except ValueError:
-            return Reply("Unknown action — the button is stale or invalid.")
-        already = "⌛ already handled — the card moved on."
+            return Reply(i18n.t(self._language(), "btn_unknown"))
+        already = i18n.t(self._language(), "already_handled")
         notice = None
         with SessionLocal() as session:
             rel = session.get(ItemRelation, rel_id)
@@ -1321,41 +1512,38 @@ class TelegramBot:
                             return Reply(already, edit=True)
                         RelationsService().confirm_supersede(rel_id)
                         self._recon_child_kept(session, child_id)
-                        notice = "✅ Confirmed — the old version is struck through (undo anytime)."
+                        notice = i18n.t(self._language(), "rel_confirmed")
                     elif rel.kind == "conflicts":
                         service.resolve_conflict(rel_id, keep="new")
-                        notice = (
-                            "✅ Keeping the new version — the old one is struck through"
-                            " (undo anytime)."
-                        )
+                        notice = i18n.t(self._language(), "rel_kept_new")
                     elif rel.kind == "cancels":
                         if state != "proposed":
                             return Reply(already, edit=True)
                         service.apply_cancellation(rel_id)
                         self._recon_child_kept(session, child_id)
-                        notice = "🗑 Cancelled — the item is struck through (restore anytime)."
+                        notice = i18n.t(self._language(), "rel_cancelled")
                 elif prefix == CB_REL_KEEP_BOTH:  # ✖ Keep both on a proposed UPDATE
                     RelationsService().discard_proposal(rel_id)
                     self._recon_child_kept(session, child_id)
-                    notice = "✖ Keeping both — proposal discarded."
+                    notice = i18n.t(self._language(), "rel_kept_both")
                 elif prefix == CB_RECON_DISCARD:
                     if rel.kind == "conflicts":
                         service.resolve_conflict(rel_id, keep="existing")
-                        notice = "✅ Keeping the existing version — proposal discarded."
+                        notice = i18n.t(self._language(), "rel_kept_existing")
                     elif rel.kind == "cancels":
                         service.discard_cancellation(rel_id)
-                        notice = "✖ Not cancelled — proposal discarded."
+                        notice = i18n.t(self._language(), "rel_not_cancelled")
                 elif prefix == CB_REL_UNDO:
                     if rel.kind == "cancels":
                         if state != "applied":
                             return Reply(already, edit=True)
                         service.restore_cancellation(rel_id)
-                        notice = "♻️ Restored — back in /recent."
+                        notice = i18n.t(self._language(), "rel_restored")
                     else:
                         if state != "applied":
                             return Reply(already, edit=True)
                         RelationsService().undo_supersede(rel_id)
-                        notice = "↩️ Undone — the earlier item is current again."
+                        notice = i18n.t(self._language(), "rel_undone")
             except (RelationsError, ValueError):
                 return Reply(already, edit=True)
         if notice is None:
@@ -1397,7 +1585,7 @@ class TelegramBot:
         finally:
             session.close()
         if rel is None:
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         try:
             if rel.kind == "cancels":
                 with SessionLocal() as svc_session:
@@ -1412,8 +1600,8 @@ class TelegramBot:
             else:
                 RelationsService().undo_supersede(rel.id)
         except (RelationsError, ValueError) as exc:
-            return Reply(f"⌛ {_esc(str(exc))}", edit=True)
-        return self._card_reply(pending, notice="♻️ Restored — back in /recent.")
+            return Reply(self._relation_error(exc), edit=True)
+        return self._card_reply(pending, notice=i18n.t(self._language(), "rel_restored"))
 
     def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
         from brain.db.models import MemoryItem  # noqa: PLC0415
@@ -1421,18 +1609,16 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
         if child is None or child.child_state != "proposed":
-            return Reply("⌛ That button expired — the card moved on.", edit=True)
+            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
         if user_id is None:
-            return Reply("Unknown user — cannot start an edit.", edit=True)
+            return Reply(i18n.t(self._language(), "fix_no_user"), edit=True)
         token = self.registry.put(Pending(ids=(child.id,), kind="fix", step="title"))
         self._fix_flow[user_id] = token
-        return Reply(
-            f"✏️ New title for: {_esc(child.raw_text[:60])}\nType the new title (or 'cancel')."
-        )
+        return Reply(i18n.t(self._language(), "fix_title_prompt", title=_esc(child.raw_text[:60])))
 
     def _fix_input(self, user_id: int, text: str) -> Reply:
         """One step of the Fix flow (title, then date)."""
@@ -1441,18 +1627,14 @@ class TelegramBot:
         if pending is None or pending.kind != "fix":
             self._fix_flow.pop(user_id, None)
             return self.capture(text)
-        if text.lower() == "cancel":
+        if text.lower() in i18n.CANCEL_WORDS:
             self._fix_flow.pop(user_id, None)
-            return Reply("✏️ Fix cancelled — nothing changed.")
+            return Reply(i18n.t(self._language(), "fix_cancelled"))
         if pending.step == "title":
             self._fix_flow[user_id] = self.registry.put(
                 Pending(ids=pending.ids, text=text, kind="fix", step="date")
             )
-            return Reply(
-                f"✏️ Title will be: {_esc(text[:60])}\n"
-                "Now the date: dd.mm / 'יום חמישי 29.10 13:00' / 'keep' to leave it "
-                "unchanged ('cancel' aborts)."
-            )
+            return Reply(i18n.t(self._language(), "fix_date_prompt", title=_esc(text[:60])))
         # step == "date"
         title_pending = self.registry.get(token)
         title = (title_pending.text if title_pending else "") or ""
@@ -1465,10 +1647,10 @@ class TelegramBot:
             child = session.get(MemoryItem, child_id)
             if child is None:
                 self._fix_flow.pop(user_id, None)
-                return Reply("⌛ That item is gone — fix aborted.")
+                return Reply(i18n.t(self._language(), "fix_item_gone"))
             source = self._proposal_source_of(child, session)
             try:
-                if text.lower() in ("keep", "-"):
+                if text.lower() in i18n.KEEP_WORDS:
                     fixed = child
                     fixed.raw_text = title
                     fixed.child_state = "kept"
@@ -1484,12 +1666,11 @@ class TelegramBot:
                         tz_name=self._timezone.key,
                     )
             except FixError as exc:
-                return Reply(f"✏️ {_esc(str(exc))}\nTry again (or 'cancel').")
+                lang = self._language()
+                error = i18n.label(lang, f"fixerr_{exc.code}", str(exc))
+                return Reply(i18n.t(lang, "fix_retry", error=_esc(error)))
             self._fix_flow.pop(user_id, None)
-            return Reply(
-                f"✏️ Fixed: {_esc(fixed.raw_text[:60])}\n"
-                "Your edit is locked — extraction will not overwrite it."
-            )
+            return Reply(i18n.t(self._language(), "fix_done", title=_esc(fixed.raw_text[:60])))
 
     def _proposal_source_of(self, child, session):
         from sqlalchemy import select  # noqa: PLC0415
@@ -1505,6 +1686,7 @@ class TelegramBot:
         ).scalar_one_or_none()
         return row
 
+    @_speaks
     def due_pings(self, now: datetime | None = None) -> list[tuple[int, Reply]]:
         """The 48h ping (D7): one Keep/Drop ping per due proposed task."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
@@ -1518,7 +1700,7 @@ class TelegramBot:
             mark_pinged(children, moment)
             session.commit()
             pings: list[tuple[int, Reply]] = []
-            lang, names = _locale_of(session)
+            lang, names = self._session_locale(session)
             for child in children:
                 token = self.registry.put(Pending(ids=(child.id,), kind="proposal"))
                 reply = Reply(
@@ -1576,7 +1758,7 @@ class TelegramBot:
         ⏸ / ▶ pauses or resumes. Re-renders the list in place."""
         lang = self._language()
         if pending.kind != "schedules" or not 0 <= index < len(pending.ids):
-            return Reply("Unknown action — the button is stale or invalid.")
+            return Reply(i18n.t(self._language(), "btn_unknown"))
         task_id = pending.ids[index]
         try:
             with self._schedule_store() as store:
@@ -1645,6 +1827,7 @@ class TelegramBot:
 
     # -- callbacks -----------------------------------------------------------------
 
+    @_speaks
     def handle_callback(self, data: str, user_id: int | None = None) -> Reply:
         """Dispatch an inline-button press; stale/unknown → graceful reply.
 
@@ -1675,6 +1858,7 @@ class TelegramBot:
                 CB_FILE,
                 CB_DELETE,
                 CB_TYPE,
+                CB_BACK,
                 CB_WA_JOIN,
                 CB_WA_SPLIT,
                 CB_PROPOSED_KEEP_ALL,
@@ -1682,7 +1866,7 @@ class TelegramBot:
             ):
                 token, arg = rest, ""
             else:
-                return Reply("Unknown action — the button is stale or invalid.")
+                return Reply(i18n.t(self._language(), "btn_unknown"))
             if prefix in (
                 CB_OPEN,
                 CB_MEM_DEL,
@@ -1694,10 +1878,10 @@ class TelegramBot:
             ):
                 index = int(arg)
         except ValueError:
-            return Reply("Unknown action — the button is stale or invalid.")
+            return Reply(i18n.t(self._language(), "btn_unknown"))
         pending = self.registry.get(token)
         if pending is None:
-            return Reply("⌛ That button expired (valid 10 minutes) — send the message again.")
+            return Reply(i18n.t(self._language(), "btn_expired"))
         if prefix == CB_WA_JOIN:
             return self._save_whatsapp_choice(pending, split=False)
         if prefix == CB_WA_SPLIT:
@@ -1710,7 +1894,7 @@ class TelegramBot:
             return self._apply_type(pending, arg)
         if prefix == CB_FILE:
             changed = self._update_items(pending, {"status": "filed"})
-            return self._card_reply(pending, notice=f"📁 Filed {changed} item(s).")
+            return self._card_reply(pending, notice=i18n.tn(self._language(), "filed", changed))
         if prefix == CB_OPEN:
             return self._open_card(pending, index)
         if prefix == CB_MEM_DEL:
@@ -1750,15 +1934,16 @@ class TelegramBot:
                 except ItemNotFound:
                     continue
         if not items:
-            return Reply("🗑 Deleted", edit=True)
+            return Reply(i18n.t(self._language(), "deleted_card"), edit=True)
         relation_notices: list[str] = []
         relation_rows: list[list[tuple[str, str]]] = []
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
+        lang = self._language()
         session = SessionLocal()
         try:
             for item in items:
-                rel_notice = correction_notice(session, item.id)
+                rel_notice = correction_notice(session, item.id, lang)
                 if rel_notice:
                     relation_notices.append(rel_notice)
                 relation_rows += self._relations_rows_for(item.id)
@@ -1783,19 +1968,20 @@ class TelegramBot:
         from brain.services.items import ItemNotFound  # noqa: PLC0415
 
         if not 0 <= index < len(pending.ids):
-            return Reply("Unknown action — the button is stale or invalid.")
+            return Reply(i18n.t(self._language(), "btn_unknown"))
         with self._services_factory() as services:
             try:
                 item = services.items.get(pending.ids[index])
             except ItemNotFound:
-                return Reply("⌛ That item was deleted.")
+                return Reply(i18n.t(self._language(), "item_deleted"))
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
+        lang = self._language()
         session = SessionLocal()
         try:
-            replaced_by = replaced_by_notice(session, item.id)
-            notice = correction_notice(session, item.id)
-            details = details_notice(session, item.id)
+            replaced_by = replaced_by_notice(session, item.id, lang)
+            notice = correction_notice(session, item.id, lang)
+            details = details_notice(session, item.id, lang)
         finally:
             session.close()
         lines = [self._item_card(item)]
@@ -1820,6 +2006,7 @@ class TelegramBot:
             superseded_by_rel,
         )
 
+        lang = self._language()
         rows: list[list[tuple[str, str]]] = []
         session = SessionLocal()
         try:
@@ -1830,13 +2017,13 @@ class TelegramBot:
             )
             if struck is not None:
                 token = self.registry.put(Pending(ids=(item_id,), kind="relation"))
-                rows.append([("♻️ Restore", f"{CB_REL_RESTORE}:{token}")])
+                rows.append([(i18n.t(lang, "btn_restore"), f"{CB_REL_RESTORE}:{token}")])
             applied = applied_supersedes_of(session, item_id)
             proposed = proposed_supersedes_of(session, item_id)
             if applied or proposed:
                 rel_ids = [rel.id for rel in applied] + [rel.id for rel in proposed]
                 token = self.registry.put(Pending(ids=(item_id, *rel_ids), kind="relation"))
-                rows += relations_keyboard(token, applied=applied, proposed=proposed)
+                rows += relations_keyboard(token, applied=applied, proposed=proposed, lang=lang)
         finally:
             session.close()
         return rows
@@ -1849,15 +2036,17 @@ class TelegramBot:
         """Type picker: emoji labels in rows of up to 3 + a back row."""
         from brain.db.enums import ItemType  # noqa: PLC0415
 
+        lang = self._language()
         buttons = [
             (
-                f"{TYPE_EMOJI.get(t.value, '🏷')} {KIND_NAME.get(t.value, t.value)}",
+                f"{TYPE_EMOJI.get(t.value, '🏷')} {_kind_name(t.value, lang)}",
                 f"{CB_TYPE_APPLY}:{token}:{t.value}",
             )
             for t in ItemType
         ]
         grid = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
-        return Reply("Pick a type:", keyboard=grid + [[("« Back", f"{CB_BACK}:{token}")]])
+        back = [[(i18n.t(lang, "btn_back"), f"{CB_BACK}:{token}")]]
+        return Reply(i18n.t(lang, "pick_type"), keyboard=grid + back)
 
     def _apply_type(self, pending: Pending, type_value: str) -> Reply:
         from brain.db.enums import ItemType  # noqa: PLC0415
@@ -1865,10 +2054,11 @@ class TelegramBot:
         try:
             item_type = ItemType(type_value)
         except ValueError:
-            return Reply("Unknown type — the button is stale or invalid.")
+            return Reply(i18n.t(self._language(), "type_unknown"))
         self._update_items(pending, {"type": item_type})
-        label = KIND_NAME.get(item_type.value, item_type.value)
-        return self._card_reply(pending, notice=f"✏️ Type: {label}")
+        lang = self._language()
+        label = _kind_name(item_type.value, lang)
+        return self._card_reply(pending, notice=i18n.t(lang, "type_set", label=label))
 
     def _update_items(self, pending: Pending, changes: dict[str, Any]) -> int:
         """Apply an ItemUpdate to the pending ids; returns how many changed."""
@@ -1895,8 +2085,8 @@ class TelegramBot:
                     deleted += 1
                 except ItemNotFound:
                     continue  # already gone: Undo pressed twice, etc.
-        verb = "↩️ Undone" if undo else "🗑 Deleted"
-        return Reply(f"{verb} {deleted} item(s).", edit=True)
+        key = "undone" if undo else "deleted"
+        return Reply(i18n.tn(self._language(), key, deleted), edit=True)
 
 
 # --- polling adapter (needs python-telegram-bot) -----------------------------
@@ -1927,7 +2117,10 @@ async def poll_loop(
     from telegram.error import Conflict, InvalidToken, NetworkError  # noqa: PLC0415
 
     await tg.initialize()
-    commands = [BotCommand(name, description) for name, description in BOT_COMMANDS]
+    # the menu speaks the bot's language at startup (one memory read)
+    language = getattr(core, "_language", None)  # stub cores in older tests lack it
+    lang = await asyncio.to_thread(language) if language is not None else None
+    commands = [BotCommand(name, description) for name, description in bot_commands(lang)]
     try:
         await tg.set_my_commands(commands)
     except Exception:  # noqa: BLE001  (command registration is cosmetic)
@@ -2589,7 +2782,8 @@ async def _handle_attachment(
             "telegram",
             str(getattr(message, "message_id", "") or ""),
         )
-        await _send(tg, chat_id, Reply(text="📎 saved, reading…"))
+        reading = i18n.t(core._language(), "att_reading")  # noqa: SLF001
+        await _send(tg, chat_id, Reply(text=reading))
         attachment_id = att.id
     task = asyncio.create_task(_read_and_report(tg, chat_id, core, attachment_id))
     logger.info("telegram: attachment %s reading in background", attachment_id)
