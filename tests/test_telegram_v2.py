@@ -105,8 +105,8 @@ class TestCaptureKeyboards:
             "⚖️ Decision",
             "📝 Note",
             "📅 Event",
-            "🏷 reminder",
-            "🏷 fact",  # extraction child kinds (PR A1)
+            "🔔 Reminder",  # extraction child kinds (PR A1): named + the card
+            "ℹ️ Fact",  # legend's emoji (they read "🏷 reminder" / "🏷 fact")
             "🔗 Reference",
             "💡 Idea",
             "« Back",

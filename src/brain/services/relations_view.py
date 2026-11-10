@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from brain import i18n
 from brain.db.models import ItemRelation, MemoryItem
 
 # Compact callback-data prefixes (kept < 64 bytes; ids live in the registry).
@@ -102,8 +103,10 @@ def _esc(value: str) -> str:
     return html.escape(str(value), quote=False)
 
 
-def one_line_escaped(session: Session, item_id) -> str:
-    return _esc(_summary(session, item_id))
+def one_line_escaped(session: Session, item_id, lang: str = i18n.DEFAULT) -> str:
+    """HTML-escaped one-line summary; in Hebrew a Latin-script summary is
+    direction-isolated so it never flips the line around it."""
+    return i18n.iso(_esc(_summary(session, item_id)), lang)
 
 
 def summary_of(session: Session, item_id) -> str:
@@ -112,7 +115,7 @@ def summary_of(session: Session, item_id) -> str:
     return _summary(session, item_id)
 
 
-def correction_notice(session: Session, item_id) -> str | None:
+def correction_notice(session: Session, item_id, lang: str = i18n.DEFAULT) -> str | None:
     """'↩︎ replaced: old → new' / '❓ maybe replaces' for the card of item_id.
 
     None when the item neither applied-superseded nor proposed-supersedes
@@ -122,23 +125,23 @@ def correction_notice(session: Session, item_id) -> str | None:
     proposed = proposed_supersedes_of(session, item_id)
     if not applied and not proposed:
         return None
-    new_summary = one_line_escaped(session, item_id)
+    new_summary = one_line_escaped(session, item_id, lang)
     lines: list[str] = []
     for rel in applied:
-        lines.append(f"↩︎ replaced: {one_line_escaped(session, rel.to_id)} → {new_summary}")
+        old = one_line_escaped(session, rel.to_id, lang)
+        lines.append(i18n.t(lang, "rv_replaced", old=old, new=new_summary))
     for rel in proposed:
-        lines.append(
-            f"❓ maybe replaces: {one_line_escaped(session, rel.to_id)} — confirm or keep both"
-        )
+        old = one_line_escaped(session, rel.to_id, lang)
+        lines.append(i18n.t(lang, "rv_maybe_replaces", old=old))
     return "\n".join(lines)
 
 
-def replaced_by_notice(session: Session, item_id) -> str | None:
+def replaced_by_notice(session: Session, item_id, lang: str = i18n.DEFAULT) -> str | None:
     """'↪︎ replaced by: <new>' for a superseded item's card (D4), or None."""
     rel = superseded_by_rel(session, item_id)
     if rel is None:
         return None
-    return f"↪︎ replaced by: {one_line_escaped(session, rel.from_id)}"
+    return i18n.t(lang, "rv_replaced_by", new=one_line_escaped(session, rel.from_id, lang))
 
 
 def relations_keyboard(
@@ -146,6 +149,7 @@ def relations_keyboard(
     *,
     applied: Sequence[ItemRelation],
     proposed: Sequence[ItemRelation],
+    lang: str = i18n.DEFAULT,
 ) -> list[list[tuple[str, str]]]:
     """One ↩︎ Undo row per applied relation; ✅/✖ row per proposed one.
 
@@ -155,13 +159,14 @@ def relations_keyboard(
     cannot drift out of sync with the registry.
     """
     rows: list[list[tuple[str, str]]] = [
-        [("↩︎ Undo", f"{CB_REL_UNDO}:{token}:{index}")] for index in range(len(applied))
+        [(i18n.t(lang, "rv_btn_undo"), f"{CB_REL_UNDO}:{token}:{index}")]
+        for index in range(len(applied))
     ]
     offset = len(applied)
     rows += [
         [
-            ("✅ Confirm replace", f"{CB_REL_CONFIRM}:{token}:{offset + index}"),
-            ("✖ Keep both", f"{CB_REL_KEEP_BOTH}:{token}:{offset + index}"),
+            (i18n.t(lang, "rv_btn_confirm"), f"{CB_REL_CONFIRM}:{token}:{offset + index}"),
+            (i18n.t(lang, "rv_btn_keep_both"), f"{CB_REL_KEEP_BOTH}:{token}:{offset + index}"),
         ]
         for index in range(len(proposed))
     ]
@@ -195,16 +200,17 @@ def recon_relation_of(session: Session, child_id) -> ItemRelation | None:
     return None
 
 
-def conflict_notice(session: Session, rel: ItemRelation) -> str:
+def conflict_notice(session: Session, rel: ItemRelation, lang: str = i18n.DEFAULT) -> str:
     """The CONFLICT card's block: which is right? + both versions escaped."""
-    return (
-        "which is right?\n"
-        f"  existing: {one_line_escaped(session, rel.to_id)}\n"
-        f"  new: {one_line_escaped(session, rel.from_id)}"
+    return i18n.t(
+        lang,
+        "rv_which",
+        old=one_line_escaped(session, rel.to_id, lang),
+        new=one_line_escaped(session, rel.from_id, lang),
     )
 
 
-def details_notice(session: Session, item_id) -> str | None:
+def details_notice(session: Session, item_id, lang: str = i18n.DEFAULT) -> str | None:
     """The MORE_DETAIL 🔔 line for an item's card: every recon details
     relation touching it (either direction) as one escaped line, or None.
     Never adds buttons — the detail itself is the other side's text."""
@@ -218,7 +224,7 @@ def details_notice(session: Session, item_id) -> str | None:
         if (rel.provenance or {}).get("how") != "recon":
             continue
         other = rel.to_id if rel.from_id == item_id else rel.from_id
-        lines.append(f"🔔 more detail captured: {one_line_escaped(session, other)}")
+        lines.append(i18n.t(lang, "rv_detail", other=one_line_escaped(session, other, lang)))
     if not lines:
         return None
     return "\n".join(lines)
