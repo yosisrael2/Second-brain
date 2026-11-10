@@ -98,22 +98,27 @@ to its section or doc.
 | Relations + dedupe + bot cards (Undo / Confirm / Keep-both / Restore) | **Done** | #48, #51 |
 | Telegram bot + launchd services (incl. the `network_recovered` event after a failure streak) | **Done** | #9-#12, #16, #18, #50, #67, #96 |
 | Cockpit (ops dashboard, restyle, health cards, WhatsApp sources, Connectors card, relations inspector) | **Done** | #13, #29, #46, #54, #80 |
+| Linux server host (file secret store, `brain secret-store`, systemd units, `deploy/README.md`; LLM token via `claude.env`) | **Done, live** on the home Proxmox server since 7 Nov | #157, #158 |
+| Auto-deploy on merge (pull-based systemd timer every 2 min: backup, fast-forward, pip, alembic, restart, health check, rollback unless the schema moved, Telegram notice) | **Done** (needs the one-time enable on the server) | #161, #166 |
+| Editable system prompts + a memory file appended to every prompt (versioned in the DB, cockpit Prompts tab, `/prompts` API) | **Done** | #162 |
+| Scheduled tasks with custom prompts (cron or hourly specs, run now / pause / resume, cockpit tab, `/schedules` in the bot, results to Telegram) | **Done** | #163, #164 |
+| Hebrew bot (user language is a `language` fact on `me`; `/language he\|en`; Hebrew cards, answers and every bot reply; bidi isolation) | **Done** (the full-reply pass is in review) | #160, #168 |
 | Ops safety (test isolation + session-start reset, live-store guards incl. the alembic live guard, ports, timeouts, tests never write the repo env file, fail-fast on unknown test-DB revision with `BRAIN_TEST_DB_RESET` opt-in) | **Done** | #10, #22, #23, #31, #38, #42, #45, #62, #70, #74, #75, #92, #122, #128 |
 | CI + extraction evaluation (incl. applies_to excl-gold-unknown; fastembed model cached between runs, 600s timeout on the eval module only) | **Done** | #4, #5, #25, #39, #61, #112 |
 
-**In progress** (5 Nov 2026)
+**In progress** (10 Nov 2026)
 
-- Nango as an opt-in token source for the Google connectors (PR #153, in review; the `brain connectors` commands only, so the email agent stays on the keychain)
+- Hebrew for every bot reply (PR #168, in review)
+- Connectors track (another session): Nango opt-in token source (PR #153), a cockpit Connectors page, then a read-only Google Keep connector
 - Stage-3 Google write-back design: Calendar + Tasks, proposal → confirm → write (PR #149, needs an explicit user GO before any write-back work)
-- WhatsApp acceptance re-run 5 (last run 6/11, bar 9/11)
-- 13 Nov hold-out eval
 
-The live instance runs `216e6c8` (deployed 28 Oct; pre-deploy backup `brain-pre-216e6c8-20261028-1730.sql`), which is everything on `main` through #151. Rollback is `git checkout --detach` of the previous sha + reinstall + restart, never `alembic downgrade`; DB backups live in `~/second-brain-backups/`. The email agent (gmail-poll) is installed and live, and the enrichment worker runs the LLM extractor for email only (cap 20/day). The other connectors (gcal, gdrive, gtasks) are registered but disabled, and the connectors launchd agent is not installed. Live held 486 items on 3 Nov. That day the stack was down for ~56h because Docker (Colima) had stopped. After the restart the API and WhatsApp agents recovered by themselves, but telegram and email needed a `launchctl kickstart -k`.
+**Where it runs.** Since 7 Nov 2026 the live service runs on the home Proxmox server (container `brain`, Ubuntu 24.04) from `/opt/second-brain` under systemd: `second-brain-api`, `second-brain-telegram`, `second-brain-email`. Postgres and Qdrant run in docker compose bound to 127.0.0.1; secrets live in `/root/.config/second-brain/` (0600). The Mac launchd agents are stopped and disabled (kept only for rollback). Once `second-brain-deploy.timer` is enabled, every merge to `main` deploys itself within about 2 minutes and reports to Telegram; until then a deploy is run by hand on the server (see [deploy/README.md](deploy/README.md)). Rollback is the previous sha + reinstall + restart, never `alembic downgrade`. WhatsApp is paused until its bridge moves to the server. The cockpit is reached over Tailscale (`tailscale serve` → 127.0.0.1:27800); the API stays loopback-only.
 
 **Planned**
 
 - Actions: approved items become Google Calendar events / tasks (design in PR #149, pending the user's GO)
-- Agent resilience: telegram + email reconnect on their own after a database outage, and an alert when Docker/Postgres is down
+- Move WhatsApp and its bridge to the server
+- Health: the "background" component knows only launchd; teach it systemd
 
 **Quality check** (22-23 Oct 2026, real questions): calendar questions **10/10**,
 school-email questions **11/12**, WhatsApp questions **6.5/11** (up from a
@@ -565,6 +570,8 @@ Shipped sources (all READ-ONLY; all disabled until enabled):
    (the framework owns them).
 
 ## Background services (launchd, 24/7)
+
+> The live service now runs on a Linux server under systemd (see [deploy/README.md](deploy/README.md)). This section describes the macOS launchd setup, kept for local runs and rollback.
 
 `scripts/service.sh` installs per-user LaunchAgents that survive logins and
 reboots — API, Telegram bot, WhatsApp poller, an opt-in Gmail agent
