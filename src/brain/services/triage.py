@@ -207,7 +207,7 @@ _HEBREW_PREFIX_RUN = "[והבכלמש]{0,3}"
 
 
 def mentions_name(name: str, text: str) -> bool:
-    """Whole-word name match (THE one implementation — ask + triage share it).
+    r"""Whole-word name match (THE one implementation — ask + triage share it).
 
     'May' must not fire inside 'mayor', 'שחר' not inside 'שחרור': nothing
     word-like may touch the name (\w is Unicode-aware, so Hebrew letters

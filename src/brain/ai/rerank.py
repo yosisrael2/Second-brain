@@ -19,6 +19,15 @@ RANK_LEVELS: tuple[str, ...] = (
     "Directly answers the question",
 )
 DEFAULT_TOP_N = 5
+# Jev rejects a request whose input is too large (HTTP 400
+# max_tokens_exceeded; measured 11 Nov 2026: 48 Hebrew candidates of 1,000
+# chars = ~32k input tokens pass, 1,500 chars fail). /ask sends up to
+# ask_recall_pool + ask_kid_recall_limit (48) full item texts, and one long
+# email was enough to fail every rerank, silently falling back to vector
+# order. Each candidate is cut to its share of this budget (relevance is
+# judged on the head of the text), never below the floor.
+STATE_CHAR_BUDGET = 24_000
+MIN_CANDIDATE_CHARS = 300
 
 
 def rerank(
@@ -41,13 +50,19 @@ def rerank(
         scores = jev.score_batch(
             f"How relevant is this candidate to the question: {question}",
             list(RANK_LEVELS),
-            [item_text(candidate) for candidate in candidates],
+            _bounded_texts(candidates),
         )
     except JevError as exc:
         logger.warning("rerank: jev unavailable (%s); keeping original order", exc)
         return list(candidates)[:top_n]
     ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0].score)
     return [candidate for _, candidate in ranked][:top_n]
+
+
+def _bounded_texts(candidates: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Candidate texts, each cut to its share of :data:`STATE_CHAR_BUDGET`."""
+    cap = max(MIN_CANDIDATE_CHARS, STATE_CHAR_BUDGET // len(candidates))
+    return [item_text(candidate)[:cap] for candidate in candidates]
 
 
 @dataclass(frozen=True)
