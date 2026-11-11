@@ -1108,8 +1108,9 @@ def test_recon_eval_accepts_spec_shape(tmp_path):
                        "start": _jlm(10, 18, 0).isoformat(),
                        "applies_to": ["Rona"]},
          "verdict": "UPDATE"},
-        # mixed-case verdict + kind still works
-        {"case_id": "spec-2",
+        # mixed-case verdict + kind still works; pinned `now` (without it the
+        # 10.11 event left the window on 11 Nov 2026 and the test went red)
+        {"case_id": "spec-2", "now": "2026-11-02T12:00:00+02:00",
          "existing_items": [
              {"id": "e2", "type": "event", "title": "טיול שנתי",
               "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"]}],
