@@ -177,10 +177,10 @@ def test_extract_cited_ids_requires_bracket_syntax():
 CONFLICT_ITEMS = [
     {
         "id": "cal-1",
-        "text": "Rona football — Wed 28 Oct 15:00-16:30 @ מרכז דקל",
+        "text": "Romi football — Wed 28 Oct 15:00-16:30 @ מרכז דקל",
         "when": "Wed 28 Oct 15:00-16:30",
     },
-    {"id": "wa-2", "text": "Rona's Wednesday football moved to 15:15-16:15 at השדה 10"},
+    {"id": "wa-2", "text": "Romi's Wednesday football moved to 15:15-16:15 at השדה 10"},
 ]
 
 
@@ -189,7 +189,7 @@ class TestConflictRule:
         llm = FakeLLMClient()
 
         answer(
-            "is there any conflict between Rona's football and my calendar?",
+            "is there any conflict between Romi's football and my calendar?",
             CONFLICT_ITEMS,
             llm=llm,
         )

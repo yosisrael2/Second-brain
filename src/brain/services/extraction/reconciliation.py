@@ -264,7 +264,7 @@ class ReconResult:
 
 def _sender_address(meta: dict[str, Any]) -> str:
     """The sender's bare email address from a source's meta (bug 4, review
-    round 2): email sources write it under 'from' ("Rinat <rinat@x>" or the
+    round 2): email sources write it under 'from' ("Tamar <tamar@x>" or the
     bare address), WhatsApp under 'sender'. Empty when neither holds one."""
     for key in ("from", "sender"):
         value = str(meta.get(key) or "")

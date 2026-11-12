@@ -53,14 +53,14 @@ def _core() -> TelegramBot:
 def _seed_family(memory: MemoryService) -> None:
     """One kid (user-confirmed seed path) + one free-text note on 'me'."""
     memory.set_kid(
-        "Rona",
+        "Romi",
         gender="girl",
-        school="בית הספר בראשית",
+        school="בית הספר הגפן",
         grade="5",
-        class_="ה' ספיר",
-        teacher="Rinat",
+        class_="ה' ברוש",
+        teacher="Tamar",
     )
-    memory.remember("Itamar plays basketball")
+    memory.remember("Ilan plays basketball")
 
 
 def test_profile_shows_seeded_kid_and_note(memory_db) -> None:
@@ -71,9 +71,9 @@ def test_profile_shows_seeded_kid_and_note(memory_db) -> None:
     reply = core.route("/profile", 111)
 
     assert "Profile" in reply.text
-    assert "Rona" in reply.text and "girl" in reply.text and "Rinat" in reply.text
-    assert "ה' ספיר" in reply.text
-    assert "Itamar plays basketball" in reply.text
+    assert "Romi" in reply.text and "girl" in reply.text and "Tamar" in reply.text
+    assert "ה' ברוש" in reply.text
+    assert "Ilan plays basketball" in reply.text
     # every ✖ button carries the number of its fact line (must-fix 2)
     buttons = [label for row in (reply.keyboard or []) for (label, _) in row]
     assert buttons, "profile must offer one ✖ per fact line"
@@ -224,8 +224,8 @@ def test_display_names_use_the_hebrew_alias(memory_db) -> None:
     core = _core()
     with core._services_factory() as services:  # noqa: SLF001 - seeding
         _seed_family(services.memory)
-        rona = services.memory._repo.find_entity(kind="person", name="Rona")  # noqa: SLF001
-        services.memory.add_alias(rona.id, "Roni")
-        services.memory.add_alias(rona.id, "רונה")
-        assert services.memory.display_names("he") == {"Rona": "רונה"}
+        romi = services.memory._repo.find_entity(kind="person", name="Romi")  # noqa: SLF001
+        services.memory.add_alias(romi.id, "Roni")
+        services.memory.add_alias(romi.id, "רומי")
+        assert services.memory.display_names("he") == {"Romi": "רומי"}
         assert services.memory.display_names("en") == {}

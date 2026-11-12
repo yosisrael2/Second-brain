@@ -27,7 +27,7 @@ from brain.services.paste import parse as parse_paste
 
 _ICS = (
     "BEGIN:VEVENT\n"
-    "SUMMARY:צופים רונה\n"
+    "SUMMARY:צופים רומי\n"
     "DTSTART;TZID=Asia/Jerusalem:20261029T170000\n"
     "DTEND;TZID=Asia/Jerusalem:20261029T181500\n"
     "END:VEVENT"
@@ -35,7 +35,7 @@ _ICS = (
 
 _ICS_2 = (
     "BEGIN:VEVENT\n"
-    "SUMMARY:צופים רונה\n"
+    "SUMMARY:צופים רומי\n"
     "DTSTART;TZID=Asia/Jerusalem:20261105T170000\n"
     "DTEND;TZID=Asia/Jerusalem:20261105T181500\n"
     "END:VEVENT"

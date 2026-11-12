@@ -53,7 +53,7 @@ def test_today_counts_as_the_weekday_match() -> None:
 def test_this_week_spans_the_israeli_week_and_reaches_a_week_ahead() -> None:
     # Israeli week starts Sunday; now (Thu 22) is late in the week, so the
     # window always reaches 7 days ahead to include upcoming days.
-    assert _ranges("How many times does Itamar have football this week?") == [
+    assert _ranges("How many times does Ilan have football this week?") == [
         "Sun 18 Oct 00:00..Thu 29 Oct 00:00"
     ]
 
@@ -79,7 +79,7 @@ def test_lunch_in_hebrew_is_not_an_afternoon_query() -> None:
 
 
 def test_no_date_expression_yields_no_range() -> None:
-    assert _ranges("Who picks Itamar up from basketball?") == []
+    assert _ranges("Who picks Ilan up from basketball?") == []
 
 
 def test_dst_boundary_is_honored_in_the_range_edges() -> None:

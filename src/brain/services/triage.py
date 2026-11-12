@@ -201,8 +201,8 @@ class RefreshableTrier:
 
 
 _HEBREW_LETTER = "[\u05d0-\u05ea]"
-# Hebrew words glue one-letter prefixes onto the word itself ('לאיתמר',
-# 'ואיתמר', 'שלאיתמר') — up to 3 of them, directly before the name.
+# Hebrew words glue one-letter prefixes onto the word itself ('לאילן',
+# 'ואילן', 'שלאילן') — up to 3 of them, directly before the name.
 _HEBREW_PREFIX_RUN = "[והבכלמש]{0,3}"
 
 
@@ -227,11 +227,11 @@ def is_name_token(name: str, token: str) -> bool:
     """Full-TOKEN name match (audience resolution — the conservative sibling).
 
     Unlike :func:`mentions_name` (a whole-word SEARCH inside longer text),
-    here the token must BE the name: an extracted "רונה לוי" or "Rona
-    Cohen" must NOT resolve to our Rona — zero wrong-child is the A2 bar,
+    here the token must BE the name: an extracted "רומי לוי" or "Romi
+    Cohen" must NOT resolve to our Romi — zero wrong-child is the A2 bar,
     and an "unknown" is always safer. Same normalisation as mentions_name:
     case-insensitive, and for Hebrew-letter names an optional run of up to
-    3 Hebrew prefix letters directly before the name (ורונה still matches).
+    3 Hebrew prefix letters directly before the name (ורומי still matches).
     """
     if not name or not token:
         return False

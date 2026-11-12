@@ -20,7 +20,7 @@
  *                <type>"); the reverse side is derived here, so one fact
  *                shows on both profiles
  *   groups       channel entities; applies_to + channel_kind label them by
- *                meaning ("Itamar · parents' chat")
+ *                meaning ("Ilan · parents' chat")
  *
  * Depends only on app.js's globals (el, $, api, toast, shortId,
  * switchTab, openInspector) and exposes ONE global:
@@ -297,7 +297,7 @@ function buildModel() {
     if ((entity.facts || []).length) proposedBySubject.set(entity.id, entity.facts);
   }
   // Mention tokens: names + aliases of people/groups (not channels: their
-  // names are long chat titles), longest first so "Rona C." beats "Rona".
+  // names are long chat titles), longest first so "Romi C." beats "Romi".
   const tokens = [];
   for (const entity of entities) {
     if (entity.kind === "channel" || entity.name === "me") continue;
@@ -374,7 +374,7 @@ function connectionsOf(entity) {
   return rows;
 }
 
-// "Dad of Itamar and Rona · Married to Zohar · in 5 groups"
+// "Dad of Ilan and Romi · Married to Keren · in 5 groups"
 function connectionSummary(entity, rows) {
   const byRole = new Map();
   let groups = 0;

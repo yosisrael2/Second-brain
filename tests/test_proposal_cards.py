@@ -121,14 +121,14 @@ class TestHebrewCard:
                 type="event",
                 occurred_at=datetime(2026, 11, 29, 22, 0, tzinfo=UTC),  # 30.11 local
                 child_state="proposed",
-                applies_to=["Itamar"],
+                applies_to=["Ilan"],
             ),
             MemoryItem(
                 raw_text="מפגש סיכום דיאלוג בנים",
                 source="email",
                 type="event",
                 child_state="proposed",
-                applies_to=["Itamar"],
+                applies_to=["Ilan"],
             ),
             MemoryItem(
                 raw_text="תחרות מטוסי הנייר של שכבה ו'",
@@ -142,15 +142,15 @@ class TestHebrewCard:
 
     def test_hebrew_card_is_numbered_and_explicit(self, world):
         repo, _session, _memory = world
-        source = _capture(repo, "עדכונים מכיתה ב' ברקת")
+        source = _capture(repo, "עדכונים מכיתה ב' רימון")
         children = self._children(repo)
 
-        card = render_source_card(source, children, TZ, lang="he", names={"Itamar": "איתמר"})
+        card = render_source_card(source, children, TZ, lang="he", names={"Ilan": "אילן"})
 
         assert card.split("\n") == [
-            "🧠 מצאתי 3 פריטים בהודעה: עדכונים מכיתה ב' ברקת",
-            "1. 📅 מבחן לאיתור מחוננים · יום ב׳ 30.11 · איתמר",
-            "2. 📅 מפגש סיכום דיאלוג בנים · ללא תאריך · איתמר",
+            "🧠 מצאתי 3 פריטים בהודעה: עדכונים מכיתה ב' רימון",
+            "1. 📅 מבחן לאיתור מחוננים · יום ב׳ 30.11 · אילן",
+            "2. 📅 מפגש סיכום דיאלוג בנים · ללא תאריך · אילן",
             "<blockquote expandable>ℹ️ לידיעה בלבד (1)",
             "ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו</blockquote>",
         ]
@@ -172,8 +172,8 @@ class TestHebrewCard:
         source = _capture(repo, "Class update")
         lines = render_source_card(source, self._children(repo), TZ).split("\n")
 
-        assert lines[1] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Itamar"
-        assert lines[2].endswith("· no date · Itamar")
+        assert lines[1] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Ilan"
+        assert lines[2].endswith("· no date · Ilan")
         assert lines[4].endswith("· not for us</blockquote>")
 
 

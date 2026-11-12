@@ -455,13 +455,13 @@ def test_adopt_rule_c_matches_subject_sender_and_time(adopt_db):
         source="email",
         raw_text=(
             "---------- Forwarded message ---------\n"
-            "מאת: בית הספר בראשית <bereshit.meshalev@edu-haifa.org.il>\n"
+            "מאת: בית הספר הגפן <office@example-school.org.il>\n"
             'נושא: תשלומי הורים תשפ"ז\nתאריך: 2026-10-22 12:43\n\nגוף ההודעה'
         ),
         occurred_at=datetime(2026, 10, 22, 10, 43, tzinfo=UTC),
         meta={
             "subject": 'תשלומי הורים תשפ"ז',
-            "from": "בית הספר בראשית <bereshit.meshalev@edu-haifa.org.il>",
+            "from": "בית הספר הגפן <office@example-school.org.il>",
             "date_iso": "2026-10-22T10:43:00+00:00",
         },
     )
@@ -470,11 +470,11 @@ def test_adopt_rule_c_matches_subject_sender_and_time(adopt_db):
         external_id="msg_9",
         version='"v1"',
         title='תשלומי הורים תשפ"ז',
-        text='תשלומי הורים תשפ"ז\n\nמ: בית הספר בראשית\n\nגוף ההודעה',
+        text='תשלומי הורים תשפ"ז\n\nמ: בית הספר הגפן\n\nגוף ההודעה',
         occurred_at=datetime(2026, 10, 22, 10, 43, tzinfo=UTC),
         meta={
             "subject": 'תשלומי הורים תשפ"ז',
-            "from": "בית הספר בראשית <bereshit.meshalev@edu-haifa.org.il>",
+            "from": "בית הספר הגפן <office@example-school.org.il>",
         },
     )
     report = adopt_connector(FakeConnector(name="email", batches=[_batch(record)]), adopt_db)
@@ -485,7 +485,7 @@ def test_adopt_rule_c_two_minute_boundary(adopt_db):
     h = Harness(adopt_db)
     meta = {
         "subject": "תשלומי הורים",
-        "from": "בית הספר בראשית <bereshit.meshalev@edu-haifa.org.il>",
+        "from": "בית הספר הגפן <office@example-school.org.il>",
         "date_iso": "2026-10-22T10:43:00+00:00",
     }
     rec_meta = {"subject": "תשלומי הורים", "from": meta["from"]}
@@ -525,7 +525,7 @@ def test_adopt_rule_c_ambiguous_two_candidates(adopt_db):
     h = Harness(adopt_db)
     rec_meta = {
         "subject": "תשלומי הורים",
-        "from": "בית הספר בראשית <bereshit.meshalev@edu-haifa.org.il>",
+        "from": "בית הספר הגפן <office@example-school.org.il>",
     }
     item_meta = {
         "subject": "תשלומי הורים",

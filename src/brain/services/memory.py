@@ -315,8 +315,8 @@ class MemoryService:
     def display_names(self, lang: str) -> dict[str, str]:
         """Entity name -> the name to show in ``lang``.
 
-        For Hebrew: the first alias written in Hebrew letters (``Itamar`` ->
-        ``איתמר``). Names without such an alias (and every name in English)
+        For Hebrew: the first alias written in Hebrew letters (``Ilan`` ->
+        ``אילן``). Names without such an alias (and every name in English)
         show as stored."""
         if lang != "he":
             return {}
@@ -399,8 +399,8 @@ class MemoryService:
                 continue
             # review round 2, bug 2: the SHARED whole-word matcher, one
             # direction only (does the sender mention the teacher?). Raw
-            # containment matched a same-first-name parent ('Rinat Levi'),
-            # a word containing the name ('Rinatech') and a short sender
+            # containment matched a same-first-name parent ('Tamar Levi'),
+            # a word containing the name ('Tamartech') and a short sender
             # inside a long teacher name. A first-name-only teacher fact
             # can still match a same-named parent — acceptable for now:
             # the results are proposals (D2 Keep/Fix/Drop), not actions.
@@ -434,10 +434,10 @@ class MemoryService:
         named = audience.get("named_kids") or []
         if named:
             # FULL-TOKEN match required (the searching mentions_name is not
-            # used here on purpose): an extracted classmate "רונה לוי" or
-            # "Rona Cohen" must stay ["unknown"] — zero wrong-child is the
+            # used here on purpose): an extracted classmate "רומי לוי" or
+            # "Romi Cohen" must stay ["unknown"] — zero wrong-child is the
             # A2 bar, and unknown is always safer than a wrong kid. Hebrew
-            # prefix runs (ורונה) still match, case-insensitively for
+            # prefix runs (ורומי) still match, case-insensitively for
             # English; a name and its alias never double-count.
             # Aliases come from each kid's OWN entity (the id kids() already
             # resolved via the kid's confirmed grade fact) — never a
@@ -1306,9 +1306,9 @@ def _norm_label(value: Any) -> str:
     Both sides of every comparison go through this: textnorm.normalize
     (geresh/gershayim, maqaf/dashes, nikud, bidi, whitespace, case) plus
     label-specific folding — quote marks dropped (ה' -> ה), dashes to
-    spaces (ה-ספיר -> ה ספיר), and a leading כיתה/class word stripped
-    (כיתה ה' ספיר -> ה ספיר). Memory stores e.g. ה' ספיר while text or
-    the LLM may write ה׳ ספיר, ה ספיר, כיתה ה' ספיר or ה-ספיר.
+    spaces (ה-ברוש -> ה ברוש), and a leading כיתה/class word stripped
+    (כיתה ה' ברוש -> ה ברוש). Memory stores e.g. ה' ברוש while text or
+    the LLM may write ה׳ ברוש, ה ברוש, כיתה ה' ברוש or ה-ברוש.
     """
     import re as _re  # noqa: PLC0415
 

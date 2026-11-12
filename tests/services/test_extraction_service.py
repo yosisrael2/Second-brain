@@ -198,7 +198,7 @@ def test_date_conflict_child_lands_in_needs_review(world: World):
 def test_applies_to_resolved_via_memory_unknown_stays_unknown(world: World):
     """Audience resolves against memory (R1-R5); no audience info stays 'unknown' (R4)."""
     world.memory.set_kid(
-        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+        "Romi", gender="girl", school="רימון", grade="2", class_="ב2", teacher="סיגל"
     )
     source = _capture(world.repo, "אספת הורים 22.10 בכיתה ב2", source="email")
     extractor = CountingExtractor(
@@ -208,7 +208,7 @@ def test_applies_to_resolved_via_memory_unknown_stays_unknown(world: World):
                 title="אספת הורי כיתה ב2",
                 quote="אספת הורים 22.10",
                 when_raw="22.10",
-                audience={"school": "ברקת", "class_": "ב2"},
+                audience={"school": "רימון", "class_": "ב2"},
             )
         ]
     )
@@ -216,7 +216,7 @@ def test_applies_to_resolved_via_memory_unknown_stays_unknown(world: World):
     service.enqueue(source)
     service.run_once(NOW)
     child = [row for row in world.session.query(MemoryItem).all() if row.child_state][0]
-    assert child.applies_to == ["Rona"]
+    assert child.applies_to == ["Romi"]
 
     # a candidate with NO audience info resolves to 'unknown', never 'nobody'
     other = _capture(world.repo, "הודעה כללית ללא קהל 22.10 חשובה", source="email")
@@ -330,7 +330,7 @@ def test_untouched_proposed_child_updates_in_place_when_memory_changes(world: Wo
     """Item 18: a proposed (user-untouched) child may be updated in place.
 
     Run 1: no kid in memory -> applies_to ['unknown']. Then the user seeds the
-    kid. Run 2 (same identity): the child now carries ['Rona'].
+    kid. Run 2 (same identity): the child now carries ['Romi'].
     """
     body = "אספת הורים לכיתה ב2 ביום חמישי 22.10 בחצר הגדולה"
     source = _capture(world.repo, body, source="email")
@@ -339,7 +339,7 @@ def test_untouched_proposed_child_updates_in_place_when_memory_changes(world: Wo
         title="אספת הורים ביום חמישי 22.10",
         quote="ביום חמישי 22.10",
         when_raw="22.10",
-        audience={"school": "ברקת", "class_": "ב2"},
+        audience={"school": "רימון", "class_": "ב2"},
     )
     service = world.with_extractor(CountingExtractor([candidate]))
     service.enqueue(source)
@@ -348,7 +348,7 @@ def test_untouched_proposed_child_updates_in_place_when_memory_changes(world: Wo
     assert child.applies_to == ["unknown"]
 
     world.memory.set_kid(
-        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+        "Romi", gender="girl", school="רימון", grade="2", class_="ב2", teacher="סיגל"
     )
     job = world.session.query(EnrichmentJob).one()
     job.state = "queued"
@@ -358,7 +358,7 @@ def test_untouched_proposed_child_updates_in_place_when_memory_changes(world: Wo
     assert report.children_created == 0
     assert report.children_updated == 1
     world.session.refresh(child)
-    assert child.applies_to == ["Rona"]
+    assert child.applies_to == ["Romi"]
     assert child.child_state == "proposed"  # still proposed until the user keeps it
 
 
@@ -555,23 +555,23 @@ def test_same_title_different_applies_to_is_not_the_same_child(world: World):
         ChildCandidate(
             kind="event", title="אספת הורים לכיתה ב2",
             quote="אספת הורים 22.10 בכיתה ב2",
-            when_raw="22.10", audience={"school": "ברקת", "grades": "2"},
+            when_raw="22.10", audience={"school": "רימון", "grades": "2"},
         ),
         ChildCandidate(
             kind="event", title="אספת הורים לכיתה ה",
             quote="אספת הורים 22.10 בכיתה ג3",
-            when_raw="22.10", audience={"school": "ברקת", "grades": "5"},
+            when_raw="22.10", audience={"school": "רימון", "grades": "5"},
         ),
     ]
     world.memory.set_kid(
-        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+        "Romi", gender="girl", school="רימון", grade="2", class_="ב2", teacher="סיגל"
     )
     service = world.with_extractor(CountingExtractor(candidates))
     service.enqueue(source)
     report = service.run_once(NOW)
     assert report.children_created == 2  # different audiences: two children
     audiences = sorted(tuple(row.applies_to) for row in _children(world.session))
-    assert audiences == [("Rona",), ("nobody",)]
+    assert audiences == [("Romi",), ("nobody",)]
 
 
 def test_same_title_with_different_applies_to_stays_two_children(world: World):
@@ -579,16 +579,16 @@ def test_same_title_with_different_applies_to_stays_two_children(world: World):
     body = "מסיבת יום הולדת 22.10 בכיתה ב2 ומסיבת יום הולדת 22.10 בכיתה ה"
     source = _capture(world.repo, body, source="email")
     world.memory.set_kid(
-        "Rona", gender="girl", school="ברקת", grade="2", class_="ב2", teacher="מעין"
+        "Romi", gender="girl", school="רימון", grade="2", class_="ב2", teacher="סיגל"
     )
     candidates = [
         ChildCandidate(
             kind="event", title="מסיבת יום הולדת", quote="מסיבת יום הולדת 22.10",
-            when_raw="22.10", audience={"school": "ברקת", "grades": "2"},
+            when_raw="22.10", audience={"school": "רימון", "grades": "2"},
         ),
         ChildCandidate(
             kind="event", title="מסיבת יום הולדת", quote="מסיבת יום הולדת 22.10",
-            when_raw="22.10", audience={"school": "ברקת", "grades": "5"},
+            when_raw="22.10", audience={"school": "רימון", "grades": "5"},
         ),
     ]
     service = world.with_extractor(CountingExtractor(candidates))
@@ -596,7 +596,7 @@ def test_same_title_with_different_applies_to_stays_two_children(world: World):
     report = service.run_once(NOW)
     assert report.children_created == 2  # same title, different audiences
     audiences = sorted(tuple(row.applies_to) for row in _children(world.session))
-    assert audiences == [("Rona",), ("nobody",)]
+    assert audiences == [("Romi",), ("nobody",)]
 
 
 def test_dropped_child_suppressed_even_after_rewording(world: World):
@@ -809,7 +809,7 @@ GOOD_REPLY = (
     '{"candidates": ['
     '{"kind": "event", "title": "כינוס הורים",'
     ' "quote": "כינוס הורים ביום חמישי 22.10",'
-    ' "when_raw": "22.10", "audience": {"school": "ברקת", "grades": "2"},'
+    ' "when_raw": "22.10", "audience": {"school": "רימון", "grades": "2"},'
     ' "importance": 3, "actionability": "none"},'
     '{"kind": "task", "title": "לשלם תשלום הורים", "quote": "הסדירו זאת בהקדם",'
     ' "when_raw": "", "due": true, "importance": 4, "actionability": "now"}'
@@ -925,12 +925,12 @@ def test_derived_child_skips_grounding_and_records_the_link(world: World):
         ChildCandidate(
             kind="fact", title="מיום 1.11 יוצאת כיתה ב2 ב-12:55",
             quote="מיום ראשון 1.11 יוצאת כיתה ב2 ב-12:55", when_raw="1.11",
-            audience={"school": "ברקת", "grades": "2"},
+            audience={"school": "רימון", "grades": "2"},
         ),
         ChildCandidate(
-            kind="task", title="לאסוף את רונה ב-12:55 מיום 1.11",
+            kind="task", title="לאסוף את רומי ב-12:55 מיום 1.11",
             quote="", when_raw="1.11", due=True, derived_from="0",
-            audience={"named_kids": ["Rona"]},
+            audience={"named_kids": ["Romi"]},
         ),
     ]
     service = world.with_extractor(CountingExtractor(candidates))
@@ -984,15 +984,15 @@ def test_compound_weekday_date_when_raw_survives_to_a_conflict_flag(world: World
 
 
 def _seed_teacher_memory(session: Session) -> None:
-    """Rona in ה' ספיר with teacher Rinat; Itamar ב' ברקת with Maayan."""
+    """Romi in ה' ברוש with teacher Tamar; Ilan ב' רימון with Sigal."""
     memory = MemoryService(MemoryRepository(session))
     memory.set_kid(
-        "Rona", gender="girl", school="בראשית", grade="5",
-        class_="ה' ספיר", teacher="Rinat",
+        "Romi", gender="girl", school="הגפן", grade="5",
+        class_="ה' ברוש", teacher="Tamar",
     )
     memory.set_kid(
-        "Itamar", gender="boy", school="בראשית", grade="2",
-        class_="ב' ברקת", teacher="Maayan",
+        "Ilan", gender="boy", school="הגפן", grade="2",
+        class_="ב' רימון", teacher="Sigal",
     )
 
 
@@ -1002,19 +1002,19 @@ def test_narrow_audience_matrix():
 
     narrow = EnrichmentService._narrow_audience
     assert narrow(None, ["unknown"]) == ["unknown"]  # no default -> item stands
-    assert narrow(["Rona"], ["unknown"]) == ["Rona"]  # unknown -> default
-    assert narrow(["Rona"], ["nobody"]) == ["nobody"]  # explicit exclusion stands
-    assert narrow(["Rona"], ["Rona"]) == ["Rona"]
-    assert narrow(["Rona", "Itamar"], ["Rona"]) == ["Rona"]  # subset narrows
-    assert narrow(["Rona"], ["Itamar"]) == ["nobody"]  # disjoint -> nobody
-    assert narrow(["Rona"], ["me"]) == ["me"]  # role-based 'me' compatible
+    assert narrow(["Romi"], ["unknown"]) == ["Romi"]  # unknown -> default
+    assert narrow(["Romi"], ["nobody"]) == ["nobody"]  # explicit exclusion stands
+    assert narrow(["Romi"], ["Romi"]) == ["Romi"]
+    assert narrow(["Romi", "Ilan"], ["Romi"]) == ["Romi"]  # subset narrows
+    assert narrow(["Romi"], ["Ilan"]) == ["nobody"]  # disjoint -> nobody
+    assert narrow(["Romi"], ["me"]) == ["me"]  # role-based 'me' compatible
 
 
 def test_sender_default_rescues_unknown_children(world: World):
     """A class teacher's update with NO audience in the body -> her kid."""
     _seed_teacher_memory(world.session)
     source = _capture(world.repo, "מחר יום ספורט. מומלץ להגיע עם בגד ספורט.", source="email")
-    source.meta = {**source.meta, "sender": "Rinat <rinat@bereshit.edu>"}
+    source.meta = {**source.meta, "sender": "Tamar <tamar@example-school.edu>"}
     world.repo.commit()
     candidates = [
         ChildCandidate(
@@ -1026,14 +1026,14 @@ def test_sender_default_rescues_unknown_children(world: World):
     service.enqueue(source)
     service.run_once(NOW)
     child = _children(world.session)[0]
-    assert child.applies_to == ["Rona"]  # was ['unknown'] before the sender default
+    assert child.applies_to == ["Romi"]  # was ['unknown'] before the sender default
 
 
 def test_item_level_audience_narrows_the_sender_default(world: World):
     """Girls-only notice from a teacher whose kid is a BOY -> nobody."""
     _seed_teacher_memory(world.session)
     source = _capture(world.repo, "בנות בלבד: מבחן ביום ראשון", source="email")
-    source.meta = {**source.meta, "sender": "Maayan <maayan@bereshit.edu>"}
+    source.meta = {**source.meta, "sender": "Sigal <sigal@example-school.edu>"}
     world.repo.commit()
     candidates = [
         ChildCandidate(
@@ -1046,7 +1046,7 @@ def test_item_level_audience_narrows_the_sender_default(world: World):
     service.enqueue(source)
     service.run_once(NOW)
     child = _children(world.session)[0]
-    assert child.applies_to == ["nobody"]  # narrowed: Itamar is a boy
+    assert child.applies_to == ["nobody"]  # narrowed: Ilan is a boy
 
 
 def test_extraction_worker_disabled_by_default():
@@ -1062,18 +1062,18 @@ def test_extraction_worker_disabled_by_default():
 
 
 def test_narrow_audience_keeps_me_alongside_the_kid():
-    """Review round 2, bug 1: item ['Itamar', 'me'] (a class activity that
+    """Review round 2, bug 1: item ['Ilan', 'me'] (a class activity that
     also asks the parent to act) must not lose the reader's half when the
     sender default names the kid — 'me' is role-based and never narrowed by
     a kid-set default."""
     from brain.services.extraction.service import EnrichmentService
 
     narrow = EnrichmentService._narrow_audience
-    assert narrow(["Itamar"], ["Itamar", "me"]) == ["Itamar", "me"]
+    assert narrow(["Ilan"], ["Ilan", "me"]) == ["Ilan", "me"]
     # nothing of the kid-set survives: the reader's own half stays
-    assert narrow(["Rona"], ["Itamar", "me"]) == ["me"]
+    assert narrow(["Romi"], ["Ilan", "me"]) == ["me"]
     # unchanged: no 'me', no overlap -> nobody
-    assert narrow(["Rona"], ["Itamar"]) == ["nobody"]
+    assert narrow(["Romi"], ["Ilan"]) == ["nobody"]
 
 
 def test_one_bad_candidate_no_longer_kills_the_valid_ones(world: World):
@@ -1259,7 +1259,7 @@ def test_eval_runner_emits_one_row_per_child(world: World, tmp_path):
     body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
     emails = tmp_path / "emails.txt"
     emails.write_text(
-        "From: Morah Rinat <rinat@example.org>\n"
+        "From: Morah Tamar <tamar@example.org>\n"
         "Date: Mon, 19 Oct 2026 09:00\n"
         f"\n{body}\n",
         encoding="utf-8",
@@ -1347,13 +1347,13 @@ def test_scope_school_overrides_the_sender_default(world: World):
     """R3: a whole-school notice from a class teacher covers EVERY kid."""
     _seed_teacher_memory(world.session)
     source = _capture(world.repo, "החופשה מתחילה ביום חמישי 22.10", source="email")
-    source.meta = {**source.meta, "sender": "Rinat <rinat@bereshit.edu>"}
+    source.meta = {**source.meta, "sender": "Tamar <tamar@example-school.edu>"}
     world.repo.commit()
     candidates = [
         ChildCandidate(
             kind="event", title="חופשה",
             quote="החופשה מתחילה ביום חמישי 22.10", when_raw="יום חמישי 22.10",
-            audience={"school": "בראשית", "scope": "school"},
+            audience={"school": "הגפן", "scope": "school"},
         ),
         ChildCandidate(
             kind="event", title="טיול הכיתה",  # class-scoped: default narrows
@@ -1365,14 +1365,14 @@ def test_scope_school_overrides_the_sender_default(world: World):
     service.enqueue(source)
     service.run_once(NOW)
     rows = {row.raw_text: row for row in _children(world.session)}
-    assert rows["חופשה"].applies_to == ["Rona", "Itamar"]  # widened, not narrowed
-    assert rows["טיול הכיתה"].applies_to == ["Rona"]  # sender default applies
+    assert rows["חופשה"].applies_to == ["Romi", "Ilan"]  # widened, not narrowed
+    assert rows["טיול הכיתה"].applies_to == ["Romi"]  # sender default applies
 
 
 def test_scope_community_overrides_the_sender_default(world: World):
     _seed_teacher_memory(world.session)
     source = _capture(world.repo, "אירוע קהילתי ביום שני 26.10", source="email")
-    source.meta = {**source.meta, "sender": "Maayan <maayan@bereshit.edu>"}
+    source.meta = {**source.meta, "sender": "Sigal <sigal@example-school.edu>"}
     world.repo.commit()
     candidates = [
         ChildCandidate(
@@ -1384,7 +1384,7 @@ def test_scope_community_overrides_the_sender_default(world: World):
     service = world.with_extractor(CountingExtractor(candidates))
     service.enqueue(source)
     service.run_once(NOW)
-    assert _children(world.session)[0].applies_to == ["Rona", "Itamar"]
+    assert _children(world.session)[0].applies_to == ["Romi", "Ilan"]
 
 
 def test_extractor_rejects_a_bad_scope(world: World):
