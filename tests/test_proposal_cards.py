@@ -740,6 +740,7 @@ class TestBotProposalFlow:
         chat_id, reply = pings[0]
         assert chat_id == 7
         assert "⏰ due soon" in reply.text
+        assert reply.silent is False  # a day away or closer: the ping rings
         token = _token_of(reply, CB_PROPOSED_KEEP)
         assert f"{CB_PROPOSED_DROP}:{token}:0" in [d for row in reply.keyboard for _l, d in row]
         assert bot.due_pings(NOW) == []  # one ping per child, never repeated

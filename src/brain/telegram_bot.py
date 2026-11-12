@@ -80,6 +80,7 @@ from brain.services.proposals import (
     apply_keep,
     due_proposed_children,
     mark_pinged,
+    ping_is_quiet,
     ping_line,
     proposal_keyboard,
     proposed_children_of,
@@ -321,13 +322,15 @@ class Reply:
     (in-place card updates) instead of sending a new one. ``toast`` is a
     callback's short feedback ("expired", "already handled", "kept"): the
     adapter shows it on the tapped button (answerCallbackQuery), and an
-    empty ``text`` then sends nothing to the chat.
+    empty ``text`` then sends nothing to the chat. ``silent=True`` delivers
+    a new message without a notification sound (digests, early pings).
     """
 
     text: str
     keyboard: list[list[tuple[str, str]]] | None = None
     edit: bool = False
     toast: str | None = None
+    silent: bool = False  # deliver without sound (disable_notification)
 
 
 @dataclass(frozen=True)
@@ -1693,7 +1696,8 @@ class TelegramBot:
 
     @_speaks
     def due_pings(self, now: datetime | None = None) -> list[tuple[int, Reply]]:
-        """The 48h ping (D7): one Keep/Drop ping per due proposed task."""
+        """The 48h ping (D7): one Keep/Drop ping per due proposed task —
+        silent while the item is still more than a day away."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         moment = now or datetime.now(tz=UTC)
@@ -1714,6 +1718,7 @@ class TelegramBot:
                         [(i18n.t(lang, "btn_keep", n="").strip(), f"{CB_PROPOSED_KEEP}:{token}:0")],
                         [(i18n.t(lang, "btn_drop", n="").strip(), f"{CB_PROPOSED_DROP}:{token}:0")],
                     ],
+                    silent=ping_is_quiet(child, moment, self._timezone.key),
                 )
                 for chat_id in sorted(self._allowed_ids):
                     pings.append((chat_id, reply))
@@ -1815,7 +1820,8 @@ class TelegramBot:
         header = i18n.t(lang, "sched_result_header", name=_one_line(claim.name, 100))
         if outcome.status == "ok" and outcome.result is not None:
             card = self._ask_card(outcome.result, 0.0, lang=lang)
-            return Reply(f"{header}\n{card.text}", keyboard=card.keyboard)
+            # a digest is routine reading: delivered silently (failures ring)
+            return Reply(f"{header}\n{card.text}", keyboard=card.keyboard, silent=True)
         if outcome.llm_unavailable:
             return Reply(f"{header}\n{i18n.t(lang, 'llm_unavailable')}")
         error = _one_line(outcome.error or "error", 200)
@@ -2636,6 +2642,7 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
         return
     text = reply.text[:TELEGRAM_REPLY_MAX_CHARS]
     markup = _inline_keyboard(reply.keyboard)
+    quiet = {"disable_notification": True} if getattr(reply, "silent", False) else {}
     if getattr(reply, "edit", False) and message_id is not None:
         edit_message = getattr(tg, "edit_message_text", None)
         if edit_message is not None:
@@ -2666,7 +2673,9 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
                     return
                 logger.debug("telegram: edit_message_text failed, sending new (%s)", exc)
     try:
-        await tg.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+        await tg.send_message(
+            chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup, **quiet
+        )
     except Exception as exc:  # noqa: BLE001  (fallback only for parse-entity errors)
         if not _is_parse_entity_error(exc):
             raise
@@ -2681,6 +2690,7 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
             text=_strip_html(text),
             parse_mode=None,
             reply_markup=markup,
+            **quiet,
         )
 
 

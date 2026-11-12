@@ -509,6 +509,20 @@ def due_proposed_children(
     return due
 
 
+_QUIET_PING_AFTER = timedelta(hours=24)
+
+
+def ping_is_quiet(child: MemoryItem, now: datetime, tz_name: str) -> bool:
+    """A 48h ping whose item is still more than a day away goes out silently
+    (no sound/vibration): it is a heads-up, not an alarm."""
+    moment = child.occurred_at
+    if moment is None:
+        return False
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=ZoneInfo(tz_name))
+    return moment - now > _QUIET_PING_AFTER
+
+
 def mark_pinged(children: list[MemoryItem], now: datetime) -> None:
     """One ping per child, never repeated (extraction_meta.pinged_at)."""
     for child in children:

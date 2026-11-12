@@ -7,13 +7,17 @@ against duck-typed tg/query fakes. Invented names only (public repo).
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from tests.test_telegram_bot import make_core
 
 from brain.db.models import MemoryItem
-from brain.services.proposals import source_short_title
+from brain.services.ask import AskResult
+from brain.services.proposals import ping_is_quiet, source_short_title
 from brain.telegram_bot import Reply
+
+TZ = "Asia/Jerusalem"
 
 # --- 1. card header never names the transport ----------------------------------
 
@@ -145,3 +149,51 @@ class TestToasts:
         core._read_language = lambda: "he"  # noqa: SLF001 — the stored language
         reply = core.handle_callback("f:deadbeef", 111)
         assert reply.text == "" and reply.toast.startswith("⌛ הכפתורים")
+
+
+# --- 3. silent notifications ----------------------------------------------------
+
+
+def _send_one(reply: Reply) -> list[dict]:
+    from brain.telegram_bot import _send  # noqa: PLC0415
+
+    tg = _TG()
+    asyncio.run(_send(tg, 555, reply))
+    return tg.sent
+
+
+class TestSilent:
+    def test_silent_reply_disables_the_notification(self):
+        sent = _send_one(Reply("☀️ digest", silent=True))
+        assert sent[0]["disable_notification"] is True
+
+    def test_default_reply_rings(self):
+        sent = _send_one(Reply("📋 card"))
+        assert not sent[0].get("disable_notification")
+
+    def _claim(self):
+        return SimpleNamespace(name="Morning digest")
+
+    def test_scheduled_digest_is_silent(self):
+        core, _ = make_core()
+        outcome = SimpleNamespace(
+            status="ok",
+            result=AskResult(answer="Nothing new", cited_ids=[]),
+            llm_unavailable=False,
+            error=None,
+        )
+        assert core.scheduled_reply(self._claim(), outcome, "en").silent is True
+
+    def test_scheduled_failure_still_rings(self):
+        core, _ = make_core()
+        outcome = SimpleNamespace(status="error", result=None, llm_unavailable=False, error="x")
+        assert core.scheduled_reply(self._claim(), outcome, "he").silent is False
+
+    def test_ping_more_than_a_day_away_is_quiet(self):
+        now = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+        far = MemoryItem(raw_text="Bake sale", occurred_at=now + timedelta(hours=30))
+        near = MemoryItem(raw_text="Bake sale", occurred_at=now + timedelta(hours=20))
+        naive = MemoryItem(raw_text="Bake sale", occurred_at=datetime(2026, 11, 3, 18, 0))
+        assert ping_is_quiet(far, now, TZ) is True
+        assert ping_is_quiet(near, now, TZ) is False
+        assert ping_is_quiet(naive, now, TZ) is True  # 18:00 local next day = 31h away
