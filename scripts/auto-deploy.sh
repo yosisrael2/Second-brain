@@ -45,6 +45,12 @@ VENV_BIN="${VENV_BIN:-$ROOT/.venv/bin}"
 # commit, or deleting this file, tries again.
 FAILED_FILE="${DEPLOY_STATE_DIR:-$ROOT/.dev}/deploy-failed-sha"
 
+# This IS the real service (like scripts/run-*.sh): alembic loads the app
+# settings, whose live-store guard refuses the live DATABASE_URL without this.
+# Missing it made every `alembic current`/`upgrade` fail; the first deploy on
+# the server (10 Nov 2026) rolled back at "alembic upgrade head".
+export BRAIN_ALLOW_LIVE=1
+
 # shellcheck source=lib.sh
 # shellcheck disable=SC1091  # dynamic path: lib.sh sits next to this script
 source "$ROOT/scripts/lib.sh"
@@ -150,6 +156,14 @@ install_units() {
 # by Postgres' transactional DDL).
 schema_rev() { "$VENV_BIN/alembic" current 2>/dev/null | tail -n 1; }
 rev_before="$(schema_rev)"
+# Unknown schema = unsafe: the rollback decision compares revisions, and two
+# empty readings would look "unchanged" and roll code back over a migrated
+# database. Stop before anything changes.
+if [ -z "$rev_before" ]; then
+  mark_failed
+  notify "❌ Deploy of ${new:0:7} stopped: could not read the database schema revision (alembic current). Nothing changed. Retry: rm $FAILED_FILE"
+  exit 0
+fi
 WAS_ACTIVE=""
 for unit in $SERVICES; do
   systemctl is-active --quiet "$unit" && WAS_ACTIVE="$WAS_ACTIVE $unit"
