@@ -58,15 +58,27 @@ load_env_file "$ROOT/.env"  # TELEGRAM_BOT_TOKEN / TELEGRAM_ALLOWED_USER_IDS for
 
 log() { printf '%s auto-deploy: %s\n' "$(date '+%F %T')" "$*"; }
 
-# Telegram notice to every allowed user. The token travels through curl's
-# config on stdin, never in argv (visible in ps).
+# notify [--quiet] MESSAGE [DETAIL]
+# Telegram notice to every allowed user: MESSAGE is a plain Hebrew sentence
+# for the family; DETAIL (English: sha, failed step, what to run) follows on
+# a second line and is what the log line records. --quiet delivers without a
+# notification sound (a routine success); failures ring. The token travels
+# through curl's config on stdin, never in argv (visible in ps).
 notify() {
-  log "$1"
+  local quiet=()
+  if [ "${1:-}" = --quiet ]; then
+    quiet=(--data-urlencode "disable_notification=true")
+    shift
+  fi
+  local text="$1" detail="${2:-}"
+  log "${detail:-$text}"
+  [ -n "$detail" ] && text="$text"$'\n'"$detail"
   [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || return 0
   local id
   for id in ${TELEGRAM_ALLOWED_USER_IDS//,/ }; do
     printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TELEGRAM_BOT_TOKEN" \
-      | curl -s -m 15 -K - --data-urlencode "chat_id=$id" --data-urlencode "text=$1" \
+      | curl -s -m 15 -K - ${quiet[@]+"${quiet[@]}"} \
+        --data-urlencode "chat_id=$id" --data-urlencode "text=$text" \
         >/dev/null 2>&1 || true
   done
 }
@@ -126,7 +138,8 @@ if [ "$(cat "$FAILED_FILE" 2>/dev/null)" = "$new" ]; then
 fi
 mark_failed() { mkdir -p "$(dirname "$FAILED_FILE")" && printf '%s\n' "$new" >"$FAILED_FILE"; }
 if ! git merge-base --is-ancestor "$old" "$new"; then
-  notify "⚠️ Deploy skipped: the server checkout ${old:0:7} is not behind origin/$BRANCH ${new:0:7} (local changes?). Fix by hand."
+  notify "⚠️ הגרסה החדשה לא הותקנה: יש בשרת שינויים מקומיים. צריך לטפל בזה ידנית." \
+    "Deploy skipped: the server checkout ${old:0:7} is not behind origin/$BRANCH ${new:0:7} (local changes?). Fix by hand."
   exit 0
 fi
 subject="$(git log -1 --format=%s "$new")"
@@ -140,7 +153,8 @@ if ! (umask 077 && docker compose exec -T db pg_dump -U brain -Fc brain >"$dump"
   || [ ! -s "$dump" ]; then
   rm -f "$dump"
   mark_failed
-  notify "❌ Deploy of ${new:0:7} stopped: the database backup failed. Nothing changed. Retry: rm $FAILED_FILE"
+  notify "❌ הגרסה החדשה לא הותקנה: הגיבוי של בסיס הנתונים נכשל. שום דבר לא השתנה, הכל עובד כרגיל." \
+    "Deploy of ${new:0:7} stopped: the database backup failed. Nothing changed. Retry: rm $FAILED_FILE"
   exit 0
 fi
 find "$BACKUP_DIR" -name 'pre-*.dump' -mtime +14 -delete 2>/dev/null || true
@@ -161,7 +175,8 @@ rev_before="$(schema_rev)"
 # database. Stop before anything changes.
 if [ -z "$rev_before" ]; then
   mark_failed
-  notify "❌ Deploy of ${new:0:7} stopped: could not read the database schema revision (alembic current). Nothing changed. Retry: rm $FAILED_FILE"
+  notify "❌ הגרסה החדשה לא הותקנה: לא הצלחתי לבדוק את מצב בסיס הנתונים. שום דבר לא השתנה, הכל עובד כרגיל." \
+    "Deploy of ${new:0:7} stopped: could not read the database schema revision (alembic current). Nothing changed. Retry: rm $FAILED_FILE"
   exit 0
 fi
 WAS_ACTIVE=""
@@ -171,7 +186,8 @@ done
 
 git merge -q --ff-only "$new" || {
   mark_failed
-  notify "❌ Deploy of ${new:0:7} failed: git could not fast-forward. Nothing changed."
+  notify "❌ הגרסה החדשה לא הותקנה. שום דבר לא השתנה, הכל עובד כרגיל." \
+    "Deploy of ${new:0:7} failed: git could not fast-forward. Nothing changed."
   exit 0
 }
 
@@ -191,13 +207,15 @@ deploy_new() {
 
 if deploy_new; then
   rm -f "$FAILED_FILE"
-  notify "✅ Deployed ${new:0:7}: $subject"
+  log "deployed ${new:0:7}: $subject"
+  notify --quiet "🔧 גרסה חדשה הותקנה ✅"
   exit 0
 fi
 mark_failed
 
 if [ "$(schema_rev)" != "$rev_before" ]; then
-  notify "❌ Deploy of ${new:0:7} failed at $step after the database schema moved, so I did NOT roll back (never alembic downgrade). Backup: $dump. Check: journalctl -u second-brain-api"
+  notify "❌ ההתקנה של הגרסה החדשה נכשלה באמצע, ואי אפשר לחזור אוטומטית לגרסה הקודמת. ייתכן שהמערכת לא עובדת, צריך בדיקה ידנית." \
+    "Deploy of ${new:0:7} failed at $step after the database schema moved, so I did NOT roll back (never alembic downgrade). Backup: $dump. Check: journalctl -u second-brain-api"
   exit 0
 fi
 log "rolling back to ${old:0:7} (failed at: $step)"
@@ -206,8 +224,10 @@ if [ -n "$units" ]; then
   install_units
 fi
 if install_and_restart && healthy; then
-  notify "↩️ Deploy of ${new:0:7} failed at $step; rolled back to ${old:0:7}. ($subject)"
+  notify "↩️ הגרסה החדשה לא עבדה, אז חזרתי לגרסה הקודמת. הכל עובד כרגיל." \
+    "Deploy of ${new:0:7} failed at $step; rolled back to ${old:0:7}. ($subject)"
 else
-  notify "❌ Deploy of ${new:0:7} failed at $step AND the rollback to ${old:0:7} is unhealthy. Check: journalctl -u second-brain-api"
+  notify "❌ הגרסה החדשה לא עבדה, וגם החזרה לגרסה הקודמת לא הצליחה. המערכת לא עובדת, צריך בדיקה ידנית." \
+    "Deploy of ${new:0:7} failed at $step AND the rollback to ${old:0:7} is unhealthy. Check: journalctl -u second-brain-api"
 fi
 exit 0
