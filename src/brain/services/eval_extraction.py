@@ -15,7 +15,7 @@ INPUT FORMAT (one JSON object per line; unknown extra fields are ignored):
      "start": "2026-10-19T13:35:00",       # ISO local wall-clock; optional (offsets are converted)
      "end": null, "all_day": true,         # all_day rows carry a date-only start
      "due": "2026-11-01",                  # tasks: due when no start
-     "applies_to": "rona",                 # "rona, itamar" | ["Rona", "me"] | "me" | "nobody"
+     "applies_to": "romi",                 # "romi, ilan" | ["Romi", "me"] | "me" | "nobody"
      "importance": 3, "actionability": "now",
      "source_quote": "verbatim text from the email",
      "relation": {"kind": "supersedes", "target": "<child_id>"},   # or "supersedes:<child_id>"
@@ -345,8 +345,8 @@ def _is_date_only(value: Any) -> bool:
 def _parse_applies_to(row: dict[str, Any], side: str, idx: int) -> tuple[frozenset[str], str]:
     """Normalize applies_to to a token set; str and list[str] both work.
 
-    worker_3's gold schema uses a JSON LIST (e.g. ["Rona"], ["Itamar",
-    "me"]); a string ("rona, me") normalizes to the same token set. An
+    worker_3's gold schema uses a JSON LIST (e.g. ["Romi"], ["Ilan",
+    "me"]); a string ("romi, me") normalizes to the same token set. An
     empty value or ["unknown"] becomes the empty set == unknown wildcard.
     Any other JSON type is a schema error — a silent fallback to unknown
     would let every row match every prediction.

@@ -64,7 +64,7 @@ def _existing(
     type: str = "event",
     title: str = BASE,
     start: datetime | None = None,
-    applies_to: tuple[str, ...] = ("Rona",),
+    applies_to: tuple[str, ...] = ("Romi",),
     location: str | None = None,
     end: datetime | None = None,
 ) -> ExistingItem:
@@ -78,7 +78,7 @@ def _candidate(
     kind: str = "event",
     title: str = BASE,
     start: datetime | None = None,
-    applies_to: tuple[str, ...] = ("Rona",),
+    applies_to: tuple[str, ...] = ("Romi",),
     location: str | None = None,
     end: datetime | None = None,
 ) -> ReconCandidate:
@@ -307,8 +307,8 @@ def test_dateless_pair_matches_on_identity():
 
 def test_different_applies_to_never_matched():
     result = classify(
-        _candidate(applies_to=("Itamar",), start=_jlm(10, 16, 0)),
-        [_existing(applies_to=("Rona",), start=_jlm(10, 16, 0))],
+        _candidate(applies_to=("Ilan",), start=_jlm(10, 16, 0)),
+        [_existing(applies_to=("Romi",), start=_jlm(10, 16, 0))],
         similarity=_similarity, now=NOW, tz_name="Asia/Jerusalem",
     )
     assert result.verdict is Verdict.NEW
@@ -453,7 +453,7 @@ class _FakeMemory:
 
 
 def _make_source(
-    session: Session, *, text: str, sender: str = "rinat@school.org.il",
+    session: Session, *, text: str, sender: str = "tamar@school.org.il",
     meta: dict[str, Any] | None = None,
 ) -> MemoryItem:
     item = MemoryItem(
@@ -716,20 +716,20 @@ def test_recon_eval_offline_end_to_end(tmp_path, capsys):
     cases = [
         {"case_id": "c1", "existing_items": [
             {"id": "e1", "type": "event", "title": "טיול שנתי",
-             "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"],
+             "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Romi"],
              "location": None}],
          "new_text_quote": "הטיול בוטל — ניפגש במועד אחר",
          "candidate": {"kind": "event", "title": "טיול שנתי", "start": None,
-                       "applies_to": ["Rona"], "location": None},
+                       "applies_to": ["Romi"], "location": None},
          "verdict": "cancellation"},
         {"case_id": "c2", "existing_items": [
             {"id": "e1", "type": "event", "title": "טיול שנתי",
-             "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"],
+             "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Romi"],
              "location": None}],
          "new_text_quote": "שינוי: הטיול ב-18:00",
          "candidate": {"kind": "event", "title": "טיול שנתי",
                        "start": _jlm(10, 18, 0).isoformat(),
-                       "applies_to": ["Rona"], "location": None},
+                       "applies_to": ["Romi"], "location": None},
          "verdict": "update"},
     ]
     path = tmp_path / "cases.jsonl"
@@ -811,7 +811,7 @@ def test_email_sender_comes_from_the_real_parse_path(db):
     from brain.services.paste import parse as parse_paste
 
     original = parse_paste(
-        "From: Rinat <rinat@school.org.il>\nTo: parents@school.org.il\n"
+        "From: Tamar <tamar@school.org.il>\nTo: parents@school.org.il\n"
         "Subject: טיול שנתי\nDate: Sun, 1 Nov 2026 10:00:00 +0200\n\n"
         "טיול שנתי יוצא ב-16:00\n",
         kind_hint="email", tz=JLM, now=NOW,
@@ -820,7 +820,7 @@ def test_email_sender_comes_from_the_real_parse_path(db):
         db, text="טיול שנתי יוצא ב-16:00", meta=dict(original.chunks[0].meta)
     )
     reply = parse_paste(
-        "From: Rinat <rinat@school.org.il>\nTo: parents@school.org.il\n"
+        "From: Tamar <tamar@school.org.il>\nTo: parents@school.org.il\n"
         "Subject: Re: טיול שנתי\nDate: Sun, 1 Nov 2026 11:00:00 +0200\n\n"
         "תיקון טעות: הטיול יוצא ב-18:00\n",
         kind_hint="email", tz=JLM, now=NOW,
@@ -1102,21 +1102,21 @@ def test_recon_eval_accepts_spec_shape(tmp_path):
         {"case_id": "spec-1", "now": "2026-11-02T12:00:00+02:00",
          "existing_items": [
              {"id": "e1", "type": "event", "title": "טיול שנתי",
-              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"]}],
+              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Romi"]}],
          "new_text_quote": "תיקון: הטיול ב-18:00",
          "candidate": {"type": "event", "title": "טיול שנתי",
                        "start": _jlm(10, 18, 0).isoformat(),
-                       "applies_to": ["Rona"]},
+                       "applies_to": ["Romi"]},
          "verdict": "UPDATE"},
         # mixed-case verdict + kind still works; pinned `now` (without it the
         # 10.11 event left the window on 11 Nov 2026 and the test went red)
         {"case_id": "spec-2", "now": "2026-11-02T12:00:00+02:00",
          "existing_items": [
              {"id": "e2", "type": "event", "title": "טיול שנתי",
-              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Rona"]}],
+              "start": _jlm(10, 16, 0).isoformat(), "applies_to": ["Romi"]}],
          "new_text_quote": "הטיול בוטל",
          "candidate": {"kind": "event", "title": "טיול שנתי", "start": None,
-                       "applies_to": ["Rona"]},
+                       "applies_to": ["Romi"]},
          "verdict": "Cancellation"},
     ]
     path = tmp_path / "cases.jsonl"
@@ -1190,11 +1190,11 @@ def test_recon_eval_uses_the_embedding_callable(tmp_path):
         "existing_items": [{"id": "e1", "type": "event",
                             "title": "annual park trip",
                             "start": _jlm(10, 16, 0).isoformat(),
-                            "applies_to": ["Rona"]}],
+                            "applies_to": ["Romi"]}],
         "new_text_quote": "לזכור: הטיול",
         "candidate": {"type": "event", "title": "annual trip to the park",
                       "start": _jlm(10, 16, 0).isoformat(),
-                      "applies_to": ["Rona"]},
+                      "applies_to": ["Romi"]},
         "verdict": "already_known",
     }]
     path = tmp_path / "cases.jsonl"
@@ -1452,16 +1452,16 @@ def test_fact_effective_date_is_more_detail(db):
     a field the stored fact LACKS -> MORE_DETAIL, not ALREADY_KNOWN."""
     # the gold frame: the pair meets via the same local day; the stored
     # fact carries only its MENTION time (no recorded validity)
-    fact = _make_existing_fact(db, title="איתמר בחוג כדורסל בימי שלישי")
+    fact = _make_existing_fact(db, title="אילן בחוג כדורסל בימי שלישי")
     fact.occurred_at = datetime(2026, 12, 1, 9, 30, tzinfo=JLM)
     db.commit()
-    source = _make_source(db, text="איתמר בחוג כדורסל בימי שלישי, מ-1.12")
+    source = _make_source(db, text="אילן בחוג כדורסל בימי שלישי, מ-1.12")
     service = _service(db, source)
     resolved = service._validate(
         _candidate_child(
-            title="איתמר בחוג כדורסל בימי שלישי",
+            title="אילן בחוג כדורסל בימי שלישי",
             when_raw="1.12",
-            quote="איתמר בחוג כדורסל בימי שלישי, מ-1.12",
+            quote="אילן בחוג כדורסל בימי שלישי, מ-1.12",
             kind="fact",
         ),
         source, NOW,

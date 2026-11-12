@@ -78,13 +78,13 @@ class FakeLLM:
 
 
 def _conversation(
-    text: str = "[WhatsApp · ב' ברקת - הורים]\n[21/10/2026, 18:23] מעין: מחר חולצה לבנה",
+    text: str = "[WhatsApp · ב' רימון - הורים]\n[21/10/2026, 18:23] סיגל: מחר חולצה לבנה",
 ) -> MemoryItem:
     return MemoryItem(
         raw_text=text,
         source="whatsapp",
         occurred_at=datetime(2026, 10, 21, 15, 23, tzinfo=UTC),
-        meta={"kind": "whatsapp_conversation", "channel": "ב' ברקת - הורים"},
+        meta={"kind": "whatsapp_conversation", "channel": "ב' רימון - הורים"},
     )
 
 
@@ -111,10 +111,10 @@ def test_kid_named_override_is_relevant_without_any_model_call() -> None:
     llm = FakeLLM(RuntimeError("llm down"))  # must never be reached
 
     result = triage_conversation(
-        "[WhatsApp · ב' ברקת - הורים]\n[21/10/2026, 18:23] אמא של יואב: מי לוקח את איתמר היום?",
+        "[WhatsApp · ב' רימון - הורים]\n[21/10/2026, 18:23] אמא של יואב: מי לוקח את אילן היום?",
         jev=jev,
         llm=llm,
-        kid_names=["Itamar", "איתמר"],
+        kid_names=["Ilan", "אילן"],
     )
 
     assert result == TriageResult(
@@ -126,9 +126,9 @@ def test_kid_named_override_is_relevant_without_any_model_call() -> None:
 def test_kid_override_uses_the_shared_matcher_rules() -> None:
     jev = FakeJev(JevChoice(option="noise", confidence=0.99))
 
-    # 'לאיתמר' (glue prefix) fires the override...
+    # 'לאילן' (glue prefix) fires the override...
     fired = triage_conversation(
-        "מה צריך לאיתמר מחר?", jev=jev, llm=FakeLLM("unused"), kid_names=["איתמר"]
+        "מה צריך לאילן מחר?", jev=jev, llm=FakeLLM("unused"), kid_names=["אילן"]
     )
     assert fired is not None and fired.method == "kid_named"
 
@@ -144,13 +144,13 @@ def test_confirmed_kid_names_uses_the_ask_kid_definition() -> None:
     from brain.services.triage import confirmed_kid_names
 
     entities = [
-        {"kind": "person", "name": "Itamar", "aliases": ["איתמר"], "facts": [
+        {"kind": "person", "name": "Ilan", "aliases": ["אילן"], "facts": [
             {"predicate": "grade", "value": "2"},
         ]},
         {"kind": "person", "name": "NoGrade", "aliases": ["x"], "facts": []},
-        {"kind": "channel", "name": "ב' ברקת - הורים", "facts": []},
+        {"kind": "channel", "name": "ב' רימון - הורים", "facts": []},
     ]
-    assert confirmed_kid_names(entities) == ["Itamar", "איתמר"]
+    assert confirmed_kid_names(entities) == ["Ilan", "אילן"]
 
 
 def test_v3_prompt_carries_the_new_relevance_rules() -> None:
@@ -277,7 +277,7 @@ def test_noise_hidden_from_listings_but_found_by_search() -> None:
     session = SessionLocal()
     repo = ItemsRepository(session)
     noise = repo.add(_conversation("[WhatsApp · ח] מישהו: תודה רבה!! 🙏"))
-    relevant = repo.add(_conversation("[WhatsApp · ב] מעין: מחר חולצה לבנה וקלמר"))
+    relevant = repo.add(_conversation("[WhatsApp · ב] סיגל: מחר חולצה לבנה וקלמר"))
     repo.apply_triage(noise, TriageResult("noise", 0.97, "jev", TRIAGE_VERSION))
     repo.apply_triage(relevant, TriageResult("relevant", 0.95, "jev", TRIAGE_VERSION))
     session.commit()
@@ -340,7 +340,7 @@ def test_enrichment_never_enqueues_noise() -> None:
     # the text carries two date expressions, so it WOULD qualify on its own
     def qualifying_conversation() -> MemoryItem:
         return _conversation(
-            "[WhatsApp · ב' ברקת - הורים]\n[21/10/2026, 18:23] מעין: מחר חולצה לבנה "
+            "[WhatsApp · ב' רימון - הורים]\n[21/10/2026, 18:23] סיגל: מחר חולצה לבנה "
             "וב-25/10/2026 טיול"
         )
 
@@ -381,7 +381,7 @@ def test_conversation_create_and_update_are_triaged() -> None:
     service._triage_item(item)  # type: ignore[attr-defined]
     assert triaged and item.triage_label == "noise"
 
-    item.raw_text += "\n[21/10/2026, 19:00] מעין: הטיול השני מתבטל"
+    item.raw_text += "\n[21/10/2026, 19:00] סיגל: הטיול השני מתבטל"
     service._triage_item(item)  # type: ignore[attr-defined]
     assert len(triaged) == 2, "an updated conversation is re-triaged"
     assert item.triage_label == "relevant", "a conversation can turn relevant"
@@ -438,11 +438,11 @@ def test_update_never_downgrades_relevant_to_noise(monkeypatch) -> None:
     service._trier = trier  # type: ignore[attr-defined]
     service._items = None  # type: ignore[attr-defined]
 
-    item = _conversation("[WhatsApp · ב] מעין: מחר חולצה לבנה וקלמר")
+    item = _conversation("[WhatsApp · ב] סיגל: מחר חולצה לבנה וקלמר")
     service._triage_item(item)  # type: ignore[attr-defined]
     assert item.triage_label == "relevant"
 
-    item.raw_text += "\n[21/10/2026, 19:00] מעין: תודה 🙏"
+    item.raw_text += "\n[21/10/2026, 19:00] סיגל: תודה 🙏"
     service._triage_item(item)  # type: ignore[attr-defined]  # trier now says noise
 
     assert item.triage_label == "relevant", "relevant may never become noise on update"
@@ -562,7 +562,7 @@ def test_backfill_triages_untriaged_whatsapp_items_only(monkeypatch) -> None:
     _wipe_items()
     session = SessionLocal()
     repo = ItemsRepository(session)
-    untriaged = repo.add(_conversation("[WhatsApp · ב] מעין: מחר חולצה"))
+    untriaged = repo.add(_conversation("[WhatsApp · ב] סיגל: מחר חולצה"))
     already = repo.add(_conversation("[WhatsApp · ג] ח: תודה 🙏"))
     repo.apply_triage(already, TriageResult("relevant", 0.9, "jev", "triage-v0"))
     email_item = repo.add(MemoryItem(
@@ -635,7 +635,7 @@ def test_health_noise_today_excludes_blocked_downgrades(monkeypatch) -> None:
     service = WhatsAppPoller.__new__(WhatsAppPoller)
     service._trier = trier  # type: ignore[attr-defined]
     service._items = None  # type: ignore[attr-defined]
-    item = _conversation("[WhatsApp · ב] מעין: מחר חולצה לבנה וקלמר")
+    item = _conversation("[WhatsApp · ב] סיגל: מחר חולצה לבנה וקלמר")
     item.triage_label = "relevant"  # a previous decision the update must not undo
     service._triage_item(item)  # type: ignore[attr-defined]
     assert item.triage_label == "relevant", "the downgrade is blocked"
@@ -777,7 +777,7 @@ def test_poller_refresh_honours_alias_added_after_trier_built(
     from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
+    romi = _confirmed_kid(world.memory, "Romi")
     path = tmp_path / "messages.db"
     _write_bridge(
         path,
@@ -792,19 +792,19 @@ def test_poller_refresh_honours_alias_added_after_trier_built(
         path,
         _bridge_row(
             "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="מה צריך לארוז לרונה ליום ראשון?",
+            content="מה צריך לארוז לרומי ליום ראשון?",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # creates conversation 1
 
     world.memory_repo.add_alias(
-        EntityAlias(entity_id=rona.id, alias="רונה", lang="he")
+        EntityAlias(entity_id=romi.id, alias="רומי", lang="he")
     )
     _add_row(
         path,
         _bridge_row(
             "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
-            content="רונה צריכה להביא כובע מחר",
+            content="רומי צריכה להביא כובע מחר",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))  # creates conversation 2
@@ -838,8 +838,8 @@ def test_alias_removed_between_passes_stops_matching(
     from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
-    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    romi = _confirmed_kid(world.memory, "Romi")
+    world.memory_repo.add_alias(EntityAlias(entity_id=romi.id, alias="רומי", lang="he"))
     path = tmp_path / "messages.db"
     _write_bridge(
         path,
@@ -854,7 +854,7 @@ def test_alias_removed_between_passes_stops_matching(
         path,
         _bridge_row(
             "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="רונה צריכה להביא כובע מחר",
+            content="רומי צריכה להביא כובע מחר",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # conversation 1: kid_named
@@ -865,7 +865,7 @@ def test_alias_removed_between_passes_stops_matching(
         path,
         _bridge_row(
             "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
-            content="רונה ואיתמר חוזרים באוטובוס",
+            content="רומי ואילן חוזרים באוטובוס",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))  # conversation 2
@@ -879,7 +879,7 @@ def test_alias_removed_between_passes_stops_matching(
     assert items[0].triage_method == "kid_named", "precondition: the alias matched"
     assert items[1].triage_method != "kid_named", (
         "after the alias row was deleted, the refreshed kid names must not "
-        "match רונה anymore (replace, not append)"
+        "match רומי anymore (replace, not append)"
     )
 
 
@@ -914,11 +914,11 @@ def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
             return super()._read_kid_names()
 
     world = triage_world
-    itamar = _confirmed_kid(world.memory, "Itamar")
-    # Hebrew alias seeded UP FRONT: the kid override matches איתמר from the
+    ilan = _confirmed_kid(world.memory, "Ilan")
+    # Hebrew alias seeded UP FRONT: the kid override matches אילן from the
     # very first pass, so the failure test isolates the refresh behaviour.
     world.memory_repo.add_alias(
-        EntityAlias(entity_id=itamar.id, alias="איתמר", lang="he")
+        EntityAlias(entity_id=ilan.id, alias="אילן", lang="he")
     )
     path = tmp_path / "messages.db"
     _write_bridge(
@@ -934,7 +934,7 @@ def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
         path,
         _bridge_row(
             "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="מה צריך לאיתמר מחר?",
+            content="מה צריך לאילן מחר?",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))  # conversation 1: kid_named
@@ -944,7 +944,7 @@ def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
         path,
         _bridge_row(
             "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
-            content="איתמר לא שכח את הכובע?",
+            content="אילן לא שכח את הכובע?",
         ),
     )
     with caplog.at_level("WARNING"):
@@ -971,7 +971,7 @@ def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
     )
     assert items[0].triage_method == "kid_named"
     assert items[1].triage_method == "kid_named", (
-        "the pass carries on with the LAST-KNOWN kid names — Itamar still matches"
+        "the pass carries on with the LAST-KNOWN kid names — Ilan still matches"
     )
 
     trier.fail_next = False
@@ -979,7 +979,7 @@ def test_refresh_failure_savepoint_keeps_pending_captures_and_pass(
         path,
         _bridge_row(
             "m4", datetime(2026, 10, 22, 19, 0, tzinfo=UTC),
-            content="איתמר הגיע הביתה",
+            content="אילן הגיע הביתה",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 19, 5, tzinfo=UTC))  # session usable, refresh works
@@ -996,10 +996,10 @@ def test_fresh_trier_instance_honours_aliases_without_refresh(
     from brain.services.triage import RefreshableTrier  # noqa: PLC0415
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
-    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    romi = _confirmed_kid(world.memory, "Romi")
+    world.memory_repo.add_alias(EntityAlias(entity_id=romi.id, alias="רומי", lang="he"))
     trier = RefreshableTrier(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM("garbage"))
-    item = _conversation("[WhatsApp · Chat A]\n[21/10/2026, 18:23] מעין: מה צריך לרונה?")
+    item = _conversation("[WhatsApp · Chat A]\n[21/10/2026, 18:23] סיגל: מה צריך לרומי?")
     result = trier(item)
     assert result is not None and result.method == "kid_named"
     assert trier.refresh_calls == 0, "a fresh trier needs no refresh call"
@@ -1069,8 +1069,8 @@ def test_failed_first_read_does_not_abort_the_session(
             return super()._read_kid_names()
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
-    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    romi = _confirmed_kid(world.memory, "Romi")
+    world.memory_repo.add_alias(EntityAlias(entity_id=romi.id, alias="רומי", lang="he"))
 
     # Construction hits the broken SQL — must survive (tolerance).
     trier = _PoisonedFirstRead(world.session, jev=FakeJev(JevError("skip")), llm=FakeLLM(
@@ -1098,7 +1098,7 @@ def test_failed_first_read_does_not_abort_the_session(
         path,
         _bridge_row(
             "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="רונה צריכה להביא כובע מחר",
+            content="רומי צריכה להביא כובע מחר",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
@@ -1131,10 +1131,10 @@ def test_trier_construction_survives_failed_kid_names_read(
     from brain.services.whatsapp import BridgeStore  # noqa: PLC0415
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
+    romi = _confirmed_kid(world.memory, "Romi")
     from brain.db.models import EntityAlias  # noqa: PLC0415
 
-    world.memory_repo.add_alias(EntityAlias(entity_id=rona.id, alias="רונה", lang="he"))
+    world.memory_repo.add_alias(EntityAlias(entity_id=romi.id, alias="רומי", lang="he"))
     state = {"broken": True}
     _break_kid_names_read(monkeypatch, state)
 
@@ -1178,7 +1178,7 @@ def test_trier_construction_survives_failed_kid_names_read(
         path,
         _bridge_row(
             "m2", datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="רונה צריכה להביא כובע מחר",
+            content="רומי צריכה להביא כובע מחר",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 13, 5, tzinfo=UTC))
@@ -1198,7 +1198,7 @@ def test_trier_construction_survives_failed_kid_names_read(
         path,
         _bridge_row(
             "m3", datetime(2026, 10, 22, 16, 0, tzinfo=UTC),
-            content="מה צריך לארוז לרונה ליום ראשון?",
+            content="מה צריך לארוז לרומי ליום ראשון?",
         ),
     )
     poller.poll(now=datetime(2026, 10, 22, 16, 5, tzinfo=UTC))
@@ -1220,9 +1220,9 @@ def test_backfill_refuses_to_run_when_kid_names_read_fails(
     from brain import cli  # noqa: PLC0415
 
     world = triage_world
-    _confirmed_kid(world.memory, "Rona")
+    _confirmed_kid(world.memory, "Romi")
     item = world.items.add(_conversation(
-        "[WhatsApp · Chat A]\n[21/10/2026, 18:23] מעין: מה צריך לרונה?"
+        "[WhatsApp · Chat A]\n[21/10/2026, 18:23] סיגל: מה צריך לרומי?"
     ))
     world.session.commit()
 
@@ -1272,7 +1272,7 @@ class _CountingTrier:
 
 _MEDIA_ONLY_TEXT = (
     "[WhatsApp · Chat A]\n"
-    "[22/10/2026, 13:00] Rinat: [image: photo.jpg — attachment not read yet]"
+    "[22/10/2026, 13:00] Tamar: [image: photo.jpg — attachment not read yet]"
 )
 
 
@@ -1363,9 +1363,9 @@ def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
     from brain.services.whatsapp import BridgeMessage  # noqa: PLC0415
 
     world = triage_world
-    rona = _confirmed_kid(world.memory, "Rona")
+    romi = _confirmed_kid(world.memory, "Romi")
     world.memory_repo.add_alias(
-        EntityAlias(entity_id=rona.id, alias="רונה", lang="he")
+        EntityAlias(entity_id=romi.id, alias="רומי", lang="he")
     )
     # the wired trier is built AFTER the alias exists (fresh read at build)
     wired = _wired_trier(world, monkeypatch, FakeJev(JevError("skip")), FakeLLM("garbage"))
@@ -1374,7 +1374,7 @@ def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
     # the unread marker already contains the filename (nothing else readable);
     # the SKIP is what keeps it unlabelled until the media is read.
     world2, poller, item = _captured_media_only_conversation(
-        world, tmp_path, trier, filename="רונה כובע.jpg"
+        world, tmp_path, trier, filename="רומי כובע.jpg"
     )
     assert trier.calls == 0
 
@@ -1383,12 +1383,12 @@ def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
+        sender="Tamar",
         content="",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
         media_type="image",
-        filename="רונה כובע.jpg",
+        filename="רומי כובע.jpg",
         file_length=2048,
     )
     att_item_id = uuid_mod.uuid4()
@@ -1405,7 +1405,7 @@ def test_media_only_conversation_retriages_after_the_last_marker_is_replaced(
         world.session,
         own_item_id=att_item_id,
         parent_id=item.id,
-        text="רונה שלחה תמונה: החולצה הלבנה ליום חמישי",
+        text="רומי שלחה תמונה: החולצה הלבנה ליום חמישי",
     )
     on_read = _make_on_read_callback(trier)  # the counting wrapper, like production
     on_read(world.session, SimpleNamespace(parent_item_id=item.id))
@@ -1516,7 +1516,7 @@ def test_partially_read_conversation_stays_skipped(triage_world: Any, tmp_path: 
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
+        sender="Tamar",
         content="",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
@@ -1570,7 +1570,7 @@ def test_retriage_after_read_never_downgrades_relevant(
         _bridge_row(
             "m2",
             datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
-            content="מה צריך לארוז לרונה?",
+            content="מה צריך לארוז לרומי?",
             media_type="image",
             filename="photo.jpg",
             url="https://mmg.whatsapp.net/v/t62.7118-24/secret.enc",
@@ -1586,8 +1586,8 @@ def test_retriage_after_read_never_downgrades_relevant(
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
-        content="מה צריך לארוז לרונה?",
+        sender="Tamar",
+        content="מה צריך לארוז לרומי?",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
         media_type="image",
@@ -1605,7 +1605,7 @@ def test_retriage_after_read_never_downgrades_relevant(
         world.session,
         own_item_id=att_item_id,
         parent_id=item.id,
-        text="תמונת הציוד לטיול של רונה",
+        text="תמונת הציוד לטיול של רומי",
     )
     on_read = _make_on_read_callback(scripted)
     on_read(world.session, SimpleNamespace(parent_item_id=item.id))
@@ -1675,7 +1675,7 @@ def test_post_read_retriage_never_touches_user_acted_items(
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
+        sender="Tamar",
         content="",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
@@ -1707,7 +1707,7 @@ def _swapped_media_only_conversation(triage_world: Any, tmp_path: Any, trier: An
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
+        sender="Tamar",
         content="",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
@@ -1766,7 +1766,7 @@ def test_i_extracted_text_triggers_exactly_one_retriage_with_that_text(
 
     # the media is read (the attachment pipeline finishes with real text);
     # the poller's on_read callback drives the re-triage on the SAME session
-    text = "רונה: החולצה הלבנה של יום חמישי מצולמת כאן"
+    text = "רומי: החולצה הלבנה של יום חמישי מצולמת כאן"
     session = world.session
     _seed_done_attachment(session, own_item_id=att_item_id, parent_id=item.id, text=text)
 
@@ -1800,7 +1800,7 @@ def test_j_backfill_skips_saved_but_unread(monkeypatch: Any, capsys: Any) -> Non
     saved_unread = repo.add(
         _conversation(
             "[WhatsApp · Chat A]\n"
-            "[22/10/2026, 13:00] Rinat: "
+            "[22/10/2026, 13:00] Tamar: "
             "[image: photo.jpg — attachment 3f2b7c1e-1111-4c2a-9d3e-5f6a7b8c9d01]"
         )
     )
@@ -1857,7 +1857,7 @@ def test_k_whole_flow_one_session_no_hang(triage_world: Any, tmp_path: Any) -> N
     message = BridgeMessage(
         id="m2",
         chat_jid="jid-a@g.us",
-        sender="Rinat",
+        sender="Tamar",
         content="",
         timestamp_utc=datetime(2026, 10, 22, 13, 0, tzinfo=UTC),
         is_from_me=False,
@@ -1907,7 +1907,7 @@ def test_l_two_images_second_input_carries_both_texts(
         message = BridgeMessage(
             id=mid,
             chat_jid="jid-a@g.us",
-            sender="Rinat",
+            sender="Tamar",
             content="",
             timestamp_utc=datetime(2026, 10, 22, 13, n, tzinfo=UTC),
             is_from_me=False,
@@ -1920,7 +1920,7 @@ def test_l_two_images_second_input_carries_both_texts(
     world.session.expire_all()
     item = world.session.query(MemoryItem).one()
 
-    t1 = "רונה מביאה את הכובע לטיול 27/10"
+    t1 = "רומי מביאה את הכובע לטיול 27/10"
     t2 = "וגם: הפנינג בכיתה ב-28/10 אחרי הצהריים"
     for n, text in enumerate((t1, t2)):
         att_item_id = uuid_mod.uuid4()
@@ -2023,7 +2023,7 @@ def test_m_production_wiring_retriages_on_the_read_session(
     monkeypatch.setattr("brain.api.deps.get_llm_client", lambda: FakeLLM("garbage"))
     world = triage_world
     _wipe_items()
-    _confirmed_kid(world.memory, "רונה")
+    _confirmed_kid(world.memory, "רומי")
     world.session.commit()
 
     # two REAL sessions, production-style: poller session + _finish session
@@ -2033,7 +2033,7 @@ def test_m_production_wiring_retriages_on_the_read_session(
 
     item = repo_finish.add(
         _conversation(
-            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Rinat: "
+            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Tamar: "
             "[image: photo.jpg — attachment 3f2b7c1e-1111-4c2a-9d3e-5f6a7b8c9d01]"
         )
     )
@@ -2045,7 +2045,7 @@ def test_m_production_wiring_retriages_on_the_read_session(
         store=AttachmentFileStore(root=tmp_path / "store"),
         pdf_reader=PdfTextLayerReader(),
         claude_reader=ClaudeFileReader(
-            query_fn=FakeQuery(reply="רונה: החולצה הלבנה ליום חמישי מצולמת כאן"),
+            query_fn=FakeQuery(reply="רומי: החולצה הלבנה ליום חמישי מצולמת כאן"),
             scratch_root=tmp_path / "scratch",
         ),
         indexer=SimpleNamespace(index=lambda i: None),
@@ -2087,7 +2087,7 @@ def test_n_hook_failure_keeps_the_read_savepoint_scoped(triage_world: Any, tmp_p
     repo = ItemsRepository(session)
     item = repo.add(
         _conversation(
-            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Rinat: "
+            "[WhatsApp · Chat A]\n[22/10/2026, 13:00] Tamar: "
             "[image: photo.jpg — attachment 3f2b7c1e-1111-4c2a-9d3e-5f6a7b8c9d01]"
         )
     )
@@ -2103,7 +2103,7 @@ def test_n_hook_failure_keeps_the_read_savepoint_scoped(triage_world: Any, tmp_p
         store=AttachmentFileStore(root=tmp_path / "store"),
         pdf_reader=PdfTextLayerReader(),
         claude_reader=ClaudeFileReader(
-            query_fn=FakeQuery(reply="רונה שלחה תמונה"),
+            query_fn=FakeQuery(reply="רומי שלחה תמונה"),
             scratch_root=tmp_path / "scratch",
         ),
         indexer=SimpleNamespace(index=lambda i: None),

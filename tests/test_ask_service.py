@@ -240,7 +240,7 @@ def test_memory_block_prepends_confirmed_facts_to_the_prompt():
     service = AskService(
         StubSearch(hits),
         FakeLLMClient(reply=capture),
-        memory_block=lambda: "Confirmed memory:\n- Rona: gender girl, grade 5",
+        memory_block=lambda: "Confirmed memory:\n- Romi: gender girl, grade 5",
     )  # type: ignore[arg-type]
 
     service.ask("what?")
@@ -250,7 +250,7 @@ def test_memory_block_prepends_confirmed_facts_to_the_prompt():
     memory_at = prompt.index("Confirmed memory:")
     sources_at = prompt.index("Sources:")
     assert date_at < memory_at < sources_at
-    assert "- Rona: gender girl, grade 5" in prompt
+    assert "- Romi: gender girl, grade 5" in prompt
 
 
 def test_empty_memory_keeps_the_prompt_byte_identical():

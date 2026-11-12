@@ -131,7 +131,7 @@ def _make_source(
     session: Session,
     *,
     text: str,
-    sender: str = "rinat@school.org.il",
+    sender: str = "tamar@school.org.il",
     series_uid: str | None = None,
 ) -> MemoryItem:
     meta: dict[str, Any] = {"sender": sender, "subject": "טיול שנתי"}
@@ -488,12 +488,12 @@ def test_pure_classify_relax_type_only_for_cancel():
         type="event",
         title=CLUB,
         start=_jlm(10, 16, 0),
-        applies_to=("Rona",),
+        applies_to=("Romi",),
     )
     cancel_candidate = ReconCandidate(
         kind="reminder",
         title=CLUB,
-        applies_to=("Rona",),
+        applies_to=("Romi",),
     )
 
     result = classify(
@@ -510,7 +510,7 @@ def test_pure_classify_relax_type_only_for_cancel():
         kind="reminder",
         title=CLUB,
         start=_jlm(10, 18, 0),
-        applies_to=("Rona",),
+        applies_to=("Romi",),
     )
     result2 = classify(
         update_candidate,

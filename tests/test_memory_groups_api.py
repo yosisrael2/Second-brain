@@ -37,8 +37,8 @@ from brain.services.memory import MemoryService
 from brain.services.triage import TriageResult
 
 _ENDPOINT = "/memory"
-_NOA_CHANNEL = "ה' ספיר - הורים"
-_ITAMAR_CHANNEL = "ב' ברקת - הורים"
+_NOA_CHANNEL = "ה' ברוש - הורים"
+_ILAN_CHANNEL = "ב' רימון - הורים"
 _FAMILY_CHANNEL = "כל המשפחה"
 
 
@@ -81,7 +81,7 @@ def _conversation(items_repo: ItemsRepository, channel: str, day: int, hour: int
     return items_repo.add(
         MemoryItem(
             source="whatsapp",
-            raw_text=f"[2{day}/10/2026, {hour}:00] {channel} / מעין: {text}",
+            raw_text=f"[2{day}/10/2026, {hour}:00] {channel} / סיגל: {text}",
             occurred_at=datetime(2026, 10, day, hour, 0, tzinfo=UTC),
             created_at=datetime(2026, 10, 23, 12, 0, tzinfo=UTC),
             meta={
@@ -89,7 +89,7 @@ def _conversation(items_repo: ItemsRepository, channel: str, day: int, hour: int
                 "channel": channel,
                 "chat_jid": "1204@g.us",
                 "count": 1,
-                "messages": [{"sender": "מעין", "at": f"2026-10-2{day}T{hour}:00:00+00:00"}],
+                "messages": [{"sender": "סיגל", "at": f"2026-10-2{day}T{hour}:00:00+00:00"}],
             },
         )
     )
@@ -129,7 +129,7 @@ def test_groups_list_relevant_conversations_newest_first(
     """5 relevant + 1 noise + 1 untriaged + 1 superseded: exactly the 5
     relevant ones, newest first; per-group cap; no noise/untriaged/sha."""
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5", class_="ה' ספיר")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5", class_="ה' ברוש")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
         for i, (day, hour) in enumerate([(21, 18), (22, 17), (23, 16), (24, 15), (25, 14)]):
             item = _conversation(items, _NOA_CHANNEL, day, hour, f"הודעה {i + 1}")
@@ -164,7 +164,7 @@ def test_groups_list_relevant_conversations_newest_first(
 
 def test_preview_is_whitespace_collapsed(groups_client: TestClient) -> None:
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
         item = _conversation(items, _NOA_CHANNEL, 21, 10, "שורה 1\n\n   שורה 2   סוף")
         _relevant(items, item)
@@ -177,20 +177,20 @@ def test_second_kid_does_not_see_the_first_kids_channel_and_family_is_on_both(
     groups_client: TestClient,
 ) -> None:
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
-        memory.set_kid("Itamar", gender="boy", school="בראשית", grade="2")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
+        memory.set_kid("Ilan", gender="boy", school="הגפן", grade="2")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
-        memory.set_channel(_ITAMAR_CHANNEL, kind="parents", applies_to="Itamar")
+        memory.set_channel(_ILAN_CHANNEL, kind="parents", applies_to="Ilan")
         memory.set_channel(_FAMILY_CHANNEL, kind="committee", applies_to="family")
-        for channel, day in [(_NOA_CHANNEL, 21), (_ITAMAR_CHANNEL, 22), (_FAMILY_CHANNEL, 23)]:
+        for channel, day in [(_NOA_CHANNEL, 21), (_ILAN_CHANNEL, 22), (_FAMILY_CHANNEL, 23)]:
             item = _conversation(items, channel, day, 10, "הודעה להורים")
             _relevant(items, item)
 
     noa = _groups(groups_client, _entity_id(groups_client, "Noa"))
-    itamar = _groups(groups_client, _entity_id(groups_client, "Itamar"))
+    ilan = _groups(groups_client, _entity_id(groups_client, "Ilan"))
     # sorted() orders by codepoint: ה (U+05D4) < כ (U+05DB); ב < כ
     assert sorted(g["channel"] for g in noa["groups"]) == [_NOA_CHANNEL, _FAMILY_CHANNEL]
-    assert sorted(g["channel"] for g in itamar["groups"]) == [_ITAMAR_CHANNEL, _FAMILY_CHANNEL]
+    assert sorted(g["channel"] for g in ilan["groups"]) == [_ILAN_CHANNEL, _FAMILY_CHANNEL]
     applies = {g["channel"]: g["applies_to"] for g in noa["groups"]}
     assert applies[_NOA_CHANNEL] == "Noa"
     assert applies[_FAMILY_CHANNEL] == "family"
@@ -215,7 +215,7 @@ def test_unknown_entity_404_and_non_person_409(groups_client: TestClient) -> Non
 def _seed_one_relevant(groups_client: TestClient) -> str:
     """Kid Noa + her channel + one relevant conversation; returns the item id."""
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
         item = _conversation(items, _NOA_CHANNEL, 21, 10, "מחר פעילות מים — להביא מגבת")
         _relevant(items, item)
@@ -257,11 +257,11 @@ def test_keep_refuses_a_foreign_or_hidden_or_nonwhatsapp_item(
     a superseded copy of the kid's own channel, and a non-WhatsApp item that
     carries the same meta.channel all refuse."""
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
-        memory.set_kid("Itamar", gender="boy", school="בראשית", grade="2")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
+        memory.set_kid("Ilan", gender="boy", school="הגפן", grade="2")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
-        memory.set_channel(_ITAMAR_CHANNEL, kind="parents", applies_to="Itamar")
-        foreign = _conversation(items, _ITAMAR_CHANNEL, 22, 10, "של איתמר")
+        memory.set_channel(_ILAN_CHANNEL, kind="parents", applies_to="Ilan")
+        foreign = _conversation(items, _ILAN_CHANNEL, 22, 10, "של אילן")
         _relevant(items, foreign)
         hidden = _conversation(items, _NOA_CHANNEL, 23, 10, "העתק ישן")
         _relevant(items, hidden)
@@ -305,7 +305,7 @@ def test_keep_undo_delete_and_restore(groups_client: TestClient) -> None:
 
 def test_keep_snippet_is_capped_and_collapsed(groups_client: TestClient) -> None:
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
         item = _conversation(items, _NOA_CHANNEL, 21, 10, "מילה " * 200)
         _relevant(items, item)
@@ -325,7 +325,7 @@ def test_by_channels_relevant_only_is_opt_in(groups_client: TestClient) -> None:
     """Default: untriaged items pass (the /recent semantics — existing callers
     unchanged). relevant_only=True: strictly triage_label == 'relevant'."""
     with _seed_scope() as (memory, items):
-        memory.set_kid("Noa", gender="girl", school="בראשית", grade="5")
+        memory.set_kid("Noa", gender="girl", school="הגפן", grade="5")
         memory.set_channel(_NOA_CHANNEL, kind="parents", applies_to="Noa")
         relevant = _conversation(items, _NOA_CHANNEL, 21, 10, "רלוונטי")
         _relevant(items, relevant)

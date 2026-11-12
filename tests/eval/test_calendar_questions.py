@@ -49,7 +49,7 @@ pytestmark = pytest.mark.timeout(600)
 
 _EVENTS = """\
 BEGIN:VEVENT
-SUMMARY:צופים רונה
+SUMMARY:צופים רומי
 DTSTART;TZID=Asia/Jerusalem:20261023T160000
 DTEND;TZID=Asia/Jerusalem:20261023T173000
 END:VEVENT
@@ -67,25 +67,25 @@ DTEND;TZID=Asia/Jerusalem:20261024T140000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:כדורגל איתמר 16:15-17:20
+SUMMARY:כדורגל אילן 16:15-17:20
 DTSTART;TZID=Asia/Jerusalem:20261025T161500
 DTEND;TZID=Asia/Jerusalem:20261025T171500
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:כדורגל לרונה
+SUMMARY:כדורגל לרומי
 DTSTART;TZID=Asia/Jerusalem:20261025T184500
 DTEND;TZID=Asia/Jerusalem:20261025T194500
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:מפגש קבוצתי איתמר - מרכז דקל( מתחילים ב07:45)
+SUMMARY:מפגש קבוצתי אילן - מרכז דקל( מתחילים ב07:45)
 DTSTART;TZID=Asia/Jerusalem:20261026T074500
 DTEND;TZID=Asia/Jerusalem:20261026T084500
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:הוראה מתקנת - רונה
+SUMMARY:הוראה מתקנת - רומי
 DTSTART;TZID=Asia/Jerusalem:20261026T161500
 DTEND;TZID=Asia/Jerusalem:20261026T170000
 END:VEVENT
@@ -97,7 +97,7 @@ DTEND;TZID=Asia/Jerusalem:20261026T220000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:זהר באירוע מהעבודה
+SUMMARY:קרן באירוע מהעבודה
 DTSTART;TZID=Asia/Jerusalem:20261026T183000
 DTEND;TZID=Asia/Jerusalem:20261026T210000
 END:VEVENT
@@ -115,25 +115,25 @@ DTEND;TZID=Asia/Jerusalem:20261027T090000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:כדורסל לאיתמר (איילת אוספת)
+SUMMARY:כדורסל לאילן (אורלי אוספת)
 DTSTART;TZID=Asia/Jerusalem:20261027T130000
 DTEND;TZID=Asia/Jerusalem:20261027T140000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:צופים לרונה
+SUMMARY:צופים לרומי
 DTSTART;TZID=Asia/Jerusalem:20261027T160000
 DTEND;TZID=Asia/Jerusalem:20261027T173000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:כדורגל איתמר 16:15-17:20
+SUMMARY:כדורגל אילן 16:15-17:20
 DTSTART;TZID=Asia/Jerusalem:20261027T161500
 DTEND;TZID=Asia/Jerusalem:20261027T171500
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:כדורגל לרונה
+SUMMARY:כדורגל לרומי
 DTSTART;TZID=Asia/Jerusalem:20261028T150000
 DTEND;TZID=Asia/Jerusalem:20261028T163000
 END:VEVENT
@@ -145,13 +145,13 @@ DTEND;TZID=Asia/Jerusalem:20261029T090000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:סיכום אבחון רונה (זום)
+SUMMARY:סיכום אבחון רומי (זום)
 DTSTART;TZID=Asia/Jerusalem:20261029T100000
 DTEND;TZID=Asia/Jerusalem:20261029T110000
 END:VEVENT
 ===
 BEGIN:VEVENT
-SUMMARY:הוראה מתקנת - רונה (השדה 10)
+SUMMARY:הוראה מתקנת - רומי (השדה 10)
 DTSTART;TZID=Asia/Jerusalem:20261029T170000
 DTEND;TZID=Asia/Jerusalem:20261029T173000
 END:VEVENT"""
@@ -160,34 +160,34 @@ END:VEVENT"""
 
 QUESTIONS = [
     ("Q1", "What do the kids have on Tuesday October 27?"),
-    ("Q2", "When is Rona's diagnosis summary meeting, and is it on Zoom?"),
-    ("Q3", "Who picks Itamar up from basketball?"),
+    ("Q2", "When is Romi's diagnosis summary meeting, and is it on Zoom?"),
+    ("Q3", "Who picks Ilan up from basketball?"),
     ("Q4", "What am I doing on Friday evening?"),
     ("Q5", "What time do I need to leave for swimming on Tuesday?"),
     ("Q6", "What is happening on Monday evening, October 26? Are there any conflicts?"),
-    ("Q7", "How many times does Itamar have football this week, and when?"),
+    ("Q7", "How many times does Ilan have football this week, and when?"),
     ("Q8", "מתי ארוחת הצהריים עם אור?"),
-    ("Q9", "What time is Itamar's football on Sunday October 25?"),
+    ("Q9", "What time is Ilan's football on Sunday October 25?"),
     ("Q10", "When is my dentist appointment?"),
 ]
 
 # (summary, local date) pairs that MUST be in the context per question.
 EXPECTED: dict[str, set[tuple[str, str]]] = {
     "Q1": {
-        ("כדורסל לאיתמר (איילת אוספת)", "2026-10-27"),
-        ("צופים לרונה", "2026-10-27"),
-        ("כדורגל איתמר 16:15-17:20", "2026-10-27"),
+        ("כדורסל לאילן (אורלי אוספת)", "2026-10-27"),
+        ("צופים לרומי", "2026-10-27"),
+        ("כדורגל אילן 16:15-17:20", "2026-10-27"),
         ("שחיה יציאה מוקדמת 06:40", "2026-10-27"),
     },
-    "Q3": {("כדורסל לאיתמר (איילת אוספת)", "2026-10-27")},
+    "Q3": {("כדורסל לאילן (אורלי אוספת)", "2026-10-27")},
     "Q4": {("ארוחת שישי עם סתיו ודניאל", "2026-10-23")},
     "Q6": {
         ("מדורה+ קמפינג של שכבה ב", "2026-10-26"),
-        ("זהר באירוע מהעבודה", "2026-10-26"),
+        ("קרן באירוע מהעבודה", "2026-10-26"),
         ("טיפול זוגי שבועי 19:00", "2026-10-26"),
     },
     "Q8": {("ארוחת צהריים עם אור", "2026-10-24")},
-    "Q9": {("כדורגל איתמר 16:15-17:20", "2026-10-25")},
+    "Q9": {("כדורגל אילן 16:15-17:20", "2026-10-25")},
 }
 
 

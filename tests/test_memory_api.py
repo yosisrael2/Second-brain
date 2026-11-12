@@ -14,7 +14,7 @@ _ENDPOINT = "/memory"
 KINDS = ["person", "group", "place", "org"]
 
 
-def _add_entity(client: TestClient, name: str = "Rona", kind: str = "person", **overrides) -> dict:
+def _add_entity(client: TestClient, name: str = "Romi", kind: str = "person", **overrides) -> dict:
     payload: dict = {"kind": kind, "name": name}
     payload.update(overrides)
     response = client.post(f"{_ENDPOINT}/entities", json=payload)
@@ -41,48 +41,48 @@ def test_get_memory_empty(client: TestClient, clean_memory: None) -> None:
 
 
 def test_get_memory_groups_facts_by_entity(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    school = _add_entity(client, name="ה' ספיר", kind="group")
-    _add_fact(client, rona["id"], predicate="grade", value="5")
-    _add_fact(client, rona["id"], predicate="gender", value="girl")
-    _add_fact(client, school["id"], predicate="teacher", value="Rinat")
+    romi = _add_entity(client, name="Romi")
+    school = _add_entity(client, name="ה' ברוש", kind="group")
+    _add_fact(client, romi["id"], predicate="grade", value="5")
+    _add_fact(client, romi["id"], predicate="gender", value="girl")
+    _add_fact(client, school["id"], predicate="teacher", value="Tamar")
 
     body = client.get(_ENDPOINT).json()
 
     by_name = {entity["name"]: entity for entity in body["entities"]}
-    assert set(by_name) == {"Rona", "ה' ספיר"}
-    assert {(f["predicate"], f["value"]) for f in by_name["Rona"]["facts"]} == {
+    assert set(by_name) == {"Romi", "ה' ברוש"}
+    assert {(f["predicate"], f["value"]) for f in by_name["Romi"]["facts"]} == {
         ("grade", "5"),
         ("gender", "girl"),
     }
-    assert by_name["ה' ספיר"]["facts"][0]["predicate"] == "teacher"
+    assert by_name["ה' ברוש"]["facts"][0]["predicate"] == "teacher"
 
 
 def test_get_memory_status_filter_proposed_excludes_confirmed(
     client: TestClient, clean_memory: None
 ) -> None:
-    rona = _add_entity(client, name="Rona")
-    itamar = _add_entity(client, name="Itamar")
-    _add_fact(client, rona["id"])  # default status: confirmed
-    _add_fact(client, itamar["id"], status="proposed")
+    romi = _add_entity(client, name="Romi")
+    ilan = _add_entity(client, name="Ilan")
+    _add_fact(client, romi["id"])  # default status: confirmed
+    _add_fact(client, ilan["id"], status="proposed")
 
     proposed = client.get(_ENDPOINT, params={"status": "proposed"}).json()
     confirmed = client.get(_ENDPOINT).json()
 
-    assert [e["name"] for e in proposed["entities"]] == ["Itamar"]  # no empty groups
-    # the default view still lists every entity; Itamar carries no confirmed facts
-    assert {e["name"] for e in confirmed["entities"]} == {"Rona", "Itamar"}
-    itamar_view = next(e for e in confirmed["entities"] if e["name"] == "Itamar")
-    assert itamar_view["facts"] == []
+    assert [e["name"] for e in proposed["entities"]] == ["Ilan"]  # no empty groups
+    # the default view still lists every entity; Ilan carries no confirmed facts
+    assert {e["name"] for e in confirmed["entities"]} == {"Romi", "Ilan"}
+    ilan_view = next(e for e in confirmed["entities"] if e["name"] == "Ilan")
+    assert ilan_view["facts"] == []
 
 
 def test_get_memory_search_q_filters(client: TestClient, clean_memory: None) -> None:
-    _add_entity(client, name="Rona")
-    _add_entity(client, name="Itamar")
+    _add_entity(client, name="Romi")
+    _add_entity(client, name="Ilan")
 
-    body = client.get(_ENDPOINT, params={"q": "rona"}).json()
+    body = client.get(_ENDPOINT, params={"q": "romi"}).json()
 
-    assert [entity["name"] for entity in body["entities"]] == ["Rona"]
+    assert [entity["name"] for entity in body["entities"]] == ["Romi"]
 
 
 def test_get_memory_rejects_bad_status(client: TestClient, clean_memory: None) -> None:
@@ -96,14 +96,14 @@ def test_get_memory_rejects_bad_status(client: TestClient, clean_memory: None) -
 def test_create_entity_returns_201_with_payload(client: TestClient, clean_memory: None) -> None:
     response = client.post(
         f"{_ENDPOINT}/entities",
-        json={"kind": "person", "name": "Rona", "aliases": ["רונה"]},
+        json={"kind": "person", "name": "Romi", "aliases": ["רומי"]},
     )
 
     assert response.status_code == 201
     body = response.json()
-    assert body["name"] == "Rona"
+    assert body["name"] == "Romi"
     assert body["kind"] == "person"
-    assert body["aliases"] == ["רונה"]
+    assert body["aliases"] == ["רומי"]
     assert uuid.UUID(body["id"])
 
 
@@ -121,12 +121,12 @@ def test_create_entity_rejects_invalid(client: TestClient, clean_memory: None) -
 
 
 def test_patch_entity_renames(client: TestClient, clean_memory: None) -> None:
-    entity = _add_entity(client, name="Rona")
+    entity = _add_entity(client, name="Romi")
 
-    response = client.patch(f"{_ENDPOINT}/entities/{entity['id']}", json={"name": "Rona C."})
+    response = client.patch(f"{_ENDPOINT}/entities/{entity['id']}", json={"name": "Romi C."})
 
     assert response.status_code == 200
-    assert response.json()["name"] == "Rona C."
+    assert response.json()["name"] == "Romi C."
 
 
 def test_patch_entity_not_found(client: TestClient, clean_memory: None) -> None:
@@ -141,7 +141,7 @@ def test_delete_entity_refused_while_current_facts_exist(
     client: TestClient, clean_memory: None
 ) -> None:
     """Delete-with-history: an entity with current facts is not deletable."""
-    entity = _add_entity(client, name="Rona")
+    entity = _add_entity(client, name="Romi")
     fact = _add_fact(client, entity["id"])
 
     response = client.delete(f"{_ENDPOINT}/entities/{entity['id']}")
@@ -162,17 +162,17 @@ def test_delete_entity_not_found(client: TestClient, clean_memory: None) -> None
 
 
 def test_create_fact_returns_201(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
+    romi = _add_entity(client, name="Romi")
 
     response = client.post(
         f"{_ENDPOINT}/facts",
-        json={"subject_id": rona["id"], "predicate": "class", "value": "ה' ספיר"},
+        json={"subject_id": romi["id"], "predicate": "class", "value": "ה' ברוש"},
     )
 
     assert response.status_code == 201
     body = response.json()
     assert body["predicate"] == "class"
-    assert body["value"] == "ה' ספיר"
+    assert body["value"] == "ה' ברוש"
     assert body["status"] == "confirmed"  # default
     assert body["valid_to"] is None  # current version
     assert body["supersedes_id"] is None
@@ -180,11 +180,11 @@ def test_create_fact_returns_201(client: TestClient, clean_memory: None) -> None
 
 
 def test_create_fact_rejects_empty_object_and_value(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
+    romi = _add_entity(client, name="Romi")
 
     response = client.post(
         f"{_ENDPOINT}/facts",
-        json={"subject_id": rona["id"], "predicate": "grade"},
+        json={"subject_id": romi["id"], "predicate": "grade"},
     )
 
     assert response.status_code == 422  # DB CHECK: object or value required
@@ -203,8 +203,8 @@ def test_create_fact_unknown_subject_404(client: TestClient, clean_memory: None)
 
 
 def test_patch_fact_closes_old_and_opens_new(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"], value="5")
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"], value="5")
 
     response = client.patch(f"{_ENDPOINT}/facts/{fact['id']}", json={"value": "6"})
 
@@ -225,8 +225,8 @@ def test_patch_fact_closes_old_and_opens_new(client: TestClient, clean_memory: N
 
 
 def test_patch_fact_absent_fields_inherited(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"], predicate="grade", value="5")
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"], predicate="grade", value="5")
 
     response = client.patch(f"{_ENDPOINT}/facts/{fact['id']}", json={"value": "6"})
 
@@ -241,8 +241,8 @@ def test_patch_fact_not_found(client: TestClient, clean_memory: None) -> None:
 
 def test_patch_closed_fact_conflicts(client: TestClient, clean_memory: None) -> None:
     """Editing a superseded fact is a 409, not a fork of history."""
-    rona = _add_entity(client, name="Rona")
-    v1 = _add_fact(client, rona["id"], value="5")
+    romi = _add_entity(client, name="Romi")
+    v1 = _add_fact(client, romi["id"], value="5")
     v2 = client.patch(f"{_ENDPOINT}/facts/{v1['id']}", json={"value": "6"}).json()
 
     response = client.patch(f"{_ENDPOINT}/facts/{v1['id']}", json={"value": "7"})
@@ -258,8 +258,8 @@ def test_patch_closed_fact_conflicts(client: TestClient, clean_memory: None) -> 
 
 
 def test_delete_fact_is_soft_history_kept(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"])
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"])
 
     response = client.delete(f"{_ENDPOINT}/facts/{fact['id']}")
 
@@ -275,8 +275,8 @@ def test_delete_fact_is_soft_history_kept(client: TestClient, clean_memory: None
 
 
 def test_delete_fact_twice_conflicts(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"])
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"])
     assert client.delete(f"{_ENDPOINT}/facts/{fact['id']}").status_code == 204
 
     response = client.delete(f"{_ENDPOINT}/facts/{fact['id']}")
@@ -292,8 +292,8 @@ def test_delete_fact_not_found(client: TestClient, clean_memory: None) -> None:
 
 
 def test_confirm_fact_proposed_to_confirmed(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"], status="proposed")
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"], status="proposed")
 
     response = client.post(f"{_ENDPOINT}/facts/{fact['id']}/confirm")
 
@@ -303,8 +303,8 @@ def test_confirm_fact_proposed_to_confirmed(client: TestClient, clean_memory: No
 
 
 def test_confirm_fact_already_confirmed_conflicts(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"])  # confirmed by default
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"])  # confirmed by default
 
     response = client.post(f"{_ENDPOINT}/facts/{fact['id']}/confirm")
 
@@ -319,8 +319,8 @@ def test_confirm_fact_not_found(client: TestClient, clean_memory: None) -> None:
 
 
 def test_fact_history_walks_the_version_chain(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    v1 = _add_fact(client, rona["id"], value="5")
+    romi = _add_entity(client, name="Romi")
+    v1 = _add_fact(client, romi["id"], value="5")
     v2 = client.patch(f"{_ENDPOINT}/facts/{v1['id']}", json={"value": "6"}).json()
     v3 = client.patch(f"{_ENDPOINT}/facts/{v2['id']}", json={"value": "7"}).json()
 
@@ -333,8 +333,8 @@ def test_fact_history_walks_the_version_chain(client: TestClient, clean_memory: 
 
 
 def test_fact_history_single_version_fact(client: TestClient, clean_memory: None) -> None:
-    rona = _add_entity(client, name="Rona")
-    fact = _add_fact(client, rona["id"])
+    romi = _add_entity(client, name="Romi")
+    fact = _add_fact(client, romi["id"])
 
     chain = client.get(f"{_ENDPOINT}/facts/{fact['id']}/history").json()
 

@@ -112,8 +112,8 @@ $('sched-new').click();
 await settle();
 check('editor open', !$('sched-editor').hidden && $('sched-preset').value === 'weekly');
 check('prompt textarea dir auto', $('sched-prompt').getAttribute('dir') === 'auto' && $('sched-name').getAttribute('dir') === 'auto');
-setValue('sched-name', '<b>Rona</b> school mail');
-setValue('sched-prompt', 'בדוק אם התקבלו מיילים חדשים מבית הספר של רונה ותסכם');
+setValue('sched-name', '<b>Romi</b> school mail');
+setValue('sched-prompt', 'בדוק אם התקבלו מיילים חדשים מבית הספר של רומי ותסכם');
 await sleep(400);
 check('preview shows words', $('sched-preview').textContent.startsWith('Every Friday at 07:00 · next:'), $('sched-preview').textContent);
 $('sched-save').click();
@@ -122,14 +122,14 @@ const post = calls.filter((c) => c.method === 'POST' && c.url === '/schedules').
 check('create posts the cron', post?.status === 201 && post.body.schedule === '0 7 * * 5' && post.body.timezone === 'Asia/Jerusalem', JSON.stringify(post));
 check('editor closed after save', $('sched-editor').hidden);
 check('card rendered', card() && card().querySelector('.sc-when').textContent === 'Every Friday at 07:00');
-check('name rendered as text', card().querySelector('.sc-name').textContent === '<b>Rona</b> school mail' && !card().querySelector('.sc-name b'));
-check('prompt preview dir auto', card().querySelector('.sc-prompt').getAttribute('dir') === 'auto' && card().querySelector('.sc-prompt').textContent.includes('רונה'));
+check('name rendered as text', card().querySelector('.sc-name').textContent === '<b>Romi</b> school mail' && !card().querySelector('.sc-name b'));
+check('prompt preview dir auto', card().querySelector('.sc-prompt').getAttribute('dir') === 'auto' && card().querySelector('.sc-prompt').textContent.includes('רומי'));
 check('active + next run', card().textContent.includes('Active') && card().querySelector('.sc-next').textContent.startsWith('Next run: Fri'), card().querySelector('.sc-next').textContent);
 
 // ---- weekly days + daily preset round-trip through edit ----
 action('edit').click();
 await settle();
-check('edit prefilled', $('sched-name').value === '<b>Rona</b> school mail' && $('sched-preset').value === 'weekly' && $('sched-day-5').checked && $('sched-time').value === '07:00');
+check('edit prefilled', $('sched-name').value === '<b>Romi</b> school mail' && $('sched-preset').value === 'weekly' && $('sched-day-5').checked && $('sched-time').value === '07:00');
 $('sched-day-0').click(); $('sched-day-3').click(); $('sched-day-5').click();
 await settle();
 $('sched-save').click();

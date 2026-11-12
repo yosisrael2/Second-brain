@@ -32,7 +32,7 @@ ignored, so the labeling schema can grow without breaking the harness.
 | `end`           | no       | carried, not scored                                                    |
 | `all_day`       | no       | explicit flag; a date-only EFFECTIVE date (`start` if present, else `due`) implies true |
 | `due`           | no       | tasks: used as the matching date when `start` is absent                |
-| `applies_to`    | no       | JSON string (`"rona"`, `"rona, itamar"`, `"me"`, `"nobody"`, `"unknown"`, empty) or JSON list of strings (`["Rona", "me"]`) — both normalize to the same token set; any other type is an error |
+| `applies_to`    | no       | JSON string (`"romi"`, `"romi, ilan"`, `"me"`, `"nobody"`, `"unknown"`, empty) or JSON list of strings (`["Romi", "me"]`) — both normalize to the same token set; any other type is an error |
 | `importance`    | no       | carried, not scored                                                    |
 | `actionability` | no       | carried, not scored                                                    |
 | `source_quote`  | no       | verbatim text from the source email (verified for preds)               |

@@ -11,7 +11,7 @@ def rel_row(child_id, target=None, relation_kind="supersedes", **over):
         "title": f"fact {child_id}",
         "start": "2026-11-03",
         "all_day": True,
-        "applies_to": "rona",
+        "applies_to": "romi",
     }
     if target:
         base["relation"] = {"kind": relation_kind, "target": target}

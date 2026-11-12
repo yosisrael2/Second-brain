@@ -209,7 +209,7 @@ function renderEditor() {
   if (!draft) { box.replaceChildren(); return; }
 
   const field = (label, id, control) => el("div", { class: "sc-field" }, el("label", { for: id, text: label }), control);
-  const name = el("input", { id: "sched-name", type: "text", dir: "auto", maxlength: "120", placeholder: "e.g. Rona's school mail" });
+  const name = el("input", { id: "sched-name", type: "text", dir: "auto", maxlength: "120", placeholder: "e.g. Romi's school mail" });
   name.value = draft.name;
   name.addEventListener("input", () => { draft.name = name.value; });
   const prompt = el("textarea", { id: "sched-prompt", class: "pr-text", dir: "auto", rows: "5", maxlength: "4000",

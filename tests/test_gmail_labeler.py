@@ -81,16 +81,16 @@ class TestClassify:
         from brain.services.gmail_labeler import classify
 
         assert (
-            classify(sender="a@x", subject="רונה", list_header=None, kid_names=["רונה"], rules=None)
-            == "SB/Kids/רונה"
+            classify(sender="a@x", subject="רומי", list_header=None, kid_names=["רומי"], rules=None)
+            == "SB/Kids/רומי"
         )
         # The Hebrew prefix run still full-matches (is_name_token).
         assert (
             classify(
-                sender="a@x", subject="לרונה", list_header=None,
-                kid_names=["רונה"], rules=None,
+                sender="a@x", subject="לרומי", list_header=None,
+                kid_names=["רומי"], rules=None,
             )
-            == "SB/Kids/רונה"
+            == "SB/Kids/רומי"
         )
 
     def test_classmate_full_name_and_substring_get_no_kid_label(self):
@@ -99,16 +99,16 @@ class TestClassify:
         # A classmate's FULL NAME in the subject: no standalone kid token.
         assert (
             classify(
-                sender="a@x", subject="רונה לוי עדכנה", list_header=None,
-                kid_names=["רונה"], rules=None,
+                sender="a@x", subject="רומי לוי עדכנה", list_header=None,
+                kid_names=["רומי"], rules=None,
             )
             == "SB/Unsorted"
         )
-        # A substring ('Ronald' contains 'Rona') is NOT a full-token match.
+        # A substring ('Romild' contains 'Romi') is NOT a full-token match.
         assert (
             classify(
-                sender="a@x", subject="Ronald", list_header=None,
-                kid_names=["Rona"], rules=None,
+                sender="a@x", subject="Romild", list_header=None,
+                kid_names=["Romi"], rules=None,
             )
             == "SB/Unsorted"
         )
@@ -127,10 +127,10 @@ class TestClassify:
         # Kids outrank Noise (precedence: Kids > ... > Noise).
         assert (
             classify(
-                sender="news@lists.example", subject="רונה",
-                list_header="<lists.example>", kid_names=["רונה"], rules=rules,
+                sender="news@lists.example", subject="רומי",
+                list_header="<lists.example>", kid_names=["רומי"], rules=rules,
             )
-            == "SB/Kids/רונה"
+            == "SB/Kids/רומי"
         )
 
     def test_domain_rule_routes_sender(self):

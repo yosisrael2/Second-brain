@@ -51,7 +51,7 @@ def upgrade() -> None:
         "child_state IS NULL OR child_state IN ('proposed', 'kept', 'dropped')",
     )
     # applies_to: resolved audience (item 17 / rule R1-R5) as a JSON list —
-    # e.g. ["Rona"], ["me"], or ["unknown"] (unknown stays unknown, R4).
+    # e.g. ["Romi"], ["me"], or ["unknown"] (unknown stays unknown, R4).
     op.add_column(
         "memory_items",
         sa.Column("applies_to", postgresql.JSONB(), nullable=True),

@@ -728,7 +728,7 @@ class EnrichmentService:
             # the ONE allowed mismatch: the stored child was unresolved
             # (['unknown']) and memory has since improved — the candidate is
             # still the same child and updates it in place (item 18). Two
-            # different KNOWN audiences (Rona vs Noa) never match.
+            # different KNOWN audiences (Romi vs Noa) never match.
             if stored != {"unknown"}:
                 return False
         return title_similarity(child.raw_text, candidate.title) >= _CHILD_IDENTITY_THRESHOLD
