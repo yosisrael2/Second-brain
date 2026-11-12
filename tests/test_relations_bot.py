@@ -427,5 +427,5 @@ class TestStateGuards:
         token = bot.registry.put(_PendingIds(ids=(new.id, rel.id)))
         monkeypatch.setattr(rel_module, "RelationsService", _Boom)
         reply = bot.handle_callback(f"{CB_REL_KEEP_BOTH}:{token}:0", 7)
-        assert "<b>&" not in reply.text
-        assert html.escape("bad <b>&", quote=False) in reply.text
+        assert "<b>&" not in reply.toast  # escaped; the adapter unescapes for the toast
+        assert html.escape("bad <b>&", quote=False) in reply.toast

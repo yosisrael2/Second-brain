@@ -402,8 +402,8 @@ class TestMixedCardTaps:
         for data in (f"{CB_REL_CONFIRM}:not-a-uuid", f"{CB_REL_CONFIRM}:",
                      f"{CB_REL_CONFIRM}:{uuid.uuid4()}", f"{CB_REL_CONFIRM}:abcd1234:0"):
             tapped = bot.handle_callback(data, 7)
-            assert tapped.keyboard is None
-            assert "⌛" in tapped.text or "Unknown" in tapped.text, (data, tapped.text)
+            assert tapped.keyboard is None and tapped.text == ""  # a toast only
+            assert "⌛" in tapped.toast or "Unknown" in tapped.toast, (data, tapped.toast)
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by is None
 
