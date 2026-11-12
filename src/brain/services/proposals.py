@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -83,16 +84,57 @@ def _esc(value: str) -> str:
     return html.escape(value, quote=False)
 
 
+# meta.channel names the TRANSPORT for bot/email/manual captures ("telegram")
+# but the conversation for WhatsApp ("<group name>"): only the latter is a title.
+_TRANSPORT_CHANNELS = frozenset(
+    "telegram email gmail imap manual api cli web cockpit whatsapp calendar ics paste".split()
+)
+_TITLE_MAX = 60
+_LINE_PREFIX = re.compile(r"^[\s>*#•·\-–—=_~|]+")
+_HAS_WORD = re.compile(r"[^\W_]")
+
+
+def _trim(value: str) -> str:
+    value = " ".join(value.split())
+    if len(value) <= _TITLE_MAX:
+        return value
+    return value[: _TITLE_MAX - 1].rstrip() + "…"
+
+
+def _first_meaningful_line(text: str) -> str | None:
+    """The first line with a letter or digit, list/quote markers stripped."""
+    for raw in text.splitlines():
+        line = _LINE_PREFIX.sub("", raw).strip()
+        if _HAS_WORD.search(line):
+            return line
+    return None
+
+
 def source_short_title(source: MemoryItem) -> str:
-    """A short human title for the card header: subject > channel > first line."""
+    """A short human title for the card header: subject > conversation name
+    (a WhatsApp group; never a transport like "telegram") > title > first
+    meaningful line > sender."""
     meta = source.meta or {}
-    for key in ("subject", "channel", "title"):
+
+    def _meta(key: str) -> str | None:
         value = meta.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()[:60]
-    first_line = (source.raw_text or "").strip().splitlines()
-    line = first_line[0].strip() if first_line else "capture"
-    return line[:60]
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    channel = _meta("channel")
+    if channel is not None and channel.lower() in _TRANSPORT_CHANNELS:
+        channel = None
+    candidates = (
+        _meta("subject"),
+        channel,
+        _meta("title"),
+        _first_meaningful_line(source.raw_text or ""),
+        _meta("sender"),
+        _meta("from"),
+    )
+    for value in candidates:
+        if value:
+            return _trim(value)
+    return "capture"
 
 
 def _local(child: MemoryItem, tz: ZoneInfo) -> datetime | None:
