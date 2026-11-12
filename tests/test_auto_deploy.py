@@ -104,7 +104,11 @@ class World:
         self.rev.write_text("rev_old\n")
         _stub(
             self.venv / "alembic",
-            f'if [ "$1" = current ]; then cat {self.rev}; exit 0; fi\n'
+            # like the real app settings: the live store needs the opt-in
+            f'if [ "${{BRAIN_ALLOW_LIVE:-}}" != 1 ]; then\n'
+            f'  echo "refusing the LIVE store" >&2; exit 1\nfi\n'
+            f'if [ "$1" = current ]; then [ "${{ALEMBIC_CURRENT_FAIL:-}}" = 1 ] && exit 1; '
+            f'cat {self.rev}; exit 0; fi\n'
             f'echo "alembic $*" >>{log}\n'
             f'[ "${{ALEMBIC_ADVANCE:-}}" = 1 ] && echo rev_new >{self.rev}\n'
             f'[ "${{ALEMBIC_FAIL:-}}" = 1 ] && exit 1\nexit 0\n',
@@ -121,8 +125,9 @@ class World:
         return _git(self.dev, "rev-parse", "HEAD")
 
     def run(self, **env: str) -> subprocess.CompletedProcess[str]:
+        base = {k: v for k, v in os.environ.items() if k != "BRAIN_ALLOW_LIVE"}
         run_env = {
-            **os.environ,
+            **base,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "DEPLOY_ROOT": str(self.root),
             "DEPLOY_BACKUP_DIR": str(self.tmp / "backups"),
@@ -265,6 +270,21 @@ def test_failed_first_migration_rolls_back(world: World) -> None:
 
     assert world.head() == world.first
     assert "failed at alembic upgrade head; rolled back" in world.calls()
+
+
+def test_unreadable_schema_revision_changes_nothing(world: World) -> None:
+    """Two empty `alembic current` readings must not count as "unchanged"
+    (that rolled code back blindly): stop before the merge, report once."""
+    world.commit("feat: thing")
+
+    result = world.run(ALEMBIC_CURRENT_FAIL="1")
+
+    assert result.returncode == 0, result.stderr
+    assert world.head() == world.first
+    assert "could not read the database schema revision" in world.calls()
+    assert "pip install" not in world.calls()
+    world.run(ALEMBIC_CURRENT_FAIL="1")
+    assert world.calls().count("could not read the database schema") == 1
 
 
 def test_a_crash_looping_service_fails_the_deploy(world: World) -> None:
