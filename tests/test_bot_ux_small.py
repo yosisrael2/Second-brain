@@ -7,6 +7,7 @@ against duck-typed tg/query fakes. Invented names only (public repo).
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -125,6 +126,11 @@ class TestToasts:
         reply = core.handle_callback("f:deadbeef", 111)
         assert reply.text == ""
         assert reply.toast and "expired" in reply.toast
+
+    def test_a_pre_durable_proposal_button_is_an_expired_toast(self):
+        core, _ = make_core()
+        reply = core.handle_callback("pk:abcd1234:0", 111)  # a card from before #172
+        assert reply.text == "" and "expired" in reply.toast
 
     def test_unknown_button_is_a_toast_only(self):
         core, _ = make_core()
@@ -251,14 +257,17 @@ class TestCardCleanup:
         assert "📅 אירוע · ✔️ משימה" not in card  # the legend is gone
 
     def test_keyboard_rows_match_the_numbers_and_skip_fyi(self):
-        rows = proposal_keyboard("tok", _kids())
+        kids = _kids()
+        for kid in kids:
+            kid.id = uuid.uuid4()
+        rows = proposal_keyboard("tok", kids)
         assert [[label for label, _ in row] for row in rows] == [
             ["1 ✅ Keep", "1 ✏️ Fix", "1 🗑 Drop"],
             ["2 ✅ Keep", "2 ✏️ Fix", "2 🗑 Drop"],
             ["✅ Keep all"],
         ]
-        # callback data still carries the child's position in the card token
-        assert [row[0][1] for row in rows[:2]] == ["pk:tok:0", "pk:tok:2"]
+        # each row's buttons act on ITS child: line 2 is the 3rd child
+        assert [row[0][1] for row in rows[:2]] == [f"pk:{kids[0].id}", f"pk:{kids[2].id}"]
 
     def test_no_fyi_block_when_everything_is_actionable(self):
         kids = [kid for kid in _kids() if kid.type != ItemType.FACT]

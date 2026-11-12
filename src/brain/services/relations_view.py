@@ -40,6 +40,8 @@ CB_REL_CONFIRM = "rc"  # rc:<token>:<index>  confirm a proposed supersede
 CB_REL_KEEP_BOTH = "rk"  # rk:<token>:<index>  reject a proposed supersede
 CB_REL_RESTORE = "rs"  # rs:<token>          restore a superseded item
 CB_RECON_DISCARD = "rd"  # rd:<token>:<index>  keep existing / not cancelled
+# A proposal card's verdict rows reuse rc/rk/rd/ru with ONE durable part, the
+# relation id (rc:<relation-uuid>): those cards are read days later.
 
 # The four recon relation kinds (D-recon-1's verdict writes).
 RECON_KINDS = ("supersedes", "conflicts", "cancels", "details")

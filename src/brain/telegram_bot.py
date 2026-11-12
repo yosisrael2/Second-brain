@@ -55,7 +55,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -70,6 +70,7 @@ from brain.services.ingest import IngestService
 from brain.services.memory import MemoryError
 from brain.services.paste import parse as parse_paste
 from brain.services.proposals import (
+    CB_PING_FLAG,
     CB_PROPOSED_DROP,
     CB_PROPOSED_FIX,
     CB_PROPOSED_KEEP,
@@ -78,6 +79,7 @@ from brain.services.proposals import (
     apply_drop,
     apply_fix,
     apply_keep,
+    apply_keep_all,
     due_proposed_children,
     mark_pinged,
     ping_is_quiet,
@@ -163,6 +165,19 @@ CB_WA_SPLIT = "wm"  # wm:<token>      -> save one item per message
 CB_MEM_DEL = "m"  # m:<token>:<index> -> remove one memory fact (soft delete)
 CB_SCHED_RUN = "sr"  # sr:<token>:<index>  -> queue a scheduled task's run-now
 CB_SCHED_TOGGLE = "st"  # st:<token>:<index> -> pause / resume a scheduled task
+
+# Proposal cards / due pings carry the id they act on instead of a registry
+# token (they are read days later, across restarts). Only the canonical
+# lowercase uuid form str(uuid) produces is accepted: callback data comes
+# from the client and is never trusted beyond that id.
+_DURABLE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _durable_id(raw: str) -> uuid_mod.UUID | None:
+    """The uuid a durable button carries, or None for anything else."""
+    return uuid_mod.UUID(raw) if _DURABLE_ID.fullmatch(raw) else None
+
+
 SCHEDULES_LIST_MAX = 20  # /schedules shows (and buttons) at most this many tasks
 
 BOT_COMMANDS = (
@@ -335,12 +350,14 @@ class Reply:
 
 @dataclass(frozen=True)
 class Pending:
-    """State parked behind a short callback token (10-minute TTL)."""
+    """State parked behind a short callback token (10-minute TTL).
+
+    Proposal cards and due pings never use it: their buttons carry ids."""
 
     ids: tuple[uuid_mod.UUID, ...] = ()  # target items for the action
     text: str | None = None  # WhatsApp paste waiting for the join/split choice
     # PR C proposal cards: what the token refers to + the fix-flow step
-    kind: str = "capture"  # "capture" | "proposal" | "fix"
+    kind: str = "capture"  # "capture" | "fix" | "relation" | "schedules"
     step: str | None = None  # fix flow: "title" | "date"
 
 
@@ -1299,34 +1316,38 @@ class TelegramBot:
         """Render the source's proposal card (None when nothing is proposed).
 
         Verdict children (D-recon-2a) get their verdict row instead of
-        Keep/Fix/Drop, and a CONFLICT child adds the both-versions block;
-        the verdict relations are parked aligned with the children so the
-        callbacks stay < 64 bytes."""
+        Keep/Fix/Drop, and a CONFLICT child adds the both-versions block.
+        Every button carries the child / relation / source id it acts on
+        (no registry token), so the card keeps working for days and across
+        restarts."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         session = SessionLocal()
         try:
-            children = proposed_children_of(session, source.id)
-            if not children:
-                return None
-            lang, names = self._session_locale(session)
-            recon, blocks = self._recon_payload(session, children, lang)
-            token = self.registry.put(
-                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
-            )
-            parts = [part for part in (
-                notice,
-                render_source_card(
-                    source, children, self._timezone.key, recon=recon, lang=lang, names=names
-                ),
-                *blocks,
-            ) if part]
-            return Reply(
-                text="\n".join(parts),
-                keyboard=proposal_keyboard(token, children, recon=recon, lang=lang),
-            )
+            return self._render_proposal_card(session, source, notice=notice)
         finally:
             session.close()
+
+    def _render_proposal_card(  # type: ignore[no-untyped-def]  # (untyped before: session/rows)
+        self, session, source, *, notice: str | None = None, edit: bool = False
+    ) -> Reply | None:
+        children = proposed_children_of(session, source.id)
+        if not children:
+            return None
+        lang, names = self._session_locale(session)
+        recon, blocks = self._recon_payload(session, children, lang)
+        parts = [part for part in (
+            notice,
+            render_source_card(
+                source, children, self._timezone.key, recon=recon, lang=lang, names=names
+            ),
+            *blocks,
+        ) if part]
+        return Reply(
+            text="\n".join(parts),
+            keyboard=proposal_keyboard(source.id, children, recon=recon, lang=lang),
+            edit=edit,
+        )
 
     def _recon_rows(self, session, children) -> dict[int, tuple[str, object, str | None]]:
         """index -> (verdict, relation, matched_title) for the card's verdict
@@ -1349,96 +1370,102 @@ class TelegramBot:
             rows[index] = (verdict, rel, matched_title)
         return rows
 
-    def _proposal_child_ids(self, pending: Pending) -> list:
-        """The child ids a card token refers to (ids[1:])."""
-        return list(pending.ids[1:])
+    def _durable_proposal_callback(
+        self, prefix: str, rest: str, user_id: int | None
+    ) -> Reply | None:
+        """Proposal-card and due-ping buttons: ``pk|pf|px:<child-uuid>`` (a
+        ping adds ``:p``), ``pa:<source-uuid>``, verdict rows
+        ``rc|rk|rd|ru:<relation-uuid>``. No registry, so they work days
+        later and after a restart; every action re-checks the DB (the item
+        exists, is still proposed, is a proposal child), so a tap on an item
+        decided elsewhere is a clear no-op. Who may tap stays the update
+        allowlist. None = not this format (a relation card's
+        ``rc:<token>:<index>`` goes on to the registry path)."""
+        raw, _, flag = rest.partition(":")
+        target = _durable_id(raw)
+        if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD):
+            if target is None or flag:
+                return None
+            return self._recon_transition(prefix, target)
+        if target is None or flag not in ("", CB_PING_FLAG):
+            # a card sent before durable buttons (pk:<token>:<index>) or junk
+            return self._toast(i18n.t(self._language(), "btn_expired"))
+        if prefix == CB_PROPOSED_KEEP_ALL:
+            return self._proposal_keep_all(target)
+        if prefix == CB_PROPOSED_FIX:
+            return self._proposal_fix_start(user_id, target)
+        return self._proposal_decide(
+            target, keep=prefix == CB_PROPOSED_KEEP, ping=flag == CB_PING_FLAG
+        )
 
-    def _proposal_keep(self, pending: Pending, index: int) -> Reply:
+    def _proposal_decide(self, child_id: uuid_mod.UUID, *, keep: bool, ping: bool) -> Reply:
+        """✅ Keep / 🗑 Drop one proposed child (row lock: two taps never
+        both apply). A ping answers one line; a card re-renders in place —
+        also after a tap on a child decided elsewhere (its other rows stay
+        usable)."""
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
-        ids = self._proposal_child_ids(pending)
-        if not 0 <= index < len(ids):
-            return self._toast(i18n.t(self._language(), "card_moved_on"))
+        lang = self._language()
         with SessionLocal() as session:
-            child = session.get(MemoryItem, ids[index])
-            if child is None or child.child_state != "proposed":
-                return self._toast(i18n.t(self._language(), "card_moved_on"))
+            child = session.get(MemoryItem, child_id, with_for_update=True)
+            if child is None or child.child_state is None:  # no proposal child
+                return self._toast(i18n.t(lang, "already_handled"))
+            source = self._proposal_source_of(child, session)
+            source_id = source.id if source is not None else None
+            if child.child_state != "proposed":
+                already = i18n.t(lang, "already_handled")
+                if ping or source_id is None:
+                    return self._toast(already)
+                session.rollback()  # release the row lock before re-rendering
+                return self._proposal_card_reply(source_id, notice=already)
             title = _esc(child.raw_text[:40])
-            apply_keep(_repo_of(session), child)
-        notice = i18n.t(self._language(), "kept_title", title=title)
-        return self._proposal_card_reply(pending, notice=notice)
+            (apply_keep if keep else apply_drop)(_repo_of(session), child)
+        notice = i18n.t(lang, "kept_title" if keep else "dropped_title", title=title)
+        if ping:
+            return Reply(notice, edit=True, toast=notice)
+        return self._proposal_card_reply(source_id, notice=notice)
 
-    def _proposal_drop(self, pending: Pending, index: int) -> Reply:
+    def _proposal_keep_all(self, source_id: uuid_mod.UUID) -> Reply:
+        """✅ Keep all: every still-proposed child of the source."""
+        from sqlalchemy import select  # noqa: PLC0415
+
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
-        ids = self._proposal_child_ids(pending)
-        if not 0 <= index < len(ids):
-            return self._toast(i18n.t(self._language(), "card_moved_on"))
         with SessionLocal() as session:
-            child = session.get(MemoryItem, ids[index])
-            if child is None or child.child_state != "proposed":
-                return self._toast(i18n.t(self._language(), "card_moved_on"))
-            title = _esc(child.raw_text[:40])
-            apply_drop(_repo_of(session), child)
-        notice = i18n.t(self._language(), "dropped_title", title=title)
-        return self._proposal_card_reply(pending, notice=notice)
-
-    def _proposal_keep_all(self, pending: Pending) -> Reply:
-        from brain.db.models import MemoryItem  # noqa: PLC0415
-        from brain.db.session import SessionLocal  # noqa: PLC0415
-
-        changed = 0
-        with SessionLocal() as session:
-            repo = _repo_of(session)
-            for child_id in self._proposal_child_ids(pending):
-                child = session.get(MemoryItem, child_id)
-                if child is not None and child.child_state == "proposed":
-                    child.child_state = "kept"
-                    changed += 1
-            if changed:
-                repo.commit()
+            ids = [child.id for child in proposed_children_of(session, source_id)]
+            locked = session.scalars(
+                select(MemoryItem)
+                .where(MemoryItem.id.in_(ids))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all() if ids else []
+            changed = apply_keep_all(_repo_of(session), list(locked))
+        if not changed:
+            already = i18n.t(self._language(), "already_handled")
+            if not ids:
+                return self._toast(already)
+            return self._proposal_card_reply(source_id, notice=already)
         notice = i18n.tn(self._language(), "kept_n", changed)
-        return self._proposal_card_reply(pending, notice=notice)
+        return self._proposal_card_reply(source_id, notice=notice)
 
-    def _proposal_card_reply(self, pending: Pending, *, notice: str) -> Reply:
+    def _proposal_card_reply(self, source_id: uuid_mod.UUID | None, *, notice: str) -> Reply:
         """Re-render the source card after an action (edit-in-place)."""
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
-        session = SessionLocal()
-        try:
-            source = session.get(MemoryItem, pending.ids[0]) if pending.ids else None
-            children = [
-                row
-                for row in (session.get(MemoryItem, cid) for cid in pending.ids[1:])
-                if row is not None and row.child_state == "proposed"
-            ]
-            if source is None or not children:
-                lang = self._language()
-                done = i18n.t(lang, "all_done")
-                return Reply(f"{notice}\n{done}", edit=True, toast=notice)
-            lang, names = self._session_locale(session)
-            recon, blocks = self._recon_payload(session, children, lang)
-            token = self.registry.put(
-                Pending(ids=(source.id, *(c.id for c in children)), kind="proposal")
+        with SessionLocal() as session:
+            source = session.get(MemoryItem, source_id) if source_id is not None else None
+            reply = (
+                self._render_proposal_card(session, source, notice=notice, edit=True)
+                if source is not None
+                else None
             )
-            parts = [part for part in (
-                notice,
-                render_source_card(
-                    source, children, self._timezone.key, recon=recon, lang=lang, names=names
-                ),
-                *blocks,
-            ) if part]
-            return Reply(
-                text="\n".join(parts),
-                keyboard=proposal_keyboard(token, children, recon=recon, lang=lang),
-                edit=True,
-                toast=notice,
-            )
-        finally:
-            session.close()
+        if reply is None:
+            done = i18n.t(self._language(), "all_done")
+            return Reply(f"{notice}\n{done}", edit=True, toast=notice)
+        return replace(reply, toast=notice)
 
     # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
 
@@ -1453,9 +1480,7 @@ class TelegramBot:
 
     def _relation_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
         """↩︎ Undo / ✅ Confirm / ✖ Keep-both on a relation (items 20a/20b);
-        a proposal card's verdict rows route to the D-recon-2a handler."""
-        if pending.kind == "proposal":
-            return self._recon_transition(prefix, pending, arg)
+        a proposal card's verdict rows are durable (_recon_transition)."""
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
 
         try:
@@ -1480,35 +1505,39 @@ class TelegramBot:
             return self._toast(self._relation_error(exc))
         return self._card_reply(pending, notice=notice)
 
-    def _recon_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
+    def _recon_transition(self, prefix: str, rel_id: uuid_mod.UUID) -> Reply:
         """Verdict rows on a proposal card (D-recon-2a): ✅ confirm update /
         keep new / confirm cancellation, ✖ keep both, ✅ keep existing /
         ✖ not cancelled, ↩︎ undo. The callback carries the RELATION ID (not
         a position), so a mixed card cannot misalign plain and verdict
         rows; nothing ever applies without a tap, and a stale callback
         after the relation changed answers "already handled" — every
-        action re-checks the relation's state."""
-        from brain.db.models import ItemRelation  # noqa: PLC0415
+        action re-checks the relation's state. Only a relation owned by a
+        still-proposed recon verdict child resolves here (the callback id
+        comes from the client)."""
+        from brain.db.models import ItemRelation, MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
         from brain.services.extraction.reconciliation import (  # noqa: PLC0415
             ReconciliationService,
         )
         from brain.services.relations import RelationsError, RelationsService  # noqa: PLC0415
 
-        try:
-            rel_id = uuid_mod.UUID(str(arg))
-        except ValueError:
-            return self._toast(i18n.t(self._language(), "btn_unknown"))
         already = i18n.t(self._language(), "already_handled")
         notice = None
         with SessionLocal() as session:
             rel = session.get(ItemRelation, rel_id)
-            if rel is None:
+            if rel is None or (rel.provenance or {}).get("how") != "recon":
                 return self._toast(already)
-            if rel.from_id not in pending.ids[1:]:
-                # a relation id from ANOTHER card must never resolve here
+            child = session.get(MemoryItem, rel.from_id)  # the verdict child owns it
+            source = self._proposal_source_of(child, session) if child is not None else None
+            if (
+                child is None
+                or source is None
+                or child.child_state != "proposed"
+                or not (child.extraction_meta or {}).get("recon_verdict")
+            ):
                 return self._toast(already)
-            child_id = rel.from_id  # the verdict child owns the relation
+            child_id, source_id = child.id, source.id
             state = (rel.provenance or {}).get("state")
             service = ReconciliationService(
                 session, _repo_of(session), tz_name=self._timezone.key,
@@ -1556,7 +1585,7 @@ class TelegramBot:
                 return self._toast(already)
         if notice is None:
             return self._toast(already)
-        return self._proposal_card_reply(pending, notice=notice)
+        return self._proposal_card_reply(source_id, notice=notice)
 
     def _recon_child_kept(self, session, child_id) -> None:
         """The acted verdict child becomes kept (it stays visible; a re-run
@@ -1611,17 +1640,14 @@ class TelegramBot:
             return self._toast(self._relation_error(exc))
         return self._card_reply(pending, notice=i18n.t(self._language(), "rel_restored"))
 
-    def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
+    def _proposal_fix_start(self, user_id: int | None, child_id: uuid_mod.UUID) -> Reply:
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
-        ids = self._proposal_child_ids(pending)
-        if not 0 <= index < len(ids):
-            return self._toast(i18n.t(self._language(), "card_moved_on"))
         with SessionLocal() as session:
-            child = session.get(MemoryItem, ids[index])
+            child = session.get(MemoryItem, child_id)
         if child is None or child.child_state != "proposed":
-            return self._toast(i18n.t(self._language(), "card_moved_on"))
+            return self._toast(i18n.t(self._language(), "already_handled"))
         if user_id is None:
             return Reply(i18n.t(self._language(), "fix_no_user"), edit=True)
         token = self.registry.put(Pending(ids=(child.id,), kind="fix", step="title"))
@@ -1711,12 +1737,13 @@ class TelegramBot:
             pings: list[tuple[int, Reply]] = []
             lang, names = self._session_locale(session)
             for child in children:
-                token = self.registry.put(Pending(ids=(child.id,), kind="proposal"))
+                keep = f"{CB_PROPOSED_KEEP}:{child.id}:{CB_PING_FLAG}"
+                drop = f"{CB_PROPOSED_DROP}:{child.id}:{CB_PING_FLAG}"
                 reply = Reply(
                     text=ping_line(child, self._timezone.key, lang=lang, names=names),
                     keyboard=[
-                        [(i18n.t(lang, "btn_keep", n="").strip(), f"{CB_PROPOSED_KEEP}:{token}:0")],
-                        [(i18n.t(lang, "btn_drop", n="").strip(), f"{CB_PROPOSED_DROP}:{token}:0")],
+                        [(i18n.t(lang, "btn_keep", n="").strip(), keep)],
+                        [(i18n.t(lang, "btn_drop", n="").strip(), drop)],
                     ],
                     silent=ping_is_quiet(child, moment, self._timezone.key),
                 )
@@ -1852,6 +1879,19 @@ class TelegramBot:
         flow, so the callback needs to know who pressed it.
         """
         prefix, _, rest = data.partition(":")
+        if prefix in (
+            CB_PROPOSED_KEEP,
+            CB_PROPOSED_FIX,
+            CB_PROPOSED_DROP,
+            CB_PROPOSED_KEEP_ALL,
+            CB_REL_UNDO,
+            CB_REL_CONFIRM,
+            CB_REL_KEEP_BOTH,
+            CB_RECON_DISCARD,
+        ):
+            durable = self._durable_proposal_callback(prefix, rest, user_id)
+            if durable is not None:
+                return durable
         try:
             if prefix == CB_NEXT:
                 return self.review(int(rest))
@@ -1859,9 +1899,6 @@ class TelegramBot:
                 CB_TYPE_APPLY,
                 CB_OPEN,
                 CB_MEM_DEL,
-                CB_PROPOSED_KEEP,
-                CB_PROPOSED_FIX,
-                CB_PROPOSED_DROP,
                 CB_REL_UNDO,
                 CB_REL_CONFIRM,
                 CB_REL_KEEP_BOTH,
@@ -1878,7 +1915,6 @@ class TelegramBot:
                 CB_BACK,
                 CB_WA_JOIN,
                 CB_WA_SPLIT,
-                CB_PROPOSED_KEEP_ALL,
                 CB_REL_RESTORE,
             ):
                 token, arg = rest, ""
@@ -1887,9 +1923,6 @@ class TelegramBot:
             if prefix in (
                 CB_OPEN,
                 CB_MEM_DEL,
-                CB_PROPOSED_KEEP,
-                CB_PROPOSED_FIX,
-                CB_PROPOSED_DROP,
                 CB_SCHED_RUN,
                 CB_SCHED_TOGGLE,
             ):
@@ -1916,14 +1949,6 @@ class TelegramBot:
             return self._open_card(pending, index)
         if prefix == CB_MEM_DEL:
             return self._remove_profile_fact(pending, index)
-        if prefix == CB_PROPOSED_KEEP:
-            return self._proposal_keep(pending, index)
-        if prefix == CB_PROPOSED_DROP:
-            return self._proposal_drop(pending, index)
-        if prefix == CB_PROPOSED_FIX:
-            return self._proposal_fix_start(user_id, pending, index)
-        if prefix == CB_PROPOSED_KEEP_ALL:
-            return self._proposal_keep_all(pending)
         if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD):
             return self._relation_transition(prefix, pending, arg)
         if prefix == CB_REL_RESTORE:
