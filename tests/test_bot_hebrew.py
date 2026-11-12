@@ -49,7 +49,7 @@ USER = 111
 _ALLOWED = re.compile(
     r"/(?:start|help|status|search|ask|review|recent|profile|remember|schedules|language)\b"
     r"|\b(?:he|en)\b"
-    r"|</?[bs]>"
+    r"|</?[bs]>|<blockquote expandable>|</blockquote>"
     r"|&(?:lt|gt|amp);"
     # user DATA the bot isolates on purpose (a file name, an English subject)
     r"|\u2068[^\u2069]*\u2069"

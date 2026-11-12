@@ -149,10 +149,10 @@ class TestHebrewCard:
 
         assert card.split("\n") == [
             "🧠 מצאתי 3 פריטים בהודעה: עדכונים מכיתה ב' ברקת",
-            "📅 אירוע · ✔️ משימה · 🔔 תזכורת · ℹ️ לידיעה",
             "1. 📅 מבחן לאיתור מחוננים · יום ב׳ 30.11 · איתמר",
             "2. 📅 מפגש סיכום דיאלוג בנים · ללא תאריך · איתמר",
-            "3. ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו",
+            "<blockquote expandable>ℹ️ לידיעה בלבד (1)",
+            "ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו</blockquote>",
         ]
 
     def test_buttons_carry_the_line_number(self, world):
@@ -164,8 +164,7 @@ class TestHebrewCard:
         assert [[label for label, _ in row] for row in rows] == [
             ["1 ✅ שמור", "1 ✏️ תקן", "1 🗑 מחק"],
             ["2 ✅ שמור", "2 ✏️ תקן", "2 🗑 מחק"],
-            ["3 ✅ שמור", "3 ✏️ תקן", "3 🗑 מחק"],
-            ["✅ שמור הכל"],
+            ["✅ שמור הכל"],  # the 'not for us' line has no buttons
         ]
 
     def test_english_card_gets_the_same_fixes(self, world):
@@ -173,9 +172,9 @@ class TestHebrewCard:
         source = _capture(repo, "Class update")
         lines = render_source_card(source, self._children(repo), TZ).split("\n")
 
-        assert lines[2] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Itamar"
-        assert lines[3].endswith("· no date · Itamar")
-        assert lines[4].endswith("· not for us")
+        assert lines[1] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Itamar"
+        assert lines[2].endswith("· no date · Itamar")
+        assert lines[4].endswith("· not for us</blockquote>")
 
 
 class TestCardRendering:

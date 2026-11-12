@@ -12,9 +12,15 @@ from types import SimpleNamespace
 
 from tests.test_telegram_bot import make_core
 
+from brain.db.enums import Actionability, ItemType
 from brain.db.models import MemoryItem
 from brain.services.ask import AskResult
-from brain.services.proposals import ping_is_quiet, source_short_title
+from brain.services.proposals import (
+    ping_is_quiet,
+    proposal_keyboard,
+    render_source_card,
+    source_short_title,
+)
 from brain.telegram_bot import Reply
 
 TZ = "Asia/Jerusalem"
@@ -197,3 +203,82 @@ class TestSilent:
         assert ping_is_quiet(far, now, TZ) is True
         assert ping_is_quiet(near, now, TZ) is False
         assert ping_is_quiet(naive, now, TZ) is True  # 18:00 local next day = 31h away
+
+
+# --- 4. proposal card: no legend, FYI children collapsed without buttons --------
+
+
+def _kids() -> list[MemoryItem]:
+    when = datetime(2026, 11, 3, 15, 0, tzinfo=UTC)  # Tue 03.11 17:00 local
+    return [
+        MemoryItem(raw_text="Parents evening", type=ItemType.EVENT, occurred_at=when,
+                   applies_to=["Noa"], child_state="proposed"),
+        MemoryItem(raw_text="Grade 6 <b>paper planes</b> & prizes", type=ItemType.FACT,
+                   applies_to=["nobody"], child_state="proposed"),
+        MemoryItem(raw_text="Sign the trip form", type=ItemType.TASK, occurred_at=when,
+                   applies_to=["Dan"], child_state="proposed"),
+        MemoryItem(raw_text="The library is closed this week", type=ItemType.FACT,
+                   applies_to=["Noa"], child_state="proposed"),
+    ]
+
+
+def _source() -> MemoryItem:
+    return MemoryItem(raw_text="Class news", meta={"channel": "telegram"})
+
+
+class TestCardCleanup:
+    def test_english_card(self):
+        card = render_source_card(_source(), _kids(), TZ)
+        assert card.split("\n") == [
+            "🧠 Found 4 items in: Class news",
+            "1. 📅 Parents evening · Tue 03.11 17:00 · Noa",
+            "2. ✔️ Sign the trip form · Tue 03.11 17:00 · Dan",
+            "<blockquote expandable>ℹ️ For your information (2)",
+            "ℹ️ Grade 6 &lt;b&gt;paper planes&lt;/b&gt; &amp; prizes · not for us",
+            "ℹ️ The library is closed this week · Noa</blockquote>",
+        ]
+
+    def test_hebrew_card(self):
+        names = {"Noa": "נועה", "Dan": "דן"}
+        card = render_source_card(_source(), _kids(), TZ, lang="he", names=names)
+        lines = card.split("\n")
+        assert lines[0] == "🧠 מצאתי 4 פריטים בהודעה: Class news"
+        assert lines[1].startswith("1. 📅") and lines[1].endswith("נועה")
+        assert lines[2].startswith("2. ✔️") and lines[2].endswith("דן")
+        assert lines[3] == "<blockquote expandable>ℹ️ לידיעה בלבד (2)"
+        assert lines[4].endswith("· לא רלוונטי אלינו")
+        assert lines[5].endswith("</blockquote>")
+        assert "📅 אירוע · ✔️ משימה" not in card  # the legend is gone
+
+    def test_keyboard_rows_match_the_numbers_and_skip_fyi(self):
+        rows = proposal_keyboard("tok", _kids())
+        assert [[label for label, _ in row] for row in rows] == [
+            ["1 ✅ Keep", "1 ✏️ Fix", "1 🗑 Drop"],
+            ["2 ✅ Keep", "2 ✏️ Fix", "2 🗑 Drop"],
+            ["✅ Keep all"],
+        ]
+        # callback data still carries the child's position in the card token
+        assert [row[0][1] for row in rows[:2]] == ["pk:tok:0", "pk:tok:2"]
+
+    def test_no_fyi_block_when_everything_is_actionable(self):
+        kids = [kid for kid in _kids() if kid.type != ItemType.FACT]
+        card = render_source_card(_source(), kids, TZ)
+        assert "blockquote" not in card
+        assert card.split("\n")[1].startswith("1. ")
+
+    def test_a_fact_with_a_recon_verdict_keeps_its_buttons(self):
+        kids = _kids()
+        verdict = ("conflict", SimpleNamespace(id="rel-1", provenance={}), None)
+        recon = {1: verdict}
+        card = render_source_card(_source(), kids, TZ, recon=recon)
+        assert "2. ℹ️ Grade 6" in card  # numbered, out of the FYI block
+        rows = proposal_keyboard("tok", kids, recon=recon)
+        assert [row[0][0] for row in rows] == [
+            "1 ✅ Keep", "2 ✅ Keep existing", "3 ✅ Keep", "✅ Keep all"
+        ]
+
+    def test_fyi_line_with_an_action_stays_numbered(self):
+        kids = _kids()
+        kids[3].actionability = Actionability.NOW
+        card = render_source_card(_source(), kids, TZ)
+        assert "3. ℹ️ The library is closed this week" in card

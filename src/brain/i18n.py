@@ -32,9 +32,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         "en": "🧠 Found 1 item in: {title}",
         "he": "🧠 מצאתי פריט אחד בהודעה: {title}",
     },
-    "card_legend": {
-        "en": "📅 event · ✔️ task · 🔔 reminder · ℹ️ for your information",
-        "he": "📅 אירוע · ✔️ משימה · 🔔 תזכורת · ℹ️ לידיעה",
+    "card_fyi": {
+        "en": "ℹ️ For your information ({n})",
+        "he": "ℹ️ לידיעה בלבד ({n})",
     },
     "no_date": {"en": "no date", "he": "ללא תאריך"},
     "who_unknown": {"en": "❓ who is this for?", "he": "❓ למי זה?"},

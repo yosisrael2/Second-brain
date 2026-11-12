@@ -43,6 +43,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from brain import i18n
+from brain.db.enums import Actionability
 from brain.db.models import MemoryItem
 from brain.services.extraction.dates import combine_local, extract_clock, resolve_when
 
@@ -158,6 +159,42 @@ def _date_part(moment: datetime, lang: str = i18n.DEFAULT) -> str:
 # ("bring a reading book every day") and a fact has no date at all.
 _DATED_TYPES = frozenset({"event", "task"})
 
+# Pure information: nothing to schedule or do unless the child says so.
+_INFO_TYPES = frozenset({"fact", "note", "reference"})
+
+
+def is_fyi(child: MemoryItem, *, has_verdict: bool = False) -> bool:
+    """A card line the family needs no decision on: not for us
+    (applies_to 'nobody'), or pure information with no date and no action.
+    Such lines render collapsed, without buttons. A child carrying a recon
+    verdict never is (its row asks a question)."""
+    if has_verdict:
+        return False
+    if (child.applies_to or []) == ["nobody"]:
+        return True
+    kind = child.type.value if child.type else ""
+    no_action = child.actionability in (None, Actionability.NONE)
+    return kind in _INFO_TYPES and child.occurred_at is None and no_action
+
+
+def card_numbers(
+    children: list[MemoryItem],
+    recon: dict[int, tuple[str, object, str | None]] | None = None,
+) -> list[int | None]:
+    """The card line number of each child (1, 2, … over the actionable ones;
+    None for an FYI line). Shared by the card text and its keyboard so a
+    button's number always matches its line."""
+    recon = recon or {}
+    numbers: list[int | None] = []
+    n = 0
+    for index, child in enumerate(children):
+        if is_fyi(child, has_verdict=index in recon):
+            numbers.append(None)
+        else:
+            n += 1
+            numbers.append(n)
+    return numbers
+
 
 def _who(applies_to: list[str] | None, lang: str, names: dict[str, str]) -> str | None:
     """The 'for whom' part: display names (e.g. Hebrew aliases), or None."""
@@ -271,33 +308,42 @@ def render_source_card(
 
     ``recon`` (D-recon-2a) maps a child's index to (verdict, relation,
     matched_title): verdict children render their state-aware marker line
-    (applied UPDATE, named cancellation target)."""
+    (applied UPDATE, named cancellation target). Actionable children are
+    numbered 1..k; FYI children (:func:`is_fyi`) follow, unnumbered, in one
+    collapsed ``<blockquote expandable>`` (the bot sends parse_mode=HTML;
+    every line is escaped by :func:`child_line`)."""
     recon = recon or {}
-    lines = []
+    numbers = card_numbers(children, recon)
+    lines: list[str] = []
+    fyi: list[str] = []
     for index, child in enumerate(children):
+        number = numbers[index]
         entry = recon.get(index)
         if entry is None:
-            lines.append(child_line(child, tz_name, lang=lang, names=names, number=index + 1))
-            continue
-        verdict, rel, matched_title = entry
-        state = (rel.provenance or {}).get("state")
-        lines.append(
-            child_line(
+            line = child_line(child, tz_name, lang=lang, names=names, number=number)
+        else:
+            verdict, rel, matched_title = entry
+            state = (rel.provenance or {}).get("state")
+            line = child_line(
                 child,
                 tz_name,
                 state=state,
                 matched_title=matched_title if verdict == "cancellation" else None,
                 lang=lang,
                 names=names,
-                number=index + 1,
+                number=number,
             )
-        )
+        (lines if number is not None else fyi).append(line)
     title = _esc(source_short_title(source))
     if len(children) == 1:
         header = i18n.t(lang, "card_header_one", title=title)
     else:
         header = i18n.t(lang, "card_header", n=len(children), title=title)
-    return "\n".join([header, i18n.t(lang, "card_legend"), *lines])
+    if fyi:
+        # collapsed: the family taps to read; no buttons for these lines
+        label = i18n.t(lang, "card_fyi", n=len(fyi))
+        lines.append("<blockquote expandable>" + "\n".join([label, *fyi]) + "</blockquote>")
+    return "\n".join([header, *lines])
 
 
 def proposal_keyboard(
@@ -317,7 +363,8 @@ def proposal_keyboard(
     (never a position), so a mixed card cannot misalign plain and verdict
     rows; callback data stays < 64 bytes (prefix + token + uuid). MORE_DETAIL
     children keep the default row (the 🔔 line lives on the matched item's
-    card, with no buttons)."""
+    card, with no buttons). FYI children (:func:`is_fyi`) get no row: the
+    callback data keeps the child's POSITION, the label its card number."""
     from brain.services.relations_view import (  # noqa: PLC0415
         CB_RECON_DISCARD,
         CB_REL_CONFIRM,
@@ -327,8 +374,9 @@ def proposal_keyboard(
 
     recon = recon or {}
     rows: list[list[tuple[str, str]]] = []
-    for index, _child in enumerate(children):
-        n = index + 1  # the line number on the card
+    for index, n in enumerate(card_numbers(children, recon)):
+        if n is None:  # an FYI line: collapsed on the card, no buttons
+            continue
         entry = recon.get(index)
         if entry is not None:
             verdict, rel, _matched_title = entry
