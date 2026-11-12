@@ -15,7 +15,7 @@ def row(**over):
         "title": "alpha beta gamma",
         "start": "2026-10-19T09:00:00",
         "all_day": False,
-        "applies_to": "rona",
+        "applies_to": "romi",
     }
     base.update(over)
     return base
@@ -54,7 +54,7 @@ def test_type_mismatch_never_matches():
 
 
 def test_known_applies_to_mismatch_blocks_match():
-    out = agg([row()], [row(child_id="p1", applies_to="itamar")])
+    out = agg([row()], [row(child_id="p1", applies_to="ilan")])
     assert "matched: 0" in out
 
 
@@ -64,19 +64,19 @@ def test_me_vs_nobody_blocks_match():
 
 
 def test_unknown_applies_to_is_a_wildcard_but_scored_wrong():
-    out = agg([row(applies_to="unknown")], [row(child_id="p1", applies_to="rona")])
+    out = agg([row(applies_to="unknown")], [row(child_id="p1", applies_to="romi")])
     assert "matched: 1" in out
     assert "applies_to_accuracy: 0.0" in out
     assert "applies_to_pred_unknown: 0" in out
 
 
 def test_applies_to_json_list_from_gold_schema():
-    # worker_3's schema uses a JSON LIST for applies_to, e.g. ["Rona"]
-    out = agg([row(applies_to=["Rona"])], [row(child_id="p1", applies_to="Itamar")])
+    # worker_3's schema uses a JSON LIST for applies_to, e.g. ["Romi"]
+    out = agg([row(applies_to=["Romi"])], [row(child_id="p1", applies_to="Ilan")])
     assert "matched: 0" in out
     out = agg(
-        [row(applies_to=["Rona", "me"])],
-        [row(child_id="p1", applies_to="me, rona")],
+        [row(applies_to=["Romi", "me"])],
+        [row(child_id="p1", applies_to="me, romi")],
     )
     assert "matched: 1" in out
     assert "applies_to_accuracy: 1.0" in out
@@ -317,11 +317,11 @@ def test_applies_to_accuracy_excl_gold_unknown_is_reported_and_correct():
         row(child_id="g1"),  # ok, gold-specific
         row(child_id="g2", applies_to="unknown"),  # wildcard match — EXCLUDED
         # dateless match, gold-specific, WRONG:
-        row(child_id="g3", applies_to="rona", start=None, due=None),
+        row(child_id="g3", applies_to="romi", start=None, due=None),
     ]
     pred = [
         row(child_id="p1"),
-        row(child_id="p2", applies_to="itamar"),
+        row(child_id="p2", applies_to="ilan"),
         row(child_id="p3", applies_to="me", start=None, due=None),
     ]
     out = agg(gold, pred)
@@ -331,7 +331,7 @@ def test_applies_to_accuracy_excl_gold_unknown_is_reported_and_correct():
 
 
 def test_applies_to_excl_gold_unknown_is_n_a_when_no_gold_specific_match():
-    out = agg([row(applies_to="unknown")], [row(child_id="p1", applies_to="rona")])
+    out = agg([row(applies_to="unknown")], [row(child_id="p1", applies_to="romi")])
     assert "applies_to_accuracy_excl_gold_unknown: n/a" in out
     assert "applies_to_excl_gold_unknown_denominator: 0" in out
 
@@ -341,12 +341,12 @@ def test_existing_aggregate_fields_are_byte_identical_on_a_mixed_fixture():
     gold = [
         row(child_id="g1"),
         row(child_id="g2", applies_to="unknown"),
-        row(child_id="g3", applies_to="rona", start=None, due=None),
+        row(child_id="g3", applies_to="romi", start=None, due=None),
         row(child_id="g4", title="unrelated delta epsilon"),
     ]
     pred = [
         row(child_id="p1"),
-        row(child_id="p2", applies_to="itamar", title="alpha beta gamma"),
+        row(child_id="p2", applies_to="ilan", title="alpha beta gamma"),
         row(child_id="p3", applies_to="me", start=None, due=None),
         row(child_id="p4", title="alpha beta gamma"),
     ]

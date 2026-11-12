@@ -96,7 +96,7 @@ def _bridge_row(
     at_utc: datetime,
     *,
     chat: str = CHAT_A_JID,
-    sender: str = "Rinat",
+    sender: str = "Tamar",
     content: str = "text",
     is_from_me: int = 0,
     **extra: Any,
@@ -304,7 +304,7 @@ def _conversation(*specs: tuple[str, datetime]) -> list[BridgeMessage]:
         BridgeMessage(
             id=id_,
             chat_jid=CHAT_A_JID,
-            sender="Rinat",
+            sender="Tamar",
             content="t",
             timestamp_utc=at,
             is_from_me=False,
@@ -359,7 +359,7 @@ def test_render_names_channel_with_sender_and_local_time():
     msgs[0] = BridgeMessage(
         id="a",
         chat_jid=CHAT_A_JID,
-        sender="Rinat",
+        sender="Tamar",
         content="שלום",
         timestamp_utc=datetime(2026, 10, 24, 21, 0, tzinfo=UTC),
         is_from_me=False,
@@ -380,14 +380,14 @@ def test_render_names_channel_with_sender_and_local_time():
     )
     text, meta = render_conversation("Chat A", CHAT_A_JID, msgs, zone_name=ZONE, gap_minutes=60)
     assert text.splitlines()[0] == "[WhatsApp · Chat A]"
-    assert "[25/10/2026, 00:00] Rinat: שלום" in text
+    assert "[25/10/2026, 00:00] Tamar: שלום" in text
     assert "[25/10/2026, 00:30] Dana: hi" in text
     assert meta["channel"] == "Chat A"
     assert meta["chat_jid"] == CHAT_A_JID
     assert meta["first_message_at"] == "2026-10-24T21:00:00+00:00"
     assert meta["last_message_at"] == "2026-10-24T21:30:00+00:00"
     assert [m["id"] for m in meta["messages"]] == ["a", "b"]
-    assert meta["messages"][0]["sender"] == "Rinat"
+    assert meta["messages"][0]["sender"] == "Tamar"
 
 
 # -- poller ------------------------------------------------------------------------
@@ -596,8 +596,8 @@ def test_dst_boundary_one_conversation_correct_local_times(tmp_path: Path, world
     poller.poll(now=datetime(2026, 10, 24, 23, 59, tzinfo=UTC))
     assert world.item_count() == 1
     item = world.session.query(MemoryItem).one()
-    assert "[25/10/2026, 01:45] Rinat: before switch" in item.raw_text
-    assert "[25/10/2026, 01:10] Rinat: after switch" in item.raw_text
+    assert "[25/10/2026, 01:45] Tamar: before switch" in item.raw_text
+    assert "[25/10/2026, 01:10] Tamar: after switch" in item.raw_text
     assert item.raw_text.index("01:45") < item.raw_text.index("01:10")  # UTC order holds
     assert item.occurred_at == datetime(2026, 10, 24, 22, 45, tzinfo=UTC)
 
@@ -678,7 +678,7 @@ def test_media_marker_without_download(tmp_path: Path, world: SimpleWorld):
     poller.poll(now=datetime(2026, 10, 22, 12, 0, tzinfo=UTC))
     item = world.session.query(MemoryItem).one()
     assert (
-        "[22/10/2026, 13:00] Rinat: the form [document: talmul.pdf — attachment not read yet]"
+        "[22/10/2026, 13:00] Tamar: the form [document: talmul.pdf — attachment not read yet]"
         in item.raw_text
     )
     media = item.meta["messages"][0]["media"]
@@ -782,7 +782,7 @@ def test_ops_endpoint_reports_today_and_media_counts(tmp_path: Path, world: Simp
     meta = dict(item.meta)
     messages = [dict(m) for m in meta["messages"]]
     messages.append(
-        {"id": "med1", "sender": "Rinat", "media": {"message_id": "med1", "status": "saved"}}
+        {"id": "med1", "sender": "Tamar", "media": {"message_id": "med1", "status": "saved"}}
     )
     messages.append(
         {"id": "med2", "sender": "Dana", "media": {"message_id": "med2", "status": "not read yet"}}

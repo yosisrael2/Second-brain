@@ -132,7 +132,7 @@ def test_aware_pred_runs_via_cli_default_timezone(capsys, tmp_path):
     pred.write_text(
         '{"email_id": "school-01", "child_id": "p1", "type": "event", '
         '"title": "כינוס באמפי", "start": "2026-10-17T21:00:00+00:00", '
-        '"all_day": true, "applies_to": "itamar"}\n',
+        '"all_day": true, "applies_to": "ilan"}\n',
         encoding="utf-8",
     )
     rc = cli.main(["eval-extraction", "--gold", str(GOLD), "--pred", str(pred), "--aggregate-only"])

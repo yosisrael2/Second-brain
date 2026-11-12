@@ -9,13 +9,13 @@ from brain.db.session import SessionLocal
 from brain.repositories.memory import MemoryRepository
 from brain.services.memory import MemoryError, MemoryService
 
-RONA = {
-    "gender": "girl", "school": "בראשית", "grade": "5",
-    "class": "ה' ספיר", "teacher": "Rinat",
+ROMI = {
+    "gender": "girl", "school": "הגפן", "grade": "5",
+    "class": "ה' ברוש", "teacher": "Tamar",
 }
-ITAMAR = {
-    "gender": "boy", "school": "בראשית", "grade": "2",
-    "class": "ב' ברקת", "teacher": "Maayan",
+ILAN = {
+    "gender": "boy", "school": "הגפן", "grade": "2",
+    "class": "ב' רימון", "teacher": "Sigal",
 }
 
 
@@ -41,8 +41,8 @@ def memory_fixture(database: None) -> MemoryService:
 
 
 def _seed_world(service: MemoryService) -> None:
-    service.set_kid("Rona", **{k.replace("class", "class_"): v for k, v in RONA.items()})
-    service.set_kid("Itamar", **{k.replace("class", "class_"): v for k, v in ITAMAR.items()})
+    service.set_kid("Romi", **{k.replace("class", "class_"): v for k, v in ROMI.items()})
+    service.set_kid("Ilan", **{k.replace("class", "class_"): v for k, v in ILAN.items()})
 
 
 def _find_fact(service: MemoryService, predicate: str, value: str):
@@ -58,27 +58,27 @@ def _find_fact(service: MemoryService, predicate: str, value: str):
 def test_grade_5_6_parents_map_to_me(memory: MemoryService):
     _seed_world(memory)
     assert memory.resolve_applies_to(
-        {"school": "בראשית", "grades": "ה-ו", "role": "parents"}
+        {"school": "הגפן", "grades": "ה-ו", "role": "parents"}
     ) == ["me"]
 
 
 def test_girls_of_class_excludes_a_boy(memory: MemoryService):
     _seed_world(memory)
-    # The girls' dialogue: girls of ב' ברקת — Itamar is a boy (explicit fact).
+    # The girls' dialogue: girls of ב' רימון — Ilan is a boy (explicit fact).
     assert memory.resolve_applies_to(
-        {"school": "בראשית", "class": "ב' ברקת", "gender": "girls"}
+        {"school": "הגפן", "class": "ב' רימון", "gender": "girls"}
     ) == ["nobody"]
 
 
 def test_whole_school_audience_returns_all_kids(memory: MemoryService):
     _seed_world(memory)
-    assert memory.resolve_applies_to({"school": "בראשית"}) == ["Rona", "Itamar"]
+    assert memory.resolve_applies_to({"school": "הגפן"}) == ["Romi", "Ilan"]
 
 
 def test_class_audience_returns_that_class_kid(memory: MemoryService):
     _seed_world(memory)
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "class": "ה' ספיר"}) == ["Rona"]
+        memory.resolve_applies_to({"school": "הגפן", "class": "ה' ברוש"}) == ["Romi"]
     )
 
 
@@ -89,36 +89,36 @@ def test_no_audience_is_unknown_never_nobody(memory: MemoryService):
 
 
 def test_empty_memory_is_unknown_never_nobody(memory: MemoryService):
-    assert memory.resolve_applies_to({"school": "בראשית"}) == ["unknown"]
+    assert memory.resolve_applies_to({"school": "הגפן"}) == ["unknown"]
 
 
 def test_numeric_grade_range_also_matches(memory: MemoryService):
     _seed_world(memory)
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "grades": "5-6"}) == ["Rona"]
+        memory.resolve_applies_to({"school": "הגפן", "grades": "5-6"}) == ["Romi"]
     )
 
 
 def test_gendered_school_wide_audience_excludes_the_other_gender(memory: MemoryService):
     _seed_world(memory)
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "gender": "boys"})
-        == ["Itamar"]
+        memory.resolve_applies_to({"school": "הגפן", "gender": "boys"})
+        == ["Ilan"]
     )
 
 
 def test_missing_gender_fact_is_unknown_not_nobody(memory: MemoryService):
     """A gendered audience + no stored gender = unconfirmable -> unknown."""
-    memory.set_kid("Niv", school="בראשית", grade="3", class_="ג' כהן")
+    memory.set_kid("Niv", school="הגפן", grade="3", class_="ג' כהן")
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "class": "ג' כהן", "gender": "girls"})
+        memory.resolve_applies_to({"school": "הגפן", "class": "ג' כהן", "gender": "girls"})
         == ["unknown"]
     )
 
 
 def test_named_kids_need_known_memory(memory: MemoryService):
     _seed_world(memory)
-    assert memory.resolve_applies_to({"named_kids": ["Rona"]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["Romi"]}) == ["Romi"]
     assert memory.resolve_applies_to({"named_kids": ["Yarden"]}) == ["unknown"]
 
 
@@ -135,85 +135,85 @@ def _add_alias(memory: MemoryService, kid_name: str, alias: str) -> None:
 def test_named_kids_match_hebrew_aliases(memory: MemoryService):
     """A kid's Hebrew alias resolves the same kid (GO-A follow-up)."""
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    _add_alias(memory, "Itamar", "איתמר")
-    assert memory.resolve_applies_to({"named_kids": ["רונה"]}) == ["Rona"]
-    assert memory.resolve_applies_to({"named_kids": ["איתמר"]}) == ["Itamar"]
+    _add_alias(memory, "Romi", "רומי")
+    _add_alias(memory, "Ilan", "אילן")
+    assert memory.resolve_applies_to({"named_kids": ["רומי"]}) == ["Romi"]
+    assert memory.resolve_applies_to({"named_kids": ["אילן"]}) == ["Ilan"]
 
 
 def test_named_kids_match_case_insensitive_and_prefixed(memory: MemoryService):
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Romi", "רומי")
     # Case-insensitive English ...
-    assert memory.resolve_applies_to({"named_kids": ["rona"]}) == ["Rona"]
-    # ... and the Hebrew prefix run (לרונה = 'for Rona').
-    assert memory.resolve_applies_to({"named_kids": ["לרונה"]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["romi"]}) == ["Romi"]
+    # ... and the Hebrew prefix run (לרומי = 'for Romi').
+    assert memory.resolve_applies_to({"named_kids": ["לרומי"]}) == ["Romi"]
 
 
 def test_named_kids_name_and_alias_do_not_double_count(memory: MemoryService):
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    assert memory.resolve_applies_to({"named_kids": ["Rona", "רונה"]}) == ["Rona"]
+    _add_alias(memory, "Romi", "רומי")
+    assert memory.resolve_applies_to({"named_kids": ["Romi", "רומי"]}) == ["Romi"]
 
 
 def test_named_kids_full_token_no_classmate_collision(memory: MemoryService):
     """A classmate sharing the first name must stay unknown (zero wrong-child)."""
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    _add_alias(memory, "Itamar", "איתמר")
-    assert memory.resolve_applies_to({"named_kids": ["רונה לוי"]}) == ["unknown"]
-    assert memory.resolve_applies_to({"named_kids": ["Rona Cohen"]}) == ["unknown"]
-    assert memory.resolve_applies_to({"named_kids": ["איתמר ס."]}) == ["unknown"]
+    _add_alias(memory, "Romi", "רומי")
+    _add_alias(memory, "Ilan", "אילן")
+    assert memory.resolve_applies_to({"named_kids": ["רומי לוי"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["Romi Cohen"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["אילן ס."]}) == ["unknown"]
 
 
 def test_named_kids_compound_token_stays_unknown(memory: MemoryService):
     """One token naming two kids is conservative: unknown, never a guess."""
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    _add_alias(memory, "Itamar", "איתמר")
-    assert memory.resolve_applies_to({"named_kids": ["רונה ואיתמר"]}) == ["unknown"]
-    assert memory.resolve_applies_to({"named_kids": ["רונה", "איתמר"]}) == [
-        "Rona", "Itamar"
+    _add_alias(memory, "Romi", "רומי")
+    _add_alias(memory, "Ilan", "אילן")
+    assert memory.resolve_applies_to({"named_kids": ["רומי ואילן"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["רומי", "אילן"]}) == [
+        "Romi", "Ilan"
     ]
 
 
 def test_named_kids_whitespace_and_prefix_forms(memory: MemoryService):
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    assert memory.resolve_applies_to({"named_kids": [" רונה "]}) == ["Rona"]
-    assert memory.resolve_applies_to({"named_kids": ["ורונה"]}) == ["Rona"]
+    _add_alias(memory, "Romi", "רומי")
+    assert memory.resolve_applies_to({"named_kids": [" רומי "]}) == ["Romi"]
+    assert memory.resolve_applies_to({"named_kids": ["ורומי"]}) == ["Romi"]
     assert memory.resolve_applies_to({"named_kids": ["רונית"]}) == ["unknown"]
 
 
 def test_named_kids_unknown_name_stays_unknown_with_aliases_present(memory: MemoryService):
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
+    _add_alias(memory, "Romi", "רומי")
     assert memory.resolve_applies_to({"named_kids": ["עלמה"]}) == ["unknown"]
 
 
 def test_aliases_do_not_change_structured_branches(memory: MemoryService):
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    _add_alias(memory, "Itamar", "איתמר")
+    _add_alias(memory, "Romi", "רומי")
+    _add_alias(memory, "Ilan", "אילן")
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "grades": "5-6"}) == ["Rona"]
+        memory.resolve_applies_to({"school": "הגפן", "grades": "5-6"}) == ["Romi"]
     )
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "gender": "boys"})
-        == ["Itamar"]
+        memory.resolve_applies_to({"school": "הגפן", "gender": "boys"})
+        == ["Ilan"]
     )
-    assert memory.resolve_applies_to({"school": "בראשית"}) == ["Rona", "Itamar"]
+    assert memory.resolve_applies_to({"school": "הגפן"}) == ["Romi", "Ilan"]
 
 
 def test_staff_role_applies_to_nobody(memory: MemoryService):
     _seed_world(memory)
-    assert memory.resolve_applies_to({"school": "בראשית", "role": "staff"}) == ["nobody"]
+    assert memory.resolve_applies_to({"school": "הגפן", "role": "staff"}) == ["nobody"]
 
 
 def test_unparseable_grade_range_is_unknown_not_nobody(memory: MemoryService):
     _seed_world(memory)
     assert (
-        memory.resolve_applies_to({"school": "בראשית", "grades": "???"})
+        memory.resolve_applies_to({"school": "הגפן", "grades": "???"})
         == ["unknown"]
     )
 
@@ -226,7 +226,7 @@ def test_set_kid_closes_old_version_and_opens_a_new_one(memory: MemoryService):
     old = _find_fact(memory, "grade", "5")
     assert old is not None
 
-    memory.set_kid("Rona", grade="6")
+    memory.set_kid("Romi", grade="6")
 
     assert _find_fact(memory, "grade", "5") is None  # no longer current
     history = memory.fact_history(old.id)
@@ -234,13 +234,13 @@ def test_set_kid_closes_old_version_and_opens_a_new_one(memory: MemoryService):
     assert history[0]["valid_to"] is not None  # the old version is closed
     assert history[1]["supersedes_id"] == history[0]["id"]
     kids = memory.kids()
-    assert [kid["grade"] for kid in kids if kid["name"] == "Rona"] == ["6"]
+    assert [kid["grade"] for kid in kids if kid["name"] == "Romi"] == ["6"]
 
 
 def test_set_kid_is_idempotent_for_unchanged_values(memory: MemoryService):
     _seed_world(memory)
     old = _find_fact(memory, "grade", "5")
-    memory.set_kid("Rona", grade="5")  # same value: no new version
+    memory.set_kid("Romi", grade="5")  # same value: no new version
     assert memory.fact_history(old.id) != []  # anchor still exists
     grades = [
         f for f in memory._repo.facts_about(old.subject_id) if f.predicate == "grade"
@@ -250,11 +250,11 @@ def test_set_kid_is_idempotent_for_unchanged_values(memory: MemoryService):
 
 def test_patch_fact_creates_a_version(memory: MemoryService):
     _seed_world(memory)
-    old = _find_fact(memory, "teacher", "Rinat")
-    new_version = memory.patch_fact(old.id, value="Rinat S.")
+    old = _find_fact(memory, "teacher", "Tamar")
+    new_version = memory.patch_fact(old.id, value="Tamar S.")
     assert new_version["supersedes_id"] == str(old.id)
     assert new_version["status"] == "confirmed"  # status inherited
-    assert [row["value"] for row in memory.fact_history(old.id)] == ["Rinat", "Rinat S."]
+    assert [row["value"] for row in memory.fact_history(old.id)] == ["Tamar", "Tamar S."]
 
 
 # -- status lifecycle --------------------------------------------------------------
@@ -297,7 +297,7 @@ def test_soft_delete_keeps_history(memory: MemoryService):
 
 
 def test_remember_targets_a_me_entity(memory: MemoryService):
-    fact = memory.remember("family calendar is organized by Zohar")
+    fact = memory.remember("family calendar is organized by Keren")
     overview = memory.overview(q="me")
     assert overview, "a 'me' person entity must exist after remember()"
     assert fact["subject_id"] == overview[0]["id"]
@@ -315,8 +315,8 @@ def test_compact_block_lists_kids_and_notes(memory: MemoryService):
     memory.remember("school items go to the family calendar")
     block = memory.compact_block()
     assert block.startswith("Confirmed memory:")
-    assert "- Rona: gender girl, grade 5, class ה' ספיר, school בראשית, teacher Rinat" in block
-    assert "- Itamar: gender boy" in block
+    assert "- Romi: gender girl, grade 5, class ה' ברוש, school הגפן, teacher Tamar" in block
+    assert "- Ilan: gender boy" in block
     assert "- note: school items go to the family calendar" in block
 
 
@@ -325,28 +325,28 @@ def test_compact_block_keeps_memory_categories_with_their_subject(memory: Memory
     well as note. A kid's routine must not vanish into the kid's attribute
     line (which only joins gender/grade/class/school/teacher)."""
     _seed_world(memory)
-    rona = memory._ensure_entity(kind="person", name="Rona")
+    romi = memory._ensure_entity(kind="person", name="Romi")
     yos = memory._ensure_entity(kind="person", name="Yos")
-    memory.add_fact(rona.id, "routine", value="football practice on Wednesdays")
+    memory.add_fact(romi.id, "routine", value="football practice on Wednesdays")
     memory.add_fact(yos.id, "preference", value="WhatsApp over phone calls at work")
     block = memory.compact_block()
-    assert "- Rona (routine): football practice on Wednesdays" in block
+    assert "- Romi (routine): football practice on Wednesdays" in block
     assert "- Yos (preference): WhatsApp over phone calls at work" in block
-    assert "- Rona: gender girl, grade 5" in block  # the attribute line is unchanged
+    assert "- Romi: gender girl, grade 5" in block  # the attribute line is unchanged
 
 
 def test_compact_block_renders_connections_by_name(memory: MemoryService):
     """A connection is an object-linked fact (connection:<type> -> object_id);
     the prompt names both ends instead of dropping it."""
     _seed_world(memory)
-    itamar = memory._ensure_entity(kind="person", name="Itamar")
+    ilan = memory._ensure_entity(kind="person", name="Ilan")
     yos = memory._ensure_entity(kind="person", name="Yos")
-    zohar = memory._ensure_entity(kind="person", name="Zohar")
-    memory.add_fact(yos.id, "connection:parent", object_id=itamar.id)
-    memory.add_fact(yos.id, "connection:spouse", object_id=zohar.id)
+    keren = memory._ensure_entity(kind="person", name="Keren")
+    memory.add_fact(yos.id, "connection:parent", object_id=ilan.id)
+    memory.add_fact(yos.id, "connection:spouse", object_id=keren.id)
     block = memory.compact_block()
-    assert "- Yos is Itamar's parent" in block
-    assert "- Yos is Zohar's spouse" in block
+    assert "- Yos is Ilan's parent" in block
+    assert "- Yos is Keren's spouse" in block
 
 
 def test_proposed_note_is_excluded_from_compact_block(memory: MemoryService):
@@ -360,17 +360,17 @@ def test_proposed_note_is_excluded_from_compact_block(memory: MemoryService):
 
 
 def test_entity_crud_and_search(memory: MemoryService):
-    created = memory.add_entity("person", "Zohar")
-    assert created["name"] == "Zohar"
+    created = memory.add_entity("person", "Keren")
+    assert created["name"] == "Keren"
 
-    assert [row["name"] for row in memory.overview(q="zohar")] == ["Zohar"]
+    assert [row["name"] for row in memory.overview(q="keren")] == ["Keren"]
     assert memory.overview(q="nobody-named-this") == []
 
-    renamed = memory.patch_entity(uuid.UUID(created["id"]), name="Zohar A.")
-    assert renamed["name"] == "Zohar A."
+    renamed = memory.patch_entity(uuid.UUID(created["id"]), name="Keren A.")
+    assert renamed["name"] == "Keren A."
 
     memory.delete_entity(uuid.UUID(created["id"]))
-    assert memory.overview(q="Zohar") == []
+    assert memory.overview(q="Keren") == []
 
 
 def test_add_fact_requires_an_existing_subject(memory: MemoryService):
@@ -411,8 +411,8 @@ def _seed_channel(
 
 def test_channel_maps_to_its_kid(memory: MemoryService):
     _seed_world(memory)
-    _seed_channel(memory, "הורים כיתה ב' ברקת", "parents", "Itamar")
-    assert memory.resolve_applies_to({"channel": "הורים כיתה ב' ברקת"}) == ["Itamar"]
+    _seed_channel(memory, "הורים כיתה ב' רימון", "parents", "Ilan")
+    assert memory.resolve_applies_to({"channel": "הורים כיתה ב' רימון"}) == ["Ilan"]
 
 
 def test_unknown_channel_is_unknown(memory: MemoryService):
@@ -427,16 +427,16 @@ def test_family_channel_resolves_all_confirmed_kids_plus_me_at_query_time(
     _seed_channel(memory, "הודעות בית ספר", "parents", "family")
     # kids sorted by name (deterministic), then 'me' — resolved at query time
     assert memory.resolve_applies_to({"channel": "הודעות בית ספר"}) == [
-        "Itamar",
-        "Rona",
+        "Ilan",
+        "Romi",
         "me",
     ]
     # a kid added later is included without touching the channel
-    memory.set_kid("Noa", gender="girl", school="בראשית", grade="4", class_="ג' ע", teacher="T")
+    memory.set_kid("Noa", gender="girl", school="הגפן", grade="4", class_="ג' ע", teacher="T")
     assert memory.resolve_applies_to({"channel": "הודעות בית ספר"}) == [
-        "Itamar",
+        "Ilan",
         "Noa",
-        "Rona",
+        "Romi",
         "me",
     ]
 
@@ -450,7 +450,7 @@ def test_channel_without_applies_to_fact_is_unknown(memory: MemoryService):
 def test_unconfirmed_applies_to_fact_is_unknown(memory: MemoryService):
     """Only CONFIRMED memory drives resolution (delta item 31d)."""
     _seed_world(memory)
-    _seed_channel(memory, "הורים שכבה ה", "parents", "Rona", confirmed=False)
+    _seed_channel(memory, "הורים שכבה ה", "parents", "Romi", confirmed=False)
     assert memory.resolve_applies_to({"channel": "הורים שכבה ה"}) == ["unknown"]
 
 
@@ -471,12 +471,12 @@ def test_seed_channel_cli_roundtrip(memory: MemoryService, capsys):
             "--kind",
             "parents",
             "--applies-to",
-            "Rona",
+            "Romi",
         ]
     )
     assert code == 0
     assert (
-        memory.resolve_applies_to({"channel": "וואטסאפ הורי שכבת ה"}) == ["Rona"]
+        memory.resolve_applies_to({"channel": "וואטסאפ הורי שכבת ה"}) == ["Romi"]
     )
     out = capsys.readouterr().out
     assert "seeded channel" in out
@@ -495,20 +495,20 @@ def test_set_kid_rejects_invalid_gender(memory: MemoryService):
 
 def test_set_channel_rejects_unknown_applies_to(memory: MemoryService):
     with pytest.raises(ValueError):
-        memory.set_channel("ערוץ", kind="parents", applies_to="rona")  # case matters
+        memory.set_channel("ערוץ", kind="parents", applies_to="romi")  # case matters
     with pytest.raises(ValueError):
         memory.set_channel("ערוץ", kind="parents", applies_to="everyone")
 
 
 def test_set_channel_reseeds_versioned_not_stacked(memory: MemoryService):
     _seed_world(memory)
-    memory.set_channel("ערוץ הורים", kind="parents", applies_to="Itamar")
-    assert memory.resolve_applies_to({"channel": "ערוץ הורים"}) == ["Itamar"]
+    memory.set_channel("ערוץ הורים", kind="parents", applies_to="Ilan")
+    assert memory.resolve_applies_to({"channel": "ערוץ הורים"}) == ["Ilan"]
 
     memory.set_channel("ערוץ הורים", kind="parents", applies_to="family")
     assert memory.resolve_applies_to({"channel": "ערוץ הורים"}) == [
-        "Itamar",
-        "Rona",
+        "Ilan",
+        "Romi",
         "me",
     ]
     # history shows 2 versions for applies_to
@@ -518,7 +518,7 @@ def test_set_channel_reseeds_versioned_not_stacked(memory: MemoryService):
         for f in memory._repo.facts_about(channel.id)
         if f.predicate == "applies_to"
     ]
-    assert [v.value for v in versions] == ["Itamar", "family"]
+    assert [v.value for v in versions] == ["Ilan", "family"]
     assert versions[1].supersedes_id == versions[0].id
 
     # re-seeding the same value adds no row
@@ -544,7 +544,7 @@ def test_seed_channel_cli_invalid_value_fails_loudly(memory: MemoryService, caps
             "--kind",
             "parents",
             "--applies-to",
-            "rona",
+            "romi",
         ]
     )
     assert code == 1
@@ -579,9 +579,9 @@ def test_seed_kid_cli_invalid_gender_fails_loudly(memory: MemoryService, capsys)
 def test_hebrew_teen_grades(memory: MemoryService):
     """ל=30 and מ=40 in Hebrew numerals — grades 11/12 are יא/יב only."""
     _seed_world(memory)
-    memory.set_kid("Noa", gender="girl", school="בראשית", grade="11", class_="יא א", teacher="T")
-    assert memory.resolve_applies_to({"school": "בראשית", "grades": "יא-יב"}) == ["Noa"]
-    assert memory.resolve_applies_to({"school": "בראשית", "grades": "יג"}) == [
+    memory.set_kid("Noa", gender="girl", school="הגפן", grade="11", class_="יא א", teacher="T")
+    assert memory.resolve_applies_to({"school": "הגפן", "grades": "יא-יב"}) == ["Noa"]
+    assert memory.resolve_applies_to({"school": "הגפן", "grades": "יג"}) == [
         "nobody"
     ]  # יג parses as 13 (a real value) — no kid in it is a KNOWN mismatch
 
@@ -590,8 +590,8 @@ def test_grade_spellings_from_real_emails(memory: MemoryService):
     """Geresh, gershayim, maqaf and dashes all parse (textnorm first)."""
     _seed_world(memory)
     for spelling in ("ה'", "ה׳", "ה־ו", "ה–ו", "ה-ו"):
-        assert memory.resolve_applies_to({"school": "בראשית", "grades": spelling}) == [
-            "Rona"
+        assert memory.resolve_applies_to({"school": "הגפן", "grades": spelling}) == [
+            "Romi"
         ], spelling
 
 
@@ -609,13 +609,13 @@ def test_patch_closed_fact_raises(memory: MemoryService):
 
 def test_delete_entity_refused_while_current_facts_exist(memory: MemoryService):
     _seed_world(memory)
-    rona = memory._repo.find_entity(kind="person", name="Rona")
+    romi = memory._repo.find_entity(kind="person", name="Romi")
     with pytest.raises(MemoryError):
-        memory.delete_entity(rona.id)  # has current facts
-    for fact in memory._repo.current_facts(subject_ids=[rona.id]):
+        memory.delete_entity(romi.id)  # has current facts
+    for fact in memory._repo.current_facts(subject_ids=[romi.id]):
         memory.delete_fact(fact.id)
-    memory.delete_entity(rona.id)  # now allowed (history rows cascade)
-    assert memory._repo.find_entity(kind="person", name="Rona") is None
+    memory.delete_entity(romi.id)  # now allowed (history rows cascade)
+    assert memory._repo.find_entity(kind="person", name="Romi") is None
 
 
 # --- follow-up cleanup PR (review of PR #28 round) ---------------------------------
@@ -626,16 +626,16 @@ def test_grade_range_with_quotes_on_both_ends(memory: MemoryService):
     _seed_world(memory)
     for spelling in ("ה'-ו'", "ה׳–ו׳"):
         assert memory.resolve_applies_to(
-            {"school": "בראשית", "grades": spelling}
-        ) == ["Rona"], spelling
+            {"school": "הגפן", "grades": spelling}
+        ) == ["Romi"], spelling
 
 
 def test_bare_yod_is_grade_ten(memory: MemoryService):
     """Bare 'י' (grade 10) and 'י'' (with geresh) parse again."""
     _seed_world(memory)
-    memory.set_kid("Noa", gender="girl", school="בראשית", grade="10", class_="י א", teacher="T")
-    assert memory.resolve_applies_to({"school": "בראשית", "grades": "י"}) == ["Noa"]
-    assert memory.resolve_applies_to({"school": "בראשית", "grades": "י'"}) == ["Noa"]
+    memory.set_kid("Noa", gender="girl", school="הגפן", grade="10", class_="י א", teacher="T")
+    assert memory.resolve_applies_to({"school": "הגפן", "grades": "י"}) == ["Noa"]
+    assert memory.resolve_applies_to({"school": "הגפן", "grades": "י'"}) == ["Noa"]
 
 
 def test_set_channel_rejects_invalid_kind(memory: MemoryService):
@@ -651,15 +651,15 @@ def test_set_channel_rejects_invalid_kind(memory: MemoryService):
 
 
 def test_class_label_variants_all_match(memory: MemoryService):
-    """ה' ספיר (memory) == ה׳ ספיר / ה ספיר / כיתה ה' ספיר / ה-ספיר (text)."""
+    """ה' ברוש (memory) == ה׳ ברוש / ה ברוש / כיתה ה' ברוש / ה-ברוש (text)."""
     _seed_world(memory)
-    for variant in ("ה׳ ספיר", "ה ספיר", "כיתה ה' ספיר", "ה-ספיר", "ה' ספיר"):
-        assert memory.resolve_applies_to({"class": variant}) == ["Rona"], variant
+    for variant in ("ה׳ ברוש", "ה ברוש", "כיתה ה' ברוש", "ה-ברוש", "ה' ברוש"):
+        assert memory.resolve_applies_to({"class": variant}) == ["Romi"], variant
 
 
 def test_school_label_variant_still_matches(memory: MemoryService):
     _seed_world(memory)
-    assert memory.resolve_applies_to({"school": "בָּרָאשִׁית"}) == ["Rona", "Itamar"]
+    assert memory.resolve_applies_to({"school": "הַגֶּפֶן"}) == ["Romi", "Ilan"]
 
 
 def test_different_class_still_incompatible(memory: MemoryService):
@@ -672,8 +672,8 @@ def test_different_class_still_incompatible(memory: MemoryService):
 
 def test_sender_matching_teacher_is_the_default_audience(memory: MemoryService):
     _seed_world(memory)
-    assert memory.default_audience_for_sender("Rinat <rinat@bereshit.edu>") == ["Rona"]
-    assert memory.default_audience_for_sender("Maayan") == ["Itamar"]
+    assert memory.default_audience_for_sender("Tamar <tamar@example-school.edu>") == ["Romi"]
+    assert memory.default_audience_for_sender("Sigal") == ["Ilan"]
     assert memory.default_audience_for_sender("דואר כללי <office@edu>") is None
     assert memory.default_audience_for_sender(None) is None
     assert memory.default_audience_for_sender("") is None
@@ -681,42 +681,42 @@ def test_sender_matching_teacher_is_the_default_audience(memory: MemoryService):
 
 def test_sender_default_uses_whole_word_teacher_matching(memory: MemoryService):
     """Review round 2, bug 2: raw containment matched BOTH ways — a parent
-    'Rinat Levi' whose first name equals the teacher's, a word merely
+    'Tamar Levi' whose first name equals the teacher's, a word merely
     CONTAINING the teacher name, and a short sender inside a long teacher
     name all defaulted to the kid. The shared whole-word matcher
     (triage.mentions_name, one direction) fixes all three."""
     _seed_world(memory)
     # whole-word: a parent whose first name equals the teacher's still matches
-    assert memory.default_audience_for_sender("Rinat Levi <rinat.levi@gmail.com>") == ["Rona"]
+    assert memory.default_audience_for_sender("Tamar Levi <tamar.levi@gmail.com>") == ["Romi"]
     # a longer word merely containing the teacher name does not
-    assert memory.default_audience_for_sender("Rinatech Ltd <office@rinatech.co>") is None
+    assert memory.default_audience_for_sender("Tamartech Ltd <office@tamartech.co>") is None
     # a short sender string inside a longer teacher name does not
-    assert memory.default_audience_for_sender("Rin") is None
+    assert memory.default_audience_for_sender("Tam") is None
 
 
 def test_sender_default_hebrew_teacher_prefix_rule(memory: MemoryService):
     """Review round 2, bug 2 (Hebrew): mentions_name allows attached Hebrew
     prepositions (והבכלמש) before the name but not arbitrary letters —
-    'קרינת' is NOT the teacher 'רינת'."""
+    'קתמר' is NOT the teacher 'תמר'."""
     _seed_world(memory)
     memory.set_kid(
         "Noa",
         gender="girl",
-        school="בראשית",
+        school="הגפן",
         grade="3",
         class_="ג' כוכב",
-        teacher="רינת",
+        teacher="תמר",
     )
-    assert memory.default_audience_for_sender("רינת לוי") == ["Noa"]
-    # Hebrew display name + an address containing the Latin 'rinat': BOTH
+    assert memory.default_audience_for_sender("תמר לוי") == ["Noa"]
+    # Hebrew display name + an address containing the Latin 'tamar': BOTH
     # teacher facts match — the acknowledged residual (a first-name-only
     # teacher fact can match a same-named parent; results are proposals,
     # D2 Keep/Fix/Drop)
-    assert memory.default_audience_for_sender("רינת לוי <rinat.levi@gmail.com>") == [
+    assert memory.default_audience_for_sender("תמר לוי <tamar.levi@gmail.com>") == [
         "Noa",
-        "Rona",
+        "Romi",
     ]
-    assert memory.default_audience_for_sender("משפחת קרינת") is None
+    assert memory.default_audience_for_sender("משפחת קתמר") is None
 
 
 def test_named_kids_same_named_nonkid_aliases_never_attach(memory: MemoryService):
@@ -728,16 +728,16 @@ def test_named_kids_same_named_nonkid_aliases_never_attach(memory: MemoryService
     from brain.db.models import Entity, EntityAlias  # noqa: PLC0415
 
     _seed_world(memory)
-    _add_alias(memory, "Rona", "רונה")
-    # A second person entity named "Rona" — NOT a kid (no grade fact), e.g. a
+    _add_alias(memory, "Romi", "רומי")
+    # A second person entity named "Romi" — NOT a kid (no grade fact), e.g. a
     # parent or classmate entered with the same first name — carrying the
     # classmate-like alias. Inserted after the kid, so a name-keyed person
     # lookup resolves to THIS entity (last-wins).
-    impostor = memory._repo.add_entity(Entity(kind="person", name="Rona"))
+    impostor = memory._repo.add_entity(Entity(kind="person", name="Romi"))
     memory._repo.add_alias(
-        EntityAlias(entity_id=impostor.id, alias="רונה לוי", lang="he")
+        EntityAlias(entity_id=impostor.id, alias="רומי לוי", lang="he")
     )
     memory._repo.commit()
 
-    assert memory.resolve_applies_to({"named_kids": ["רונה לוי"]}) == ["unknown"]
-    assert memory.resolve_applies_to({"named_kids": ["רונה"]}) == ["Rona"]
+    assert memory.resolve_applies_to({"named_kids": ["רומי לוי"]}) == ["unknown"]
+    assert memory.resolve_applies_to({"named_kids": ["רומי"]}) == ["Romi"]

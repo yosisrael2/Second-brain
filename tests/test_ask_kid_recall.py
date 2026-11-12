@@ -89,33 +89,33 @@ def _world() -> tuple[MemoryService, ItemsRepository]:
     return memory, ItemsRepository(session)
 
 
-def _seed_itamar_world(memory: MemoryService, repo: ItemsRepository) -> MemoryItem:
-    """Itamar + his class channel ('family' channel for Rona-leak contrast)."""
-    memory.add_entity("person", "Itamar", aliases=["איתמר"])
-    memory.add_entity("person", "Rona")
+def _seed_ilan_world(memory: MemoryService, repo: ItemsRepository) -> MemoryItem:
+    """Ilan + his class channel ('family' channel for Romi-leak contrast)."""
+    memory.add_entity("person", "Ilan", aliases=["אילן"])
+    memory.add_entity("person", "Romi")
     memory.set_kid(
-        "Itamar",
+        "Ilan",
         gender="boy",
-        school="בראשית",
+        school="הגפן",
         grade="2",
-        class_="ב' ברקת",
-        teacher="Maayan",
+        class_="ב' רימון",
+        teacher="Sigal",
     )
-    memory.set_kid("Rona", gender="girl", school="בראשית", grade="5", class_="ה' ספיר")
-    memory.set_channel("ב' ברקת - הורים", kind="parents", applies_to="Itamar")
-    memory.set_channel("רונה כדורגל", kind="club", applies_to="Rona")  # leak guard
+    memory.set_kid("Romi", gender="girl", school="הגפן", grade="5", class_="ה' ברוש")
+    memory.set_channel("ב' רימון - הורים", kind="parents", applies_to="Ilan")
+    memory.set_channel("רומי כדורגל", kind="club", applies_to="Romi")  # leak guard
     memory.set_channel("כל המשפחה", kind="committee", applies_to="family")
 
-    # the item the semantic leg can NEVER find: no 'Itamar'/'איתמר' anywhere
+    # the item the semantic leg can NEVER find: no 'Ilan'/'אילן' anywhere
     class_item = repo.add(
         MemoryItem(
-            raw_text="[21/10/2026, 18:23] ב' ברקת - הורים / מעין: מחר חולצה לבנה וקלמר עם סרגל",
+            raw_text="[21/10/2026, 18:23] ב' רימון - הורים / סיגל: מחר חולצה לבנה וקלמר עם סרגל",
             occurred_at=datetime(2026, 10, 21, 15, 23, tzinfo=UTC),
             meta={
                 "count": 1,
                 "messages": [
                     {
-                        "sender": "ב' ברקת - הורים / מעין",
+                        "sender": "ב' רימון - הורים / סיגל",
                         "at": "2026-10-21T15:23:00+00:00",
                         "at_raw": "21/10/2026, 18:23",
                     }
@@ -144,24 +144,24 @@ def _service(
 
 def test_kid_question_recalls_channel_item_without_kid_name(clean_items, memory_db) -> None:
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     search = RecordingSearch([])  # semantic leg finds nothing (the failure mode)
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "מה איתמר צריך להביא מחר לבית ספר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
+        "מה אילן צריך להביא מחר לבית ספר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
     )
 
     assert len(search.seen_extra) == 1 and search.seen_extra[0], "kid leg must feed the pool"
     assert any(
-        "איתמר" not in hit.item.raw_text and "Itamar" not in hit.item.raw_text
+        "אילן" not in hit.item.raw_text and "Ilan" not in hit.item.raw_text
         for hit in result.sources
     ), "the recalled item must not contain the kid's name"
 
 
 def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     family_item = repo.add(
         MemoryItem(
             raw_text="[20/10/2026, 09:00] כל המשפחה / אבא: קמפינג בערב הבחירות בהר עגול",
@@ -172,7 +172,7 @@ def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "מה קורה בערב הבחירות, איתמר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
+        "מה קורה בערב הבחירות, אילן?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
     )
 
     assert str(family_item.id) in [str(hit.item.id) for hit in result.sources]
@@ -180,8 +180,8 @@ def test_family_channel_recalled_for_named_kid(clean_items, memory_db) -> None:
 
 def test_no_kid_named_leaves_pool_unchanged(clean_items, memory_db) -> None:
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
-    semantic_hit = repo.add(MemoryItem(raw_text="הקמפינג של כיתת ב' ברקת בהר עגול"))
+    _seed_ilan_world(memory, repo)
+    semantic_hit = repo.add(MemoryItem(raw_text="הקמפינג של כיתת ב' רימון בהר עגול"))
     search = RecordingSearch([SearchHit(item=semantic_hit, score=0.9)])
     service = _service(memory, repo, search)
 
@@ -199,10 +199,10 @@ def test_no_kid_named_leaves_pool_unchanged(clean_items, memory_db) -> None:
 
 def test_other_kids_channels_never_leak(clean_items, memory_db) -> None:
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
-    rona_item = repo.add(
+    _seed_ilan_world(memory, repo)
+    romi_item = repo.add(
         MemoryItem(
-            raw_text="[19/10/2026, 17:00] רונה כדורגל / המאמנת: אימון רביעי 15:15 באשכולות",
+            raw_text="[19/10/2026, 17:00] רומי כדורגל / המאמנת: אימון רביעי 15:15 באשכולות",
             occurred_at=datetime(2026, 10, 19, 14, 0, tzinfo=UTC),
         )
     )
@@ -210,27 +210,27 @@ def test_other_kids_channels_never_leak(clean_items, memory_db) -> None:
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "איתמר צריך חולצה לבנה מחר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
+        "אילן צריך חולצה לבנה מחר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC)
     )
 
-    assert str(rona_item.id) not in [str(hit.item.id) for hit in result.sources]
+    assert str(romi_item.id) not in [str(hit.item.id) for hit in result.sources]
 
 
 def test_kid_recall_cap_respected(clean_items, memory_db) -> None:
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     for n in range(20):
         repo.add(
             MemoryItem(
                 raw_text=(
-                    f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' ברקת - הורים / מעין: הודעה מספר {n}"
+                    f"[2{n // 10}/10/2026, 1{n % 10}:00] ב' רימון - הורים / סיגל: הודעה מספר {n}"
                 )
             )
         )
     search = RecordingSearch([])
     service = _service(memory, repo, search, kid_recall_limit=16)
 
-    service.ask("מה חדש אצל איתמר?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
+    service.ask("מה חדש אצל אילן?", now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
 
     assert len(search.seen_extra[0]) == 16, "the extra leg must respect its cap"
 
@@ -242,9 +242,9 @@ def test_kid_name_matches_word_boundaries_only(clean_items, memory_db) -> None:
     sub-word of another word in the question must not widen the pool.
     """
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)  # unrelated world so only May can fire
+    _seed_ilan_world(memory, repo)  # unrelated world so only May can fire
     memory.add_entity("person", "May")
-    memory.set_kid("May", gender="girl", school="בראשית", grade="3", class_="ג' שקד")
+    memory.set_kid("May", gender="girl", school="הגפן", grade="3", class_="ג' שקד")
     memory.set_channel("ג' שקד - הורים", kind="parents", applies_to="May")
     repo.add(MemoryItem(
         raw_text="[21/10/2026, 18:00] ג' שקד - הורים / המחנכת: מחר יום ספור",
@@ -266,15 +266,15 @@ def test_kid_name_matches_word_boundaries_only(clean_items, memory_db) -> None:
 
 
 def test_hebrew_prefixes_still_name_a_kid(clean_items, memory_db) -> None:
-    """Hebrew glues prefixes onto words: 'לאיתמר'/'ואיתמר'/'שלאיתמר' are all
-    questions that NAME Itamar, so the prefix run [והבכלמש]{0,3} must be
+    """Hebrew glues prefixes onto words: 'לאילן'/'ואילן'/'שלאילן' are all
+    questions that NAME Ilan, so the prefix run [והבכלמש]{0,3} must be
     allowed before the name — while 'שחר' inside 'שחרור' still must not fire
     (the word continues with a letter, the name does not end there).
     """
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     memory.add_entity("person", "Shachar", aliases=["שחר"])
-    memory.set_kid("Shachar", gender="boy", school="בראשית", grade="4", class_="ד' נוף")
+    memory.set_kid("Shachar", gender="boy", school="הגפן", grade="4", class_="ד' נוף")
     memory.set_channel("שחר חוג כדורסל", kind="club", applies_to="Shachar")
     repo.add(MemoryItem(
         raw_text="[21/10/2026, 18:30] שחר חוג כדורסל / המאמן: מחר מתאמנים בדווקא בבוקר",
@@ -284,9 +284,9 @@ def test_hebrew_prefixes_still_name_a_kid(clean_items, memory_db) -> None:
     service = _service(memory, repo, search)
 
     for question in (
-        "מה צריך לאיתמר מחר?",       # single prefix ל
-        "ואיתמר, מה הוא צריך?",       # single prefix ו
-        "האם שלאיתמר יש מחר משהו?",   # prefix combo של
+        "מה צריך לאילן מחר?",       # single prefix ל
+        "ואילן, מה הוא צריך?",       # single prefix ו
+        "האם שלאילן יש מחר משהו?",   # prefix combo של
     ):
         service.ask(question, now=datetime(2026, 10, 22, 15, 0, tzinfo=UTC))
         assert search.seen_extra[-1], f"'{question}' must fire the kid leg"
@@ -302,7 +302,7 @@ def test_by_text_any_excludes_dropped_children(clean_items, memory_db) -> None:
     """Repo contract (design item 19): dropped extracted children are never
     recalled; ordinary captures, proposed and kept children are."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     for state in [None, "proposed", "kept", "dropped"]:
         repo.add(MemoryItem(
             raw_text="[21/10/2026, 19:00] ג' שקד - הורים / המחנכת: טיול שנתי בטבעון",
@@ -318,7 +318,7 @@ def test_by_text_any_excludes_dropped_children(clean_items, memory_db) -> None:
 
 # --- WA39 acceptance run 1 (24 Oct): the newest-N flood -----------------------
 
-_TEACHER = "ב' ברקת - הורים"
+_TEACHER = "ב' רימון - הורים"
 
 
 def _whatsapp_item(
@@ -338,7 +338,7 @@ def _whatsapp_item(
     return repo.add(
         MemoryItem(
             source="whatsapp",
-            raw_text=f"[2{day}/10/2026, {hour}:00] {channel} / מעין: {text}",
+            raw_text=f"[2{day}/10/2026, {hour}:00] {channel} / סיגל: {text}",
             occurred_at=datetime(2026, 10, day, hour - 2, 0, tzinfo=UTC),
             created_at=datetime(2026, 10, captured, 12, 0, tzinfo=UTC),
             meta={
@@ -347,7 +347,7 @@ def _whatsapp_item(
                 "count": 1,
                 "messages": [
                     {
-                        "sender": f"{channel} / מעין",
+                        "sender": f"{channel} / סיגל",
                         "at": f"2026-10-{day}T{hour - 2}:00:00+00:00",
                         "at_raw": f"2{day}/10/2026, {hour}:00",
                     }
@@ -365,7 +365,7 @@ def test_farm_conversation_recalled_despite_newer_flood(clean_items, memory_db) 
     resolved time window when one resolves (the temporal leg's own
     resolution), else falls back to the newest-N cap — never all history."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     # the target: the teacher-channel conversation ABOUT the farm day —
     # no kid name anywhere in its text (the semantic leg cannot find it)
     farm = _whatsapp_item(
@@ -377,14 +377,14 @@ def test_farm_conversation_recalled_despite_newer_flood(clean_items, memory_db) 
         _whatsapp_item(
             repo, _TEACHER, 23, 8 + n % 12, f"הודעה שנייה־עשרים מספר {n}"
         )
-    rona_item = _whatsapp_item(
-        repo, "רונה כדורגל", 21, 9, "אימון הכדורגל של רונה מחר בשעה 15:15"
+    romi_item = _whatsapp_item(
+        repo, "רומי כדורגל", 21, 9, "אימון הכדורגל של רומי מחר בשעה 15:15"
     )
     search = RecordingSearch([])  # semantic leg finds nothing (the failure mode)
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -393,7 +393,7 @@ def test_farm_conversation_recalled_despite_newer_flood(clean_items, memory_db) 
         "the kid's-channel conversation inside the question's resolved window "
         "must join the recall pool even when newer items fill the newest-N cap"
     )
-    assert str(rona_item.id) not in recalled, (
+    assert str(romi_item.id) not in recalled, (
         "another kid's channel must never be recalled for this kid's question"
     )
 
@@ -402,14 +402,14 @@ def test_kid_channel_recall_without_resolved_window_is_recent_n(clean_items, mem
     """No date in the question -> the kid leg falls back to the newest-N cap
     (never all history) and still respects the overall pool cap."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     old = _whatsapp_item(repo, _TEACHER, 9, 10, "שיחה ישנה מתחילת החודש")
     for n in range(20):
         _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"הודעה חדשה מספר {n}")
     search = RecordingSearch([])
     service = _service(memory, repo, search, kid_recall_limit=16)
 
-    service.ask("מה חדש אצל איתמר?", now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC))
+    service.ask("מה חדש אצל אילן?", now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC))
 
     extra_ids = [str(item.id) for item in search.seen_extra[0]]
     assert len(extra_ids) == 16, "the pool cap holds"
@@ -423,14 +423,14 @@ def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) ->
     contain the kid's class string, so the class text needle cannot
     accidentally recall the item."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
-    memory.set_channel("קשר עם המחנך", kind="teacher", applies_to="Itamar")
+    _seed_ilan_world(memory, repo)
+    memory.set_channel("קשר עם המחנך", kind="teacher", applies_to="Ilan")
     item = _whatsapp_item(repo, "קשר עם המחנך", 21, 10, "מחר הכיתה בחווה החקלאית", captured=21)
     search = RecordingSearch([])
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
     assert str(item.id) in [str(hit.item.id) for hit in result.sources], (
@@ -447,7 +447,7 @@ def test_no_channel_facts_keeps_the_kid_leg_text_only(clean_items, memory_db) ->
     search2 = RecordingSearch([])
     service2 = _service(memory, repo, search2)
     service2.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
     assert all(str(item.id) != str(i.id) for i in search2.seen_extra[0]), (
@@ -469,17 +469,17 @@ def test_by_channels_hides_confirmed_cancellation_until_restored(clean_items) ->
     repo = ItemsRepository(session)
     normal = repo.add(
         MemoryItem(
-            raw_text="[21/10/2026, 18:20] ב' ברקת - הורים / מעין: מחר ספרייה",
+            raw_text="[21/10/2026, 18:20] ב' רימון - הורים / סיגל: מחר ספרייה",
             source="whatsapp",
-            meta={"channel": "ב' ברקת - הורים"},
+            meta={"channel": "ב' רימון - הורים"},
             occurred_at=datetime(2026, 10, 21, 15, 20, tzinfo=UTC),
         )
     )
     cancelled = repo.add(
         MemoryItem(
-            raw_text="[21/10/2026, 19:00] ב' ברקת - הורים / מעין: בוטל הטיול",
+            raw_text="[21/10/2026, 19:00] ב' רימון - הורים / סיגל: בוטל הטיול",
             source="whatsapp",
-            meta={"channel": "ב' ברקת - הורים"},
+            meta={"channel": "ב' רימון - הורים"},
             occurred_at=datetime(2026, 10, 21, 16, 0, tzinfo=UTC),
         )
     )
@@ -502,7 +502,7 @@ def test_by_channels_hides_confirmed_cancellation_until_restored(clean_items) ->
     def _ids() -> set[str]:
         return {
             str(item.id)
-            for item in repo.by_channels(["ב' ברקת - הורים"], limit=10)
+            for item in repo.by_channels(["ב' רימון - הורים"], limit=10)
         }
 
     # RED: today by_channels still returns the confirmed-cancelled row
@@ -525,7 +525,7 @@ def test_announcement_sent_before_the_window_is_recalled_via_lookback(
     KID_RECALL_LOOKBACK_DAYS (default 3) — and slot priority is in-window >
     lookback > newest flood."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     # the announcement: sent Tue 20.10 evening (18:00 UTC = 21:00 Jerusalem),
     # one hour BEFORE the 'Wednesday 21.10' window opens at 20.10 21:00 UTC —
     # no kid name in its text (the semantic leg cannot find it)
@@ -540,7 +540,7 @@ def test_announcement_sent_before_the_window_is_recalled_via_lookback(
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -556,7 +556,7 @@ def test_lookback_respects_its_days_bound(clean_items, memory_db) -> None:
     KID_RECALL_LOOKBACK_DAYS before the window opens stays out of the pool
     (never all history)."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     old = _whatsapp_item(
         repo, _TEACHER, 16, 10, "שיעור בחווה החקלאית ביום ד' הקרוב", captured=16
     )
@@ -567,7 +567,7 @@ def test_lookback_respects_its_days_bound(clean_items, memory_db) -> None:
     service = _service(memory, repo, search)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -602,7 +602,7 @@ def _email(repo: ItemsRepository, n: int) -> MemoryItem:
     """A high-scoring semantic item (school email) that outranks chat noise."""
     return repo.add(
         MemoryItem(
-            raw_text=f"מכתב מנהלת בית הספר בראשית — הודעה כללית מספר {n} על תשלומים",
+            raw_text=f"מכתב מנהלת בית הספר הגפן — הודעה כללית מספר {n} על תשלומים",
         )
     )
 
@@ -613,14 +613,14 @@ def test_kid_items_are_additions_not_carve_out(clean_items, memory_db) -> None:
     never displaced — the context is the general top_k PLUS up to
     ask_kid_reserved_slots kid items (default 4)."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     emails = [_email(repo, n) for n in range(10)]
     kid_item = _whatsapp_item(repo, _TEACHER, 18, 15, "מי שרוצה להביא נעלי בית לכיתה, מוזמן")
     search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
     service = _service2(memory, repo, search, top_k=8)
 
     result = service.ask(
-        "Is there anything optional Itamar can bring to class?",
+        "Is there anything optional Ilan can bring to class?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -642,7 +642,7 @@ def test_dated_question_adds_the_d_minus_1_announcement(clean_items, memory_db) 
     DATE RELEVANCE: in-window kid-channel items first, then the lookback
     items ordered by distance to the window — before rerank order."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     chats = [
         _whatsapp_item(repo, _TEACHER, 23, 8 + n % 12, f"שיחה חדשה מספר {n}")
         for n in range(6)
@@ -659,7 +659,7 @@ def test_dated_question_adds_the_d_minus_1_announcement(clean_items, memory_db) 
     service = _service2(memory, repo, search, top_k=8)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -682,7 +682,7 @@ def test_dated_additions_order_in_window_before_lookback(clean_items, memory_db)
     """In-window kid-channel items come before lookback items; lookback items
     order by distance to the window, nearest first."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     emails = [_email(repo, n) for n in range(8)]
     far = _whatsapp_item(repo, _TEACHER, 17, 12, "לפני שבוע: סרגל לכיתה", captured=17)
     near = _whatsapp_item(repo, _TEACHER, 20, 12, "מחר צריך סרגל לכיתה", captured=20)
@@ -691,7 +691,7 @@ def test_dated_additions_order_in_window_before_lookback(clean_items, memory_db)
     service = _service2(memory, repo, search, top_k=8)
 
     result = service.ask(
-        "Where was Itamar's class on Wednesday 21.10?",
+        "Where was Ilan's class on Wednesday 21.10?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -707,7 +707,7 @@ def test_undated_question_adds_by_rerank_order(clean_items, memory_db) -> None:
     """No resolved window: the kid additions fill in rerank order, as before
     — the reranked-out kid items still join the general top_k."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     emails = [_email(repo, n) for n in range(8)]
     kid_items = [
         _whatsapp_item(repo, _TEACHER, 18, 15, "נעלי בית לכיתה — מי שרוצה מוזמן"),
@@ -720,7 +720,7 @@ def test_undated_question_adds_by_rerank_order(clean_items, memory_db) -> None:
     service = _service2(memory, repo, search, top_k=8)
 
     result = service.ask(
-        "What should Itamar bring to class this week?",
+        "What should Ilan bring to class this week?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
@@ -735,7 +735,7 @@ def test_undated_question_adds_by_rerank_order(clean_items, memory_db) -> None:
 def test_no_kid_named_context_byte_identical(clean_items, memory_db) -> None:
     """No kid named -> the context is exactly the general top_k, unchanged."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     emails = [_email(repo, n) for n in range(10)]
     _whatsapp_item(repo, _TEACHER, 18, 15, "נעלי בית לכיתה")  # never fetched
     search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails])
@@ -750,24 +750,24 @@ def test_no_kid_named_context_byte_identical(clean_items, memory_db) -> None:
 
 
 def test_reservation_never_touches_other_kids_channels(clean_items, memory_db) -> None:
-    """An Itamar question adds only Itamar-pool items: a Rona-channel item
+    """An Ilan question adds only Ilan-pool items: a Romi-channel item
     ranked below the cut stays out even when slots go unused."""
     memory, repo = _world()
-    _seed_itamar_world(memory, repo)
+    _seed_ilan_world(memory, repo)
     emails = [_email(repo, n) for n in range(8)]
-    rona_item = _whatsapp_item(repo, "רונה כדורגל", 18, 15, "אימון כדורגל מחר בבנימינה")
-    # rona ranks 9th — below the top-8 cut — so only the ADDITION path could
+    romi_item = _whatsapp_item(repo, "רומי כדורגל", 18, 15, "אימון כדורגל מחר באורנים")
+    # romi ranks 9th — below the top-8 cut — so only the ADDITION path could
     # ever bring it in
     search = RecordingSearch([SearchHit(item=e, score=0.9) for e in emails]
-                             + [SearchHit(item=rona_item, score=0.5)])
+                             + [SearchHit(item=romi_item, score=0.5)])
     service = _service2(memory, repo, search, top_k=8)
 
     result = service.ask(
-        "What should Itamar bring to class tomorrow?",
+        "What should Ilan bring to class tomorrow?",
         now=datetime(2026, 10, 24, 9, 0, tzinfo=UTC),
     )
 
     ids = [str(hit.item.id) for hit in result.sources]
-    assert str(rona_item.id) not in ids, (
-        "Rona's channel item is not in Itamar's kid pool -> never added"
+    assert str(romi_item.id) not in ids, (
+        "Romi's channel item is not in Ilan's kid pool -> never added"
     )

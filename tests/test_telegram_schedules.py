@@ -110,7 +110,7 @@ def _core(ask: _Ask | None = None, lang: str = "en") -> TelegramBot:
     return TelegramBot(services_factory=factory, allowed_ids=frozenset({111, 222}), timezone=IL)
 
 
-def _task(name: str = "Rona mail", prompt: str = "בדוק מיילים", **kw: Any) -> uuid.UUID:
+def _task(name: str = "Romi mail", prompt: str = "בדוק מיילים", **kw: Any) -> uuid.UUID:
     with _store() as store:
         return store.create(
             name=name, prompt=prompt, schedule=kw.pop("schedule", "0 7 * * 5"), **kw
@@ -153,13 +153,13 @@ def test_schedules_empty(sched_db):
 
 
 def test_schedules_lists_state_next_run_and_buttons(sched_db):
-    active = _task("Rona <mail>")
+    active = _task("Romi <mail>")
     paused = _task("Daily digest", schedule="0 6 * * *")
     with _store() as store:
         store.set_enabled(paused, False)
         next_run = store.get(active).next_run_at.astimezone(IL)
     reply = _core().route("/schedules", 111)
-    assert "1. ▶ <b>Rona &lt;mail&gt;</b> — Every Friday at 07:00" in reply.text
+    assert "1. ▶ <b>Romi &lt;mail&gt;</b> — Every Friday at 07:00" in reply.text
     assert f"Active · next: Fri {next_run.strftime('%d.%m')} 07:00" in reply.text
     assert "2. ⏸ <b>Daily digest</b> — Every day at 06:00" in reply.text
     assert "Paused" in reply.text
@@ -183,12 +183,12 @@ def test_pause_and_resume_buttons(sched_db):
     core = _core()
     reply = core.route("/schedules", 111)
     paused = core.handle_callback(_callbacks(reply)[1], 111)
-    assert paused.edit and "⏸ Paused: Rona mail" in paused.text
+    assert paused.edit and "⏸ Paused: Romi mail" in paused.text
     with _store() as store:
         task = store.get(task_id)
         assert not task.enabled and task.next_run_at is None
     resumed = core.handle_callback(_callbacks(paused)[1], 111)
-    assert "▶ Resumed: Rona mail" in resumed.text
+    assert "▶ Resumed: Romi mail" in resumed.text
     with _store() as store:
         assert store.get(task_id).next_run_at is not None
 
@@ -219,7 +219,7 @@ def test_run_now_button_runs_off_the_loop_and_messages_every_user(sched_db):
     ask = _Ask({"מה חדש מבית הספר?": "שני מיילים חדשים"})
     core = _core(ask)
     queued = core.handle_callback(_callbacks(core.route("/schedules", 111))[0], 111)
-    assert "Queued: Rona mail" in queued.text
+    assert "Queued: Romi mail" in queued.text
     tg = _Tg()
     main = threading.current_thread()
 
@@ -229,7 +229,7 @@ def test_run_now_button_runs_off_the_loop_and_messages_every_user(sched_db):
     assert ask.calls[0]["thread"] is not main and ask.calls[0]["on_loop"] is False
     assert [msg["chat_id"] for msg in tg.sent] == [111, 222]
     text = tg.sent[0]["text"]
-    assert text.startswith("⏰ <b>Rona mail</b>\n🧠 <b>Answer</b>")
+    assert text.startswith("⏰ <b>Romi mail</b>\n🧠 <b>Answer</b>")
     assert "שני מיילים חדשים" in text
     (run,) = _runs(task_id)
     assert run.status == "ok" and run.trigger == "manual" and run.output == "שני מיילים חדשים"

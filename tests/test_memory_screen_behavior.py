@@ -109,15 +109,15 @@ M2_FIXTURES = {
         "id": "e1", "kind": "person", "name": "Noa", "aliases": [],
         "facts": [
             {"id": "f-ita", "subject_id": "e1", "predicate": "applies_to",
-             "value": "Itamar", "object_id": None, "status": "confirmed",
+             "value": "Ilan", "object_id": None, "status": "confirmed",
              "provenance": {}},
         ],
     }],
     "proposed": [{
         "id": "e1", "kind": "person", "name": "Noa", "aliases": [],
         "facts": [
-            {"id": "f-rona", "subject_id": "e1", "predicate": "applies_to",
-             "value": "Rona", "object_id": None, "status": "proposed",
+            {"id": "f-romi", "subject_id": "e1", "predicate": "applies_to",
+             "value": "Romi", "object_id": None, "status": "proposed",
              "provenance": {}},
         ],
     }],
@@ -219,13 +219,13 @@ M3_FIXTURES = {
     "entities": [
         {"id": "e1", "kind": "person", "name": "Noa", "aliases": [], "facts": [
             {"id": "f-note", "subject_id": "e1", "predicate": "note",
-             "value": "Birthday party on 3.5 for Rona", "object_id": None,
+             "value": "Birthday party on 3.5 for Romi", "object_id": None,
              "status": "confirmed", "provenance": {}},
             {"id": "f-bday", "subject_id": "e1", "predicate": "birthday",
              "value": "1.1.2010", "object_id": None, "status": "confirmed",
              "provenance": {}},
         ]},
-        {"id": "e2", "kind": "person", "name": "Rona", "aliases": [], "facts": []},
+        {"id": "e2", "kind": "person", "name": "Romi", "aliases": [], "facts": []},
     ],
     "proposed": [],
 }
@@ -342,7 +342,7 @@ def test_move_undo_restores_overwritten_value_via_the_new_row() -> None:
     """B2 (PR #136 review): patch_fact closes the old row and opens a NEW id,
     so the Undo of a PATCHed move must retarget the row the server CREATED —
     patching the old id again 409s ('cannot edit a closed fact'). Also covers
-    the overwrite leg: ticking 'also on Rona' over her EXISTING birthday must
+    the overwrite leg: ticking 'also on Romi' over her EXISTING birthday must
     stay undoable, restoring what she had."""
     payload = screen_behavior(
         """
@@ -368,7 +368,7 @@ def test_move_undo_restores_overwritten_value_via_the_new_row() -> None:
       field.dispatchEvent(new window.Event('change', { bubbles: true }));
       await settle(80);
       const box = form.querySelector('input[type=checkbox]');
-      check('the also-on-Rona checkbox is offered for a shared birthday', Boolean(box));
+      check('the also-on-Romi checkbox is offered for a shared birthday', Boolean(box));
       if (!box) return;
       box.click();
       const save = [...form.querySelectorAll('button')].find((b) => b.textContent === 'Move');
@@ -380,7 +380,7 @@ def test_move_undo_restores_overwritten_value_via_the_new_row() -> None:
       if (!undoBtn) return;
       undoBtn.click();
       await settle(400);
-      // The PATCH response created new-N for Rona's closed f-bday-2; the undo
+      // The PATCH response created new-N for Romi's closed f-bday-2; the undo
       // must PATCH new-N back to her old value. Patching f-bday-2 would be a
       // 409 against the honest stub (closed rows refuse edits).
       const undoPatches = calls.filter((c) => c.method === 'PATCH' && /new-\\d+$/.test(c.url));
@@ -394,7 +394,7 @@ def test_move_undo_restores_overwritten_value_via_the_new_row() -> None:
     """,
         M3_OVERWRITE_FIXTURES,
     )
-    assert_check(payload, "the also-on-Rona checkbox is offered for a shared birthday")
+    assert_check(payload, "the also-on-Romi checkbox is offered for a shared birthday")
     assert_check(payload, "the move offers an Undo")
     assert_check(payload, "the Undo patches the NEW row id back to the previous value")
     assert_check(payload, "no request hit a closed row (no 409s during move+undo)")
@@ -412,7 +412,7 @@ M3_OVERWRITE_FIXTURES = {
                     "id": "f-note",
                     "subject_id": "e1",
                     "predicate": "note",
-                    "value": "Birthday party on 3.5 for Rona",
+                    "value": "Birthday party on 3.5 for Romi",
                     "object_id": None,
                     "status": "confirmed",
                     "provenance": {},
@@ -422,7 +422,7 @@ M3_OVERWRITE_FIXTURES = {
         {
             "id": "e2",
             "kind": "person",
-            "name": "Rona",
+            "name": "Romi",
             "aliases": [],
             "facts": [
                 {
@@ -474,7 +474,7 @@ def test_move_failure_rolls_back_the_writes() -> None:
       const save = [...form.querySelectorAll('button')].find((b) => b.textContent === 'Move');
       save.click();
       await settle(400);
-      // Noa (no birthday) writes first -> POST new-1; Rona's stale closed row
+      // Noa (no birthday) writes first -> POST new-1; Romi's stale closed row
       // (valid_to set in the fixture) makes the PATCH 409 like the real server.
       const created = calls.filter((c) => c.method === 'POST' && c.url === '/memory/facts');
       check('the write to Noa went through first',
@@ -506,19 +506,19 @@ M3_STALE_FIXTURES = {
                     "id": "f-note",
                     "subject_id": "e1",
                     "predicate": "note",
-                    "value": "Birthday party on 3.5 for Rona",
+                    "value": "Birthday party on 3.5 for Romi",
                     "object_id": None,
                     "status": "confirmed",
                     "provenance": {},
                 },
             ],
         },
-        # Rona's birthday row is STALE on the client: valid_to is set, so the
+        # Romi's birthday row is STALE on the client: valid_to is set, so the
         # honest stub refuses to PATCH it (409) exactly like the real backend.
         {
             "id": "e2",
             "kind": "person",
-            "name": "Rona",
+            "name": "Romi",
             "aliases": [],
             "facts": [
                 {
@@ -539,9 +539,9 @@ M3_STALE_FIXTURES = {
 
 
 def test_move_checkbox_unchecks_when_its_field_hides_it() -> None:
-    """Minor b (PR #136 review): ticking 'also on Rona' for a birthday and
+    """Minor b (PR #136 review): ticking 'also on Romi' for a birthday and
     then switching the field (birthday -> work) hides the checkbox but left
-    it CHECKED — the move silently wrote onto Rona. Hiding must uncheck."""
+    it CHECKED — the move silently wrote onto Romi. Hiding must uncheck."""
     payload = screen_behavior(
         """
       await window.MemoryTab.refresh();
@@ -577,17 +577,17 @@ def test_move_checkbox_unchecks_when_its_field_hides_it() -> None:
       const save = [...form.querySelectorAll('button')].find((b) => b.textContent === 'Move');
       save.click();
       await settle(400);
-      const toRona = calls.filter((c) => c.body && c.body.subject_id === 'e2');
-      const ronaPatches = calls.filter((c) => c.method === 'PATCH' && c.url.includes('f-bday-2'));
-      check('nothing was written to Rona after the field changed',
-        toRona.length === 0 && ronaPatches.length === 0,
-        `toRona=${JSON.stringify(toRona)} ronaPatches=${JSON.stringify(ronaPatches)}`);
+      const toRomi = calls.filter((c) => c.body && c.body.subject_id === 'e2');
+      const romiPatches = calls.filter((c) => c.method === 'PATCH' && c.url.includes('f-bday-2'));
+      check('nothing was written to Romi after the field changed',
+        toRomi.length === 0 && romiPatches.length === 0,
+        `toRomi=${JSON.stringify(toRomi)} romiPatches=${JSON.stringify(romiPatches)}`);
     """,
         M3_OVERWRITE_FIXTURES,
     )
     assert_check(payload, "the checkbox is checked while its field is selected")
     assert_check(payload, "switching the field unchecks the hidden checkbox")
-    assert_check(payload, "nothing was written to Rona after the field changed")
+    assert_check(payload, "nothing was written to Romi after the field changed")
 
 
 # --- Undo stack: a second delete must not erase the first delete's Undo ------
@@ -664,8 +664,8 @@ def test_undo_stack_restores_both_deleted_memories() -> None:
 
 
 def test_connection_form_other_type_wording() -> None:
-    """'other' rendered as 'Noa is the connected of Rona' — the wording must
-    read 'Noa is connected to Rona'."""
+    """'other' rendered as 'Noa is the connected of Romi' — the wording must
+    read 'Noa is connected to Romi'."""
     payload = screen_behavior("""
       await window.MemoryTab.refresh();
       await settle(150);
@@ -689,7 +689,7 @@ def test_connection_form_other_type_wording() -> None:
     """, {
         "entities": [
             {"id": "e1", "kind": "person", "name": "Noa", "aliases": [], "facts": []},
-            {"id": "e2", "kind": "person", "name": "Rona", "aliases": [], "facts": []},
+            {"id": "e2", "kind": "person", "name": "Romi", "aliases": [], "facts": []},
         ],
         "proposed": [],
     })
@@ -698,12 +698,12 @@ def test_connection_form_other_type_wording() -> None:
     assert_check(payload, "the other type reads \"is connected to\"")
 
 
-def _conn_fixture(noah_facts, rona_facts):
-    """Two people (Noa e1, Rona e2) with the given fact lists."""
+def _conn_fixture(noah_facts, romi_facts):
+    """Two people (Noa e1, Romi e2) with the given fact lists."""
     return {
         "entities": [
             {"id": "e1", "kind": "person", "name": "Noa", "aliases": [], "facts": noah_facts},
-            {"id": "e2", "kind": "person", "name": "Rona", "aliases": [], "facts": rona_facts},
+            {"id": "e2", "kind": "person", "name": "Romi", "aliases": [], "facts": romi_facts},
         ],
         "proposed": [],
     }
@@ -724,8 +724,8 @@ def _conn_fact(fid, subject, target, predicate="connection:parent"):
 def test_connection_form_blocks_the_reverse_stored_duplicate() -> None:
     """Minor d (PR #136 review): the duplicate guard only looked at links
     STORED on this profile. The same relation stored on the other side
-    (Rona's 'parent' fact pointing at Noa) IS the duplicate of adding 'Noa
-    is the child of Rona' — it must be blocked, not stacked twice."""
+    (Romi's 'parent' fact pointing at Noa) IS the duplicate of adding 'Noa
+    is the child of Romi' — it must be blocked, not stacked twice."""
     payload = screen_behavior(
         """
       await window.MemoryTab.refresh();
@@ -755,7 +755,7 @@ def test_connection_form_blocks_the_reverse_stored_duplicate() -> None:
       check('the block explains the duplicate', toastText.includes('already connected'),
         `toast=${toastText}`);
     """,
-        _conn_fixture([], [_conn_fact("f-rona-parent", "e2", "e1")]),
+        _conn_fixture([], [_conn_fact("f-romi-parent", "e2", "e1")]),
     )
     assert_check(payload, "the profile opens")
     assert_check(payload, "the add-connection form opens")
@@ -764,8 +764,8 @@ def test_connection_form_blocks_the_reverse_stored_duplicate() -> None:
 
 
 def test_connection_form_does_not_call_a_contradiction_a_duplicate() -> None:
-    """Minor d (PR #136 review): an existing 'Noa is the parent of Rona'
-    link and a new 'Noa is the child of Rona' CONTRADICT each other — they
+    """Minor d (PR #136 review): an existing 'Noa is the parent of Romi'
+    link and a new 'Noa is the child of Romi' CONTRADICT each other — they
     are not the same fact, so the guard must not block it as a duplicate."""
     payload = screen_behavior(
         """
@@ -1203,7 +1203,7 @@ AVATAR_FIXTURES = {
              "value": "abc123", "object_id": None, "status": "confirmed",
              "provenance": {"sha256": "abc123", "mime": "image/png"}},
         ]},
-        {"id": "e-plain", "kind": "person", "name": "Rona", "aliases": [], "facts": []},
+        {"id": "e-plain", "kind": "person", "name": "Romi", "aliases": [], "facts": []},
         {"id": "e-group", "kind": "channel", "name": "3rd grade parents",
          "aliases": [], "facts": []},
     ],
@@ -1427,7 +1427,7 @@ GROUPS_FIXTURES = {
             {"id": "f-grade", "subject_id": "e-kid", "predicate": "grade",
              "value": "5", "object_id": None, "status": "confirmed", "provenance": {}},
         ]},
-        {"id": "e-lonely", "kind": "person", "name": "Itamar", "aliases": [], "facts": [
+        {"id": "e-lonely", "kind": "person", "name": "Ilan", "aliases": [], "facts": [
             {"id": "f-grade2", "subject_id": "e-lonely", "predicate": "grade",
              "value": "2", "object_id": None, "status": "confirmed", "provenance": {}},
         ]},
@@ -1436,7 +1436,7 @@ GROUPS_FIXTURES = {
     "proposed": [],
     "groupsByEntity": {
         "e-kid": {"groups": [{
-            "channel": "ה' ספיר - הורים", "applies_to": "Noa",
+            "channel": "ה' ברוש - הורים", "applies_to": "Noa",
             "conversations": [
                 {"item_id": "i-1", "occurred_at": "2026-10-25T09:00:00+00:00",
                  "preview": "מחר פעילות מים — להביא מגבת", "kept_fact_id": None},
@@ -1461,7 +1461,7 @@ def test_groups_section_renders_keep_and_kept_states() -> None:
       const section = document.querySelector('#memory-detail .mm-groups-body');
       check('the kid profile has a groups section', Boolean(section));
       if (!section) return;
-      check('the channel header renders', section.textContent.includes("ה' ספיר - הורים"));
+      check('the channel header renders', section.textContent.includes("ה' ברוש - הורים"));
       const row1 = [...section.querySelectorAll('.mm-group-row')]
         .find((r) => r.textContent.includes('להביא מגבת'));
       check('the open conversation has a keep button', Boolean(row1)
@@ -1504,7 +1504,7 @@ def test_groups_empty_state_and_hidden_for_non_kid() -> None:
       await settle(300);
       let section = document.querySelector('#memory-detail .mm-groups-body');
       check('the empty state names the kid', Boolean(section)
-        && section.textContent.includes('No WhatsApp groups linked to Itamar'),
+        && section.textContent.includes('No WhatsApp groups linked to Ilan'),
         section ? section.textContent.slice(0, 120) : 'no section');
       document.querySelector('[data-entity="e-adult"]').click();
       await settle(300);

@@ -153,7 +153,7 @@ class TestProductionSites:
         body = "הגיעו עם כובע לטיול ביום חמישי 22.10. יש להצטייד בכובע."
         emails = tmp_path / "emails.txt"
         emails.write_text(
-            "From: Morah Rinat <rinat@example.org>\n"
+            "From: Morah Tamar <tamar@example.org>\n"
             "Date: Mon, 19 Oct 2026 09:00\n"
             f"\n{body}\n",
             encoding="utf-8",

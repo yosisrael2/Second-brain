@@ -84,7 +84,7 @@ def _wa(repo, channel, body, *, day=20, hour=15):
     return repo.add(
         MemoryItem(
             source="whatsapp",
-            raw_text=f"[{day}/10/2026, {hour}:00] {channel} / מעין: {body}",
+            raw_text=f"[{day}/10/2026, {hour}:00] {channel} / סיגל: {body}",
             occurred_at=datetime(2026, 10, day, hour - 2, 0, tzinfo=UTC),
             created_at=datetime(2026, 10, day, 12, 0, tzinfo=UTC),
             meta={
@@ -97,10 +97,10 @@ def _wa(repo, channel, body, *, day=20, hour=15):
     )
 
 
-def _seed_itamar(memory: MemoryService) -> None:
-    memory.add_entity("person", "Itamar", aliases=["איתמר"])
-    memory.set_kid("Itamar", gender="boy", school="בראשית", grade="2", class_="ב' ברקת")
-    memory.set_channel("ב' ברקת - הורים", kind="parents", applies_to="Itamar")
+def _seed_ilan(memory: MemoryService) -> None:
+    memory.add_entity("person", "Ilan", aliases=["אילן"])
+    memory.set_kid("Ilan", gender="boy", school="הגפן", grade="2", class_="ב' רימון")
+    memory.set_channel("ב' רימון - הורים", kind="parents", applies_to="Ilan")
 
 
 def test_kid_leg_broken_sql_does_not_kill_the_ask(clean_items, memory_db) -> None:
@@ -109,7 +109,7 @@ def test_kid_leg_broken_sql_does_not_kill_the_ask(clean_items, memory_db) -> Non
     later query on the SAME session must still work — no aborted
     transaction (the #117 trap)."""
     memory, repo, session = _world()
-    _seed_itamar(memory)
+    _seed_ilan(memory)
     hit = repo.add(MemoryItem(raw_text="מכתב הנהלה על תשלומים"))
     repo.commit()  # production shape: the ask path is read-only, its reads
     # see COMMITTED rows — the overview failure must not eat them
@@ -133,7 +133,7 @@ def test_kid_leg_broken_sql_does_not_kill_the_ask(clean_items, memory_db) -> Non
         memory=BrokenSQLMemory(session),  # type: ignore[arg-type]
         items_repo=repo,
     )
-    result = service.ask("מה איתמר צריך?", now=NOW)
+    result = service.ask("מה אילן צריך?", now=NOW)
     assert [str(h.item.id) for h in result.sources] == [str(hit.id)], (
         "a broken kid leg must not kill the ask"
     )
@@ -154,7 +154,7 @@ def test_kid_repo_query_broken_sql_savepoint_keeps_uncommitted(
     path cannot give — UNCOMMITTED work from earlier in the transaction
     survives the scoped rollback."""
     memory, repo, session = _world()
-    _seed_itamar(memory)
+    _seed_ilan(memory)
     hit = repo.add(MemoryItem(raw_text="מכתב הנהלה על תשלומים"))  # uncommitted
 
     class BrokenByTextInputRepo:
@@ -180,7 +180,7 @@ def test_kid_repo_query_broken_sql_savepoint_keeps_uncommitted(
         memory=memory,
         items_repo=BrokenByTextInputRepo(repo),  # type: ignore[arg-type]
     )
-    result = service.ask("מה איתמר צריך?", now=NOW)
+    result = service.ask("מה אילן צריך?", now=NOW)
     assert [str(h.item.id) for h in result.sources] == [str(hit.id)], (
         "a broken kid-leg query must not kill the ask"
     )
@@ -363,16 +363,16 @@ def test_by_text_any_excludes_noise(clean_items, memory_db) -> None:
     by_channels but WITHOUT the noise rule — one rule now: noise-triaged
     conversations are never ask-context material."""
     memory, repo, session = _world()
-    _seed_itamar(memory)
+    _seed_ilan(memory)
     repo.add(
         MemoryItem(
             source="whatsapp",
-            raw_text="[20/10/2026, 10:00] ב' ברקת - הורים / מישהו: צ'אט סתם על המשחק",
+            raw_text="[20/10/2026, 10:00] ב' רימון - הורים / מישהו: צ'אט סתם על המשחק",
             triage_label="noise",
-            meta={"channel": "ב' ברקת - הורים", "count": 1, "messages": []},
+            meta={"channel": "ב' רימון - הורים", "count": 1, "messages": []},
         )
     )
-    recalled = repo.by_text_any(["ב' ברקת - הורים"], limit=16)
+    recalled = repo.by_text_any(["ב' רימון - הורים"], limit=16)
     assert [str(i.id) for i in recalled] == [], (
         "noise-triaged rows must not come back through the kid-leg needles"
     )
@@ -508,7 +508,7 @@ def test_no_kid_ask_takes_no_extra_savepoint(clean_items, memory_db) -> None:
     kid-mention check: a no-kid ask takes none (the conflict leg's own
     single savepoint is pre-existing)."""
     memory, repo, session = _world()
-    _seed_itamar(memory)
+    _seed_ilan(memory)
     hit = repo.add(MemoryItem(raw_text="מכתב הנהלה על תשלומים"))
     repo.commit()
     calls: list[int] = []
@@ -549,8 +549,8 @@ def test_second_session_kid_leg_still_savepointed(
     _LEAKED.append(s2)
     memory = MemoryService(MemoryRepository(s1))
     repo = ItemsRepository(s2)
-    _seed_itamar(memory)  # entities on s1
-    wa = _wa(repo, "ב' ברקת - הורים", "מחר יום כיף בבית הספר", day=21)
+    _seed_ilan(memory)  # entities on s1
+    wa = _wa(repo, "ב' רימון - הורים", "מחר יום כיף בבית הספר", day=21)
     repo.commit()  # items on s2
     calls: dict[str, int] = {"s1": 0, "s2": 0}
     for name, s in (("s1", s1), ("s2", s2)):
@@ -571,7 +571,7 @@ def test_second_session_kid_leg_still_savepointed(
         memory=memory,  # type: ignore[arg-type]
         items_repo=repo,
     )
-    result = service.ask("מה איתמר צריך?", now=NOW)
+    result = service.ask("מה אילן צריך?", now=NOW)
     ids = [str(h.item.id) for h in result.sources]
     assert str(wa.id) in ids, "the kid leg still recalls across two sessions"
     assert calls["s1"] >= 1 and calls["s2"] >= 2, (
@@ -593,7 +593,7 @@ def test_overview_non_db_error_leaves_session_alone(
     from types import SimpleNamespace
 
     memory, repo, session = _world()
-    _seed_itamar(memory)
+    _seed_ilan(memory)
     hit = repo.add(MemoryItem(raw_text="מכתב הנהלה על תשלומים"))  # uncommitted
 
     class NonDbBrokenMemory:
@@ -614,7 +614,7 @@ def test_overview_non_db_error_leaves_session_alone(
         memory=NonDbBrokenMemory(session),  # type: ignore[arg-type]
         items_repo=repo,
     )
-    result = service.ask("מה איתמר צריך?", now=NOW)
+    result = service.ask("מה אילן צריך?", now=NOW)
     assert [str(h.item.id) for h in result.sources] == [str(hit.id)], (
         "a non-db kid-leg failure must not kill the ask"
     )

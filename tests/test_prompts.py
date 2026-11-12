@@ -56,7 +56,7 @@ _DEFAULT_SHA256 = {
     MEMORY_FILE_KEY: hashlib.sha256(b"").hexdigest(),
 }
 
-MEMORY_TEXT = "# Family\nRona is in grade 5 — רונה בכיתה ה׳.\nAlways answer in Hebrew."
+MEMORY_TEXT = "# Family\nRomi is in grade 5 — רומי בכיתה ה׳.\nAlways answer in Hebrew."
 
 
 # --- fixtures ---------------------------------------------------------------------

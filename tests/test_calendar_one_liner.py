@@ -21,13 +21,13 @@ from brain.services.paste import parse as parse_paste
 
 JERUSALEM = ZoneInfo("Asia/Jerusalem")
 
-_ICS_RONA = (
+_ICS_ROMI = (
     "BEGIN:VEVENT\n"
-    "SUMMARY:צופים רונה\n"
+    "SUMMARY:צופים רומי\n"
     "DTSTART;TZID=Asia/Jerusalem:20261029T170000\n"
     "DTEND;TZID=Asia/Jerusalem:20261029T181500\n"
-    "LOCATION:עמק חפר\n"
-    "ORGANIZER;CN=zohari:mailto:zohari@wix.com\n"
+    "LOCATION:אורנים\n"
+    "ORGANIZER;CN=keren:mailto:keren@example.com\n"
     "ATTENDEE:mailto:yosisrael@gmail.com\n"
     "END:VEVENT"
 )
@@ -41,37 +41,37 @@ def _parse_ics(text: str) -> Any:
 
 
 def test_ics_raw_text_is_a_human_one_liner_and_ics_goes_to_meta():
-    parsed = _parse_ics(_ICS_RONA)
+    parsed = _parse_ics(_ICS_ROMI)
 
     chunk = parsed.chunks[0]
-    assert chunk.raw_text == "צופים רונה — Thu 29 Oct 17:00–18:15 @ עמק חפר"
-    assert chunk.meta["ics_raw"] == _ICS_RONA
+    assert chunk.raw_text == "צופים רומי — Thu 29 Oct 17:00–18:15 @ אורנים"
+    assert chunk.meta["ics_raw"] == _ICS_ROMI
     # parsed fields are untouched
-    assert chunk.meta["title"] == "צופים רונה"
-    assert chunk.meta["location"] == "עמק חפר"
+    assert chunk.meta["title"] == "צופים רומי"
+    assert chunk.meta["location"] == "אורנים"
     assert chunk.occurred_at == datetime(2026, 10, 29, 15, 0, tzinfo=UTC)  # 17:00 IST
 
 
 def test_one_liner_without_location_has_no_at_part():
-    ics = _ICS_RONA.replace("LOCATION:עמק חפר\n", "")
+    ics = _ICS_ROMI.replace("LOCATION:אורנים\n", "")
     parsed = _parse_ics(ics)
 
-    assert parsed.chunks[0].raw_text == "צופים רונה — Thu 29 Oct 17:00–18:15"
+    assert parsed.chunks[0].raw_text == "צופים רומי — Thu 29 Oct 17:00–18:15"
 
 
 def test_one_liner_dst_summer_and_winter_wall_times():
     # 16:00Z on Oct 20 2026 = 19:00 IDT (UTC+3); 15:00Z on Oct 29 = 17:00 IST (UTC+2)
     summer = _parse_ics(
-        "BEGIN:VEVENT\nSUMMARY:כדורגל איתמר\nDTSTART:20261020T160000Z\n"
+        "BEGIN:VEVENT\nSUMMARY:כדורגל אילן\nDTSTART:20261020T160000Z\n"
         "DTEND:20261020T171500Z\nEND:VEVENT"
     )
     winter = _parse_ics(
-        "BEGIN:VEVENT\nSUMMARY:כדורגל רונה\nDTSTART:20261029T150000Z\n"
+        "BEGIN:VEVENT\nSUMMARY:כדורגל רומי\nDTSTART:20261029T150000Z\n"
         "DTEND:20261029T161500Z\nEND:VEVENT"
     )
 
-    assert summer.chunks[0].raw_text == "כדורגל איתמר — Tue 20 Oct 19:00–20:15"
-    assert winter.chunks[0].raw_text == "כדורגל רונה — Thu 29 Oct 17:00–18:15"
+    assert summer.chunks[0].raw_text == "כדורגל אילן — Tue 20 Oct 19:00–20:15"
+    assert winter.chunks[0].raw_text == "כדורגל רומי — Thu 29 Oct 17:00–18:15"
 
 
 def test_one_liner_date_only_event_shows_day_without_times():
@@ -99,14 +99,14 @@ def test_calendar_text_path_gets_the_same_one_liner_and_keeps_original():
 
 def _legacy_calendar_item(repo: FakeRepository) -> MemoryItem:
     item = MemoryItem(
-        raw_text=_ICS_RONA,  # pre-PR storage: the whole ICS blob
+        raw_text=_ICS_ROMI,  # pre-PR storage: the whole ICS blob
         source="calendar",
         occurred_at=datetime(2026, 10, 29, 15, 0, tzinfo=UTC),
         meta={
-            "title": "צופים רונה",
+            "title": "צופים רומי",
             "start": "2026-10-29T17:00:00+02:00",
             "end": "2026-10-29T18:15:00+02:00",
-            "location": "עמק חפר",
+            "location": "אורנים",
         },
     )
     repo.add(item)
@@ -128,8 +128,8 @@ def test_normalize_calendar_rewrites_ics_items_to_one_liners(
     finally:
         get_settings.cache_clear()
 
-    assert item.raw_text == "צופים רונה — Thu 29 Oct 17:00–18:15 @ עמק חפר"
-    assert item.meta["ics_raw"] == _ICS_RONA
+    assert item.raw_text == "צופים רומי — Thu 29 Oct 17:00–18:15 @ אורנים"
+    assert item.meta["ics_raw"] == _ICS_ROMI
     assert item.fingerprint == content_fingerprint(
         item.raw_text, item.occurred_at, "calendar"
     )

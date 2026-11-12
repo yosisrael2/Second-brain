@@ -102,7 +102,7 @@ def test_clock_extraction():
 
 
 # --- weekday resolution against the sent day (live bug, 30 Oct 2026) ---------
-# Rinat's Friday 30.10 newsletter: "שבוע הבא ... וביום שישי נשמע הרצאה" —
+# Tamar's Friday 30.10 newsletter: "שבוע הבא ... וביום שישי נשמע הרצאה" —
 # the extractor copied when_raw "ביום שישי" and the resolver put the lecture
 # on the SENT day (Fri 30.10) instead of Fri 06.11.
 

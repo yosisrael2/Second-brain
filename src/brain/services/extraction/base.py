@@ -16,7 +16,7 @@ from brain.services.extraction import dates as xdates
 from brain.services.extraction.candidates import CHILD_KINDS, ChildCandidate
 
 # The extractor sees the memory layer's compact prompt block (kids, classes,
-# channels) so A2 can resolve "Maayan's class" against real names.
+# channels) so A2 can resolve "Sigal's class" against real names.
 MemoryContext = str
 
 

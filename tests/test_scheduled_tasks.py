@@ -27,7 +27,7 @@ from conftest import assert_test_database
 
 IL = ZoneInfo("Asia/Jerusalem")
 HEBREW_PROMPT = (
-    "בדוק אם התקבלו מיילים חדשים 7 ימים אחרונים מהדומיין edu-haifa.org.il (בית הספר של רונה) ותסכם"
+    "בדוק אם התקבלו מיילים חדשים 7 ימים אחרונים מהדומיין school.org.il (בית הספר של רומי) ותסכם"
 )
 
 
@@ -58,7 +58,7 @@ def _at(local: str) -> datetime:
 def _make(now: datetime, schedule: str = "0 7 * * 5", **kw) -> uuid.UUID:
     with _store() as store:
         task = store.create(
-            name=kw.pop("name", "Rona school mail"),
+            name=kw.pop("name", "Romi school mail"),
             prompt=kw.pop("prompt", HEBREW_PROMPT),
             schedule=schedule,
             now=now,
@@ -350,7 +350,7 @@ def test_stale_running_rows_are_reaped(sched_db):
 
 
 def _body(**overrides) -> dict:
-    body = {"name": "Rona school mail", "prompt": HEBREW_PROMPT, "schedule": "0 7 * * 5"}
+    body = {"name": "Romi school mail", "prompt": HEBREW_PROMPT, "schedule": "0 7 * * 5"}
     body.update(overrides)
     return body
 

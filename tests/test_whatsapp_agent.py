@@ -68,7 +68,7 @@ def _bridge(tmp_path: Path) -> Path:
         conn.execute("INSERT INTO chats VALUES ('j1@g.us', 'Chat A', NULL)")
         conn.execute(
             "INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)"
-            " VALUES ('m1', 'j1@g.us', 'Rinat', 'hello', ?, 0)",
+            " VALUES ('m1', 'j1@g.us', 'Tamar', 'hello', ?, 0)",
             (datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S+03:00"),),
         )
         conn.commit()

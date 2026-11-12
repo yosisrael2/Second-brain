@@ -168,7 +168,7 @@ def load_rules(path: str | None) -> RuleSet:
 
 
 def _sender_domain(sender: str | None) -> str:
-    """The domain of 'Rinat <office@school.example>' — lowercase, no brackets."""
+    """The domain of 'Tamar <office@school.example>' — lowercase, no brackets."""
     if not sender or "@" not in sender:
         return ""
     tail = sender.rsplit("@", 1)[1].strip().strip(">").lower()

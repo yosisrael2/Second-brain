@@ -47,10 +47,10 @@ NOW = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)  # Wed 21 Oct 2026, 15:00 JLM
 _SUNDAY_SERIES = (
     "BEGIN:VEVENT\n"
     "UID:scouts-series@example.com\n"
-    "SUMMARY:צופים רונה\n"
+    "SUMMARY:צופים רומי\n"
     "DTSTART;TZID=Asia/Jerusalem:20261018T100000\n"
     "DTEND;TZID=Asia/Jerusalem:20261018T111500\n"
-    "LOCATION:עמק חפר\n"
+    "LOCATION:אורנים\n"
     "RRULE:FREQ=WEEKLY\n"
     "END:VEVENT"
 )
@@ -60,7 +60,7 @@ _SUNDAY_SERIES = (
 _WEDNESDAY_SERIES = (
     "BEGIN:VEVENT\n"
     "UID:football-series@example.com\n"
-    "SUMMARY:כדורגל איתמר\n"
+    "SUMMARY:כדורגל אילן\n"
     "DTSTART;TZID=Asia/Jerusalem:20261021T160000\n"
     "DTEND;TZID=Asia/Jerusalem:20261021T171500\n"
     "RRULE:FREQ=WEEKLY\n"
@@ -77,7 +77,7 @@ def _ics_with_rrule(rrule: str, *, dtstart: str = "20261101T100000", extra: str 
     return (
         "BEGIN:VEVENT\n"
         "UID:series@example.com\n"
-        "SUMMARY:צופים רונה\n"
+        "SUMMARY:צופים רומי\n"
         f"DTSTART;TZID=Asia/Jerusalem:{dtstart}\n"
         f"DTEND;TZID=Asia/Jerusalem:{dtstart[:8]}T111500\n"
         f"RRULE:{rrule}\n"
@@ -113,8 +113,8 @@ def test_each_occurrence_renders_the_existing_one_liner_with_its_own_date():
     parsed = _parse_ics(_SUNDAY_SERIES)
 
     first, second = parsed.chunks[0], parsed.chunks[1]
-    assert first.raw_text == "צופים רונה — Sun 25 Oct 10:00–11:15 @ עמק חפר"
-    assert second.raw_text == "צופים רונה — Sun 1 Nov 10:00–11:15 @ עמק חפר"
+    assert first.raw_text == "צופים רומי — Sun 25 Oct 10:00–11:15 @ אורנים"
+    assert second.raw_text == "צופים רומי — Sun 1 Nov 10:00–11:15 @ אורנים"
     # the occurrence start/end in meta are the occurrence's own instants
     assert first.meta["start"] == "2026-10-25T10:00:00+02:00"
     assert second.meta["end"] == "2026-11-01T11:15:00+02:00"
@@ -195,14 +195,14 @@ def test_non_recurring_ics_is_unchanged():
     parsed = _parse_ics(
         "BEGIN:VEVENT\n"
         "UID:one-off@example.com\n"
-        "SUMMARY:צופים רונה\n"
+        "SUMMARY:צופים רומי\n"
         "DTSTART;TZID=Asia/Jerusalem:20261029T170000\n"
         "DTEND;TZID=Asia/Jerusalem:20261029T181500\n"
         "END:VEVENT"
     )
 
     assert len(parsed.chunks) == 1
-    assert parsed.chunks[0].raw_text == "צופים רונה — Thu 29 Oct 17:00–18:15"
+    assert parsed.chunks[0].raw_text == "צופים רומי — Thu 29 Oct 17:00–18:15"
     assert "series_uid" not in parsed.chunks[0].meta
 
 
@@ -214,7 +214,7 @@ def test_malformed_rrule_falls_back_to_the_single_item():
 
     assert len(parsed.chunks) == 1
     assert parsed.chunks[0].occurred_at == datetime(2026, 11, 1, 8, 0, tzinfo=UTC)
-    assert parsed.chunks[0].raw_text == "צופים רונה — Sun 1 Nov 10:00–11:15"
+    assert parsed.chunks[0].raw_text == "צופים רומי — Sun 1 Nov 10:00–11:15"
     assert "series_uid" not in parsed.chunks[0].meta
     assert "rrule_raw" not in parsed.chunks[0].meta
 
@@ -241,7 +241,7 @@ def test_zoneless_timed_rrule_keeps_the_wall_time_across_dst():
     parsed = _parse_ics(
         "BEGIN:VEVENT\n"
         "UID:zoneless@example.com\n"
-        "SUMMARY:כדורגל איתמר\n"
+        "SUMMARY:כדורגל אילן\n"
         "DTSTART:20261021T160000\n"
         "DTEND:20261021T171500\n"
         "RRULE:FREQ=WEEKLY\n"
@@ -263,7 +263,7 @@ def test_all_day_weekly_rrule_renders_one_date_only_item_per_occurrence():
     parsed = _parse_ics(
         "BEGIN:VEVENT\n"
         "UID:allday-series@example.com\n"
-        "SUMMARY:צופים רונה\n"
+        "SUMMARY:צופים רומי\n"
         "DTSTART;VALUE=DATE:20261018\n"
         "RRULE:FREQ=WEEKLY\n"
         "END:VEVENT"
@@ -283,8 +283,8 @@ def test_all_day_weekly_rrule_renders_one_date_only_item_per_occurrence():
         datetime(2026, 12, 12, 22, 0, tzinfo=UTC),
         datetime(2026, 12, 19, 22, 0, tzinfo=UTC),
     ]
-    assert parsed.chunks[0].raw_text == "צופים רונה — Sun 25 Oct"
-    assert parsed.chunks[1].raw_text == "צופים רונה — Sun 1 Nov"
+    assert parsed.chunks[0].raw_text == "צופים רומי — Sun 25 Oct"
+    assert parsed.chunks[1].raw_text == "צופים רומי — Sun 1 Nov"
     assert all("–" not in c.raw_text for c in parsed.chunks), "no times on all-day items"
     assert all(c.meta["series_uid"] == "allday-series@example.com" for c in parsed.chunks)
 
@@ -348,6 +348,6 @@ def test_temporal_question_finds_the_occurrence_through_the_real_search_path(fre
     hits = [
         item for start, end in ranges for item in repo.by_occurrence(start=start, end=end, limit=30)
     ]
-    assert any("כדורגל איתמר" in item.raw_text for item in hits), (
+    assert any("כדורגל אילן" in item.raw_text for item in hits), (
         "the Wednesday 4.11 occurrence must be found by the temporal path"
     )

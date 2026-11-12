@@ -137,11 +137,11 @@ check('restore badge', item('whatsapp_triage').textContent.includes('changed · 
 
 item('memory_file').click();
 await settle();
-type('רונה בכיתה ה׳ — answer in Hebrew');
+type('רומי בכיתה ה׳ — answer in Hebrew');
 $('prompt-save').click();
 await settle();
 check('memory file saved', calls.some((c) => c.method === 'PUT' && c.url === '/prompts/memory_file' && c.status === 200));
-check('memory text shown', $('prompt-text').value === 'רונה בכיתה ה׳ — answer in Hebrew');
+check('memory text shown', $('prompt-text').value === 'רומי בכיתה ה׳ — answer in Hebrew');
 check('memory badge', item('memory_file').textContent.includes('v1'));
 
 console.log(JSON.stringify({ ok: checks.every((c) => c.pass), checks }));

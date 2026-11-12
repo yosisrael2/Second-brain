@@ -195,12 +195,12 @@ class TestDedupeKey:
             raw_text="White shirt for the trip",
             type="reminder",
             occurred_at=base,
-            applies_to=["Rona"],
+            applies_to=["Romi"],
         )
         candidate = {
             "type": "reminder",
             "occurred_at": base + timedelta(minutes=30),
-            "applies_to": ["Rona"],
+            "applies_to": ["Romi"],
             "text": "White shirt for the school trip",
         }
         match = svc.find_duplicate(candidate, [child], similarity=lambda a, b: 0.9)
@@ -210,26 +210,26 @@ class TestDedupeKey:
         """R5/item 21: grade 2 vs grade 5 same day stay separate."""
         svc = self.svc()
         base = datetime(2026, 11, 3, 9, 0, tzinfo=UTC)
-        rona = _item(
+        romi = _item(
             raw_text="White shirt for the trip",
             type="reminder",
             occurred_at=base,
-            applies_to=["Rona"],
+            applies_to=["Romi"],
         )
-        itamar = _item(
+        ilan = _item(
             raw_text="White shirt for the trip",
             type="reminder",
             occurred_at=base,
-            applies_to=["Itamar"],
+            applies_to=["Ilan"],
         )
         candidate = {
             "type": "reminder",
             "occurred_at": base,
-            "applies_to": ["Itamar"],
+            "applies_to": ["Ilan"],
             "text": "White shirt for the trip",
         }
-        match = svc.find_duplicate(candidate, [rona, itamar], similarity=lambda a, b: 1.0)
-        assert match == itamar and match != rona
+        match = svc.find_duplicate(candidate, [romi, ilan], similarity=lambda a, b: 1.0)
+        assert match == ilan and match != romi
 
     def test_more_than_one_hour_apart_does_not_match(self, ops_env):
         svc = self.svc()
@@ -252,12 +252,12 @@ class TestDedupeKey:
         svc = self.svc()
         base = datetime(2026, 11, 3, 9, 0, tzinfo=UTC)
         existing = _item(
-            raw_text="White shirt", type="reminder", occurred_at=base, applies_to=["Rona"]
+            raw_text="White shirt", type="reminder", occurred_at=base, applies_to=["Romi"]
         )
         candidate = {
             "type": "event",
             "occurred_at": base,
-            "applies_to": ["Rona"],
+            "applies_to": ["Romi"],
             "text": "White shirt",
         }
         assert svc.find_duplicate(candidate, [existing], similarity=lambda a, b: 1.0) is None
@@ -283,12 +283,12 @@ class TestDedupeKey:
         """Facts have no date: the ±1h gate applies only when both have one."""
         svc = self.svc()
         existing = _item(
-            raw_text="Reading book every day", type="fact", occurred_at=None, applies_to=["Rona"]
+            raw_text="Reading book every day", type="fact", occurred_at=None, applies_to=["Romi"]
         )
         candidate = {
             "type": "fact",
             "occurred_at": None,
-            "applies_to": ["Rona"],
+            "applies_to": ["Romi"],
             "text": "Reading book every day",
         }
         assert svc.find_duplicate(candidate, [existing], similarity=lambda a, b: 0.95) == existing
