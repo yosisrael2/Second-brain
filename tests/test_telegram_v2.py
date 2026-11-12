@@ -122,8 +122,8 @@ class TestCaptureKeyboards:
 
         for data in ("u:deadbeef", "zz:junk", "ty:deadbeef:task", "n:not-a-number"):
             reply = core.handle_callback(data)  # must not raise
-            assert reply.keyboard is None
-            assert "expire" in reply.text.lower() or "unknown" in reply.text.lower()
+            assert reply.keyboard is None and reply.text == ""  # a toast, no chat message
+            assert "expire" in reply.toast.lower() or "unknown" in reply.toast.lower()
 
     def test_callback_data_is_compact(self, monkeypatch):
         core, _ = make_core()

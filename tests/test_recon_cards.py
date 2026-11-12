@@ -369,7 +369,7 @@ class TestMixedCardTaps:
         forged = f"{CB_REL_CONFIRM}:{token_a}:{rel_b.id}"
         tapped = bot.handle_callback(forged, 7)
         session.expire_all()
-        assert "already handled" in tapped.text
+        assert "already handled" in tapped.toast
         rel_b_row = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
         assert (rel_b_row.provenance or {}).get("state") == "proposed"  # untouched
         assert session.get(MemoryItem, old_b.id).superseded_by is None
@@ -514,7 +514,7 @@ class TestConflictCards:
 
         bot.handle_callback(data, 7)
         again = bot.handle_callback(data, 7)
-        assert "already handled" in again.text
+        assert "already handled" in again.toast
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by == child.id  # not re-struck twice
 
@@ -630,7 +630,7 @@ class TestStaleGuard:
 
         bot.handle_callback(data, 7)
         again = bot.handle_callback(data, 7)
-        assert "already handled" in again.text
+        assert "already handled" in again.toast
 
     def test_keep_both_on_an_applied_relation_answers_already_handled(self, world):
         """The state guard must also protect the destructive keep-both path:
@@ -647,7 +647,7 @@ class TestStaleGuard:
 
         bot.handle_callback(confirm, 7)
         stale = bot.handle_callback(keep_both, 7)
-        assert "already handled" in stale.text
+        assert "already handled" in stale.toast
         session.expire_all()
         rel = session.query(ItemRelation).one()
         assert (rel.provenance or {}).get("state") == "applied"  # still applied

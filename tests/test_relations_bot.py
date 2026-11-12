@@ -252,7 +252,7 @@ class TestCallbackHygiene:
     def test_stale_token_gets_the_graceful_reply(self, world):
         bot, _ = _bot(world)
         reply = bot.handle_callback(f"{CB_REL_RESTORE}:{uuid.uuid4().hex[:8]}", 7)
-        assert "expired" in reply.text or "Unknown" in reply.text
+        assert "expired" in reply.toast or "Unknown" in reply.toast
 
     def test_user_text_is_escaped_in_notices(self, world):
         repo, _ = world
@@ -360,7 +360,7 @@ class TestStateGuards:
         session.expire_all()
         assert RelationsService().get(rel.id) is not None
         assert session.get(MemoryItem, old.id).superseded_by == new.id
-        assert "already applied" in reply.text
+        assert "already applied" in reply.toast
 
     def test_discard_proposal_refuses_an_applied_relation(self, world):
         repo, _ = world

@@ -208,7 +208,7 @@ def test_stale_index_is_rejected(sched_db):
     core = _core()
     data = _callbacks(core.route("/schedules", 111))[0]
     token = data.split(":")[1]
-    assert "stale" in core.handle_callback(f"{CB_SCHED_RUN}:{token}:9", 111).text
+    assert "stale" in core.handle_callback(f"{CB_SCHED_RUN}:{token}:9", 111).toast
 
 
 # --- runner -----------------------------------------------------------------------------

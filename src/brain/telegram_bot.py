@@ -318,12 +318,16 @@ class Reply:
     ``keyboard`` rows are tuples of ``(label, callback_data)``; the adapter
     turns them into a PTB InlineKeyboardMarkup. Empty keyboard = plain text.
     ``edit=True`` asks the adapter to EDIT the message a callback came from
-    (in-place card updates) instead of sending a new one.
+    (in-place card updates) instead of sending a new one. ``toast`` is a
+    callback's short feedback ("expired", "already handled", "kept"): the
+    adapter shows it on the tapped button (answerCallbackQuery), and an
+    empty ``text`` then sends nothing to the chat.
     """
 
     text: str
     keyboard: list[list[tuple[str, str]]] | None = None
     edit: bool = False
+    toast: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1154,7 +1158,7 @@ class TelegramBot:
         """Soft-delete one profile fact, then re-render the card in place."""
         lang = self._language()
         if not 0 <= index < len(pending.ids):
-            return Reply(i18n.t(lang, "btn_unknown"))
+            return self._toast(i18n.t(lang, "btn_unknown"))
         with self._services_factory() as services:
             memory = getattr(services, "memory", None)
             if memory is None:
@@ -1162,7 +1166,7 @@ class TelegramBot:
             try:
                 memory.delete_fact(pending.ids[index])
             except (KeyError, MemoryError):
-                return Reply(i18n.t(lang, "fact_gone"))
+                return self._toast(i18n.t(lang, "fact_gone"))
         return self.profile_reply(notice=i18n.t(lang, "fact_removed"))
 
     def profile_reply(self, notice: str | None = None) -> Reply:
@@ -1352,11 +1356,11 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
             if child is None or child.child_state != "proposed":
-                return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+                return self._toast(i18n.t(self._language(), "card_moved_on"))
             title = _esc(child.raw_text[:40])
             apply_keep(_repo_of(session), child)
         notice = i18n.t(self._language(), "kept_title", title=title)
@@ -1368,11 +1372,11 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
             if child is None or child.child_state != "proposed":
-                return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+                return self._toast(i18n.t(self._language(), "card_moved_on"))
             title = _esc(child.raw_text[:40])
             apply_drop(_repo_of(session), child)
         notice = i18n.t(self._language(), "dropped_title", title=title)
@@ -1411,7 +1415,7 @@ class TelegramBot:
             if source is None or not children:
                 lang = self._language()
                 done = i18n.t(lang, "all_done")
-                return Reply(f"{notice}\n{done}", edit=True)
+                return Reply(f"{notice}\n{done}", edit=True, toast=notice)
             lang, names = self._session_locale(session)
             recon, blocks = self._recon_payload(session, children, lang)
             token = self.registry.put(
@@ -1428,6 +1432,7 @@ class TelegramBot:
                 text="\n".join(parts),
                 keyboard=proposal_keyboard(token, children, recon=recon, lang=lang),
                 edit=True,
+                toast=notice,
             )
         finally:
             session.close()
@@ -1453,10 +1458,10 @@ class TelegramBot:
         try:
             index = int(arg)
         except ValueError:
-            return Reply(i18n.t(self._language(), "btn_unknown"))
+            return self._toast(i18n.t(self._language(), "btn_unknown"))
         rel_ids = list(pending.ids[1:])
         if not 0 <= index < len(rel_ids):
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         service = RelationsService()
         try:
             if prefix == CB_REL_UNDO:
@@ -1469,7 +1474,7 @@ class TelegramBot:
                 service.discard_proposal(rel_ids[index])
                 notice = i18n.t(self._language(), "rel_kept_both")
         except RelationsError as exc:
-            return Reply(self._relation_error(exc), edit=True)
+            return self._toast(self._relation_error(exc))
         return self._card_reply(pending, notice=notice)
 
     def _recon_transition(self, prefix: str, pending: Pending, arg: str) -> Reply:
@@ -1490,16 +1495,16 @@ class TelegramBot:
         try:
             rel_id = uuid_mod.UUID(str(arg))
         except ValueError:
-            return Reply(i18n.t(self._language(), "btn_unknown"))
+            return self._toast(i18n.t(self._language(), "btn_unknown"))
         already = i18n.t(self._language(), "already_handled")
         notice = None
         with SessionLocal() as session:
             rel = session.get(ItemRelation, rel_id)
             if rel is None:
-                return Reply(already, edit=True)
+                return self._toast(already)
             if rel.from_id not in pending.ids[1:]:
                 # a relation id from ANOTHER card must never resolve here
-                return Reply(already, edit=True)
+                return self._toast(already)
             child_id = rel.from_id  # the verdict child owns the relation
             state = (rel.provenance or {}).get("state")
             service = ReconciliationService(
@@ -1509,7 +1514,7 @@ class TelegramBot:
                 if prefix == CB_REL_CONFIRM:
                     if rel.kind == "supersedes":
                         if state != "proposed":
-                            return Reply(already, edit=True)
+                            return self._toast(already)
                         RelationsService().confirm_supersede(rel_id)
                         self._recon_child_kept(session, child_id)
                         notice = i18n.t(self._language(), "rel_confirmed")
@@ -1518,7 +1523,7 @@ class TelegramBot:
                         notice = i18n.t(self._language(), "rel_kept_new")
                     elif rel.kind == "cancels":
                         if state != "proposed":
-                            return Reply(already, edit=True)
+                            return self._toast(already)
                         service.apply_cancellation(rel_id)
                         self._recon_child_kept(session, child_id)
                         notice = i18n.t(self._language(), "rel_cancelled")
@@ -1536,18 +1541,18 @@ class TelegramBot:
                 elif prefix == CB_REL_UNDO:
                     if rel.kind == "cancels":
                         if state != "applied":
-                            return Reply(already, edit=True)
+                            return self._toast(already)
                         service.restore_cancellation(rel_id)
                         notice = i18n.t(self._language(), "rel_restored")
                     else:
                         if state != "applied":
-                            return Reply(already, edit=True)
+                            return self._toast(already)
                         RelationsService().undo_supersede(rel_id)
                         notice = i18n.t(self._language(), "rel_undone")
             except (RelationsError, ValueError):
-                return Reply(already, edit=True)
+                return self._toast(already)
         if notice is None:
-            return Reply(already, edit=True)
+            return self._toast(already)
         return self._proposal_card_reply(pending, notice=notice)
 
     def _recon_child_kept(self, session, child_id) -> None:
@@ -1585,7 +1590,7 @@ class TelegramBot:
         finally:
             session.close()
         if rel is None:
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         try:
             if rel.kind == "cancels":
                 with SessionLocal() as svc_session:
@@ -1600,7 +1605,7 @@ class TelegramBot:
             else:
                 RelationsService().undo_supersede(rel.id)
         except (RelationsError, ValueError) as exc:
-            return Reply(self._relation_error(exc), edit=True)
+            return self._toast(self._relation_error(exc))
         return self._card_reply(pending, notice=i18n.t(self._language(), "rel_restored"))
 
     def _proposal_fix_start(self, user_id: int | None, pending: Pending, index: int) -> Reply:
@@ -1609,11 +1614,11 @@ class TelegramBot:
 
         ids = self._proposal_child_ids(pending)
         if not 0 <= index < len(ids):
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         with SessionLocal() as session:
             child = session.get(MemoryItem, ids[index])
         if child is None or child.child_state != "proposed":
-            return Reply(i18n.t(self._language(), "card_moved_on"), edit=True)
+            return self._toast(i18n.t(self._language(), "card_moved_on"))
         if user_id is None:
             return Reply(i18n.t(self._language(), "fix_no_user"), edit=True)
         token = self.registry.put(Pending(ids=(child.id,), kind="fix", step="title"))
@@ -1758,7 +1763,7 @@ class TelegramBot:
         ⏸ / ▶ pauses or resumes. Re-renders the list in place."""
         lang = self._language()
         if pending.kind != "schedules" or not 0 <= index < len(pending.ids):
-            return Reply(i18n.t(self._language(), "btn_unknown"))
+            return self._toast(i18n.t(self._language(), "btn_unknown"))
         task_id = pending.ids[index]
         try:
             with self._schedule_store() as store:
@@ -1827,6 +1832,12 @@ class TelegramBot:
 
     # -- callbacks -----------------------------------------------------------------
 
+    @staticmethod
+    def _toast(text: str) -> Reply:
+        """A feedback-only callback result: a toast on the tapped button, no
+        chat message, and the card it came from stays as it is."""
+        return Reply(text="", toast=text)
+
     @_speaks
     def handle_callback(self, data: str, user_id: int | None = None) -> Reply:
         """Dispatch an inline-button press; stale/unknown → graceful reply.
@@ -1866,7 +1877,7 @@ class TelegramBot:
             ):
                 token, arg = rest, ""
             else:
-                return Reply(i18n.t(self._language(), "btn_unknown"))
+                return self._toast(i18n.t(self._language(), "btn_unknown"))
             if prefix in (
                 CB_OPEN,
                 CB_MEM_DEL,
@@ -1878,10 +1889,10 @@ class TelegramBot:
             ):
                 index = int(arg)
         except ValueError:
-            return Reply(i18n.t(self._language(), "btn_unknown"))
+            return self._toast(i18n.t(self._language(), "btn_unknown"))
         pending = self.registry.get(token)
         if pending is None:
-            return Reply(i18n.t(self._language(), "btn_expired"))
+            return self._toast(i18n.t(self._language(), "btn_expired"))
         if prefix == CB_WA_JOIN:
             return self._save_whatsapp_choice(pending, split=False)
         if prefix == CB_WA_SPLIT:
@@ -1968,12 +1979,12 @@ class TelegramBot:
         from brain.services.items import ItemNotFound  # noqa: PLC0415
 
         if not 0 <= index < len(pending.ids):
-            return Reply(i18n.t(self._language(), "btn_unknown"))
+            return self._toast(i18n.t(self._language(), "btn_unknown"))
         with self._services_factory() as services:
             try:
                 item = services.items.get(pending.ids[index])
             except ItemNotFound:
-                return Reply(i18n.t(self._language(), "item_deleted"))
+                return self._toast(i18n.t(self._language(), "item_deleted"))
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         lang = self._language()
@@ -2054,7 +2065,7 @@ class TelegramBot:
         try:
             item_type = ItemType(type_value)
         except ValueError:
-            return Reply(i18n.t(self._language(), "type_unknown"))
+            return self._toast(i18n.t(self._language(), "type_unknown"))
         self._update_items(pending, {"type": item_type})
         lang = self._language()
         label = _kind_name(item_type.value, lang)
@@ -2621,6 +2632,8 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
     with tags stripped and parse_mode=None, and an ops event records the
     fallback — a reply must never be silently lost.
     """
+    if not reply.text:  # a toast-only callback result: nothing for the chat
+        return
     text = reply.text[:TELEGRAM_REPLY_MAX_CHARS]
     markup = _inline_keyboard(reply.keyboard)
     if getattr(reply, "edit", False) and message_id is not None:
@@ -2800,6 +2813,26 @@ async def _read_and_report(tg: Any, chat_id: int, core: TelegramBot, attachment_
         record_event("telegram", "attachment_report", ok=False, detail={"error": str(exc)})
 
 
+TOAST_MAX_CHARS = 200  # Telegram's answerCallbackQuery text limit
+
+
+async def _answer_callback(query: Any, toast: str | None = None) -> None:
+    """Acknowledge a button tap; ``toast`` shows as a transient notification
+    (plain text: the HTML a notice may carry is stripped). A failed answer
+    (e.g. a query older than Telegram's window) never blocks the reply."""
+    answer = getattr(query, "answer", None)
+    if answer is None:
+        return
+    try:
+        if toast:
+            text = _strip_html(toast).strip()[:TOAST_MAX_CHARS]
+            await answer(text=text, show_alert=False)
+        else:
+            await answer()
+    except Exception as exc:  # noqa: BLE001 — the ack is best-effort
+        logger.debug("telegram: answerCallbackQuery failed (%s)", exc)
+
+
 async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
     """Allowlist-check and dispatch one Telegram update."""
     user = update.effective_user
@@ -2814,14 +2847,16 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
         return  # never reply to strangers
     if update.callback_query is not None:
         query = update.callback_query
-        answer = getattr(query, "answer", None)
-        if answer is not None:
-            await answer()
-        reply = core.handle_callback(query.data or "", user.id)
+        try:
+            reply = core.handle_callback(query.data or "", user.id)
+        except Exception:
+            await _answer_callback(query)  # stop the button's spinner anyway
+            raise
+        await _answer_callback(query, reply.toast)
         record_event("telegram", EVENT_CALLBACK, ok=True, detail={})
         message = getattr(query, "message", None)
         chat_id = getattr(message, "chat_id", None)
-        if chat_id is not None:
+        if chat_id is not None and reply.text:
             await _send(tg, chat_id, reply, message_id=getattr(message, "message_id", None))
         return
     message = update.effective_message

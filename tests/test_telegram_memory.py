@@ -120,7 +120,7 @@ def test_profile_remove_already_removed_is_graceful(memory_db) -> None:
     # second press on the stale button: the fact is now closed ->
     # MemoryService.delete_fact raises MemoryError (not KeyError)
     second = core.handle_callback(callback)
-    assert "already removed" in second.text
+    assert "already removed" in second.toast
 
 
 def test_remember_stores_confirmed_note_on_me(memory_db) -> None:
@@ -178,7 +178,7 @@ def test_remove_buttons_survive_registry_ttl_gracefully(memory_db) -> None:
 
     reply = core.handle_callback(callback)
 
-    assert "expired" in reply.text
+    assert "expired" in reply.toast
 
 
 # --- bot language (a memory-layer fact on 'me') ---------------------------------
