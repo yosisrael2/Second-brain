@@ -343,41 +343,69 @@ class TestMixedCardTaps:
         session.expire_all()
         assert session.get(MemoryItem, old_b.id).superseded_by == child_b.id
 
-    def test_foreign_relation_id_through_another_cards_token_refused(self, world):
-        """Two open cards: a callback rc:<tokenA>:<relation-of-B> through
-        card A's token must change NOTHING — the handler may only resolve
-        relations that belong to THIS card's children."""
+    def test_a_relation_that_is_no_proposal_verdict_is_refused(self, world):
+        """The verdict buttons carry the RELATION id (no token): an id of a
+        relation that no proposed verdict child owns (here a manual
+        supersede between two captures) must change NOTHING."""
         repo, session = world
-        source_a = _capture(repo, "email: plans A")
+        source = _capture(repo, "email: plans A")
         old_a = _capture(repo, "family dinner on Friday")
-        child_a = _recon_child(repo, session, source=source_a, matched=old_a,
+        child_a = _recon_child(repo, session, source=source, matched=old_a,
                                verdict="update", text="family dinner moved to Saturday")
-        source_b = _capture(repo, "email: plans B")
         old_b = _capture(repo, "gym on Thursday")
-        child_b = _recon_child(repo, session, source=source_b, matched=old_b,
-                               verdict="update", text="gym moved to Friday")
+        new_b = _capture(repo, "gym moved to Friday")
+        rel_b = ItemRelation(from_id=new_b.id, to_id=old_b.id, kind="supersedes",
+                             provenance={"how": "manual", "state": "proposed"})
+        session.add(rel_b)
+        repo.commit()
         bot, _ = _bot(world)
-        card_a = bot._proposal_reply_for(source_a)  # parks tokenA
-        rel_b = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
-        token_a = next(
-            data.split(":")[1]
-            for row in card_a.keyboard or []
-            for _label, data in row
-            if data.startswith(f"{CB_REL_CONFIRM}:")
-        )
+        card = bot._proposal_reply_for(source)
 
-        forged = f"{CB_REL_CONFIRM}:{token_a}:{rel_b.id}"
-        tapped = bot.handle_callback(forged, 7)
+        for prefix in (CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD, CB_REL_UNDO):
+            tapped = bot.handle_callback(f"{prefix}:{rel_b.id}", 7)
+            assert "already handled" in tapped.text
         session.expire_all()
-        assert "already handled" in tapped.text
-        rel_b_row = session.query(ItemRelation).filter_by(from_id=child_b.id).one()
-        assert (rel_b_row.provenance or {}).get("state") == "proposed"  # untouched
+        assert (session.get(ItemRelation, rel_b.id).provenance or {}).get("state") == "proposed"
         assert session.get(MemoryItem, old_b.id).superseded_by is None
-        # card A's own relation is still appliable from its own row
-        own = bot.handle_callback(_find(card_a, CB_REL_CONFIRM), 7)
+        # the card's own relation is still appliable from its own row
+        own = bot.handle_callback(_find(card, CB_REL_CONFIRM), 7)
         session.expire_all()
         assert session.get(MemoryItem, old_a.id).superseded_by == child_a.id
         assert "✅" in own.text
+
+    def test_verdict_tap_after_a_restart_applies(self, world):
+        """The bot restarts on every deploy; a verdict card read the next
+        day must still apply (no in-memory token behind the button)."""
+        repo, session = world
+        source = _capture(repo, "email: family dinner plan")
+        old = _capture(repo, "family dinner on Friday")
+        child = _recon_child(repo, session, source=source, matched=old, verdict="update",
+                             text="family dinner moved to Saturday")
+        bot, _ = _bot(world)
+        data = _find(bot._proposal_reply_for(source), CB_REL_CONFIRM)
+
+        fresh, _ = _bot(world)
+        tapped = fresh.handle_callback(data, 7)
+        assert "✅" in tapped.text
+        session.expire_all()
+        assert session.get(MemoryItem, old.id).superseded_by == child.id
+        again, _ = _bot(world)
+        assert "already handled" in again.handle_callback(data, 7).text
+
+    def test_malformed_verdict_callbacks_change_nothing(self, world):
+        repo, session = world
+        source = _capture(repo, "email: family dinner plan")
+        old = _capture(repo, "family dinner on Friday")
+        _recon_child(repo, session, source=source, matched=old, verdict="update",
+                     text="family dinner moved to Saturday")
+        bot, _ = _bot(world)
+        for data in (f"{CB_REL_CONFIRM}:not-a-uuid", f"{CB_REL_CONFIRM}:",
+                     f"{CB_REL_CONFIRM}:{uuid.uuid4()}", f"{CB_REL_CONFIRM}:abcd1234:0"):
+            tapped = bot.handle_callback(data, 7)
+            assert tapped.keyboard is None
+            assert "⌛" in tapped.text or "Unknown" in tapped.text, (data, tapped.text)
+        session.expire_all()
+        assert session.get(MemoryItem, old.id).superseded_by is None
 
     def test_plain_child_row_tap_never_touches_a_relation(self, world):
         """[plain(0), recon(1)]: dropping the PLAIN child touches no relation."""
@@ -400,8 +428,7 @@ class TestMixedCardTaps:
             for _label, data in row
             if data.startswith(f"{CB_PROPOSED_FIX}:")
         )
-        token, _, index = fix_data.partition(":")[2].partition(":")
-        drop = f"{CB_PROPOSED_DROP}:{token}:{index}"
+        drop = CB_PROPOSED_DROP + fix_data[len(CB_PROPOSED_FIX):]  # the same row's Drop
         bot.handle_callback(drop, 7)
         session.expire_all()
         rel = session.query(ItemRelation).filter_by(from_id=recon_child.id).one()

@@ -325,8 +325,7 @@ class TestKeyboard:
             )
             for i in range(3)
         ]
-        token = "abcd1234"
-        rows = proposal_keyboard(token, children)
+        rows = proposal_keyboard(uuid.uuid4(), children)
         flat = [data for row in rows for _label, data in row]
         assert sum(1 for d in flat if d.startswith(f"{CB_PROPOSED_KEEP}:")) == 3
         assert sum(1 for d in flat if d.startswith(f"{CB_PROPOSED_FIX}:")) == 3
@@ -343,7 +342,7 @@ class TestKeyboard:
             )
             for i in range(3)
         ]
-        rows = proposal_keyboard("abcdef12", children)
+        rows = proposal_keyboard(uuid.uuid4(), children)
         for row in rows:
             for _label, data in row:
                 assert len(data.encode()) < 64
@@ -632,8 +631,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        token = _token_of(card, CB_PROPOSED_KEEP)
-        reply = bot.handle_callback(f"{CB_PROPOSED_KEEP}:{token}:0", 7)
+        reply = bot.handle_callback(_button(card, CB_PROPOSED_KEEP), 7)
         session.expire_all()
         child = session.query(MemoryItem).filter(MemoryItem.child_state == "kept").one()
         assert child.raw_text  # state in the DB matches the tap
@@ -647,8 +645,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        token = _token_of(card, CB_PROPOSED_DROP)
-        bot.handle_callback(f"{CB_PROPOSED_DROP}:{token}:1", 7)
+        bot.handle_callback(_button(card, CB_PROPOSED_DROP, 1), 7)
         # re-run the extraction: the dropped child must not come back
         again = EnrichmentService(repo, session, memory=memory)
         again.enqueue(source, budget="backfill")
@@ -665,8 +662,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        token = _token_of(card, CB_PROPOSED_KEEP_ALL)
-        bot.handle_callback(f"{CB_PROPOSED_KEEP_ALL}:{token}", 7)
+        bot.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
         session.expire_all()
         kept = session.query(MemoryItem).filter(MemoryItem.child_state == "kept").count()
         assert kept == 2
@@ -681,8 +677,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        token = _token_of(card, CB_PROPOSED_FIX)
-        step1 = bot.handle_callback(f"{CB_PROPOSED_FIX}:{token}:0", 7)
+        step1 = bot.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
         assert "New title" in step1.text
         step2 = bot.route("Trip to Eshkolot", 7)
         assert "Now the date" in step2.text
@@ -704,8 +699,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        token = _token_of(card, CB_PROPOSED_FIX)
-        bot.handle_callback(f"{CB_PROPOSED_FIX}:{token}:0", 7)
+        bot.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
         reply = bot.route("cancel", 7)
         assert "cancelled" in reply.text
         session.expire_all()
@@ -740,21 +734,188 @@ class TestBotProposalFlow:
         chat_id, reply = pings[0]
         assert chat_id == 7
         assert "⏰ due soon" in reply.text
-        token = _token_of(reply, CB_PROPOSED_KEEP)
-        assert f"{CB_PROPOSED_DROP}:{token}:0" in [d for row in reply.keyboard for _l, d in row]
+        assert _button(reply, CB_PROPOSED_KEEP)
+        assert _button(reply, CB_PROPOSED_DROP)
         assert bot.due_pings(NOW) == []  # one ping per child, never repeated
         session.expire_all()
         session.refresh(due)
         assert due.extraction_meta.get("pinged_at") is not None
 
 
-def _token_of(reply, prefix: str) -> str:
-    """The registry token behind the first button with this prefix."""
-    for row in reply.keyboard:
-        for _label, data in row:
-            if data.startswith(f"{prefix}:"):
-                return data.split(":")[1]
-    raise AssertionError(f"no {prefix} button in {reply.keyboard}")
+class TestDurableButtons:
+    """Proposal cards and due pings arrive asynchronously and are read hours
+    later; the bot restarts on every deploy. Their buttons carry the id they
+    act on (no in-memory token), so a tap days later or after a restart
+    still works — and every tap re-checks the DB, so a decided item is a
+    clear no-op."""
+
+    def _card(self, world):
+        repo, _session, _memory = world
+        bot, service = _bot(world)
+        source = _capture(repo, SOURCE_BODY)
+        service.on_children_changed = bot.proposals_changed
+        service.enqueue(source)
+        service.run_once(NOW)
+        _chat, card = bot.drain_outbound()[0]
+        return bot, card, source
+
+    def _states(self, session) -> list[str]:
+        session.expire_all()
+        return sorted(
+            row.child_state for row in session.query(MemoryItem)
+            if row.child_state is not None
+        )
+
+    def test_a_tap_an_hour_later_still_works(self, world, monkeypatch):
+        _repo, session, _memory = world
+        bot, card, _source = self._card(world)
+        import brain.telegram_bot as tb
+
+        later = tb.time.monotonic() + 3600
+        monkeypatch.setattr(tb.time, "monotonic", lambda: later)
+        reply = bot.handle_callback(_button(card, CB_PROPOSED_KEEP), 7)
+        assert "✅ Kept" in reply.text
+        assert self._states(session) == ["kept", "proposed"]
+
+    def test_a_tap_after_a_restart_still_works(self, world):
+        _repo, session, _memory = world
+        _old_bot, card, _source = self._card(world)
+        fresh, _service = _bot(world)  # a new process: empty in-memory state
+        reply = fresh.handle_callback(_button(card, CB_PROPOSED_DROP, 1), 7)
+        assert "🗑 Dropped" in reply.text
+        assert reply.edit is True
+        assert self._states(session) == ["dropped", "proposed"]
+        # the re-rendered card's buttons work on yet another fresh bot
+        again, _service = _bot(world)
+        kept = again.handle_callback(_button(reply, CB_PROPOSED_KEEP), 7)
+        assert "✅ Kept" in kept.text
+        assert self._states(session) == ["dropped", "kept"]
+
+    def test_keep_all_after_a_restart(self, world):
+        _repo, session, _memory = world
+        _old_bot, card, _source = self._card(world)
+        fresh, _service = _bot(world)
+        reply = fresh.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
+        assert "Kept 2" in reply.text
+        assert self._states(session) == ["kept", "kept"]
+
+    def test_fix_after_a_restart_starts_the_flow(self, world):
+        _old_bot, card, _source = self._card(world)
+        fresh, _service = _bot(world)
+        step1 = fresh.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
+        assert "New title" in step1.text
+
+    def test_an_already_decided_item_is_a_clear_no_op(self, world):
+        _repo, session, _memory = world
+        bot, card, _source = self._card(world)
+        keep = _button(card, CB_PROPOSED_KEEP)
+        drop = _button(card, CB_PROPOSED_DROP)  # the same child's Drop
+        bot.handle_callback(keep, 7)
+        assert self._states(session) == ["kept", "proposed"]
+        fresh, _service = _bot(world)
+        for data in (drop, keep, _button(card, CB_PROPOSED_FIX)):
+            stale = fresh.handle_callback(data, 7)
+            assert "already handled" in stale.text
+        assert self._states(session) == ["kept", "proposed"]  # never re-applied
+        assert 7 not in fresh._fix_flow  # noqa: SLF001  (no Fix flow on a kept child)
+
+    def test_keep_all_twice_keeps_nothing_new(self, world):
+        _repo, session, _memory = world
+        bot, card, _source = self._card(world)
+        bot.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
+        again = bot.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
+        assert "already handled" in again.text
+        assert self._states(session) == ["kept", "kept"]
+
+    def test_malformed_and_foreign_callbacks_change_nothing(self, world):
+        repo, session, _memory = world
+        bot, card, source = self._card(world)
+        plain = _capture(repo, "a plain note")  # not a proposal child
+        cases = [
+            f"{CB_PROPOSED_KEEP}:not-a-uuid",
+            f"{CB_PROPOSED_KEEP}:",
+            f"{CB_PROPOSED_KEEP}:{str(uuid.uuid4()).upper()}",
+            f"{CB_PROPOSED_DROP}:{uuid.uuid4()}:x:y",
+            f"{CB_PROPOSED_DROP}:{uuid.uuid4()}",  # well-formed, unknown id
+            f"{CB_PROPOSED_KEEP_ALL}:{uuid.uuid4()}",
+            f"{CB_PROPOSED_KEEP_ALL}:{plain.id}",  # an id that is no source
+            f"{CB_PROPOSED_FIX}:'; DROP TABLE memory_items;--",
+            f"{CB_PROPOSED_KEEP}:abcd1234:0",  # a card sent before this change
+            f"{CB_PROPOSED_KEEP_ALL}:abcd1234",
+        ]
+        for data in cases:
+            reply = bot.handle_callback(data, 7)
+            assert reply.text.startswith("⌛"), (data, reply.text)
+            assert reply.keyboard is None
+        # a real id, but of an item that is no proposal child
+        for prefix in (CB_PROPOSED_KEEP, CB_PROPOSED_DROP, CB_PROPOSED_FIX):
+            reply = bot.handle_callback(f"{prefix}:{plain.id}", 7)
+            assert "already handled" in reply.text
+        assert self._states(session) == ["proposed", "proposed"]
+        session.refresh(plain)
+        assert plain.child_state is None
+
+    def test_a_pre_change_card_answers_the_friendly_expired(self, world):
+        bot, _card, _source = self._card(world)
+        reply = bot.handle_callback(f"{CB_PROPOSED_KEEP}:abcd1234:0", 7)
+        assert "expired" in reply.text
+
+    def test_card_buttons_carry_ids_under_64_bytes(self, world):
+        _repo, session, _memory = world
+        _bot_, card, source = self._card(world)
+        datas = [data for row in card.keyboard for _label, data in row]
+        assert all(len(data.encode()) < 64 for data in datas)
+        assert _button(card, CB_PROPOSED_KEEP_ALL) == f"{CB_PROPOSED_KEEP_ALL}:{source.id}"
+
+    def test_due_ping_keep_works_after_a_restart(self, world):
+        repo, session, _memory = world
+        bot, _service = _bot(world)
+        source = _capture(repo, "Note from the class teacher")
+        due = repo.add(MemoryItem(
+            raw_text="Return the form", source="email", type="task",
+            occurred_at=NOW + timedelta(hours=24), child_state="proposed",
+        ))
+        repo.commit()
+        from brain.db.models import ItemSource
+
+        session.add(ItemSource(child_id=due.id, source_id=source.id, quote="form"))
+        session.commit()
+        [(_chat, ping)] = bot.due_pings(NOW)
+        fresh, _service = _bot(world)
+        reply = fresh.handle_callback(_button(ping, CB_PROPOSED_KEEP), 7)
+        assert "✅ Kept" in reply.text
+        assert reply.edit is True
+        assert reply.keyboard is None  # the ping stays a one-liner
+        session.expire_all()
+        assert session.get(MemoryItem, due.id).child_state == "kept"
+        stale = fresh.handle_callback(_button(ping, CB_PROPOSED_DROP), 7)
+        assert "already handled" in stale.text
+        session.expire_all()
+        assert session.get(MemoryItem, due.id).child_state == "kept"
+
+    def test_due_ping_drop_without_a_source_link(self, world):
+        repo, session, _memory = world
+        bot, _service = _bot(world)
+        due = repo.add(MemoryItem(
+            raw_text="Bring the permission slip", source="email", type="task",
+            occurred_at=NOW + timedelta(hours=24), child_state="proposed",
+        ))
+        repo.commit()
+        [(_chat, ping)] = bot.due_pings(NOW)
+        reply = _bot(world)[0].handle_callback(_button(ping, CB_PROPOSED_DROP), 7)
+        assert "🗑 Dropped" in reply.text
+        session.expire_all()
+        assert session.get(MemoryItem, due.id).child_state == "dropped"
+
+
+def _button(reply, prefix: str, nth: int = 0) -> str:
+    """The callback data of the nth button with this prefix."""
+    found = [
+        data for row in reply.keyboard or [] for _label, data in row
+        if data.split(":")[0] == prefix
+    ]
+    assert len(found) > nth, f"no {prefix} button #{nth} in {reply.keyboard}"
+    return found[nth]
 
 
 class TestFixReindexes:

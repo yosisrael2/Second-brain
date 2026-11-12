@@ -60,11 +60,15 @@ CHILD_EMOJI = {
     "idea": "💡",
 }
 
-# Callback prefixes (compact; ids live in the bot's PendingRegistry).
-CB_PROPOSED_KEEP = "pk"  # keep one child:  pk:<token>:<index>
-CB_PROPOSED_FIX = "pf"  # fix one child:   pf:<token>:<index>
-CB_PROPOSED_DROP = "px"  # drop one child:  px:<token>:<index>
-CB_PROPOSED_KEEP_ALL = "pa"  # keep all:        pa:<token>
+# Callback prefixes. Proposal cards and due pings are read hours or days
+# later and the bot restarts on every deploy, so their buttons carry the id
+# they act on (no in-memory token): prefix + ":" + canonical uuid = 39 bytes,
+# well under Telegram's 64. The bot re-validates every tap against the DB.
+CB_PROPOSED_KEEP = "pk"  # keep one child:  pk:<child-uuid>[:p]
+CB_PROPOSED_FIX = "pf"  # fix one child:   pf:<child-uuid>
+CB_PROPOSED_DROP = "px"  # drop one child:  px:<child-uuid>[:p]
+CB_PROPOSED_KEEP_ALL = "pa"  # keep all:        pa:<source-uuid>
+CB_PING_FLAG = "p"  # a due ping's button: answer one line, never the whole card
 
 _PING_WINDOW = timedelta(hours=48)
 
@@ -259,7 +263,7 @@ def render_source_card(
 
 
 def proposal_keyboard(
-    token: str,
+    source_id: object,
     children: list[MemoryItem],
     *,
     recon: dict[int, tuple[str, object, str | None]] | None = None,
@@ -273,7 +277,7 @@ def proposal_keyboard(
     asks ✅ keep existing / ✅ keep new, CANCELLATION offers ✅ Confirm
     cancellation / ✖ Not cancelled. The verdict rows carry the RELATION ID
     (never a position), so a mixed card cannot misalign plain and verdict
-    rows; callback data stays < 64 bytes (prefix + token + uuid). MORE_DETAIL
+    rows; callback data stays < 64 bytes (prefix + uuid). MORE_DETAIL
     children keep the default row (the 🔔 line lives on the matched item's
     card, with no buttons)."""
     from brain.services.relations_view import (  # noqa: PLC0415
@@ -285,32 +289,32 @@ def proposal_keyboard(
 
     recon = recon or {}
     rows: list[list[tuple[str, str]]] = []
-    for index, _child in enumerate(children):
+    for index, child in enumerate(children):
         n = index + 1  # the line number on the card
         entry = recon.get(index)
         if entry is not None:
             verdict, rel, _matched_title = entry
             state = (rel.provenance or {}).get("state")
             if verdict == "update" and state == "applied":
-                rows.append([(i18n.t(lang, "btn_undo", n=n), f"{CB_REL_UNDO}:{token}:{rel.id}")])
+                rows.append([(i18n.t(lang, "btn_undo", n=n), f"{CB_REL_UNDO}:{rel.id}")])
                 continue
             if verdict == "update":
                 rows.append([
-                    (i18n.t(lang, "btn_confirm_update", n=n), f"{CB_REL_CONFIRM}:{token}:{rel.id}"),
-                    (i18n.t(lang, "btn_keep_both", n=n), f"{CB_REL_KEEP_BOTH}:{token}:{rel.id}"),
+                    (i18n.t(lang, "btn_confirm_update", n=n), f"{CB_REL_CONFIRM}:{rel.id}"),
+                    (i18n.t(lang, "btn_keep_both", n=n), f"{CB_REL_KEEP_BOTH}:{rel.id}"),
                 ])
                 continue
             if verdict == "conflict":
-                discard = f"{CB_RECON_DISCARD}:{token}:{rel.id}"
-                confirm = f"{CB_REL_CONFIRM}:{token}:{rel.id}"
+                discard = f"{CB_RECON_DISCARD}:{rel.id}"
+                confirm = f"{CB_REL_CONFIRM}:{rel.id}"
                 rows.append([
                     (i18n.t(lang, "btn_keep_existing", n=n), discard),
                     (i18n.t(lang, "btn_keep_new", n=n), confirm),
                 ])
                 continue
             if verdict == "cancellation":
-                confirm = f"{CB_REL_CONFIRM}:{token}:{rel.id}"
-                discard = f"{CB_RECON_DISCARD}:{token}:{rel.id}"
+                confirm = f"{CB_REL_CONFIRM}:{rel.id}"
+                discard = f"{CB_RECON_DISCARD}:{rel.id}"
                 rows.append([
                     (i18n.t(lang, "btn_confirm_cancel", n=n), confirm),
                     (i18n.t(lang, "btn_not_cancelled", n=n), discard),
@@ -318,12 +322,12 @@ def proposal_keyboard(
                 continue
         rows.append(
             [
-                (i18n.t(lang, "btn_keep", n=n), f"{CB_PROPOSED_KEEP}:{token}:{index}"),
-                (i18n.t(lang, "btn_fix", n=n), f"{CB_PROPOSED_FIX}:{token}:{index}"),
-                (i18n.t(lang, "btn_drop", n=n), f"{CB_PROPOSED_DROP}:{token}:{index}"),
+                (i18n.t(lang, "btn_keep", n=n), f"{CB_PROPOSED_KEEP}:{child.id}"),
+                (i18n.t(lang, "btn_fix", n=n), f"{CB_PROPOSED_FIX}:{child.id}"),
+                (i18n.t(lang, "btn_drop", n=n), f"{CB_PROPOSED_DROP}:{child.id}"),
             ]
         )
-    rows.append([(i18n.t(lang, "btn_keep_all"), f"{CB_PROPOSED_KEEP_ALL}:{token}")])
+    rows.append([(i18n.t(lang, "btn_keep_all"), f"{CB_PROPOSED_KEEP_ALL}:{source_id}")])
     return rows
 
 
