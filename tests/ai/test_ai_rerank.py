@@ -95,3 +95,40 @@ def test_rerank_missing_text_falls_back_to_serialized_candidate():
     rerank("q", candidates, top_n=1, jev=CaptureJev())
 
     assert '"no text key"' in seen["states"][0]
+
+
+def test_rerank_bounds_the_jev_payload():
+    """48 long candidates must fit Jev's input limit (HTTP 400 max_tokens_exceeded)."""
+    from brain.ai.rerank import STATE_CHAR_BUDGET
+
+    candidates = [{"id": str(i), "text": "שלום " * 2000} for i in range(48)]
+    jev = StubJev([JevScore(1.0, 0.9)] * 48)
+
+    rerank("q", candidates, top_n=5, jev=jev)
+
+    states = jev.calls[0][2]
+    assert len(states) == 48
+    assert sum(len(s) for s in states) <= STATE_CHAR_BUDGET
+    assert all(s.startswith("שלום") for s in states)
+
+
+def test_rerank_keeps_short_texts_whole():
+    jev = StubJev([JevScore(1.0, 0.9)] * 3)
+
+    rerank("q", CANDIDATES, top_n=3, jev=jev)
+
+    assert jev.calls[0][2] == [c["text"] for c in CANDIDATES]
+
+
+def test_jev_http_error_names_the_reason():
+    """A 400 must say why (the body), not only the status line."""
+    import httpx
+
+    from brain.ai.jev import JevClient
+
+    def handler(request):
+        return httpx.Response(400, json={"detail": {"error_type": "max_tokens_exceeded"}})
+
+    client = JevClient(api_key="k", transport=httpx.MockTransport(handler))
+    with pytest.raises(JevError, match="HTTP 400.*max_tokens_exceeded"):
+        client.score_batch("q", ["low", "high"], ["x"])

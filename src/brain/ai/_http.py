@@ -28,5 +28,10 @@ def post_json(
         return response
     except httpx.TimeoutException as exc:
         raise error(f"{context} request timed out after {timeout_s}s") from exc
+    except httpx.HTTPStatusError as exc:
+        # The response body says WHY (e.g. Jev's max_tokens_exceeded); the
+        # status line alone hid it. Bodies carry no request headers or keys.
+        body = " ".join(exc.response.text.split())[:200]
+        raise error(f"{context} request failed: HTTP {exc.response.status_code}: {body}") from exc
     except httpx.HTTPError as exc:
         raise error(f"{context} request failed: {type(exc).__name__}: {exc}") from exc
