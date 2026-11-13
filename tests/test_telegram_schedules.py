@@ -96,8 +96,17 @@ class _Tg:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
 
-    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "markup": reply_markup})
+    async def send_message(
+        self, chat_id, text, parse_mode=None, reply_markup=None, disable_notification=None
+    ):
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "markup": reply_markup,
+                "silent": bool(disable_notification),
+            }
+        )
 
 
 def _core(ask: _Ask | None = None, lang: str = "en") -> TelegramBot:
@@ -208,7 +217,7 @@ def test_stale_index_is_rejected(sched_db):
     core = _core()
     data = _callbacks(core.route("/schedules", 111))[0]
     token = data.split(":")[1]
-    assert "stale" in core.handle_callback(f"{CB_SCHED_RUN}:{token}:9", 111).text
+    assert "stale" in core.handle_callback(f"{CB_SCHED_RUN}:{token}:9", 111).toast
 
 
 # --- runner -----------------------------------------------------------------------------
@@ -228,6 +237,7 @@ def test_run_now_button_runs_off_the_loop_and_messages_every_user(sched_db):
     assert [call["question"] for call in ask.calls] == ["מה חדש מבית הספר?"]
     assert ask.calls[0]["thread"] is not main and ask.calls[0]["on_loop"] is False
     assert [msg["chat_id"] for msg in tg.sent] == [111, 222]
+    assert all(msg["silent"] for msg in tg.sent)  # a digest arrives without a sound
     text = tg.sent[0]["text"]
     assert text.startswith("⏰ <b>Romi mail</b>\n🧠 <b>Answer</b>")
     assert "שני מיילים חדשים" in text
@@ -273,6 +283,8 @@ def test_one_failing_task_does_not_affect_another(sched_db):
     failed = "failed: RuntimeError: kaput"
     assert any(t.startswith("⏰ <b>Broken</b>") and failed in t for t in texts)
     assert any(t.startswith("⏰ <b>Fine</b>") and "all good" in t for t in texts)
+    rings = {msg["text"].split("\n")[0]: not msg["silent"] for msg in tg.sent}
+    assert rings == {"⏰ <b>Broken</b>": True, "⏰ <b>Fine</b>": False}  # failures ring
     assert _runs(bad)[0].status == "error" and _runs(good)[0].status == "ok"
 
 
@@ -319,6 +331,7 @@ def test_run_timeout_records_error_drops_the_late_result_and_blocks_reclaim(sche
     asyncio.run(scenario())
     assert [msg["chat_id"] for msg in tg.sent] == [111, 222]
     assert "took longer than 1s" in tg.sent[0]["text"]
+    assert not tg.sent[0]["silent"]  # a timeout rings
     runs = _runs(task_id)
     assert len(runs) == 1 and runs[0].status == "error"
     assert runs[0].error == "timed out after 1s" and runs[0].output is None

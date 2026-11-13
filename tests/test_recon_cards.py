@@ -363,7 +363,7 @@ class TestMixedCardTaps:
 
         for prefix in (CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD, CB_REL_UNDO):
             tapped = bot.handle_callback(f"{prefix}:{rel_b.id}", 7)
-            assert "already handled" in tapped.text
+            assert "already handled" in tapped.toast
         session.expire_all()
         assert (session.get(ItemRelation, rel_b.id).provenance or {}).get("state") == "proposed"
         assert session.get(MemoryItem, old_b.id).superseded_by is None
@@ -390,7 +390,7 @@ class TestMixedCardTaps:
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by == child.id
         again, _ = _bot(world)
-        assert "already handled" in again.handle_callback(data, 7).text
+        assert "already handled" in again.handle_callback(data, 7).toast
 
     def test_malformed_verdict_callbacks_change_nothing(self, world):
         repo, session = world
@@ -402,8 +402,8 @@ class TestMixedCardTaps:
         for data in (f"{CB_REL_CONFIRM}:not-a-uuid", f"{CB_REL_CONFIRM}:",
                      f"{CB_REL_CONFIRM}:{uuid.uuid4()}", f"{CB_REL_CONFIRM}:abcd1234:0"):
             tapped = bot.handle_callback(data, 7)
-            assert tapped.keyboard is None
-            assert "⌛" in tapped.text or "Unknown" in tapped.text, (data, tapped.text)
+            assert tapped.keyboard is None and tapped.text == ""  # a toast only
+            assert "⌛" in tapped.toast or "Unknown" in tapped.toast, (data, tapped.toast)
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by is None
 
@@ -541,7 +541,7 @@ class TestConflictCards:
 
         bot.handle_callback(data, 7)
         again = bot.handle_callback(data, 7)
-        assert "already handled" in again.text
+        assert "already handled" in again.toast
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by == child.id  # not re-struck twice
 
@@ -657,7 +657,7 @@ class TestStaleGuard:
 
         bot.handle_callback(data, 7)
         again = bot.handle_callback(data, 7)
-        assert "already handled" in again.text
+        assert "already handled" in again.toast
 
     def test_keep_both_on_an_applied_relation_answers_already_handled(self, world):
         """The state guard must also protect the destructive keep-both path:
@@ -674,7 +674,7 @@ class TestStaleGuard:
 
         bot.handle_callback(confirm, 7)
         stale = bot.handle_callback(keep_both, 7)
-        assert "already handled" in stale.text
+        assert "already handled" in stale.toast
         session.expire_all()
         rel = session.query(ItemRelation).one()
         assert (rel.provenance or {}).get("state") == "applied"  # still applied

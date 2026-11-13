@@ -49,7 +49,7 @@ USER = 111
 _ALLOWED = re.compile(
     r"/(?:start|help|status|search|ask|review|recent|profile|remember|schedules|language)\b"
     r"|\b(?:he|en)\b"
-    r"|</?[bs]>"
+    r"|</?[bs]>|<blockquote expandable>|</blockquote>"
     r"|&(?:lt|gt|amp);"
     # user DATA the bot isolates on purpose (a file name, an English subject)
     r"|\u2068[^\u2069]*\u2069"
@@ -213,8 +213,9 @@ def _find(reply: tb.Reply, prefix: str, nth: int = 0) -> str:
 
 
 def _english_left(reply: tb.Reply) -> list[str]:
-    """Latin words left in a reply's text and button labels (allowlist removed)."""
-    chunks = [reply.text, *(label for row in reply.keyboard or [] for label, _ in row)]
+    """Latin words left in a reply's text, toast and button labels (allowlist removed)."""
+    labels = [label for row in reply.keyboard or [] for label, _ in row]
+    chunks = [reply.text, reply.toast or "", *labels]
     leftovers = []
     for chunk in chunks:
         stripped = _ALLOWED.sub("", chunk)
@@ -329,7 +330,7 @@ def test_english_replies_stay_english(world, monkeypatch) -> None:
 
     assert replies["/start"].text.startswith("👋 Second Brain bot ready.")
     assert replies["/review"].text.startswith("📥 Inbox (1/")
-    assert replies["expired"].text == (
+    assert replies["expired"].toast == (
         "⌛ That button expired (valid 10 minutes) — send the message again."
     )
     assert replies["fix cancel"].text == "✏️ Fix cancelled — nothing changed."  # "ביטול" works too

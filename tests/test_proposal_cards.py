@@ -149,10 +149,10 @@ class TestHebrewCard:
 
         assert card.split("\n") == [
             "🧠 מצאתי 3 פריטים בהודעה: עדכונים מכיתה ב' רימון",
-            "📅 אירוע · ✔️ משימה · 🔔 תזכורת · ℹ️ לידיעה",
             "1. 📅 מבחן לאיתור מחוננים · יום ב׳ 30.11 · אילן",
             "2. 📅 מפגש סיכום דיאלוג בנים · ללא תאריך · אילן",
-            "3. ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו",
+            "<blockquote expandable>ℹ️ לידיעה בלבד (1)",
+            "ℹ️ תחרות מטוסי הנייר של שכבה ו' · לא רלוונטי אלינו</blockquote>",
         ]
 
     def test_buttons_carry_the_line_number(self, world):
@@ -164,8 +164,7 @@ class TestHebrewCard:
         assert [[label for label, _ in row] for row in rows] == [
             ["1 ✅ שמור", "1 ✏️ תקן", "1 🗑 מחק"],
             ["2 ✅ שמור", "2 ✏️ תקן", "2 🗑 מחק"],
-            ["3 ✅ שמור", "3 ✏️ תקן", "3 🗑 מחק"],
-            ["✅ שמור הכל"],
+            ["✅ שמור הכל"],  # the 'not for us' line has no buttons
         ]
 
     def test_english_card_gets_the_same_fixes(self, world):
@@ -173,9 +172,9 @@ class TestHebrewCard:
         source = _capture(repo, "Class update")
         lines = render_source_card(source, self._children(repo), TZ).split("\n")
 
-        assert lines[2] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Ilan"
-        assert lines[3].endswith("· no date · Ilan")
-        assert lines[4].endswith("· not for us")
+        assert lines[1] == "1. 📅 מבחן לאיתור מחוננים · Mon 30.11 · Ilan"
+        assert lines[2].endswith("· no date · Ilan")
+        assert lines[4].endswith("· not for us</blockquote>")
 
 
 class TestCardRendering:
@@ -815,7 +814,7 @@ class TestDurableButtons:
         fresh, _service = _bot(world)
         for data in (drop, keep, _button(card, CB_PROPOSED_FIX)):
             stale = fresh.handle_callback(data, 7)
-            assert "already handled" in stale.text
+            assert "already handled" in stale.toast
         assert self._states(session) == ["kept", "proposed"]  # never re-applied
         assert 7 not in fresh._fix_flow  # noqa: SLF001  (no Fix flow on a kept child)
 
@@ -824,7 +823,7 @@ class TestDurableButtons:
         bot, card, _source = self._card(world)
         bot.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
         again = bot.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
-        assert "already handled" in again.text
+        assert "already handled" in again.toast
         assert self._states(session) == ["kept", "kept"]
 
     def test_malformed_and_foreign_callbacks_change_nothing(self, world):
@@ -845,12 +844,13 @@ class TestDurableButtons:
         ]
         for data in cases:
             reply = bot.handle_callback(data, 7)
-            assert reply.text.startswith("⌛"), (data, reply.text)
+            assert reply.toast.startswith("⌛"), (data, reply.toast)  # a toast only
+            assert reply.text == ""
             assert reply.keyboard is None
         # a real id, but of an item that is no proposal child
         for prefix in (CB_PROPOSED_KEEP, CB_PROPOSED_DROP, CB_PROPOSED_FIX):
             reply = bot.handle_callback(f"{prefix}:{plain.id}", 7)
-            assert "already handled" in reply.text
+            assert "already handled" in reply.toast
         assert self._states(session) == ["proposed", "proposed"]
         session.refresh(plain)
         assert plain.child_state is None
@@ -858,7 +858,7 @@ class TestDurableButtons:
     def test_a_pre_change_card_answers_the_friendly_expired(self, world):
         bot, _card, _source = self._card(world)
         reply = bot.handle_callback(f"{CB_PROPOSED_KEEP}:abcd1234:0", 7)
-        assert "expired" in reply.text
+        assert "expired" in reply.toast
 
     def test_card_buttons_carry_ids_under_64_bytes(self, world):
         _repo, session, _memory = world
@@ -889,7 +889,7 @@ class TestDurableButtons:
         session.expire_all()
         assert session.get(MemoryItem, due.id).child_state == "kept"
         stale = fresh.handle_callback(_button(ping, CB_PROPOSED_DROP), 7)
-        assert "already handled" in stale.text
+        assert "already handled" in stale.toast
         session.expire_all()
         assert session.get(MemoryItem, due.id).child_state == "kept"
 

@@ -186,7 +186,11 @@ def test_new_commit_backs_up_migrates_restarts_and_reports(world: World) -> None
         "notify -s",
     ]
     assert "second-brain-api second-brain-telegram second-brain-email" in calls[3]
-    assert "✅ Deployed" in calls[4] and "feat: thing" in calls[4]
+    # the family gets a plain Hebrew line, delivered without a sound; the
+    # sha and the commit subject stay in the log
+    assert "text=🔧 גרסה חדשה הותקנה ✅" in calls[4]
+    assert "disable_notification=true" in calls[4]
+    assert f"deployed {new[:7]}: feat: thing" in result.stdout
     # each unit is checked on its own (is-active with several units passes
     # when ANY of them is up)
     checks = [c for c in world.calls().splitlines() if c.startswith("systemctl is-active")]
@@ -205,6 +209,8 @@ def test_unhealthy_deploy_rolls_back_code_and_is_not_retried(world: World) -> No
     assert world.head() == world.first  # rolled back
     assert "↩️" not in world.calls()  # rollback is unhealthy too in this world
     assert "rollback" in world.calls() and "❌" in world.calls()
+    assert "וגם החזרה לגרסה הקודמת לא הצליחה" in world.calls()  # Hebrew line first
+    assert "disable_notification" not in world.calls()  # a failure rings
 
     world.log.unlink()
     world.health.write_text(HEALTHY)
@@ -237,7 +243,9 @@ def test_rollback_reports_success_when_old_code_is_healthy(world: World) -> None
     world.run()
 
     assert world.head() == world.first
-    assert "↩️ Deploy of" in world.calls()
+    notice = world.calls().split("text=", 1)[1]
+    assert notice.startswith("↩️ הגרסה החדשה לא עבדה, אז חזרתי לגרסה הקודמת.")
+    assert "\nDeploy of" in notice and "rolled back to" in notice  # technical 2nd line
 
 
 def test_schema_that_moved_is_never_rolled_back(world: World) -> None:
@@ -303,7 +311,7 @@ def test_a_unit_that_was_already_stopped_does_not_fail_the_deploy(world: World) 
     world.run(SERVICE_DISABLED="second-brain-email")
 
     assert world.head() == new
-    assert "✅ Deployed" in world.calls()
+    assert "גרסה חדשה הותקנה" in world.calls()
 
 
 def test_unparseable_deploy_script_is_refused(world: World) -> None:
@@ -363,4 +371,4 @@ def test_diverged_checkout_is_left_alone(world: World) -> None:
     world.run()
 
     assert world.head() == local
-    assert "Deploy skipped" in world.calls()
+    assert "Deploy skipped" in world.calls() and "שינויים מקומיים" in world.calls()
