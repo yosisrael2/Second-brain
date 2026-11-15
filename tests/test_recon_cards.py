@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -98,6 +99,17 @@ def _bot(world):
 
 def _labels(reply) -> list[str]:
     return [label for row in reply.keyboard or [] for label, _ in row]
+
+
+def _drill(bot, reply):
+    """A list card's buttons plus every item's focus-view buttons (the
+    drill-down): verdict buttons live on the verdict item's focus view."""
+    rows = list(reply.keyboard or [])
+    for row in reply.keyboard or []:
+        for _label, data in row:
+            if data.startswith("po:"):
+                rows.extend(bot.handle_callback(data, 7).keyboard or [])
+    return SimpleNamespace(text=reply.text, keyboard=rows, toast=reply.toast)
 
 
 def _find(reply, prefix: str) -> str:
@@ -175,8 +187,9 @@ class TestUpdateCards:
         assert reply is not None
         assert "↩︎ proposes:" in reply.text
         assert "when: Friday 10:00 → Saturday 10:00" in reply.text
-        assert "1 ✅ Confirm update" in _labels(reply)
-        assert "1 ✖ Keep both" in _labels(reply)
+        # the only item on the card opens in focus: no list, no Back
+        assert reply.text.split("\n")[1].startswith("<b>1 / 1 · ")
+        assert _labels(reply) == ["✅ Confirm update", "✖ Keep both"]
         # the recon verdict owns the row: no Keep/Fix/Drop for it
         assert "✏️ Fix" not in _labels(reply)
         confirm = _find(reply, CB_REL_CONFIRM)
@@ -194,9 +207,16 @@ class TestUpdateCards:
         bot, _ = _bot(world)
         reply = bot._proposal_reply_for(source)
 
-        labels = _labels(reply)
-        assert "1 ✅ Confirm update" in labels
-        assert "2 ✏️ Fix" in labels  # the plain child keeps its row
+        # the list: one button per item, the verdict item flagged ⚠️
+        assert _labels(reply) == [
+            "⚠️ 1 · • family dinner moved to…", "2 · • buy wine", "✅ Keep all 2",
+        ]
+        verdict_focus = bot.handle_callback(reply.keyboard[0][0][1], 7)
+        plain_focus = bot.handle_callback(reply.keyboard[1][0][1], 7)
+        assert _labels(verdict_focus) == [
+            "✅ Confirm update", "✖ Keep both", "↩︎ Back to list",
+        ]
+        assert "✏️ Fix" in _labels(plain_focus)  # the plain child keeps Keep/Fix/Drop
 
     def test_confirm_update_applies_and_strikes_the_old_item(self, world):
         repo, session = world
@@ -218,8 +238,9 @@ class TestUpdateCards:
         # the confirmed child is kept, so it leaves the proposal card:
         # the honest close is the notice + all-done, not an applied row
         # (the ↩︎ Undo row belongs to the AUTO-apply card, see above)
-        assert "✅ Confirmed" in tapped.text
-        assert "✓ all done here." in tapped.text
+        assert "✅ Confirmed" in tapped.toast
+        assert tapped.text.startswith("✅ 1 kept\n<blockquote expandable>")
+        assert tapped.keyboard is None
 
     def test_keep_both_discards_and_keeps_both_visible(self, world):
         repo, session = world
@@ -237,7 +258,7 @@ class TestUpdateCards:
         assert session.get(MemoryItem, old.id).superseded_by is None
         assert session.get(MemoryItem, child.id).child_state == "kept"
         assert _hidden(session, old.id) is False
-        assert "✖" in tapped.text
+        assert "✖" in tapped.toast
 
     def test_auto_applied_update_card_shows_undo_only(self, world):
         repo, session = world
@@ -250,7 +271,7 @@ class TestUpdateCards:
 
         assert "↩︎ applied:" in reply.text
         labels = _labels(reply)
-        assert "1 ↩︎ Undo" in labels
+        assert "↩︎ Undo" in labels
         assert "✅ Confirm update" not in labels
         assert "✖ Keep both" not in labels
 
@@ -269,7 +290,7 @@ class TestUpdateCards:
         assert session.get(MemoryItem, old.id).superseded_by is None
         rel = session.query(ItemRelation).filter_by(from_id=child.id).one()
         assert (rel.provenance or {}).get("state") == "undone"
-        assert "↩️" in tapped.text
+        assert "↩️" in tapped.toast
 
 
 class TestMixedCardTaps:
@@ -289,7 +310,7 @@ class TestMixedCardTaps:
         recon_child = _recon_child(repo, session, source=source, matched=old,
                                    verdict="update", text="family dinner moved to Saturday")
         bot, _ = _bot(world)
-        reply = bot._proposal_reply_for(source)
+        reply = _drill(bot, bot._proposal_reply_for(source))
 
         data = _find(reply, CB_REL_CONFIRM)
         tapped = bot.handle_callback(data, 7)
@@ -297,7 +318,7 @@ class TestMixedCardTaps:
         assert session.get(MemoryItem, old.id).superseded_by == recon_child.id
         rel = session.query(ItemRelation).filter_by(from_id=recon_child.id).one()
         assert (rel.provenance or {}).get("state") == "applied"
-        assert "✅" in tapped.text
+        assert "✅" in tapped.toast
 
     def test_tap_applies_only_the_tapped_row_on_a_three_child_card(self, world):
         """[plain(0), recon_A(1), recon_B(2)]: A's Confirm applies A only;
@@ -314,7 +335,7 @@ class TestMixedCardTaps:
         child_b = _recon_child(repo, session, source=source, matched=old_b,
                                verdict="update", text="gym moved to Friday")
         bot, _ = _bot(world)
-        reply = bot._proposal_reply_for(source)
+        reply = _drill(bot, bot._proposal_reply_for(source))
 
         # A's row: the Confirm whose callback names A's RELATION id
         rel_a = session.query(ItemRelation).filter_by(from_id=child_a.id).one()
@@ -332,7 +353,7 @@ class TestMixedCardTaps:
         assert session.get(MemoryItem, old_b.id).superseded_by is None
 
         # B is still appliable from its own row (the re-rendered card)
-        re_reply = bot._proposal_reply_for(source)
+        re_reply = _drill(bot, bot._proposal_reply_for(source))
         b_data = next(
             data
             for row in re_reply.keyboard or []
@@ -371,7 +392,7 @@ class TestMixedCardTaps:
         own = bot.handle_callback(_find(card, CB_REL_CONFIRM), 7)
         session.expire_all()
         assert session.get(MemoryItem, old_a.id).superseded_by == child_a.id
-        assert "✅" in own.text
+        assert "✅" in own.toast
 
     def test_verdict_tap_after_a_restart_applies(self, world):
         """The bot restarts on every deploy; a verdict card read the next
@@ -386,7 +407,7 @@ class TestMixedCardTaps:
 
         fresh, _ = _bot(world)
         tapped = fresh.handle_callback(data, 7)
-        assert "✅" in tapped.text
+        assert "✅" in tapped.toast
         session.expire_all()
         assert session.get(MemoryItem, old.id).superseded_by == child.id
         again, _ = _bot(world)
@@ -418,7 +439,7 @@ class TestMixedCardTaps:
         recon_child = _recon_child(repo, session, source=source, matched=old,
                                    verdict="update", text="family dinner moved to Saturday")
         bot, _ = _bot(world)
-        reply = bot._proposal_reply_for(source)
+        reply = _drill(bot, bot._proposal_reply_for(source))
 
         # the plain child's index is the one whose row carries a Fix button
         # (default rows only) — positions are not assumed further
@@ -452,8 +473,8 @@ class TestConflictCards:
         assert "birthday dinner at Nana's" in reply.text  # the existing version
         assert "birthday dinner at Daniel's" in reply.text  # the new version
         labels = _labels(reply)
-        assert "1 ✅ Keep existing" in labels
-        assert "1 ✅ Keep new" in labels
+        assert "✅ Keep existing" in labels
+        assert "✅ Keep new" in labels
         assert "✏️ Fix" not in labels
         keep_existing = _find(reply, CB_RECON_DISCARD)
         keep_new = _find(reply, CB_REL_CONFIRM)
@@ -477,7 +498,7 @@ class TestConflictCards:
         assert rel.kind == "conflicts"
         assert (rel.provenance or {}).get("state") == "applied"
         assert session.get(MemoryItem, child.id).child_state == "kept"
-        assert "✅" in tapped.text
+        assert "✅" in tapped.toast
 
     def test_conflict_keep_existing_discards_and_drops_the_child(self, world, monkeypatch):
         from brain import ops
@@ -501,7 +522,8 @@ class TestConflictCards:
         assert session.get(MemoryItem, child.id).child_state == "dropped"
         assert session.get(MemoryItem, old.id).superseded_by is None
         assert _hidden(session, old.id) is False
-        assert "✅" in tapped.text
+        assert "✅" in tapped.toast
+        assert tapped.text.startswith("🗑 1 dropped")  # the card collapses
         assert any("recon_conflict_resolved" in str(a) for a, _k in seen)
 
     def test_conflict_keep_new_restore_on_the_target_card(self, world):
@@ -609,7 +631,7 @@ class TestCancellationCards:
         assert session.get(MemoryItem, child.id).child_state == "dropped"
         assert (session.get(MemoryItem, target.id).extraction_meta or {}).get("cancelled") is None
         assert _hidden(session, target.id) is False
-        assert "✖" in tapped.text
+        assert "✖" in tapped.toast
 
 
 class TestMoreDetailCards:

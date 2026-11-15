@@ -71,22 +71,33 @@ from brain.services.memory import MemoryError
 from brain.services.paste import parse as parse_paste
 from brain.services.proposals import (
     CB_PING_FLAG,
+    CB_PROPOSED_BACK,
     CB_PROPOSED_DROP,
     CB_PROPOSED_FIX,
     CB_PROPOSED_KEEP,
     CB_PROPOSED_KEEP_ALL,
+    CB_PROPOSED_NOOP,
+    CB_PROPOSED_OPEN,
+    CB_PROPOSED_PAGE,
     FixError,
     apply_drop,
     apply_fix,
     apply_keep,
     apply_keep_all,
+    card_children_of,
+    card_numbers,
     due_proposed_children,
+    focus_keyboard,
     mark_pinged,
+    page_of,
     ping_is_quiet,
     ping_line,
     proposal_keyboard,
     proposed_children_of,
+    render_done,
+    render_focus,
     render_source_card,
+    undecided_positions,
 )
 from brain.services.relations_view import (
     CB_RECON_DISCARD,
@@ -339,6 +350,9 @@ class Reply:
     adapter shows it on the tapped button (answerCallbackQuery), and an
     empty ``text`` then sends nothing to the chat. ``silent=True`` delivers
     a new message without a notification sound (digests, early pings).
+    ``followups`` are in-place edits of OTHER messages, sent after this
+    reply: ``(chat_id, message_id, reply)`` — the Fix flow's last answer
+    re-renders the proposal card it started from.
     """
 
     text: str
@@ -346,6 +360,7 @@ class Reply:
     edit: bool = False
     toast: str | None = None
     silent: bool = False  # deliver without sound (disable_notification)
+    followups: tuple[tuple[int, int, Reply], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -359,6 +374,9 @@ class Pending:
     # PR C proposal cards: what the token refers to + the fix-flow step
     kind: str = "capture"  # "capture" | "fix" | "relation" | "schedules"
     step: str | None = None  # fix flow: "title" | "date"
+    # fix flow: the proposal card message the ✏️ Fix tap came from (re-rendered
+    # in place once the fix lands); None when the adapter did not say
+    card: tuple[int, int] | None = None  # (chat_id, message_id)
 
 
 class PendingRegistry:
@@ -1297,57 +1315,112 @@ class TelegramBot:
         self._outbound = []
         return queued
 
-    def _recon_payload(  # type: ignore[no-untyped-def]  # (untyped before: session/rows)
-        self, session, children, lang: str = i18n.DEFAULT
-    ):
-        """(recon, blocks) for a proposal card: the verdict rows and the
-        CONFLICT both-versions blocks (D-recon-2a). The verdict rows carry
-        the relation ID in the callback data — nothing positional to
-        misalign."""
-        recon = self._recon_rows(session, children)
-        blocks = [
-            conflict_notice(session, rel, lang)  # type: ignore[arg-type]  # rel: ItemRelation
-            for verdict, rel, _title in recon.values()
-            if verdict == "conflict"
-        ]
-        return recon, blocks
-
-    def _proposal_reply_for(self, source, *, notice: str | None = None) -> Reply | None:
-        """Render the source's proposal card (None when nothing is proposed).
-
-        Verdict children (D-recon-2a) get their verdict row instead of
-        Keep/Fix/Drop, and a CONFLICT child adds the both-versions block.
-        Every button carries the child / relation / source id it acts on
-        (no registry token), so the card keeps working for days and across
-        restarts."""
+    def _proposal_reply_for(self, source) -> Reply | None:
+        """The source's proposal card as first sent (None when nothing is
+        proposed): the list view, or the focus view directly when the card
+        has one actionable child. Every button carries the child / relation
+        / source id it acts on (no registry token), so the card keeps
+        working for days and across restarts."""
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         session = SessionLocal()
         try:
-            return self._render_proposal_card(session, source, notice=notice)
+            return self._proposal_view(session, source, initial=True)
         finally:
             session.close()
 
-    def _render_proposal_card(  # type: ignore[no-untyped-def]  # (untyped before: session/rows)
-        self, session, source, *, notice: str | None = None, edit: bool = False
+    def _proposal_view(  # type: ignore[no-untyped-def]  # (untyped before: session/rows)
+        self,
+        session,
+        source,
+        *,
+        page: int | None = None,
+        focus: uuid_mod.UUID | None = None,
+        after: uuid_mod.UUID | None = None,
+        edit: bool = False,
+        initial: bool = False,
     ) -> Reply | None:
-        children = proposed_children_of(session, source.id)
-        if not children:
+        """Render the card's current state from the DB (one message, edited
+        in place on every tap):
+
+        - nothing left to decide → the collapsed done summary (no keyboard);
+        - ``focus`` (an undecided actionable child) → its focus view;
+        - exactly one actionable child on the card → its focus view, without
+          Back / Keep all;
+        - else the list view on ``page`` — or, with ``after`` (the child
+          just decided), on the page holding the next undecided child.
+
+        None when the source has no proposal children (``initial``: none
+        still proposed — nothing to send)."""
+        children = card_children_of(session, source.id)
+        open_any = any(child.child_state == "proposed" for child in children)
+        if not open_any and (initial or not children):
             return None
         lang, names = self._session_locale(session)
-        recon, blocks = self._recon_payload(session, children, lang)
-        parts = [part for part in (
-            notice,
-            render_source_card(
-                source, children, self._timezone.key, recon=recon, lang=lang, names=names
-            ),
-            *blocks,
-        ) if part]
+        recon = self._recon_rows(session, children)
+        tz = self._timezone.key
+        numbers = card_numbers(children, recon)
+        actionable = [index for index, n in enumerate(numbers) if n is not None]
+        waiting = undecided_positions(children, recon)
+        if (actionable and not waiting) or not open_any:
+            return Reply(
+                render_done(source, children, tz, recon=recon, lang=lang, names=names),
+                edit=edit,
+            )
+        ids = [child.id for child in children]
+        single = len(actionable) == 1
+        target = ids.index(focus) if focus in ids else None
+        if target not in waiting and single:
+            target = waiting[0]
+        if target is not None and target in waiting:
+            child = children[target]
+            entry = recon.get(target)
+            blocks = []
+            if entry is not None and entry[0] == "conflict":
+                blocks.append(conflict_notice(session, entry[1], lang))  # type: ignore[arg-type]
+            text = render_focus(
+                source,
+                children,
+                target,
+                tz,
+                recon=recon,
+                lang=lang,
+                names=names,
+                quote=self._child_quote(session, child.id, source.id),
+                blocks=blocks,
+                with_fyi=single,
+            )
+            back = None if single else page_of(waiting.index(target), len(waiting))
+            keyboard = focus_keyboard(
+                source.id, child, recon_entry=entry, lang=lang, back_page=back
+            )
+            return Reply(text, keyboard=keyboard, edit=edit)
+        if after is not None and after in ids and waiting:
+            decided = ids.index(after)
+            later = [index for index in waiting if index > decided]
+            page = page_of(waiting.index((later or waiting)[0]), len(waiting))
         return Reply(
-            text="\n".join(parts),
-            keyboard=proposal_keyboard(source.id, children, recon=recon, lang=lang),
+            render_source_card(source, children, tz, recon=recon, lang=lang, names=names),
+            keyboard=proposal_keyboard(
+                source.id, children, tz, recon=recon, lang=lang, page=page or 0
+            ),
             edit=edit,
         )
+
+    @staticmethod
+    def _child_quote(session, child_id, source_id) -> str | None:  # type: ignore[no-untyped-def]
+        """The source text a child was extracted from (the focus excerpt)."""
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from brain.db.models import ItemSource  # noqa: PLC0415
+
+        return session.scalars(
+            select(ItemSource.quote)
+            .where(ItemSource.child_id == child_id)
+            .where(ItemSource.source_id == source_id)
+            .order_by(ItemSource.created_at.asc())
+            .limit(1)
+        ).first()
 
     def _recon_rows(self, session, children) -> dict[int, tuple[str, object, str | None]]:
         """index -> (verdict, relation, matched_title) for the card's verdict
@@ -1371,38 +1444,95 @@ class TelegramBot:
         return rows
 
     def _durable_proposal_callback(
-        self, prefix: str, rest: str, user_id: int | None
+        self,
+        prefix: str,
+        rest: str,
+        user_id: int | None,
+        card: tuple[int, int] | None = None,
     ) -> Reply | None:
         """Proposal-card and due-ping buttons: ``pk|pf|px:<child-uuid>`` (a
         ping adds ``:p``), ``pa:<source-uuid>``, verdict rows
-        ``rc|rk|rd|ru:<relation-uuid>``. No registry, so they work days
+        ``rc|rk|rd|ru:<relation-uuid>``, and the list / drill-down
+        navigation ``po:<child-uuid>``, ``pg:<source-uuid>:<page>``,
+        ``pb:<source-uuid>[:<page>]``, ``pn``. No registry, so they work days
         later and after a restart; every action re-checks the DB (the item
         exists, is still proposed, is a proposal child), so a tap on an item
         decided elsewhere is a clear no-op. Who may tap stays the update
-        allowlist. None = not this format (a relation card's
-        ``rc:<token>:<index>`` goes on to the registry path)."""
+        allowlist. ``card`` is the (chat, message) the tap came from (the Fix
+        flow edits it once the fix lands). None = not this format (a
+        relation card's ``rc:<token>:<index>`` goes on to the registry
+        path)."""
+        if prefix == CB_PROPOSED_NOOP:
+            return Reply(text="")  # the page indicator: a plain ack
         raw, _, flag = rest.partition(":")
         target = _durable_id(raw)
         if prefix in (CB_REL_UNDO, CB_REL_CONFIRM, CB_REL_KEEP_BOTH, CB_RECON_DISCARD):
             if target is None or flag:
                 return None
             return self._recon_transition(prefix, target)
+        if prefix in (CB_PROPOSED_PAGE, CB_PROPOSED_BACK):
+            page_ok = flag.isdigit() and len(flag) <= 3
+            if target is None or not (page_ok or (prefix == CB_PROPOSED_BACK and not flag)):
+                return self._toast(i18n.t(self._language(), "btn_expired"))
+            return self._proposal_page(target, int(flag or 0))
         if target is None or flag not in ("", CB_PING_FLAG):
             # a card sent before durable buttons (pk:<token>:<index>) or junk
             return self._toast(i18n.t(self._language(), "btn_expired"))
+        if prefix == CB_PROPOSED_OPEN:
+            if flag:
+                return self._toast(i18n.t(self._language(), "btn_expired"))
+            return self._proposal_open(target)
         if prefix == CB_PROPOSED_KEEP_ALL:
             return self._proposal_keep_all(target)
         if prefix == CB_PROPOSED_FIX:
-            return self._proposal_fix_start(user_id, target)
+            return self._proposal_fix_start(user_id, target, card)
         return self._proposal_decide(
             target, keep=prefix == CB_PROPOSED_KEEP, ping=flag == CB_PING_FLAG
         )
 
+    def _proposal_open(self, child_id: uuid_mod.UUID) -> Reply:
+        """``po``: the tapped child's focus view (read-only: nothing changes).
+        A child decided meanwhile answers "already handled" and re-renders
+        the card's current state."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        already = i18n.t(self._language(), "already_handled")
+        with SessionLocal() as session:
+            child = session.get(MemoryItem, child_id)
+            source = (
+                self._proposal_source_of(child, session)
+                if child is not None and child.child_state is not None
+                else None
+            )
+            if child is None or source is None:
+                return self._toast(already)
+            if child.child_state != "proposed":
+                reply = self._proposal_view(session, source, after=child.id, edit=True)
+                return replace(reply, toast=already) if reply else self._toast(already)
+            reply = self._proposal_view(session, source, focus=child.id, edit=True)
+        return reply or self._toast(already)
+
+    def _proposal_page(self, source_id: uuid_mod.UUID, page: int) -> Reply:
+        """``pg`` / ``pb``: the list view on one page (read-only)."""
+        from brain.db.models import MemoryItem  # noqa: PLC0415
+        from brain.db.session import SessionLocal  # noqa: PLC0415
+
+        with SessionLocal() as session:
+            source = session.get(MemoryItem, source_id)
+            reply = (
+                self._proposal_view(session, source, page=page, edit=True)
+                if source is not None
+                else None
+            )
+        return reply or self._toast(i18n.t(self._language(), "already_handled"))
+
     def _proposal_decide(self, child_id: uuid_mod.UUID, *, keep: bool, ping: bool) -> Reply:
         """✅ Keep / 🗑 Drop one proposed child (row lock: two taps never
-        both apply). A ping answers one line; a card re-renders in place —
-        also after a tap on a child decided elsewhere (its other rows stay
-        usable)."""
+        both apply). A ping answers one line; a card re-renders in place as
+        the list, on the page of the next undecided child — also after a
+        tap on a child decided elsewhere (the toast says so). An old card's
+        per-row buttons land here too and come back in the new layout."""
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
@@ -1418,13 +1548,13 @@ class TelegramBot:
                 if ping or source_id is None:
                     return self._toast(already)
                 session.rollback()  # release the row lock before re-rendering
-                return self._proposal_card_reply(source_id, notice=already)
+                return self._proposal_card_reply(source_id, notice=already, after=child_id)
             title = _esc(child.raw_text[:40])
             (apply_keep if keep else apply_drop)(_repo_of(session), child)
         notice = i18n.t(lang, "kept_title" if keep else "dropped_title", title=title)
         if ping:
             return Reply(notice, edit=True, toast=notice)
-        return self._proposal_card_reply(source_id, notice=notice)
+        return self._proposal_card_reply(source_id, notice=notice, after=child_id)
 
     def _proposal_keep_all(self, source_id: uuid_mod.UUID) -> Reply:
         """✅ Keep all: every still-proposed child of the source."""
@@ -1435,6 +1565,9 @@ class TelegramBot:
 
         with SessionLocal() as session:
             ids = [child.id for child in proposed_children_of(session, source_id)]
+            # the toast counts what the button said (FYI lines are kept too)
+            card = card_children_of(session, source_id)
+            listed = len(undecided_positions(card, self._recon_rows(session, card)))
             locked = session.scalars(
                 select(MemoryItem)
                 .where(MemoryItem.id.in_(ids))
@@ -1447,18 +1580,26 @@ class TelegramBot:
             if not ids:
                 return self._toast(already)
             return self._proposal_card_reply(source_id, notice=already)
-        notice = i18n.tn(self._language(), "kept_n", changed)
+        notice = i18n.tn(self._language(), "kept_n", min(listed, changed) or changed)
         return self._proposal_card_reply(source_id, notice=notice)
 
-    def _proposal_card_reply(self, source_id: uuid_mod.UUID | None, *, notice: str) -> Reply:
-        """Re-render the source card after an action (edit-in-place)."""
+    def _proposal_card_reply(
+        self,
+        source_id: uuid_mod.UUID | None,
+        *,
+        notice: str,
+        after: uuid_mod.UUID | None = None,
+    ) -> Reply:
+        """Re-render the source card after an action (edit-in-place); the
+        action's feedback is the toast. ``after`` = the child just acted on:
+        the list opens on the page of the next undecided child."""
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
         with SessionLocal() as session:
             source = session.get(MemoryItem, source_id) if source_id is not None else None
             reply = (
-                self._render_proposal_card(session, source, notice=notice, edit=True)
+                self._proposal_view(session, source, after=after, edit=True)
                 if source is not None
                 else None
             )
@@ -1466,6 +1607,7 @@ class TelegramBot:
             done = i18n.t(self._language(), "all_done")
             return Reply(f"{notice}\n{done}", edit=True, toast=notice)
         return replace(reply, toast=notice)
+
 
     # -- relation cards (PR B: items 20a/20b/D4) --------------------------------
 
@@ -1585,7 +1727,7 @@ class TelegramBot:
                 return self._toast(already)
         if notice is None:
             return self._toast(already)
-        return self._proposal_card_reply(source_id, notice=notice)
+        return self._proposal_card_reply(source_id, notice=notice, after=child_id)
 
     def _recon_child_kept(self, session, child_id) -> None:
         """The acted verdict child becomes kept (it stays visible; a re-run
@@ -1640,19 +1782,42 @@ class TelegramBot:
             return self._toast(self._relation_error(exc))
         return self._card_reply(pending, notice=i18n.t(self._language(), "rel_restored"))
 
-    def _proposal_fix_start(self, user_id: int | None, child_id: uuid_mod.UUID) -> Reply:
+    def _proposal_fix_start(
+        self,
+        user_id: int | None,
+        child_id: uuid_mod.UUID,
+        card: tuple[int, int] | None = None,
+    ) -> Reply:
+        """✏️ Fix: start the text-reply flow. The prompt names the item by
+        its card number ("#3 <title>") and arrives silently; ``card`` (the
+        message the tap came from) is re-rendered once the fix lands."""
         from brain.db.models import MemoryItem  # noqa: PLC0415
         from brain.db.session import SessionLocal  # noqa: PLC0415
 
+        number = None
         with SessionLocal() as session:
             child = session.get(MemoryItem, child_id)
+            if child is not None and child.child_state == "proposed":
+                source = self._proposal_source_of(child, session)
+                if source is not None:
+                    children = card_children_of(session, source.id)
+                    ids = [row.id for row in children]
+                    if child.id in ids:
+                        recon = self._recon_rows(session, children)
+                        number = card_numbers(children, recon)[ids.index(child.id)]
+        lang = self._language()
         if child is None or child.child_state != "proposed":
-            return self._toast(i18n.t(self._language(), "already_handled"))
+            return self._toast(i18n.t(lang, "already_handled"))
         if user_id is None:
-            return Reply(i18n.t(self._language(), "fix_no_user"), edit=True)
-        token = self.registry.put(Pending(ids=(child.id,), kind="fix", step="title"))
+            return Reply(i18n.t(lang, "fix_no_user"), edit=True)
+        token = self.registry.put(
+            Pending(ids=(child.id,), kind="fix", step="title", card=card)
+        )
         self._fix_flow[user_id] = token
-        return Reply(i18n.t(self._language(), "fix_title_prompt", title=_esc(child.raw_text[:60])))
+        title = _esc(child.raw_text[:60])
+        if number is None:
+            return Reply(i18n.t(lang, "fix_title_prompt", title=title), silent=True)
+        return Reply(i18n.t(lang, "fix_title_prompt_n", n=number, title=title), silent=True)
 
     def _fix_input(self, user_id: int, text: str) -> Reply:
         """One step of the Fix flow (title, then date)."""
@@ -1666,7 +1831,7 @@ class TelegramBot:
             return Reply(i18n.t(self._language(), "fix_cancelled"))
         if pending.step == "title":
             self._fix_flow[user_id] = self.registry.put(
-                Pending(ids=pending.ids, text=text, kind="fix", step="date")
+                Pending(ids=pending.ids, text=text, kind="fix", step="date", card=pending.card)
             )
             return Reply(i18n.t(self._language(), "fix_date_prompt", title=_esc(text[:60])))
         # step == "date"
@@ -1704,7 +1869,15 @@ class TelegramBot:
                 error = i18n.label(lang, f"fixerr_{exc.code}", str(exc))
                 return Reply(i18n.t(lang, "fix_retry", error=_esc(error)))
             self._fix_flow.pop(user_id, None)
-            return Reply(i18n.t(self._language(), "fix_done", title=_esc(fixed.raw_text[:60])))
+            done = Reply(i18n.t(self._language(), "fix_done", title=_esc(fixed.raw_text[:60])))
+            if pending.card is None or source is None:
+                return done
+            # the card the Fix started from: back to the list, the line ✏️
+            card = self._proposal_view(session, source, after=fixed.id, edit=True)
+            if card is None:
+                return done
+            chat_id, message_id = pending.card
+            return replace(done, followups=((chat_id, message_id, card),))
 
     def _proposal_source_of(self, child, session):
         from sqlalchemy import select  # noqa: PLC0415
@@ -1872,11 +2045,20 @@ class TelegramBot:
         return Reply(text="", toast=text)
 
     @_speaks
-    def handle_callback(self, data: str, user_id: int | None = None) -> Reply:
+    def handle_callback(
+        self,
+        data: str,
+        user_id: int | None = None,
+        *,
+        chat_id: int | None = None,
+        message_id: int | None = None,
+    ) -> Reply:
         """Dispatch an inline-button press; stale/unknown → graceful reply.
 
         ``user_id`` is optional (PR C): the Fix button opens a per-user edit
-        flow, so the callback needs to know who pressed it.
+        flow, so the callback needs to know who pressed it. ``chat_id`` /
+        ``message_id`` name the message the button sits on (the Fix flow
+        re-renders that card when the fix lands).
         """
         prefix, _, rest = data.partition(":")
         if prefix in (
@@ -1884,12 +2066,17 @@ class TelegramBot:
             CB_PROPOSED_FIX,
             CB_PROPOSED_DROP,
             CB_PROPOSED_KEEP_ALL,
+            CB_PROPOSED_OPEN,
+            CB_PROPOSED_PAGE,
+            CB_PROPOSED_BACK,
+            CB_PROPOSED_NOOP,
             CB_REL_UNDO,
             CB_REL_CONFIRM,
             CB_REL_KEEP_BOTH,
             CB_RECON_DISCARD,
         ):
-            durable = self._durable_proposal_callback(prefix, rest, user_id)
+            card = (chat_id, message_id) if chat_id is not None and message_id is not None else None
+            durable = self._durable_proposal_callback(prefix, rest, user_id, card)
             if durable is not None:
                 return durable
         try:
@@ -2882,17 +3069,20 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
         return  # never reply to strangers
     if update.callback_query is not None:
         query = update.callback_query
+        message = getattr(query, "message", None)
+        chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "message_id", None)
         try:
-            reply = core.handle_callback(query.data or "", user.id)
+            reply = core.handle_callback(
+                query.data or "", user.id, chat_id=chat_id, message_id=message_id
+            )
         except Exception:
             await _answer_callback(query)  # stop the button's spinner anyway
             raise
         await _answer_callback(query, reply.toast)
         record_event("telegram", EVENT_CALLBACK, ok=True, detail={})
-        message = getattr(query, "message", None)
-        chat_id = getattr(message, "chat_id", None)
         if chat_id is not None and reply.text:
-            await _send(tg, chat_id, reply, message_id=getattr(message, "message_id", None))
+            await _send(tg, chat_id, reply, message_id=message_id)
         return
     message = update.effective_message
     if message is None:
@@ -2946,6 +3136,12 @@ async def _handle_update(tg: Any, core: TelegramBot, update: Any) -> None:
         else:
             reply = core.route(message.text, user.id, forward=_forward_info(message))
         await _send(tg, chat_id, reply)
+        for card_chat, card_message, card in getattr(reply, "followups", ()):
+            # an edit of another message (the Fix flow's card): best-effort
+            try:
+                await _send(tg, card_chat, card, message_id=card_message)
+            except Exception as exc:  # noqa: BLE001 — the reply already went out
+                logger.debug("telegram: follow-up card edit failed (%s)", exc)
     # stickers/other unsupported message types: nothing to capture yet
 
 

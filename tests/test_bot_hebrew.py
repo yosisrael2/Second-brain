@@ -49,7 +49,7 @@ USER = 111
 _ALLOWED = re.compile(
     r"/(?:start|help|status|search|ask|review|recent|profile|remember|schedules|language)\b"
     r"|\b(?:he|en)\b"
-    r"|</?[bs]>|<blockquote expandable>|</blockquote>"
+    r"|</?[bsi]>|<blockquote expandable>|</blockquote>"
     r"|&(?:lt|gt|amp);"
     # user DATA the bot isolates on purpose (a file name, an English subject)
     r"|\u2068[^\u2069]*\u2069"
@@ -212,6 +212,15 @@ def _find(reply: tb.Reply, prefix: str, nth: int = 0) -> str:
     return found[nth]
 
 
+def _item(reply: tb.Reply, *, verdict: bool) -> str:
+    """A list card's item button: the ⚠️ (recon verdict) one, or a plain one."""
+    for row in reply.keyboard or []:
+        for label, data in row:
+            if data.startswith("po:") and label.startswith("⚠️") == verdict:
+                return data
+    raise AssertionError(f"no {'verdict' if verdict else 'plain'} item in {reply.keyboard}")
+
+
 def _english_left(reply: tb.Reply) -> list[str]:
     """Latin words left in a reply's text, toast and button labels (allowlist removed)."""
     labels = [label for row in reply.keyboard or [] for label, _ in row]
@@ -285,14 +294,20 @@ def _drive_everything(core: tb.TelegramBot, monkeypatch) -> list[tuple[str, tb.R
     source = _proposal_source()
     card = step("proposal card", core._proposal_reply_for(source))  # noqa: SLF001
     step("due ping", core.due_pings())
-    card = step("keep", core.handle_callback(_find(card, "pk"), USER))
-    step("fix", core.handle_callback(_find(card, "pf"), USER))
+    focus = step("open item", core.handle_callback(_item(card, verdict=False), USER))
+    card = step("keep", core.handle_callback(_find(focus, "pk"), USER))
+    step("stale open", core.handle_callback(_find(focus, "pk").replace("pk:", "po:"), USER))
+    focus = step("open item again", core.handle_callback(_item(card, verdict=False), USER))
+    step("fix", core.handle_callback(_find(focus, "pf"), USER))
     step("fix title", core.route("אסיפת הורים כיתה ה׳", USER))
     step("fix bad date", core.route("מתישהו", USER))
     step("fix cancel", core.route("ביטול", USER))
-    card = step("conflict keep existing", core.handle_callback(_find(card, "rd"), USER))
-    step("drop", core.handle_callback(_find(card, "px"), USER))
-    step("stale card button", core.handle_callback(_find(card, "pk"), USER))
+    card = step("back to list", core.handle_callback(_find(focus, "pb"), USER))
+    focus = step("open conflict", core.handle_callback(_item(card, verdict=True), USER))
+    card = step("conflict keep existing", core.handle_callback(_find(focus, "rd"), USER))
+    focus = step("open last", core.handle_callback(_item(card, verdict=False), USER))
+    step("drop", core.handle_callback(_find(focus, "px"), USER))
+    step("stale card button", core.handle_callback(_find(focus, "pk"), USER))
     step("keep all", core.handle_callback(_find(card, "pa"), USER))
 
     with SessionLocal() as session:
@@ -406,7 +421,8 @@ def test_fix_flow_accepts_hebrew_words(world) -> None:
     core = _core()
     _seed_family(core, "he")
     card = core._proposal_reply_for(_proposal_source())  # noqa: SLF001
-    core.handle_callback(_find(card, "pf"), USER)
+    focus = core.handle_callback(_item(card, verdict=False), USER)
+    core.handle_callback(_find(focus, "pf"), USER)
     core.route("שם חדש", USER)
 
     done = core.route("השאר", USER)

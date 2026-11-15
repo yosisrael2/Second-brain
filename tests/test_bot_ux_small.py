@@ -107,7 +107,7 @@ class _StubCore:
     def is_allowed(self, user_id) -> bool:
         return True
 
-    def handle_callback(self, data: str, user_id=None) -> Reply:
+    def handle_callback(self, data: str, user_id=None, **_origin) -> Reply:
         return self._reply
 
 
@@ -260,14 +260,14 @@ class TestCardCleanup:
         kids = _kids()
         for kid in kids:
             kid.id = uuid.uuid4()
-        rows = proposal_keyboard("tok", kids)
+        rows = proposal_keyboard("tok", kids, TZ)
         assert [[label for label, _ in row] for row in rows] == [
-            ["1 ✅ Keep", "1 ✏️ Fix", "1 🗑 Drop"],
-            ["2 ✅ Keep", "2 ✏️ Fix", "2 🗑 Drop"],
-            ["✅ Keep all"],
+            ["1 · 📅 Parents evening · 03.11"],
+            ["2 · ✔️ Sign the trip form · 03.11"],
+            ["✅ Keep all 2"],
         ]
-        # each row's buttons act on ITS child: line 2 is the 3rd child
-        assert [row[0][1] for row in rows[:2]] == [f"pk:{kids[0].id}", f"pk:{kids[2].id}"]
+        # each button opens ITS child: line 2 is the 3rd child
+        assert [row[0][1] for row in rows[:2]] == [f"po:{kids[0].id}", f"po:{kids[2].id}"]
 
     def test_no_fyi_block_when_everything_is_actionable(self):
         kids = [kid for kid in _kids() if kid.type != ItemType.FACT]
@@ -281,9 +281,14 @@ class TestCardCleanup:
         recon = {1: verdict}
         card = render_source_card(_source(), kids, TZ, recon=recon)
         assert "2. ℹ️ Grade 6" in card  # numbered, out of the FYI block
-        rows = proposal_keyboard("tok", kids, recon=recon)
+        for kid in kids:
+            kid.id = uuid.uuid4()
+        rows = proposal_keyboard("tok", kids, TZ, recon=recon)
         assert [row[0][0] for row in rows] == [
-            "1 ✅ Keep", "2 ✅ Keep existing", "3 ✅ Keep", "✅ Keep all"
+            "1 · 📅 Parents evening · 03.11",
+            "⚠️ 2 · ℹ️ Grade 6 <b>paper planes…",  # a button label is plain text
+            "3 · ✔️ Sign the trip form · 03.11",
+            "✅ Keep all 3",
         ]
 
     def test_fyi_line_with_an_action_stays_numbered(self):
