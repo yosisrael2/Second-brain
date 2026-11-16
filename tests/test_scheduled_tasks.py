@@ -288,7 +288,7 @@ def test_excluded_inflight_task_waits(sched_db):
 
 
 def test_execute_claim_records_ok_with_cited_ids(sched_db):
-    task_id = _make(_at("2026-11-08 12:00"))
+    task_id = _make(datetime.now(tz=UTC))  # next slot in the future: only the requested run is due
     with _store() as store:
         store.request_run(task_id)
         (claim,) = store.claim_due(max_late_s=60)
@@ -309,7 +309,7 @@ def test_execute_claim_records_ok_with_cited_ids(sched_db):
 
 
 def test_execute_claim_records_errors_without_raising(sched_db):
-    task_id = _make(_at("2026-11-08 12:00"))
+    task_id = _make(datetime.now(tz=UTC))  # next slot in the future: only the requested run is due
     with _store() as store:
         store.request_run(task_id)
         (claim,) = store.claim_due(max_late_s=60)
@@ -324,7 +324,7 @@ def test_execute_claim_records_errors_without_raising(sched_db):
 
 
 def test_finish_is_first_writer_wins(sched_db):
-    task_id = _make(_at("2026-11-08 12:00"))
+    task_id = _make(datetime.now(tz=UTC))  # next slot in the future: only the requested run is due
     with _store() as store:
         store.request_run(task_id)
         (claim,) = store.claim_due(max_late_s=60)
