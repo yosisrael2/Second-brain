@@ -2868,6 +2868,10 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
                 )
                 return
             except Exception as exc:  # noqa: BLE001
+                if _is_not_modified_error(exc):
+                    # the card already shows this state (a double tap, a stale
+                    # button on an up-to-date card): done — never a new card
+                    return
                 if _is_parse_entity_error(exc):
                     record_event(
                         "telegram",
@@ -2904,6 +2908,12 @@ async def _send(tg: Any, chat_id: int, reply: Reply, *, message_id: int | None =
             reply_markup=markup,
             **quiet,
         )
+
+
+def _is_not_modified_error(exc: BaseException) -> bool:
+    """True for Telegram BadRequest 'Message is not modified' (an edit whose
+    text and keyboard equal what the message already shows)."""
+    return type(exc).__name__ == "BadRequest" and "message is not modified" in str(exc).lower()
 
 
 def _is_parse_entity_error(exc: BaseException) -> bool:

@@ -62,6 +62,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "btn_drop": {"en": "{n} 🗑 Drop", "he": "{n} 🗑 מחק"},
     "btn_keep_all": {"en": "✅ Keep all", "he": "✅ שמור הכל"},
     "btn_keep_all_n": {"en": "✅ Keep all {n}", "he": "✅ שמור הכל ({n})"},
+    "more_lines": {"en": "… +{n} more", "he": "… ועוד {n}"},
     "btn_back_list": {"en": "↩︎ Back to list", "he": "↩︎ חזרה לרשימה"},
     "btn_undo": {"en": "{n} ↩︎ Undo", "he": "{n} ↩︎ בטל"},
     "btn_confirm_update": {"en": "{n} ✅ Confirm update", "he": "{n} ✅ אשר עדכון"},

@@ -88,6 +88,11 @@ LIST_PAGE_SIZE = 6  # item buttons per page once the list pages
 LIST_PAGING_ABOVE = 8  # up to this many undecided items fit one page
 BUTTON_TITLE_MAX = 24  # an item button's title part (ellipsis beyond)
 _EXCERPT_MAX = 160  # the focus view's source excerpt
+# Card text budget (characters of the HTML we send): the adapter hard-cuts
+# replies at 4000, which could land mid-tag; a card stays under this by
+# dropping trailing lines ("… +k more"), never by cutting inside one.
+CARD_TEXT_MAX = 3800
+_FYI_SHARE = CARD_TEXT_MAX // 4  # the collapsed FYI block's own budget
 DECIDED_STATES = ("kept", "dropped")
 
 _PING_WINDOW = timedelta(hours=48)
@@ -408,10 +413,28 @@ def _header(source: MemoryItem, count: int, lang: str) -> str:
     return i18n.t(lang, "card_header", n=count, title=title)
 
 
+def fit_lines(lines: list[str], budget: int, lang: str = i18n.DEFAULT) -> list[str]:
+    """The leading ``lines`` that fit ``budget`` characters (newline-joined),
+    plus "… +k more" for the rest. Whole lines only, so no HTML tag is ever
+    cut; the caller wraps the result (a blockquote stays closed)."""
+    if sum(len(line) + 1 for line in lines) <= budget:
+        return lines
+    room = budget - len(i18n.t(lang, "more_lines", n=len(lines))) - 1
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > room:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return [*kept, i18n.t(lang, "more_lines", n=len(lines) - len(kept))]
+
+
 def _fyi_block(fyi: list[str], lang: str) -> str:
     # collapsed: the family taps to read; no buttons for these lines
     label = i18n.t(lang, "card_fyi", n=len(fyi))
-    return "<blockquote expandable>" + "\n".join([label, *fyi]) + "</blockquote>"
+    shown = fit_lines(fyi, _FYI_SHARE - len(label) - 40, lang)
+    return "<blockquote expandable>" + "\n".join([label, *shown]) + "</blockquote>"
 
 
 def _split_lines(
@@ -452,9 +475,10 @@ def render_source_card(
     is escaped by :func:`child_line`)."""
     recon = recon or {}
     lines, fyi = _split_lines(children, tz_name, recon, lang, names)
-    if fyi:
-        lines.append(_fyi_block(fyi, lang))
-    return "\n".join([_header(source, len(children), lang), *lines])
+    header = _header(source, len(children), lang)
+    tail = [_fyi_block(fyi, lang)] if fyi else []
+    budget = CARD_TEXT_MAX - len(header) - sum(len(t) + 1 for t in tail) - 1
+    return "\n".join([header, *fit_lines(lines, budget, lang), *tail])
 
 
 def undecided_positions(children: list[MemoryItem], recon: Recon | None = None) -> list[int]:
@@ -712,7 +736,10 @@ def render_done(
     ]
     summary = " · ".join(parts) or i18n.t(lang, "all_done").strip()
     lines, fyi = _split_lines(children, tz_name, recon, lang, names)
-    body = [_header(source, len(children), lang), *lines, *fyi]
+    header = _header(source, len(children), lang)
+    # the closing tag is always written: lines are dropped whole, never cut
+    budget = CARD_TEXT_MAX - len(summary) - len(header) - 60
+    body = [header, *fit_lines([*lines, *fyi], budget, lang)]
     return summary + "\n<blockquote expandable>" + "\n".join(body) + "</blockquote>"
 
 

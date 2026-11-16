@@ -28,6 +28,7 @@ from brain.db.models import ItemRelation, ItemSource, MemoryItem
 from brain.db.session import SessionLocal, engine
 from brain.repositories.items import ItemsRepository
 from brain.services.proposals import (
+    CARD_TEXT_MAX,
     CB_PROPOSED_BACK,
     CB_PROPOSED_DROP,
     CB_PROPOSED_FIX,
@@ -599,3 +600,76 @@ class TestAdapter:
         asyncio.run(_handle_update(tg, Core(), update))
         assert [m["text"] for m in tg.sent] == ["✏️ Fixed"]
         assert [(e["message_id"], e["text"]) for e in tg.edits] == [(42, "🧠 list")]
+
+    def test_an_unchanged_card_edit_never_posts_a_new_card(self):
+        """A double tap (same pg:, a stale pk on an up-to-date card) renders
+        the same text + keyboard; Telegram answers 'Message is not modified'.
+        That edit is done — it must not fall back to a brand-new card."""
+        from brain.telegram_bot import Reply, _send
+
+        class BadRequest(Exception):  # PTB's class name is what is matched
+            pass
+
+        class TG(_TG):
+            async def edit_message_text(self, **kwargs) -> None:
+                self.edits.append(kwargs)
+                raise BadRequest(
+                    "Message is not modified: specified new message content and reply "
+                    "markup are exactly the same as a current content and reply markup"
+                )
+
+        tg = TG()
+        card = Reply("🧠 list", keyboard=[[("1 · ✔️ Task", "po:x")]], edit=True)
+        asyncio.run(_send(tg, 555, card, message_id=9))
+        assert len(tg.edits) == 1 and tg.sent == []
+
+    def test_other_edit_failures_still_fall_back_to_a_new_message(self):
+        from brain.telegram_bot import Reply, _send
+
+        class BadRequest(Exception):
+            pass
+
+        class TG(_TG):
+            async def edit_message_text(self, **kwargs) -> None:
+                raise BadRequest("Message to edit not found")
+
+        tg = TG()
+        asyncio.run(_send(tg, 555, Reply("🧠 list", edit=True), message_id=9))
+        assert [m["text"] for m in tg.sent] == ["🧠 list"]
+
+
+class TestLongCards:
+    """The adapter hard-cuts a reply at 4000 characters, which could land
+    mid-tag; a card drops whole trailing lines instead ("… +k more")."""
+
+    @staticmethod
+    def _long_kids(n: int, fyi: int = 0) -> list[MemoryItem]:
+        kids = _kids(n + fyi)
+        for i, kid in enumerate(kids):
+            kid.raw_text = f"Item {i + 1}: " + "bring the signed form for Romi & Ilan " * 3
+            if i >= n:
+                kid.type, kid.occurred_at, kid.applies_to = ItemType.FACT, None, ["nobody"]
+        return kids
+
+    def test_long_list_stays_under_the_limit_with_whole_lines(self):
+        card = render_source_card(_source(), self._long_kids(60, fyi=30), TZ)
+        assert len(card) <= CARD_TEXT_MAX
+        lines = card.split("\n")
+        # one marker for the numbered lines, one inside the FYI blockquote
+        assert sum(1 for line in lines if line.startswith("… +")) == 2
+        assert " more</blockquote>" in card  # the quote still closes
+        assert card.count("<blockquote expandable>") == card.count("</blockquote>") == 1
+        assert card.endswith("</blockquote>")
+
+    def test_long_done_summary_closes_its_blockquote(self):
+        kids = self._long_kids(60)
+        for kid in kids:
+            kid.child_state = "kept"
+        done = render_done(_source(), kids, TZ, lang="he")
+        assert len(done) <= CARD_TEXT_MAX
+        assert done.split("\n")[0] == "✅ 60 נשמרו"
+        assert done.endswith("</blockquote>") and done.count("<blockquote") == 1
+        assert "… ועוד " in done
+
+    def test_short_cards_are_untouched(self):
+        assert "more" not in render_source_card(_source(), _kids(5), TZ)
