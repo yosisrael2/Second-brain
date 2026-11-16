@@ -27,6 +27,7 @@ from brain.services.proposals import (
     CB_PROPOSED_FIX,
     CB_PROPOSED_KEEP,
     CB_PROPOSED_KEEP_ALL,
+    CB_PROPOSED_OPEN,
     apply_drop,
     apply_fix,
     apply_keep,
@@ -159,12 +160,12 @@ class TestHebrewCard:
         repo, _session, _memory = world
         children = self._children(repo)
 
-        rows = proposal_keyboard("tok", children, lang="he")
+        rows = proposal_keyboard("tok", children, TZ, lang="he")
 
         assert [[label for label, _ in row] for row in rows] == [
-            ["1 ✅ שמור", "1 ✏️ תקן", "1 🗑 מחק"],
-            ["2 ✅ שמור", "2 ✏️ תקן", "2 🗑 מחק"],
-            ["✅ שמור הכל"],  # the 'not for us' line has no buttons
+            ["1 · 📅 מבחן לאיתור מחוננים · 30.11"],
+            ["2 · 📅 מפגש סיכום דיאלוג בנים"],
+            ["✅ שמור הכל (2)"],  # the 'not for us' line has no button
         ]
 
     def test_english_card_gets_the_same_fixes(self, world):
@@ -314,7 +315,7 @@ class TestSupersedeHook:
 
 
 class TestKeyboard:
-    def test_rows_per_child_plus_keep_all(self, world):
+    def test_one_open_button_per_child_plus_keep_all(self, world):
         repo, session, _memory = world
         children = [
             repo.add(
@@ -324,11 +325,12 @@ class TestKeyboard:
             )
             for i in range(3)
         ]
-        rows = proposal_keyboard(uuid.uuid4(), children)
+        rows = proposal_keyboard(uuid.uuid4(), children, TZ)
         flat = [data for row in rows for _label, data in row]
-        assert sum(1 for d in flat if d.startswith(f"{CB_PROPOSED_KEEP}:")) == 3
-        assert sum(1 for d in flat if d.startswith(f"{CB_PROPOSED_FIX}:")) == 3
-        assert sum(1 for d in flat if d.startswith(f"{CB_PROPOSED_DROP}:")) == 3
+        assert [d for d in flat if d.startswith(f"{CB_PROPOSED_OPEN}:")] == [
+            f"{CB_PROPOSED_OPEN}:{child.id}" for child in children
+        ]
+        assert not any(d.split(":")[0] in ("pk", "pf", "px") for d in flat)
         assert any(d.startswith(f"{CB_PROPOSED_KEEP_ALL}:") for d in flat)
 
     def test_callback_data_stays_under_64_bytes(self, world):
@@ -341,7 +343,7 @@ class TestKeyboard:
             )
             for i in range(3)
         ]
-        rows = proposal_keyboard(uuid.uuid4(), children)
+        rows = proposal_keyboard(uuid.uuid4(), children, TZ)
         for row in rows:
             for _label, data in row:
                 assert len(data.encode()) < 64
@@ -630,11 +632,11 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        reply = bot.handle_callback(_button(card, CB_PROPOSED_KEEP), 7)
+        reply = bot.handle_callback(_button(_focus(bot, card), CB_PROPOSED_KEEP), 7)
         session.expire_all()
         child = session.query(MemoryItem).filter(MemoryItem.child_state == "kept").one()
         assert child.raw_text  # state in the DB matches the tap
-        assert "✅ Kept" in reply.text
+        assert "✅ Kept" in reply.toast
 
     def test_drop_callback_suppresses_and_never_returns(self, world):
         repo, session, memory = world
@@ -644,7 +646,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        bot.handle_callback(_button(card, CB_PROPOSED_DROP, 1), 7)
+        bot.handle_callback(_button(_focus(bot, card, 1), CB_PROPOSED_DROP), 7)
         # re-run the extraction: the dropped child must not come back
         again = EnrichmentService(repo, session, memory=memory)
         again.enqueue(source, budget="backfill")
@@ -676,8 +678,9 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        step1 = bot.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
-        assert "New title" in step1.text
+        step1 = bot.handle_callback(_button(_focus(bot, card), CB_PROPOSED_FIX), 7)
+        assert "New title for #1" in step1.text
+        assert step1.silent is True
         step2 = bot.route("Trip to Eshkolot", 7)
         assert "Now the date" in step2.text
         step3 = bot.route("יום חמישי 29.10", 7)
@@ -698,7 +701,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        bot.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
+        bot.handle_callback(_button(_focus(bot, card), CB_PROPOSED_FIX), 7)
         reply = bot.route("cancel", 7)
         assert "cancelled" in reply.text
         session.expire_all()
@@ -712,7 +715,7 @@ class TestBotProposalFlow:
         service.enqueue(source)
         service.run_once(NOW)
         _chat, card = bot.drain_outbound()[0]
-        assert "<b>" not in card.text
+        assert "<b>with</b>" not in card.text  # user text never becomes markup
         assert "&lt;b&gt;" in card.text
 
     def test_ping_fires_once_with_buttons_then_never(self, world):
@@ -772,22 +775,22 @@ class TestDurableButtons:
 
         later = tb.time.monotonic() + 3600
         monkeypatch.setattr(tb.time, "monotonic", lambda: later)
-        reply = bot.handle_callback(_button(card, CB_PROPOSED_KEEP), 7)
-        assert "✅ Kept" in reply.text
+        reply = bot.handle_callback(_button(_focus(bot, card), CB_PROPOSED_KEEP), 7)
+        assert "✅ Kept" in reply.toast
         assert self._states(session) == ["kept", "proposed"]
 
     def test_a_tap_after_a_restart_still_works(self, world):
         _repo, session, _memory = world
         _old_bot, card, _source = self._card(world)
         fresh, _service = _bot(world)  # a new process: empty in-memory state
-        reply = fresh.handle_callback(_button(card, CB_PROPOSED_DROP, 1), 7)
-        assert "🗑 Dropped" in reply.text
+        reply = fresh.handle_callback(_button(_focus(fresh, card, 1), CB_PROPOSED_DROP), 7)
+        assert "🗑 Dropped" in reply.toast
         assert reply.edit is True
         assert self._states(session) == ["dropped", "proposed"]
         # the re-rendered card's buttons work on yet another fresh bot
         again, _service = _bot(world)
-        kept = again.handle_callback(_button(reply, CB_PROPOSED_KEEP), 7)
-        assert "✅ Kept" in kept.text
+        kept = again.handle_callback(_button(_focus(again, reply), CB_PROPOSED_KEEP), 7)
+        assert "✅ Kept" in kept.toast
         assert self._states(session) == ["dropped", "kept"]
 
     def test_keep_all_after_a_restart(self, world):
@@ -795,24 +798,27 @@ class TestDurableButtons:
         _old_bot, card, _source = self._card(world)
         fresh, _service = _bot(world)
         reply = fresh.handle_callback(_button(card, CB_PROPOSED_KEEP_ALL), 7)
-        assert "Kept 2" in reply.text
+        assert "Kept 2" in reply.toast
+        assert reply.text.startswith("✅ 2 kept")  # collapsed: nothing left to decide
+        assert reply.keyboard is None
         assert self._states(session) == ["kept", "kept"]
 
     def test_fix_after_a_restart_starts_the_flow(self, world):
         _old_bot, card, _source = self._card(world)
         fresh, _service = _bot(world)
-        step1 = fresh.handle_callback(_button(card, CB_PROPOSED_FIX), 7)
+        step1 = fresh.handle_callback(_button(_focus(fresh, card), CB_PROPOSED_FIX), 7)
         assert "New title" in step1.text
 
     def test_an_already_decided_item_is_a_clear_no_op(self, world):
         _repo, session, _memory = world
         bot, card, _source = self._card(world)
-        keep = _button(card, CB_PROPOSED_KEEP)
-        drop = _button(card, CB_PROPOSED_DROP)  # the same child's Drop
+        focus = _focus(bot, card)
+        keep = _button(focus, CB_PROPOSED_KEEP)
+        drop = _button(focus, CB_PROPOSED_DROP)  # the same child's Drop
         bot.handle_callback(keep, 7)
         assert self._states(session) == ["kept", "proposed"]
         fresh, _service = _bot(world)
-        for data in (drop, keep, _button(card, CB_PROPOSED_FIX)):
+        for data in (drop, keep, _button(focus, CB_PROPOSED_FIX), _button(card, "po")):
             stale = fresh.handle_callback(data, 7)
             assert "already handled" in stale.toast
         assert self._states(session) == ["kept", "proposed"]  # never re-applied
@@ -883,7 +889,7 @@ class TestDurableButtons:
         [(_chat, ping)] = bot.due_pings(NOW)
         fresh, _service = _bot(world)
         reply = fresh.handle_callback(_button(ping, CB_PROPOSED_KEEP), 7)
-        assert "✅ Kept" in reply.text
+        assert "✅ Kept" in reply.text  # a ping answers in its own line
         assert reply.edit is True
         assert reply.keyboard is None  # the ping stays a one-liner
         session.expire_all()
@@ -906,6 +912,13 @@ class TestDurableButtons:
         assert "🗑 Dropped" in reply.text
         session.expire_all()
         assert session.get(MemoryItem, due.id).child_state == "dropped"
+
+
+def _focus(bot, card, nth: int = 0):
+    """Tap the nth item button of a list card: its focus view."""
+    reply = bot.handle_callback(_button(card, CB_PROPOSED_OPEN, nth), 7)
+    assert reply.edit is True  # the drill-down edits the card in place
+    return reply
 
 
 def _button(reply, prefix: str, nth: int = 0) -> str:

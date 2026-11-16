@@ -5,8 +5,13 @@ Implements delta items 19/20/D2/D4/D7 (PR C) on top of the A1 model:
 - a source whose enrichment run created/updated children gets ONE card:
   "🧠 found N items in <source short title>", one line per proposed child
   (kind emoji, title, resolved date in the configured local zone,
-  applies_to, "⚠️" when the date is conflicted) with per-child
-  ✅ Keep / ✏️ Fix / 🗑 Drop buttons and one "Keep all";
+  applies_to, "⚠️" when the date is conflicted). The card is a list +
+  drill-down in ONE message, edited in place: the list has one button per
+  undecided item (paged above LIST_PAGING_ABOVE) and one "Keep all N"; a
+  tap opens that item's focus view (✅ Keep / ✏️ Fix / 🗑 Drop, or its
+  recon verdict buttons, then ↩︎ Back). Decided lines stay with a
+  ✅ / ✏️ / 🗑 prefix; once nothing is left the card collapses to a
+  one-line summary;
 - actions set ``child_state`` (kept / dropped); dropped children are
   remembered by the A1 re-run diff and never reappear (item 30);
 - Keep makes a child list in /recent and /review (item 19: proposed
@@ -26,9 +31,9 @@ Implements delta items 19/20/D2/D4/D7 (PR C) on top of the A1 model:
 Kind emoji map by the STORED child type (the spec's mapping: 📅 event,
 ✔️ task, 🔔 reminder, ℹ️ fact; legacy types keep sensible fallbacks).
 
-All card text is HTML-escaped here; callback data stays < 64 bytes because
-child ids ride the bot's pending registry (only the short token + an index
-travel in the callback).
+All card text is HTML-escaped here; callback data stays < 64 bytes: a
+button carries a two-letter prefix + the uuid it acts on (+ a page number),
+and the bot re-validates every tap against the DB.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -71,6 +77,23 @@ CB_PROPOSED_FIX = "pf"  # fix one child:   pf:<child-uuid>
 CB_PROPOSED_DROP = "px"  # drop one child:  px:<child-uuid>[:p]
 CB_PROPOSED_KEEP_ALL = "pa"  # keep all:        pa:<source-uuid>
 CB_PING_FLAG = "p"  # a due ping's button: answer one line, never the whole card
+# The list + drill-down card (one message, edited in place): the list shows
+# one button per undecided item; a tap opens that item's focus view.
+CB_PROPOSED_OPEN = "po"  # open one child's focus view: po:<child-uuid>
+CB_PROPOSED_PAGE = "pg"  # a list page:                 pg:<source-uuid>:<page>
+CB_PROPOSED_BACK = "pb"  # focus -> back to the list:   pb:<source-uuid>[:<page>]
+CB_PROPOSED_NOOP = "pn"  # the page indicator: answers the tap, changes nothing
+
+LIST_PAGE_SIZE = 6  # item buttons per page once the list pages
+LIST_PAGING_ABOVE = 8  # up to this many undecided items fit one page
+BUTTON_TITLE_MAX = 24  # an item button's title part (ellipsis beyond)
+_EXCERPT_MAX = 160  # the focus view's source excerpt
+# Card text budget (characters of the HTML we send): the adapter hard-cuts
+# replies at 4000, which could land mid-tag; a card stays under this by
+# dropping trailing lines ("… +k more"), never by cutting inside one.
+CARD_TEXT_MAX = 3800
+_FYI_SHARE = CARD_TEXT_MAX // 4  # the collapsed FYI block's own budget
+DECIDED_STATES = ("kept", "dropped")
 
 _PING_WINDOW = timedelta(hours=48)
 
@@ -192,7 +215,12 @@ def card_numbers(
     numbers: list[int | None] = []
     n = 0
     for index, child in enumerate(children):
-        if is_fyi(child, has_verdict=index in recon):
+        # a decided verdict child keeps its number even after its relation
+        # is gone (✖ Keep both deletes it): the numbers never shift
+        decided_verdict = child.child_state in DECIDED_STATES and bool(
+            (child.extraction_meta or {}).get("recon_verdict")
+        )
+        if is_fyi(child, has_verdict=index in recon or decided_verdict):
             numbers.append(None)
         else:
             n += 1
@@ -214,6 +242,45 @@ def _who(applies_to: list[str] | None, lang: str, names: dict[str, str]) -> str 
     return _esc(", ".join(shown)) if shown else None
 
 
+def _detail_parts(
+    child: MemoryItem, tz_name: str, lang: str, names: dict[str, str] | None
+) -> list[str]:
+    """The date (or an explicit "no date") and the for-whom part of a line."""
+    kind = child.type.value if child.type else ""
+    parts: list[str] = []
+    moment = _local(child, ZoneInfo(tz_name))
+    if moment is not None:
+        parts.append(_date_part(moment, lang))
+    elif kind in _DATED_TYPES:
+        parts.append(i18n.t(lang, "no_date"))
+    who = _who(child.applies_to, lang, names or {})
+    if who:
+        parts.append(who)
+    return parts
+
+
+def _marker_parts(
+    child: MemoryItem,
+    *,
+    state: str | None,
+    matched_title: str | None,
+    lang: str,
+    verdict: bool,
+) -> list[str]:
+    parts: list[str] = []
+    marker = superseded_marker(child, lang)
+    if marker:
+        parts.append(marker)
+    recon = (
+        verdict_marker(child, state=state, matched_title=matched_title, lang=lang)
+        if verdict
+        else ""
+    )
+    if recon:
+        parts.append(_esc(recon))
+    return parts
+
+
 def child_line(
     child: MemoryItem,
     tz_name: str,
@@ -223,6 +290,7 @@ def child_line(
     lang: str = i18n.DEFAULT,
     names: dict[str, str] | None = None,
     number: int | None = None,
+    verdict: bool = True,
 ) -> str:
     """One card line for one child (HTML-escaped).
 
@@ -230,27 +298,18 @@ def child_line(
     card builders look it up): an applied UPDATE renders "↩︎ applied:
     …" and a cancellation names its target. ``number`` prefixes the line
     so it matches its numbered buttons; ``names`` maps stored applies_to
-    names to display names (the Hebrew alias when the bot speaks Hebrew)."""
-    tz = ZoneInfo(tz_name)
+    names to display names (the Hebrew alias when the bot speaks Hebrew).
+    ``verdict=False`` leaves out the recon marker (a decided child whose
+    relation is gone: "proposes …" would no longer be true)."""
     kind = child.type.value if child.type else ""
     emoji = CHILD_EMOJI.get(kind, "•")
     warning = "⚠️ " if child.date_conflict else ""
     prefix = f"{number}. " if number is not None else ""
     parts = [f"{prefix}{warning}{emoji} {i18n.iso(_esc(child.raw_text), lang)}"]
-    moment = _local(child, tz)
-    if moment is not None:
-        parts.append(_date_part(moment, lang))
-    elif kind in _DATED_TYPES:
-        parts.append(i18n.t(lang, "no_date"))
-    who = _who(child.applies_to, lang, names or {})
-    if who:
-        parts.append(who)
-    marker = superseded_marker(child, lang)
-    if marker:
-        parts.append(marker)
-    recon = verdict_marker(child, state=state, matched_title=matched_title, lang=lang)
-    if recon:
-        parts.append(_esc(recon))
+    parts.extend(_detail_parts(child, tz_name, lang, names))
+    parts.extend(
+        _marker_parts(child, state=state, matched_title=matched_title, lang=lang, verdict=verdict)
+    )
     return " · ".join(parts)
 
 
@@ -299,76 +358,293 @@ def verdict_marker(
     return ""
 
 
-def render_source_card(
-    source: MemoryItem,
+Recon = dict[int, tuple[str, object, str | None]]
+
+# verdicts that ask a question (⚠️ on the list button); MORE_DETAIL only adds
+_FLAGGED_VERDICTS = frozenset({"update", "conflict", "cancellation"})
+
+
+def decision_mark(child: MemoryItem) -> str | None:
+    """✅ kept / ✏️ fixed (kept + user-edited) / 🗑 dropped; None = undecided."""
+    if child.child_state == "dropped":
+        return "🗑"
+    if child.child_state == "kept":
+        return "✏️" if (child.extraction_meta or {}).get("user_edited") else "✅"
+    return None
+
+
+def _card_line(
+    child: MemoryItem,
+    index: int,
+    number: int | None,
+    recon: Recon,
+    tz_name: str,
+    lang: str,
+    names: dict[str, str] | None,
+) -> str:
+    """One list line: the child line, prefixed ✅/✏️/🗑 once decided."""
+    mark = decision_mark(child)
+    entry = recon.get(index)
+    if entry is None:
+        line = child_line(
+            child, tz_name, lang=lang, names=names, number=number, verdict=mark is None
+        )
+    else:
+        verdict, rel, matched_title = entry
+        state = (getattr(rel, "provenance", None) or {}).get("state")
+        line = child_line(
+            child,
+            tz_name,
+            state=state,
+            matched_title=matched_title if verdict == "cancellation" else None,
+            lang=lang,
+            names=names,
+            number=number,
+        )
+    if mark == "🗑":
+        return f"{mark} <s>{line}</s>"
+    return f"{mark} {line}" if mark else line
+
+
+def _header(source: MemoryItem, count: int, lang: str) -> str:
+    title = _esc(source_short_title(source))
+    if count == 1:
+        return i18n.t(lang, "card_header_one", title=title)
+    return i18n.t(lang, "card_header", n=count, title=title)
+
+
+def fit_lines(lines: list[str], budget: int, lang: str = i18n.DEFAULT) -> list[str]:
+    """The leading ``lines`` that fit ``budget`` characters (newline-joined),
+    plus "… +k more" for the rest. Whole lines only, so no HTML tag is ever
+    cut; the caller wraps the result (a blockquote stays closed)."""
+    if sum(len(line) + 1 for line in lines) <= budget:
+        return lines
+    room = budget - len(i18n.t(lang, "more_lines", n=len(lines))) - 1
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > room:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return [*kept, i18n.t(lang, "more_lines", n=len(lines) - len(kept))]
+
+
+def _fyi_block(fyi: list[str], lang: str) -> str:
+    # collapsed: the family taps to read; no buttons for these lines
+    label = i18n.t(lang, "card_fyi", n=len(fyi))
+    shown = fit_lines(fyi, _FYI_SHARE - len(label) - 40, lang)
+    return "<blockquote expandable>" + "\n".join([label, *shown]) + "</blockquote>"
+
+
+def _split_lines(
     children: list[MemoryItem],
     tz_name: str,
-    *,
-    recon: dict[int, tuple[str, object, str | None]] | None = None,
-    lang: str = i18n.DEFAULT,
-    names: dict[str, str] | None = None,
-) -> str:
-    """The whole card text for one source's proposed children (HTML-escaped).
-
-    ``recon`` (D-recon-2a) maps a child's index to (verdict, relation,
-    matched_title): verdict children render their state-aware marker line
-    (applied UPDATE, named cancellation target). Actionable children are
-    numbered 1..k; FYI children (:func:`is_fyi`) follow, unnumbered, in one
-    collapsed ``<blockquote expandable>`` (the bot sends parse_mode=HTML;
-    every line is escaped by :func:`child_line`)."""
-    recon = recon or {}
+    recon: Recon,
+    lang: str,
+    names: dict[str, str] | None,
+) -> tuple[list[str], list[str]]:
     numbers = card_numbers(children, recon)
     lines: list[str] = []
     fyi: list[str] = []
     for index, child in enumerate(children):
         number = numbers[index]
-        entry = recon.get(index)
-        if entry is None:
-            line = child_line(child, tz_name, lang=lang, names=names, number=number)
-        else:
-            verdict, rel, matched_title = entry
-            state = (rel.provenance or {}).get("state")
-            line = child_line(
-                child,
-                tz_name,
-                state=state,
-                matched_title=matched_title if verdict == "cancellation" else None,
-                lang=lang,
-                names=names,
-                number=number,
-            )
+        line = _card_line(child, index, number, recon, tz_name, lang, names)
         (lines if number is not None else fyi).append(line)
-    title = _esc(source_short_title(source))
-    if len(children) == 1:
-        header = i18n.t(lang, "card_header_one", title=title)
-    else:
-        header = i18n.t(lang, "card_header", n=len(children), title=title)
-    if fyi:
-        # collapsed: the family taps to read; no buttons for these lines
-        label = i18n.t(lang, "card_fyi", n=len(fyi))
-        lines.append("<blockquote expandable>" + "\n".join([label, *fyi]) + "</blockquote>")
-    return "\n".join([header, *lines])
+    return lines, fyi
+
+
+def render_source_card(
+    source: MemoryItem,
+    children: list[MemoryItem],
+    tz_name: str,
+    *,
+    recon: Recon | None = None,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
+) -> str:
+    """The card's LIST text for one source's children (HTML-escaped).
+
+    ``children`` are every child of the source (:func:`card_children_of`):
+    undecided ones render as before, decided ones stay on the card with a
+    ✅ / ✏️ / 🗑 prefix (no button). ``recon`` (D-recon-2a) maps a child's
+    index to (verdict, relation, matched_title): verdict children render
+    their state-aware marker line. Actionable children are numbered 1..k;
+    FYI children (:func:`is_fyi`) follow, unnumbered, in one collapsed
+    ``<blockquote expandable>`` (the bot sends parse_mode=HTML; every line
+    is escaped by :func:`child_line`)."""
+    recon = recon or {}
+    lines, fyi = _split_lines(children, tz_name, recon, lang, names)
+    header = _header(source, len(children), lang)
+    tail = [_fyi_block(fyi, lang)] if fyi else []
+    budget = CARD_TEXT_MAX - len(header) - sum(len(t) + 1 for t in tail) - 1
+    return "\n".join([header, *fit_lines(lines, budget, lang), *tail])
+
+
+def undecided_positions(children: list[MemoryItem], recon: Recon | None = None) -> list[int]:
+    """Indexes of the undecided actionable children, in card order: the
+    list view's buttons."""
+    numbers = card_numbers(children, recon)
+    return [
+        index
+        for index, (child, n) in enumerate(zip(children, numbers, strict=True))
+        if n is not None and child.child_state == "proposed"
+    ]
+
+
+def page_count(undecided: int) -> int:
+    """Pages of the list view: one up to LIST_PAGING_ABOVE items, then
+    LIST_PAGE_SIZE item buttons per page."""
+    if undecided <= LIST_PAGING_ABOVE:
+        return 1
+    return -(-undecided // LIST_PAGE_SIZE)
+
+
+def page_of(position: int, undecided: int) -> int:
+    """The list page that shows the ``position``-th undecided item."""
+    if undecided <= LIST_PAGING_ABOVE:
+        return 0
+    return max(0, min(position, undecided - 1)) // LIST_PAGE_SIZE
+
+
+def _button_title(text: str) -> str:
+    text = " ".join(text.split())
+    if len(text) <= BUTTON_TITLE_MAX:
+        return text
+    return text[: BUTTON_TITLE_MAX - 1].rstrip() + "…"
+
+
+def item_button_label(child: MemoryItem, number: int, tz_name: str, *, flagged: bool) -> str:
+    """'3 · 📅 Parents evening · 05.11' (⚠️ first for a recon verdict)."""
+    kind = child.type.value if child.type else ""
+    label = f"{number} · {CHILD_EMOJI.get(kind, '•')} {_button_title(child.raw_text)}"
+    moment = _local(child, ZoneInfo(tz_name))
+    if moment is not None:
+        label += f" · {moment.strftime('%d.%m')}"
+    return f"⚠️ {label}" if flagged else label
+
+
+def _flagged(recon: Recon, index: int) -> bool:
+    entry = recon.get(index)
+    return entry is not None and entry[0] in _FLAGGED_VERDICTS
 
 
 def proposal_keyboard(
     source_id: object,
     children: list[MemoryItem],
+    tz_name: str,
     *,
-    recon: dict[int, tuple[str, object, str | None]] | None = None,
+    recon: Recon | None = None,
     lang: str = i18n.DEFAULT,
+    page: int = 0,
 ) -> list[list[tuple[str, str]]]:
-    """Per-child ✅/✏️/🗑 rows + one 'Keep all' row (callback data < 64 bytes).
+    """The LIST view's keyboard: one ``po:<child>`` button per undecided
+    actionable child (one per row, labelled with its card number), a
+    ◀ p/P ▶ row once more than LIST_PAGING_ABOVE items wait, then
+    ✅ Keep all N (N = what is still undecided). Decided and FYI children
+    get no button. Callback data stays < 64 bytes (prefix + uuid [+ page]).
+    ``page`` is clamped to the pages that exist."""
+    recon = recon or {}
+    numbers = card_numbers(children, recon)
+    waiting = undecided_positions(children, recon)
+    pages = page_count(len(waiting))
+    page = max(0, min(page, pages - 1))
+    shown = waiting[page * LIST_PAGE_SIZE : (page + 1) * LIST_PAGE_SIZE] if pages > 1 else waiting
+    rows: list[list[tuple[str, str]]] = []
+    for index in shown:
+        child, number = children[index], numbers[index]
+        assert number is not None  # undecided_positions keeps numbered lines only
+        label = item_button_label(child, number, tz_name, flagged=_flagged(recon, index))
+        rows.append([(label, f"{CB_PROPOSED_OPEN}:{child.id}")])
+    if pages > 1:
+        rows.append(
+            [
+                ("◀", f"{CB_PROPOSED_PAGE}:{source_id}:{(page - 1) % pages}"),
+                (f"{page + 1}/{pages}", CB_PROPOSED_NOOP),
+                ("▶", f"{CB_PROPOSED_PAGE}:{source_id}:{(page + 1) % pages}"),
+            ]
+        )
+    # Keep all keeps every proposed child (FYI included); a card of FYI
+    # lines only still offers it
+    remaining = len(waiting) or sum(1 for c in children if c.child_state == "proposed")
+    if remaining:
+        rows.append(
+            [(i18n.t(lang, "btn_keep_all_n", n=remaining), f"{CB_PROPOSED_KEEP_ALL}:{source_id}")]
+        )
+    return rows
 
-    ``recon`` (D-recon-2a) maps a child's index to (verdict, relation,
-    matched_title): the verdict owns that child's row — UPDATE proposes
-    ✅ Confirm update / ✖ Keep both (or ↩︎ Undo once auto-applied), CONFLICT
-    asks ✅ keep existing / ✅ keep new, CANCELLATION offers ✅ Confirm
-    cancellation / ✖ Not cancelled. The verdict rows carry the RELATION ID
-    (never a position), so a mixed card cannot misalign plain and verdict
-    rows; callback data stays < 64 bytes (prefix + uuid). MORE_DETAIL
-    children keep the default row (the 🔔 line lives on the matched item's
-    card, with no buttons). FYI children (:func:`is_fyi`) get no row; the
-    labels carry the card number (:func:`card_numbers`)."""
+
+def _excerpt(quote: str) -> str:
+    quote = " ".join(quote.split())
+    if len(quote) > _EXCERPT_MAX:
+        quote = quote[: _EXCERPT_MAX - 1].rstrip() + "…"
+    return quote
+
+
+def render_focus(
+    source: MemoryItem,
+    children: list[MemoryItem],
+    index: int,
+    tz_name: str,
+    *,
+    recon: Recon | None = None,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
+    quote: str | None = None,
+    blocks: Iterable[str] = (),
+    with_fyi: bool = False,
+) -> str:
+    """The FOCUS view of one child (HTML-escaped): the card header, then
+    "{n} / {N} · {icon} {title}", the date · person line, the recon /
+    superseded markers, ``blocks`` (a CONFLICT's both versions) and a short
+    italic excerpt of the source quote. ``with_fyi`` adds the collapsed FYI
+    lines (a card whose only actionable child opens in focus directly)."""
+    recon = recon or {}
+    numbers = card_numbers(children, recon)
+    child = children[index]
+    number = numbers[index]
+    total = max((n for n in numbers if n is not None), default=0)
+    kind = child.type.value if child.type else ""
+    warning = "⚠️ " if child.date_conflict else ""
+    title = i18n.iso(_esc(child.raw_text), lang)
+    lines = [
+        _header(source, len(children), lang),
+        f"<b>{number} / {total} · {warning}{CHILD_EMOJI.get(kind, '•')} {title}</b>",
+    ]
+    details = _detail_parts(child, tz_name, lang, names)
+    if details:
+        lines.append(" · ".join(details))
+    entry = recon.get(index)
+    state = (getattr(entry[1], "provenance", None) or {}).get("state") if entry else None
+    matched = entry[2] if entry and entry[0] == "cancellation" else None
+    markers = _marker_parts(child, state=state, matched_title=matched, lang=lang, verdict=True)
+    if markers:
+        lines.append(" · ".join(markers))
+    lines.extend(block for block in blocks if block)
+    if quote and quote.strip():
+        lines.append(f"<i>{i18n.iso(_esc(_excerpt(quote)), lang)}</i>")
+    if with_fyi:
+        _lines, fyi = _split_lines(children, tz_name, recon, lang, names)
+        if fyi:
+            lines.append(_fyi_block(fyi, lang))
+    return "\n".join(lines)
+
+
+def _plain(label_key: str, lang: str) -> str:
+    """A numbered button template without its number (the focus view)."""
+    return i18n.t(lang, label_key, n="").strip()
+
+
+def verdict_rows(
+    entry: tuple[str, object, str | None], lang: str = i18n.DEFAULT
+) -> list[list[tuple[str, str]]] | None:
+    """The recon verdict's buttons (D-recon-2a) for its focus view, or None
+    for a verdict that asks nothing (MORE_DETAIL keeps Keep/Fix/Drop).
+
+    UPDATE proposes ✅ Confirm update / ✖ Keep both (or ↩︎ Undo once
+    auto-applied), CONFLICT asks ✅ keep existing / ✅ keep new,
+    CANCELLATION offers ✅ Confirm cancellation / ✖ Not cancelled. The
+    buttons carry the RELATION ID (never a position)."""
     from brain.services.relations_view import (  # noqa: PLC0415
         CB_RECON_DISCARD,
         CB_REL_CONFIRM,
@@ -376,49 +652,117 @@ def proposal_keyboard(
         CB_REL_UNDO,
     )
 
-    recon = recon or {}
-    rows: list[list[tuple[str, str]]] = []
-    for index, (child, n) in enumerate(zip(children, card_numbers(children, recon), strict=True)):
-        if n is None:  # an FYI line: collapsed on the card, no buttons
-            continue
-        entry = recon.get(index)
-        if entry is not None:
-            verdict, rel, _matched_title = entry
-            state = (rel.provenance or {}).get("state")
-            if verdict == "update" and state == "applied":
-                rows.append([(i18n.t(lang, "btn_undo", n=n), f"{CB_REL_UNDO}:{rel.id}")])
-                continue
-            if verdict == "update":
-                rows.append([
-                    (i18n.t(lang, "btn_confirm_update", n=n), f"{CB_REL_CONFIRM}:{rel.id}"),
-                    (i18n.t(lang, "btn_keep_both", n=n), f"{CB_REL_KEEP_BOTH}:{rel.id}"),
-                ])
-                continue
-            if verdict == "conflict":
-                discard = f"{CB_RECON_DISCARD}:{rel.id}"
-                confirm = f"{CB_REL_CONFIRM}:{rel.id}"
-                rows.append([
-                    (i18n.t(lang, "btn_keep_existing", n=n), discard),
-                    (i18n.t(lang, "btn_keep_new", n=n), confirm),
-                ])
-                continue
-            if verdict == "cancellation":
-                confirm = f"{CB_REL_CONFIRM}:{rel.id}"
-                discard = f"{CB_RECON_DISCARD}:{rel.id}"
-                rows.append([
-                    (i18n.t(lang, "btn_confirm_cancel", n=n), confirm),
-                    (i18n.t(lang, "btn_not_cancelled", n=n), discard),
-                ])
-                continue
-        rows.append(
+    verdict, rel, _matched_title = entry
+    rel_id = getattr(rel, "id", None)
+    state = (getattr(rel, "provenance", None) or {}).get("state")
+    confirm = f"{CB_REL_CONFIRM}:{rel_id}"
+    discard = f"{CB_RECON_DISCARD}:{rel_id}"
+    if verdict == "update" and state == "applied":
+        return [[(_plain("btn_undo", lang), f"{CB_REL_UNDO}:{rel_id}")]]
+    if verdict == "update":
+        return [
             [
-                (i18n.t(lang, "btn_keep", n=n), f"{CB_PROPOSED_KEEP}:{child.id}"),
-                (i18n.t(lang, "btn_fix", n=n), f"{CB_PROPOSED_FIX}:{child.id}"),
-                (i18n.t(lang, "btn_drop", n=n), f"{CB_PROPOSED_DROP}:{child.id}"),
+                (_plain("btn_confirm_update", lang), confirm),
+                (_plain("btn_keep_both", lang), f"{CB_REL_KEEP_BOTH}:{rel_id}"),
             ]
-        )
-    rows.append([(i18n.t(lang, "btn_keep_all"), f"{CB_PROPOSED_KEEP_ALL}:{source_id}")])
+        ]
+    if verdict == "conflict":
+        return [
+            [
+                (_plain("btn_keep_existing", lang), discard),
+                (_plain("btn_keep_new", lang), confirm),
+            ]
+        ]
+    if verdict == "cancellation":
+        return [
+            [
+                (_plain("btn_confirm_cancel", lang), confirm),
+                (_plain("btn_not_cancelled", lang), discard),
+            ]
+        ]
+    return None
+
+
+def focus_keyboard(
+    source_id: object,
+    child: MemoryItem,
+    *,
+    recon_entry: tuple[str, object, str | None] | None = None,
+    lang: str = i18n.DEFAULT,
+    back_page: int | None = 0,
+) -> list[list[tuple[str, str]]]:
+    """The FOCUS view's keyboard: ✅ Keep / ✏️ Fix / 🗑 Drop (or the
+    child's recon verdict buttons), then ↩︎ Back to list — the back row
+    returns to ``back_page``; None leaves it out (a one-item card)."""
+    rows = verdict_rows(recon_entry, lang) if recon_entry is not None else None
+    if rows is None:
+        rows = [
+            [
+                (_plain("btn_keep", lang), f"{CB_PROPOSED_KEEP}:{child.id}"),
+                (_plain("btn_fix", lang), f"{CB_PROPOSED_FIX}:{child.id}"),
+                (_plain("btn_drop", lang), f"{CB_PROPOSED_DROP}:{child.id}"),
+            ]
+        ]
+    if back_page is not None:
+        back = f"{CB_PROPOSED_BACK}:{source_id}:{back_page}"
+        rows.append([(i18n.t(lang, "btn_back_list"), back)])
     return rows
+
+
+def render_done(
+    source: MemoryItem,
+    children: list[MemoryItem],
+    tz_name: str,
+    *,
+    recon: Recon | None = None,
+    lang: str = i18n.DEFAULT,
+    names: dict[str, str] | None = None,
+) -> str:
+    """Nothing left to decide: a one-line summary ("✅ 9 kept · ✏️ 1 fixed ·
+    🗑 1 dropped", zero parts left out) over the whole list, collapsed in
+    one expandable blockquote. Counts cover the numbered (actionable)
+    children — the lines the family decided on."""
+    recon = recon or {}
+    numbers = card_numbers(children, recon)
+    counts = {"✅": 0, "✏️": 0, "🗑": 0}
+    for child, number in zip(children, numbers, strict=True):
+        mark = decision_mark(child)
+        if number is not None and mark is not None:
+            counts[mark] += 1
+    parts = [
+        i18n.t(lang, key, n=counts[mark])
+        for mark, key in (("✅", "done_kept"), ("✏️", "done_fixed"), ("🗑", "done_dropped"))
+        if counts[mark]
+    ]
+    summary = " · ".join(parts) or i18n.t(lang, "all_done").strip()
+    lines, fyi = _split_lines(children, tz_name, recon, lang, names)
+    header = _header(source, len(children), lang)
+    # the closing tag is always written: lines are dropped whole, never cut
+    budget = CARD_TEXT_MAX - len(summary) - len(header) - 60
+    body = [header, *fit_lines([*lines, *fyi], budget, lang)]
+    return summary + "\n<blockquote expandable>" + "\n".join(body) + "</blockquote>"
+
+
+def card_children_of(session: Session, source_id) -> list[MemoryItem]:
+    """Every proposal child linked to one source — undecided and decided —
+    in card order (the list keeps decided lines with their ✅/✏️/🗑)."""
+    from brain.db.models import ItemSource  # noqa: PLC0415
+
+    stmt = (
+        select(MemoryItem)
+        .join(ItemSource, ItemSource.child_id == MemoryItem.id)
+        .where(ItemSource.source_id == source_id)
+        .where(MemoryItem.child_state.is_not(None))
+        .order_by(MemoryItem.created_at.asc(), MemoryItem.id.asc())
+    )
+    # a child may carry several quote rows for the same source: one line each
+    seen: set[object] = set()
+    children: list[MemoryItem] = []
+    for child in session.scalars(stmt):
+        if child.id not in seen:
+            seen.add(child.id)
+            children.append(child)
+    return children
 
 
 # --- state transitions ------------------------------------------------------------
@@ -518,7 +862,8 @@ def apply_fix(
         except Exception as exc:  # noqa: BLE001 — same fallback policy as ingest
             logger.warning(
                 "proposals: re-indexing fixed child %s failed (%s); deferred to 'brain reindex'",
-                child.id, exc,
+                child.id,
+                exc,
             )
     return child
 

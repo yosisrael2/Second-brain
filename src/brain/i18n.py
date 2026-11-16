@@ -61,6 +61,9 @@ _STRINGS: dict[str, dict[str, str]] = {
     "btn_fix": {"en": "{n} ✏️ Fix", "he": "{n} ✏️ תקן"},
     "btn_drop": {"en": "{n} 🗑 Drop", "he": "{n} 🗑 מחק"},
     "btn_keep_all": {"en": "✅ Keep all", "he": "✅ שמור הכל"},
+    "btn_keep_all_n": {"en": "✅ Keep all {n}", "he": "✅ שמור הכל ({n})"},
+    "more_lines": {"en": "… +{n} more", "he": "… ועוד {n}"},
+    "btn_back_list": {"en": "↩︎ Back to list", "he": "↩︎ חזרה לרשימה"},
     "btn_undo": {"en": "{n} ↩︎ Undo", "he": "{n} ↩︎ בטל"},
     "btn_confirm_update": {"en": "{n} ✅ Confirm update", "he": "{n} ✅ אשר עדכון"},
     "btn_keep_both": {"en": "{n} ✖ Keep both", "he": "{n} ✖ השאר את שניהם"},
@@ -416,6 +419,10 @@ _STRINGS: dict[str, dict[str, str]] = {
     "kept_n_one": {"en": "✅ Kept {n} item(s).", "he": "✅ נשמר פריט אחד."},
     "kept_n_zero": {"en": "✅ Kept {n} item(s).", "he": "✅ לא נשאר כאן מה לשמור."},
     "all_done": {"en": " ✓ all done here.", "he": "✓ סיימנו עם ההודעה הזאת."},
+    # the collapsed card once nothing is left to decide (zero parts omitted)
+    "done_kept": {"en": "✅ {n} kept", "he": "✅ {n} נשמרו"},
+    "done_fixed": {"en": "✏️ {n} fixed", "he": "✏️ {n} תוקנו"},
+    "done_dropped": {"en": "🗑 {n} dropped", "he": "🗑 {n} נמחקו"},
     # relation transitions (supersede / recon verdicts)
     "rel_undone": {
         "en": "↩️ Undone — the earlier item is current again.",
@@ -481,6 +488,10 @@ _STRINGS: dict[str, dict[str, str]] = {
     "fix_title_prompt": {
         "en": "✏️ New title for: {title}\nType the new title (or 'cancel').",
         "he": "✏️ מתקנים את: {title}\nכתבו את השם הנכון (או „ביטול” כדי לצאת).",
+    },
+    "fix_title_prompt_n": {
+        "en": "✏️ New title for #{n} {title}\nType the new title (or 'cancel').",
+        "he": "✏️ מתקנים את #{n} {title}\nכתבו את השם הנכון (או „ביטול” כדי לצאת).",
     },
     "fix_cancelled": {
         "en": "✏️ Fix cancelled — nothing changed.",
