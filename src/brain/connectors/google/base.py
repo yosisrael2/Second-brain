@@ -278,7 +278,11 @@ class GoogleConnector(Connector):
         Works without the google libs importable: HttpError carries
         ``.resp.status``; RefreshError is recognized by type name (same
         approach as ai/gmail.py until C5 consolidates them).
+        Already-translated errors (e.g. raised by a Nango refresh_handler
+        inside google-auth) pass through unchanged.
         """
+        if isinstance(exc, ConnectorError):
+            return exc
         if type(exc).__name__ == "RefreshError" or "invalid_grant" in str(exc):
             return ConnectorAuthError(f"refresh token rejected ({exc})")
         resp = getattr(exc, "resp", None)
