@@ -267,6 +267,26 @@ class Settings(BaseSettings):
     )
     gdrive_depth: int = Field(default=1, validation_alias="BRAIN_GDRIVE_DEPTH")
 
+    # Where the Google connectors get their tokens. "keychain" (default): the
+    # refresh token from `brain connectors auth google`. "nango": Nango holds
+    # the OAuth connection and hands out access tokens; each enabled Google
+    # connector needs its NANGO_<NAME>_CONNECTION_ID. The provider config
+    # keys default to Nango's integration ids for each product. Only the
+    # connector sync path uses this; gmail-poll and the labeler stay keychain.
+    google_auth: Literal["keychain", "nango"] = Field(
+        default="keychain", validation_alias="BRAIN_GOOGLE_AUTH"
+    )
+    nango_secret_key: SecretStr | None = None
+    nango_host: str = "https://api.nango.dev"
+    nango_email_connection_id: str = ""
+    nango_email_provider_config_key: str = "google-mail"
+    nango_gcal_connection_id: str = ""
+    nango_gcal_provider_config_key: str = "google-calendar"
+    nango_gdrive_connection_id: str = ""
+    nango_gdrive_provider_config_key: str = "google-drive"
+    nango_gtasks_connection_id: str = ""
+    nango_gtasks_provider_config_key: str = "google-tasks"
+
     # Connectors (connectors ticket): the enabled data sources, comma
     # separated (BRAIN_CONNECTORS="email,gcal,gdrive,gtasks"). Default empty
     # = none enabled; `brain connectors sync` refuses disabled names and
